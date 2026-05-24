@@ -9,6 +9,11 @@ import java.util.Map;
 
 /**
  * Vehicle/profile-specific panoramic defaults.
+ *
+ * Encoder dimensions are derived from the panoramic strip aspect: the mosaic
+ * is a 2x2 grid of full-height tiles, so a 5120x960 strip yields 2x1280 wide
+ * and 2x960 tall = 2560x1920 (4:3 quadrants). A 5120x720 strip yields
+ * 2560x1440 (16:9 quadrants). Hardcoding 2560x1920 stretches Tang content.
  */
 public final class CameraProfile {
     private final String id;
@@ -77,6 +82,23 @@ public final class CameraProfile {
         return directPreviewHeight;
     }
 
+    /**
+     * Encoder/mosaic output width. The mosaic is a 2x2 grid of camera tiles,
+     * each tile = (panoWidth/4) wide. Two tiles side-by-side = panoWidth/2.
+     * For 5120 strip → 2560.
+     */
+    public int getEncoderWidth() {
+        return Math.max(1, panoWidth / 2);
+    }
+
+    /**
+     * Encoder/mosaic output height. Each tile is panoHeight tall, two tiles
+     * stacked = panoHeight*2. For 960 strip → 1920 (Seal). For 720 strip → 1440 (Tang).
+     */
+    public int getEncoderHeight() {
+        return Math.max(1, panoHeight * 2);
+    }
+
     public EnumMap<CameraRole, CameraSourceRef> getDefaultRoleMappings() {
         return new EnumMap<>(defaultRoleMappings);
     }
@@ -107,6 +129,8 @@ public final class CameraProfile {
         putSafely(out, "panoSurfaceMode", panoSurfaceMode);
         putSafely(out, "directPreviewWidth", directPreviewWidth);
         putSafely(out, "directPreviewHeight", directPreviewHeight);
+        putSafely(out, "encoderWidth", getEncoderWidth());
+        putSafely(out, "encoderHeight", getEncoderHeight());
 
         JSONObject mappings = new JSONObject();
         for (Map.Entry<CameraRole, CameraSourceRef> entry : defaultRoleMappings.entrySet()) {

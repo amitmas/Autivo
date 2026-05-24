@@ -49,7 +49,8 @@ public class StorageManager {
     // Storage type enum
     public enum StorageType {
         INTERNAL,
-        SD_CARD
+        SD_CARD,
+        USB
     }
     
     // Hybrid logger - uses DaemonLogger when running as daemon, android.util.Log otherwise
@@ -105,17 +106,6 @@ public class StorageManager {
     private static final String LEGACY_APP_FILES_DIR = "/storage/emulated/0/Android/data/com.overdrive.app/files";
     private static final String LEGACY_SURVEILLANCE_DIR = LEGACY_APP_FILES_DIR + "/sentry_events";
 
-    // Known SD card mount paths (BYD and common Android paths)
-    private static final String[] SD_CARD_PATHS = {
-        "/storage/external_sd",
-        "/storage/sdcard1",
-        "/storage/sdcard0",
-        "/mnt/external_sd",
-        "/mnt/sdcard/external_sd",
-        "/mnt/media_rw",
-        "/mnt/sdcard",
-    };
-    
     // Subdirectories
     public static final String RECORDINGS_SUBDIR = "recordings";
     public static final String SURVEILLANCE_SUBDIR = "surveillance";
@@ -124,6 +114,18 @@ public class StorageManager {
     
     // Config file location
     private static final String CONFIG_FILE = "/data/local/tmp/overdrive_config.json";
+
+    // Persisted UUID of whichever public volume we've previously confirmed as
+    // the SD card. Used as the first-class signal in classifyPublicVolume()
+    // when the BYD vendor prop (sys.byd.mSdcardUuid) is empty. The vendor
+    // prop is only populated WHILE the card is mounted on this firmware, so
+    // during the unmount window between ACC OFF and our remount attempt the
+    // prop returns "" and the major-number fallback was misclassifying the
+    // bridged-SD (major 8, DEVNAME=sd*) as USB. Learning the FAT volume
+    // serial from a previous successful cycle bridges the gap. File is
+    // tiny (~10 bytes), atomic-write semantics not required because a stale
+    // value still resolves to the same physical card.
+    private static final String LEARNED_SD_UUID_FILE = "/data/local/tmp/overdrive_sd_uuid";
     
     // Default limits (in bytes)
     private static final long DEFAULT_RECORDINGS_LIMIT_MB = 500;
@@ -131,8 +133,23 @@ public class StorageManager {
     private static final long DEFAULT_PROXIMITY_LIMIT_MB = 500;
     private static final long DEFAULT_TRIPS_LIMIT_MB = 500;
     private static final long MIN_LIMIT_MB = 100;
-    private static final long MAX_LIMIT_MB_INTERNAL = 100000;  // 100GB max for internal
-    private static final long MAX_LIMIT_MB_SD_CARD = 100000;  // 100GB max for SD card
+
+    // Hard ceiling fallback used only when StatFs reports 0 (volume unmounted
+    // at the moment of the read). Keeps the slider usable while we wait for a
+    // refresh. Real cap comes from getEffectiveMaxLimitMb(type) below, which
+    // pulls the live filesystem total minus a safety reserve.
+    private static final long MAX_LIMIT_MB_FALLBACK = 100000;  // 100GB
+
+    // Per-category share of the volume — recordings, surveillance, trips,
+    // proximity all live on the same FS, so giving each one 100% of the disk
+    // overcommits by 4x. 40% per category leaves headroom for the OS, the
+    // muxer flush queue, and the other Overdrive categories competing for
+    // the same pool.
+    private static final double PER_CATEGORY_SHARE = 0.40;
+
+    // Reserve a small fraction of the volume so the encoder can never hit
+    // ENOSPC mid-file from the user setting "max" on a near-empty disk.
+    private static final long VOLUME_HEADROOM_MB = 256;
     
     // Periodic cleanup interval (30 seconds)
     private static final long CLEANUP_INTERVAL_SECONDS = 30;
@@ -151,6 +168,14 @@ public class StorageManager {
     // SD card state
     private String sdCardPath = null;
     private boolean sdCardAvailable = false;
+
+    // USB state — flash drives mounted via OTG. Treated as a separate volume
+    // class from SD because of how head-units enumerate them: SD sits behind
+    // an mmc driver (Linux major 179), USB behind sd/SCSI (major 8/65/66/...).
+    // Without this distinction discoverSdCard() will happily latch onto a USB
+    // stick when both are present.
+    private String usbPath = null;
+    private boolean usbAvailable = false;
     
     // Singleton instance
     private static StorageManager instance;
@@ -166,6 +191,12 @@ public class StorageManager {
     private File sdCardSurveillanceDir;
     private File sdCardProximityDir;
     private File sdCardTripsDir;
+
+    // USB directories (may be null if USB drive not available)
+    private File usbRecordingsDir;
+    private File usbSurveillanceDir;
+    private File usbProximityDir;
+    private File usbTripsDir;
     
     // Active directories (based on storage type selection)
     private File recordingsDir;
@@ -177,39 +208,117 @@ public class StorageManager {
     private ScheduledExecutorService cleanupScheduler;
     private final AtomicBoolean recordingActive = new AtomicBoolean(false);
     private final AtomicBoolean surveillanceActive = new AtomicBoolean(false);
-    
+
+    // SOTA: Authoritative "encoder is mid-write" probe.
+    //
+    // The setRecordingActive / setSurveillanceActive booleans above track the
+    // *user-facing* recording state, set by GpuMosaicRecorder.startRecording /
+    // stopRecording. They are NOT a reliable signal for "is the disk writer
+    // currently flushing packets to the SD card", because there's a real lag:
+    //   - User starts recording → recordingActive=true. Encoder hasn't yet
+    //     produced its first packet. Cleanup CAN safely run for ~100 ms.
+    //   - User stops recording → recordingActive=false. Disk writer is still
+    //     draining the muxer queue + finalising the moov atom (~50-200ms).
+    //     A cleanup burst here corrupts the still-open file's footer write.
+    //
+    // The probe below points at HardwareEventRecorderGpu.isWritingToFile() —
+    // the volatile flag set under startStopLock that goes true the moment the
+    // muxer is constructed and false ONLY after closeEventRecording has
+    // released it. Cleanup uses this to gate destructive deletes and avoid
+    // contending with the realtime SD-card writes during an active recording.
+    //
+    // Default probe returns false so a stale binding never blocks cleanup
+    // forever. PipelineDaemon installs the real probe after the encoder
+    // exists; if the encoder is later released, the probe returns false
+    // gracefully (HardwareEventRecorderGpu.isWritingToFile reads a volatile
+    // field that's false when the recorder isn't holding a muxer).
+    private volatile java.util.function.BooleanSupplier encoderWritingProbe = () -> false;
+    /**
+     * Set true the first time setEncoderWritingProbe wires a real probe. The
+     * periodic cleanup loop early-returns until this flips, so the first
+     * 30-second tick after daemon boot can't run un-gated against a default
+     * fail-open probe (audit P1).
+     */
+    private final java.util.concurrent.atomic.AtomicBoolean probeWired =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
+
     // Async cleanup executor (single thread to avoid concurrent cleanup)
-    private final java.util.concurrent.ExecutorService asyncCleanupExecutor = 
+    private final java.util.concurrent.ExecutorService asyncCleanupExecutor =
         Executors.newSingleThreadExecutor(r -> {
-            Thread t = new Thread(r, "StorageCleanupAsync");
+            Thread t = new Thread(() -> {
+                // SOTA: Linux nice +10 (THREAD_PRIORITY_BACKGROUND). The Java
+                // MIN_PRIORITY below is advisory; this is what actually keeps
+                // file deletes from preempting the disk writer's muxer writes
+                // under SD card I/O contention.
+                try {
+                    android.os.Process.setThreadPriority(
+                            android.os.Process.THREAD_PRIORITY_BACKGROUND);
+                } catch (Throwable ignored) {}
+                r.run();
+            }, "StorageCleanupAsync");
             t.setDaemon(true);
-            t.setPriority(Thread.MIN_PRIORITY);  // Low priority to not interfere with recording
+            t.setPriority(Thread.MIN_PRIORITY);
             return t;
         });
-    
+
+    // Deferred-cleanup queue: when a save event fires while encoder is mid-
+    // write, instead of running the delete burst we mark the directory as
+    // "needs cleanup later". A polling pass on the same asyncCleanupExecutor
+    // drains this set the next time encoderWritingProbe returns false. Without
+    // this, a back-to-back recording/cleanup pattern would skip cleanup
+    // forever and storage would grow past the limit.
+    private final java.util.Set<String> deferredCleanupDirs =
+        java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private static final String DEFERRED_RECORDINGS = "recordings";
+    private static final String DEFERRED_SURVEILLANCE = "surveillance";
+    private static final String DEFERRED_PROXIMITY = "proximity";
+    private static final String DEFERRED_TRIPS = "trips";
+
     // Cleanup lock to prevent concurrent cleanup operations
     private final Object cleanupLock = new Object();
     
-    // SD card mount watchdog (keeps SD card mounted during sentry mode)
+    // SD card / USB mount watchdog (keeps the configured external volume
+    // mounted during sentry mode). Single scheduler covers both classes —
+    // each volume gets its own consecutive-failure counter so quiet-log
+    // throttling is independent.
     private ScheduledExecutorService sdCardWatchdog;
     private static final long SD_WATCHDOG_INTERVAL_SECONDS = 15;
     private int sdWatchdogConsecutiveFailures = 0;
+    private int usbWatchdogConsecutiveFailures = 0;
     private static final int SD_WATCHDOG_MAX_VERBOSE_FAILURES = 5;  // Log verbosely for first 5 failures
     private static final int SD_WATCHDOG_QUIET_LOG_INTERVAL = 20;   // Then log every 20th attempt (~5 min)
     
+    /**
+     * Parse a storage-type string from persisted config. Anything that
+     * doesn't match SD_CARD/USB falls back to INTERNAL — that includes
+     * legacy configs and accidentally-truncated writes.
+     */
+    private static StorageType parseStorageType(String s) {
+        if ("SD_CARD".equals(s)) return StorageType.SD_CARD;
+        if ("USB".equals(s))     return StorageType.USB;
+        return StorageType.INTERNAL;
+    }
+
     private StorageManager() {
-        discoverSdCard();
+        discoverVolumes();
         initDirectories();
         loadConfig();
 
-        // SOTA: If config says SD card but it's not available, try to mount it
-        // This happens when daemon starts and SD card is unmounted
+        // SOTA: If config says SD/USB but it's not available, try to mount it
+        // This happens when daemon starts and the volume is unmounted
         if (!sdCardAvailable &&
             (surveillanceStorageType == StorageType.SD_CARD ||
              recordingsStorageType == StorageType.SD_CARD ||
              tripsStorageType == StorageType.SD_CARD)) {
             logInfo("SD card configured but not available - attempting mount...");
             ensureSdCardMounted(true);
+        }
+        if (!usbAvailable &&
+            (surveillanceStorageType == StorageType.USB ||
+             recordingsStorageType == StorageType.USB ||
+             tripsStorageType == StorageType.USB)) {
+            logInfo("USB configured but not available - attempting mount...");
+            ensureUsbMounted(true);
         }
 
         updateActiveDirectories();
@@ -256,150 +365,193 @@ public class StorageManager {
     /**
      * SOTA: Mount SD card, optionally forcing a remount.
      * Uses Android's StorageManager (sm) command to mount public volumes.
-     * 
+     *
      * @param force If true, always attempt to mount even if already mounted
      * @return true if SD card is now mounted, false otherwise
      */
     public boolean ensureSdCardMounted(boolean force) {
+        return ensureVolumeMounted("SD", force);
+    }
+
+    /**
+     * Mount USB drive (or remount if stale). Mirror of ensureSdCardMounted
+     * for the USB volume class.
+     */
+    public boolean ensureUsbMounted() {
+        return ensureUsbMounted(false);
+    }
+
+    public boolean ensureUsbMounted(boolean force) {
+        return ensureVolumeMounted("USB", force);
+    }
+
+    /**
+     * Generic mount-or-remount for a specific volume class (SD or USB).
+     * Walks {@code sm list-volumes all}, classifies each public volume by
+     * underlying block-device major number (see classifyPublicVolume), and
+     * mounts the first one matching the requested class. Updates the
+     * corresponding {@code <class>Path} / {@code <class>Available} fields
+     * + initializes per-class directories on success.
+     *
+     * @param targetClass "SD" or "USB"
+     * @param force       attempt even if already mounted (for remount cases)
+     */
+    private boolean ensureVolumeMounted(String targetClass, boolean force) {
+        boolean isSd = "SD".equals(targetClass);
+        String currentPath = isSd ? sdCardPath : usbPath;
+        boolean currentAvailable = isSd ? sdCardAvailable : usbAvailable;
+
         // Quick check: if path is already accessible, no work needed
-        if (sdCardAvailable && sdCardPath != null) {
-            File sdDir = new File(sdCardPath);
-            if (sdDir.exists() && sdDir.canWrite()) {
-                logDebug("SD card already mounted at: " + sdCardPath);
+        if (!force && currentAvailable && currentPath != null) {
+            if (isMountWritable(currentPath)) {
+                logDebug(targetClass + " already mounted at: " + currentPath);
                 return true;
             }
         }
-        
-        logDebug("Mounting SD card...");
-        
+
+        logDebug("Mounting " + targetClass + "...");
+
         try {
-            // Step 1: Find the Volume ID using 'sm list-volumes all'
             Process listProcess = Runtime.getRuntime().exec(new String[]{"sm", "list-volumes", "all"});
             BufferedReader reader = new BufferedReader(new InputStreamReader(listProcess.getInputStream()));
             String line;
-            String volumeId = null;      // e.g., "public:8,97"
-            String volumeUuid = null;    // e.g., "3661-3064"
-            
+            String volumeId = null;
+            String volumeUuid = null;
+            int volMajor = -1, volMinor = -1;
+
             while ((line = reader.readLine()) != null) {
-                // Parse lines like: "public:8,97 unmounted 3661-3064" or "public:8,97 mounted 3661-3064"
                 line = line.trim();
                 logDebug("sm list-volumes: " + line);
-                
-                if (line.startsWith("public:")) {
-                    String[] parts = line.split("\\s+");
-                    if (parts.length >= 3) {
-                        volumeId = parts[0];           // e.g., "public:8,97"
-                        String state = parts[1];       // e.g., "unmounted" or "mounted"
-                        volumeUuid = parts[2];         // e.g., "3661-3064"
-                        
-                        // If already mounted, check if path is actually accessible
-                        if ("mounted".equals(state)) {
-                            String mountPath = "/storage/" + volumeUuid;
-                            File mountDir = new File(mountPath);
-                            if (mountDir.exists() && mountDir.canWrite()) {
-                                sdCardPath = mountPath;
-                                sdCardAvailable = true;
-                                logInfo("SD card already mounted at: " + sdCardPath);
-                                reader.close();
-                                listProcess.waitFor();
-                                initSdCardDirectories();
-                                updateActiveDirectories();
-                                return true;
-                            }
-                            // Mounted but path not accessible — stale mount, will remount below
-                            logWarn("SD card volume " + volumeId + " reports mounted but path " + mountPath + 
-                                " not accessible — will force remount");
-                        }
-                        
-                        break;  // Found the public volume
-                    }
+                if (!line.startsWith("public:")) continue;
+                String[] parts = line.split("\\s+");
+                if (parts.length < 3) continue;
+
+                String[] dev = parts[0].substring("public:".length()).split(",");
+                int major, minor;
+                try {
+                    major = Integer.parseInt(dev[0]);
+                    minor = Integer.parseInt(dev[1]);
+                } catch (Exception e) {
+                    continue;
                 }
+                String state = parts[1];
+                String thisUuid = parts[2];
+                String klass = classifyPublicVolume(major, minor, thisUuid);
+                if (!targetClass.equals(klass)) continue;  // wrong volume class
+
+                if ("mounted".equals(state)) {
+                    String mountPath = "/storage/" + thisUuid;
+                    if (isMountWritable(mountPath)) {
+                        if (isSd) {
+                            sdCardPath = mountPath;
+                            sdCardAvailable = true;
+                            learnSdUuid(thisUuid);  // remember for next unmount window
+                        } else {
+                            usbPath = mountPath;
+                            usbAvailable = true;
+                        }
+                        logInfo(targetClass + " already mounted at: " + mountPath);
+                        reader.close();
+                        listProcess.waitFor();
+                        if (isSd) initSdCardDirectories(); else initUsbDirectories();
+                        updateActiveDirectories();
+                        return true;
+                    }
+                    logWarn(targetClass + " volume " + parts[0] + " reports mounted but path " +
+                        mountPath + " not accessible — will force remount");
+                }
+
+                volumeId = parts[0];
+                volumeUuid = thisUuid;
+                volMajor = major;
+                volMinor = minor;
+                break;
             }
             reader.close();
             listProcess.waitFor();
-            
-            // Step 2: Always attempt mount if we found a volume
-            // sm mount is safe to call even if already mounted (no-op if healthy)
-            // For stale mounts, this forces the system to re-establish the FUSE path
+
             if (volumeId != null) {
-                
                 Process mountProcess = Runtime.getRuntime().exec(new String[]{"sm", "mount", volumeId});
-                
-                // Capture output for debugging
                 BufferedReader outReader = new BufferedReader(new InputStreamReader(mountProcess.getInputStream()));
                 BufferedReader errReader = new BufferedReader(new InputStreamReader(mountProcess.getErrorStream()));
                 StringBuilder output = new StringBuilder();
                 String outLine;
-                while ((outLine = outReader.readLine()) != null) {
-                    output.append(outLine).append("\n");
-                }
-                while ((outLine = errReader.readLine()) != null) {
-                    output.append("ERR: ").append(outLine).append("\n");
-                }
+                while ((outLine = outReader.readLine()) != null) output.append(outLine).append("\n");
+                while ((outLine = errReader.readLine()) != null) output.append("ERR: ").append(outLine).append("\n");
                 outReader.close();
                 errReader.close();
-                
+
                 int exitCode = mountProcess.waitFor();
-                logInfo("sm mount exit code: " + exitCode + 
+                logInfo("sm mount " + volumeId + " exit code: " + exitCode +
                     (output.length() > 0 ? ", output: " + output.toString().trim() : ""));
-                
+
                 if (exitCode == 0 && volumeUuid != null) {
-                    // Wait for mount to complete
                     String mountPath = "/storage/" + volumeUuid;
-                    File mountDir = new File(mountPath);
-                    
-                    // Wait up to 5 seconds for mount to appear
                     for (int i = 0; i < 10; i++) {
                         Thread.sleep(500);
-                        if (mountDir.exists() && mountDir.canWrite()) {
-                            sdCardPath = mountPath;
-                            sdCardAvailable = true;
-                            logInfo("SD card mounted successfully at: " + sdCardPath);
-                            initSdCardDirectories();
+                        if (isMountWritable(mountPath)) {
+                            if (isSd) {
+                                sdCardPath = mountPath;
+                                sdCardAvailable = true;
+                                learnSdUuid(volumeUuid);
+                            } else {
+                                usbPath = mountPath;
+                                usbAvailable = true;
+                            }
+                            logInfo(targetClass + " mounted successfully at: " + mountPath);
+                            if (isSd) initSdCardDirectories(); else initUsbDirectories();
                             updateActiveDirectories();
                             return true;
                         }
-                        logDebug("Waiting for mount... attempt " + (i+1) + "/10");
+                        logDebug("Waiting for " + targetClass + " mount... attempt " + (i+1) + "/10");
                     }
-                    logWarn("SD card mount path not accessible after mount: " + mountPath);
+                    logWarn(targetClass + " mount path not accessible after mount: " + mountPath);
                 } else {
-                    logWarn("sm mount command failed with exit code: " + exitCode);
+                    logWarn("sm mount " + volumeId + " failed with exit code: " + exitCode);
                 }
             } else {
-                logDebug("No public SD card volume found");
+                logDebug("No public " + targetClass + " volume found");
             }
-            
+
         } catch (Exception e) {
-            logError("Error mounting SD card: " + e.getMessage());
+            logError("Error mounting " + targetClass + ": " + e.getMessage());
         }
-        
+
         // Re-run discovery in case mount succeeded but we missed it
-        discoverSdCard();
-        return sdCardAvailable;
+        discoverVolumes();
+        return isSd ? sdCardAvailable : usbAvailable;
     }
     
     /**
      * Check if SD card is currently mounted (without attempting to mount).
      * Simply checks if the path exists and is writable.
-     * 
+     *
      * @return true if SD card is mounted
      */
     public boolean isSdCardMounted() {
         if (sdCardPath == null) {
             return false;
         }
-        
-        File sdDir = new File(sdCardPath);
-        return sdDir.exists() && sdDir.isDirectory() && sdDir.canWrite();
+        return isMountWritable(sdCardPath);
     }
-    
+
     /**
-     * Ensure SD card is ready for use.
-     * If SD card storage is selected but not mounted, attempts to mount it.
+     * Check if USB drive is currently mounted (without attempting to mount).
+     */
+    public boolean isUsbMounted() {
+        if (usbPath == null) {
+            return false;
+        }
+        return isMountWritable(usbPath);
+    }
+
+    /**
+     * Ensure storage is ready for use.
+     * If SD/USB storage is selected but not mounted, attempts to mount it.
      * If mount fails, falls back to internal storage.
-     * 
+     *
      * @param forSurveillance true if checking for surveillance, false for recordings
-     * @return true if storage is ready (either SD card mounted or fallback to internal)
+     * @return true if storage is ready (either SD/USB mounted or fallback to internal)
      */
     public boolean ensureStorageReady(boolean forSurveillance) {
         StorageType selectedType = forSurveillance ? surveillanceStorageType : recordingsStorageType;
@@ -410,7 +562,7 @@ public class StorageManager {
         }
 
         // CRITICAL: Don't switch storage location while recording is active
-        // This prevents files from being split across SD card and internal storage
+        // This prevents files from being split across volumes
         if (!forSurveillance && recordingActive.get()) {
             logDebug("Recording active - not switching storage location");
             return true;
@@ -420,195 +572,290 @@ public class StorageManager {
             return true;
         }
 
-        // SD card selected - ensure it's mounted
-        if (!isSdCardMounted()) {
-            logInfo("SD card not mounted, attempting to mount for " + 
-                (forSurveillance ? "surveillance" : "recordings"));
-
-            if (!ensureSdCardMounted()) {
-                logWarn("Failed to mount SD card, falling back to internal storage");
-
-                // Temporary fallback: point active directory to internal storage
-                // but do NOT change the storage type preference — user still wants SD card.
-                // When SD card comes back (watchdog remount or next ensureStorageReady call),
-                // updateActiveDirectories() will restore the SD card path.
-                if (forSurveillance) {
-                    surveillanceDir = internalSurveillanceDir;
-                    proximityDir = internalProximityDir;
-                } else {
-                    recordingsDir = internalRecordingsDir;
+        if (selectedType == StorageType.SD_CARD) {
+            if (!isSdCardMounted()) {
+                logInfo("SD card not mounted, attempting to mount for " +
+                    (forSurveillance ? "surveillance" : "recordings"));
+                if (!ensureSdCardMounted()) {
+                    logWarn("Failed to mount SD card, falling back to internal storage");
+                    if (forSurveillance) {
+                        surveillanceDir = internalSurveillanceDir;
+                        proximityDir = internalProximityDir;
+                    } else {
+                        recordingsDir = internalRecordingsDir;
+                    }
+                    return true;
                 }
-
-                return true;  // Internal storage is ready
             }
+            initSdCardDirectories();
+            updateActiveDirectories();
+
+            // Pre-reserve space on SD card by cleaning BYD dashcam files if needed
+            try {
+                ExternalStorageCleaner cleaner = ExternalStorageCleaner.getInstance();
+                if (cleaner.isEnabled() && cleaner.isSdCardAvailable()) {
+                    cleaner.ensureReservedSpace();
+                }
+            } catch (Exception e) {
+                logWarn("Pre-recording CDR cleanup failed: " + e.getMessage());
+            }
+            return true;
         }
 
-        // SD card is mounted, ensure directories exist
-        initSdCardDirectories();
-        updateActiveDirectories();
-
-        // Pre-reserve space on SD card by cleaning BYD dashcam files if needed
-        try {
-            ExternalStorageCleaner cleaner = ExternalStorageCleaner.getInstance();
-            if (cleaner.isEnabled() && cleaner.isSdCardAvailable()) {
-                cleaner.ensureReservedSpace();
+        if (selectedType == StorageType.USB) {
+            if (!isUsbMounted()) {
+                logInfo("USB not mounted, attempting to mount for " +
+                    (forSurveillance ? "surveillance" : "recordings"));
+                if (!ensureUsbMounted()) {
+                    logWarn("Failed to mount USB, falling back to internal storage");
+                    if (forSurveillance) {
+                        surveillanceDir = internalSurveillanceDir;
+                        proximityDir = internalProximityDir;
+                    } else {
+                        recordingsDir = internalRecordingsDir;
+                    }
+                    return true;
+                }
             }
-        } catch (Exception e) {
-            logWarn("Pre-recording CDR cleanup failed: " + e.getMessage());
+            initUsbDirectories();
+            updateActiveDirectories();
+            return true;
         }
 
         return true;
     }
     
     /**
-     * Discover SD card path using sm list-volumes, BYD system properties, or known mount points.
+     * Backwards-compatible alias for {@link #discoverVolumes()} — public
+     * callers (refreshSdCard, watchdog) keep working unchanged.
      */
     public void discoverSdCard() {
+        discoverVolumes();
+    }
+
+    /**
+     * Classify a public volume as SD or USB.
+     *
+     * Three signals, in order of authority:
+     *   1. {@code sys.byd.mSdcardUuid} — vendor-set prop carrying the UUID of
+     *      the SD card slot's volume. Present on BYD head-units; the most
+     *      reliable signal because the firmware itself decides what the
+     *      slot is. We compare against the volume's UUID (parts[2] from sm
+     *      list-volumes), so this works even when the kernel exposes the
+     *      SD reader through a USB/SCSI bridge (which surfaces the device
+     *      under major 8 / DEVNAME=sd*, otherwise indistinguishable from
+     *      a real USB stick — see Seal 2026-05 firmware).
+     *   2. {@code /sys/dev/block/M:N/uevent} DEVNAME — kernel-level. Reliable
+     *      when the SD goes through the standard mmc subsystem (major 179),
+     *      misleading when SD is bridged through SCSI (sda*). Used as the
+     *      first fallback when the BYD prop didn't match.
+     *   3. Linux major-number table — last resort.
+     *      - 179         → mmcblk* (SD slot)                → SD
+     *      - 8, 65..71,  → sd* (SCSI; USB-OTG flash drives) → USB
+     *        128..135
+     *
+     * @return "SD", "USB", or null if classification failed (treat as
+     *         "don't claim it for either" — better than misclassifying).
+     */
+    private String classifyPublicVolume(int major, int minor, String volumeUuid) {
+        // Signal 1 (vendor-authoritative, live-only): does this volume's UUID
+        // match the BYD SD-slot UUID prop? Most reliable WHEN populated, but
+        // BYD only writes the prop while the card is mounted, so this misses
+        // during the unmount window between ACC OFF and our remount attempt.
+        if (volumeUuid != null && !volumeUuid.isEmpty()) {
+            String sdUuid = getSystemProperty("sys.byd.mSdcardUuid");
+            if (sdUuid != null && !sdUuid.isEmpty() && sdUuid.equalsIgnoreCase(volumeUuid)) {
+                return "SD";
+            }
+        }
+
+        // Signal 1b (vendor-authoritative, persistent): UUID we previously
+        // confirmed as SD via a successful mount. Survives the unmount
+        // window where the BYD vendor prop returns empty. The FAT volume
+        // serial in `volumeUuid` is stable across remount cycles for the
+        // same physical card, so a match here is conclusive.
+        if (volumeUuid != null && !volumeUuid.isEmpty()) {
+            String learned = readLearnedSdUuid();
+            if (!learned.isEmpty() && learned.equalsIgnoreCase(volumeUuid)) {
+                return "SD";
+            }
+        }
+
+        // Signal 2: DEVNAME from the kernel uevent.
+        try {
+            File ueventFile = new File("/sys/dev/block/" + major + ":" + minor + "/uevent");
+            if (ueventFile.exists() && ueventFile.canRead()) {
+                BufferedReader r = new BufferedReader(new FileReader(ueventFile));
+                String l;
+                String devname = null;
+                while ((l = r.readLine()) != null) {
+                    if (l.startsWith("DEVNAME=")) {
+                        devname = l.substring("DEVNAME=".length()).trim();
+                        break;
+                    }
+                }
+                r.close();
+                if (devname != null) {
+                    if (devname.startsWith("mmcblk")) return "SD";
+                    if (devname.startsWith("sd"))     return "USB";
+                }
+            }
+        } catch (Exception e) {
+            logDebug("classifyPublicVolume read failed for " + major + ":" + minor + ": " + e.getMessage());
+        }
+
+        // Signal 3: major-number fallback.
+        if (major == 179) return "SD";
+        if (major == 8 || (major >= 65 && major <= 71) || (major >= 128 && major <= 135)) return "USB";
+        return null;
+    }
+
+    /**
+     * Probe whether the given mount point is writable from app/daemon UID.
+     * Java's File.canWrite() returns false on FUSE-bridged mounts that are
+     * actually writable via shell, so we fall back to a touch+rm probe.
+     */
+    private boolean isMountWritable(String mountPath) {
+        File dir = new File(mountPath);
+        if (!dir.exists() || !dir.isDirectory()) return false;
+        if (dir.canWrite()) return true;
+        try {
+            Process p = Runtime.getRuntime().exec(new String[]{
+                "sh", "-c", "touch " + mountPath + "/.overdrive_probe && rm " + mountPath + "/.overdrive_probe"
+            });
+            return p.waitFor() == 0;
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    /**
+     * Discover both SD card and USB drive paths in a single pass so they
+     * can never alias each other. Replaces the old SD-only discoverSdCard
+     * which would happily latch onto a USB stick when both were inserted
+     * (the type-blind methods accepted any writable {@code public:} volume).
+     *
+     * Strategy:
+     *   1. {@code sm list-volumes all} — walk every mounted public volume
+     *      and classify by underlying block-device major number.
+     *   2. BYD UUID prop ({@code sys.byd.mSdcardUuid}) as a tie-breaker
+     *      for SD when sm didn't help.
+     *   3. /proc/mounts vfat/exfat as final fallback, with the same
+     *      major-number classifier applied to the source device.
+     *
+     * The legacy /storage/ blind scan and SD_CARD_PATHS catch-all are
+     * removed — they were the source of the SD/USB confusion.
+     */
+    public void discoverVolumes() {
         sdCardPath = null;
         sdCardAvailable = false;
-        
-        // Method 1: Check using 'sm list-volumes all' for mounted public volumes
+        usbPath = null;
+        usbAvailable = false;
+
+        // Method 1: sm list-volumes all
         try {
             Process listProcess = Runtime.getRuntime().exec(new String[]{"sm", "list-volumes", "all"});
             BufferedReader reader = new BufferedReader(new InputStreamReader(listProcess.getInputStream()));
             String line;
-            
+
             while ((line = reader.readLine()) != null) {
                 // Parse lines like: "public:8,97 mounted 3661-3064"
                 line = line.trim();
-                if (line.startsWith("public:") && line.contains("mounted")) {
-                    String[] parts = line.split("\\s+");
-                    if (parts.length >= 3) {
-                        String volumeUuid = parts[2];  // e.g., "3661-3064"
-                        String mountPath = "/storage/" + volumeUuid;
-                        File mountDir = new File(mountPath);
-                        
-                        if (mountDir.exists() && mountDir.isDirectory() && mountDir.canWrite()) {
-                            sdCardPath = mountPath;
-                            sdCardAvailable = true;
-                            logInfo("Found SD card via sm list-volumes: " + sdCardPath);
-                            reader.close();
-                            listProcess.waitFor();
-                            return;
-                        }
-                    }
+                if (!line.startsWith("public:") || !line.contains("mounted")) continue;
+                String[] parts = line.split("\\s+");
+                if (parts.length < 3) continue;
+
+                // parts[0] = "public:8,97" → major=8, minor=97
+                String[] dev = parts[0].substring("public:".length()).split(",");
+                int major, minor;
+                try {
+                    major = Integer.parseInt(dev[0]);
+                    minor = Integer.parseInt(dev[1]);
+                } catch (Exception e) {
+                    continue;
                 }
+                String volumeUuid = parts[2];
+                String mountPath = "/storage/" + volumeUuid;
+                if (!isMountWritable(mountPath)) continue;
+
+                String klass = classifyPublicVolume(major, minor, volumeUuid);
+                if ("SD".equals(klass) && !sdCardAvailable) {
+                    sdCardPath = mountPath;
+                    sdCardAvailable = true;
+                    learnSdUuid(volumeUuid);
+                    logInfo("Found SD card via sm list-volumes (" + major + ":" + minor + "): " + sdCardPath);
+                } else if ("USB".equals(klass) && !usbAvailable) {
+                    usbPath = mountPath;
+                    usbAvailable = true;
+                    logInfo("Found USB drive via sm list-volumes (" + major + ":" + minor + "): " + usbPath);
+                }
+                // Keep iterating — both kinds may be present.
             }
             reader.close();
             listProcess.waitFor();
         } catch (Exception e) {
             logDebug("Could not check sm list-volumes: " + e.getMessage());
         }
-        
-        // Method 2: Check BYD system property for SD card UUID
-        String sdUuid = getSystemProperty("sys.byd.mSdcardUuid");
-        if (sdUuid != null && !sdUuid.isEmpty()) {
-            String uuidPath = "/storage/" + sdUuid;
-            File uuidDir = new File(uuidPath);
-            if (uuidDir.exists() && uuidDir.isDirectory() && uuidDir.canWrite()) {
-                sdCardPath = uuidPath;
-                sdCardAvailable = true;
-                logInfo("Found SD card via BYD UUID: " + sdCardPath);
-                return;
-            }
-        }
-        
-        // Method 3: Scan /storage/ for mounted volumes
-        try {
-            File storageDir = new File("/storage");
-            if (storageDir.exists() && storageDir.isDirectory()) {
-                File[] volumes = storageDir.listFiles();
-                if (volumes != null) {
-                    for (File vol : volumes) {
-                        // Skip known non-SD entries
-                        String name = vol.getName();
-                        if (name.equals("emulated") || name.equals("self") || name.startsWith(".")) {
-                            continue;
-                        }
-                        
-                        // Any writable directory under /storage/ that isn't emulated/self could be an SD card
-                        if (vol.isDirectory() && vol.canWrite()) {
-                            sdCardPath = vol.getAbsolutePath();
-                            sdCardAvailable = true;
-                            logInfo("Found SD card via /storage scan: " + sdCardPath);
-                            return;
-                        }
-                        
-                        // Some mounts are readable but not writable via Java — try shell test
-                        if (vol.isDirectory() && vol.canRead()) {
-                            try {
-                                Process p = Runtime.getRuntime().exec(new String[]{
-                                    "sh", "-c", "touch " + vol.getAbsolutePath() + "/.overdrive_probe && rm " + vol.getAbsolutePath() + "/.overdrive_probe"
-                                });
-                                int exitCode = p.waitFor();
-                                if (exitCode == 0) {
-                                    sdCardPath = vol.getAbsolutePath();
-                                    sdCardAvailable = true;
-                                    logInfo("Found SD card via /storage scan (shell write test): " + sdCardPath);
-                                    return;
-                                }
-                            } catch (Exception ignored) {}
-                        }
-                    }
+
+        // Method 2: BYD UUID prop is SD-specific. Only use if Method 1 missed SD.
+        if (!sdCardAvailable) {
+            String sdUuid = getSystemProperty("sys.byd.mSdcardUuid");
+            if (sdUuid != null && !sdUuid.isEmpty()) {
+                String uuidPath = "/storage/" + sdUuid;
+                if (isMountWritable(uuidPath) && !uuidPath.equals(usbPath)) {
+                    sdCardPath = uuidPath;
+                    sdCardAvailable = true;
+                    learnSdUuid(sdUuid);
+                    logInfo("Found SD card via BYD UUID: " + sdCardPath);
                 }
             }
-        } catch (Exception e) {
-            logDebug("Could not scan /storage: " + e.getMessage());
         }
-        
-        // Method 4: Parse /proc/mounts for vfat/exfat filesystems (SD card signatures)
-        try {
-            BufferedReader reader = new BufferedReader(new FileReader("/proc/mounts"));
-            String line;
-            while ((line = reader.readLine()) != null) {
-                // SD cards are typically vfat, exfat, or sdcardfs
-                if (line.contains("vfat") || line.contains("exfat")) {
+
+        // Method 3: /proc/mounts for vfat/exfat — classify the source device
+        // by its base name (mmcblk* → SD, sd* → USB) before claiming it.
+        if (!sdCardAvailable || !usbAvailable) {
+            try {
+                BufferedReader reader = new BufferedReader(new FileReader("/proc/mounts"));
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    if (!line.contains("vfat") && !line.contains("exfat")) continue;
                     String[] parts = line.split("\\s+");
-                    if (parts.length >= 2) {
-                        String mountPoint = parts[1];
-                        // Skip internal partitions
-                        if (mountPoint.startsWith("/mnt/vendor") || mountPoint.startsWith("/firmware") ||
-                            mountPoint.equals("/boot") || mountPoint.startsWith("/cache")) {
-                            continue;
-                        }
-                        File mountDir = new File(mountPoint);
-                        if (mountDir.exists() && mountDir.isDirectory() && mountDir.canRead()) {
-                            // Verify writable via shell
-                            try {
-                                Process p = Runtime.getRuntime().exec(new String[]{
-                                    "sh", "-c", "touch " + mountPoint + "/.overdrive_probe && rm " + mountPoint + "/.overdrive_probe"
-                                });
-                                int exitCode = p.waitFor();
-                                if (exitCode == 0) {
-                                    sdCardPath = mountPoint;
-                                    sdCardAvailable = true;
-                                    logInfo("Found SD card via /proc/mounts: " + sdCardPath + " (filesystem: " + 
-                                        (line.contains("exfat") ? "exfat" : "vfat") + ")");
-                                    reader.close();
-                                    return;
-                                }
-                            } catch (Exception ignored) {}
-                        }
+                    if (parts.length < 2) continue;
+                    String source = parts[0];      // e.g., /dev/block/mmcblk1p1 or /dev/block/sda1
+                    String mountPoint = parts[1];
+                    if (mountPoint.startsWith("/mnt/vendor") || mountPoint.startsWith("/firmware") ||
+                        mountPoint.equals("/boot") || mountPoint.startsWith("/cache")) {
+                        continue;
+                    }
+                    if (!isMountWritable(mountPoint)) continue;
+
+                    // Strip /dev/block/ prefix and trailing partition number.
+                    String base = source;
+                    int slash = base.lastIndexOf('/');
+                    if (slash >= 0) base = base.substring(slash + 1);
+                    // base now like "mmcblk1p1" or "sda1"
+                    String klass = null;
+                    if (base.startsWith("mmcblk")) klass = "SD";
+                    else if (base.startsWith("sd")) klass = "USB";
+
+                    if ("SD".equals(klass) && !sdCardAvailable && !mountPoint.equals(usbPath)) {
+                        sdCardPath = mountPoint;
+                        sdCardAvailable = true;
+                        logInfo("Found SD card via /proc/mounts (" + source + "): " + sdCardPath);
+                    } else if ("USB".equals(klass) && !usbAvailable && !mountPoint.equals(sdCardPath)) {
+                        usbPath = mountPoint;
+                        usbAvailable = true;
+                        logInfo("Found USB drive via /proc/mounts (" + source + "): " + usbPath);
                     }
                 }
-            }
-            reader.close();
-        } catch (Exception e) {
-            logDebug("Could not parse /proc/mounts: " + e.getMessage());
-        }
-        
-        // Method 4: Check known paths
-        for (String path : SD_CARD_PATHS) {
-            File dir = new File(path);
-            if (dir.exists() && dir.isDirectory() && dir.canWrite()) {
-                sdCardPath = path;
-                sdCardAvailable = true;
-                logInfo("Found SD card at: " + sdCardPath);
-                return;
+                reader.close();
+            } catch (Exception e) {
+                logDebug("Could not parse /proc/mounts: " + e.getMessage());
             }
         }
-        
-        logDebug("No writable SD card found");
+
+        if (!sdCardAvailable) logDebug("No writable SD card found");
+        if (!usbAvailable) logDebug("No writable USB drive found");
     }
     
     /**
@@ -634,7 +881,43 @@ public class StorageManager {
             }
         }
     }
-    
+
+    /**
+     * Read the persisted UUID of the volume previously confirmed as SD. See
+     * {@link #LEARNED_SD_UUID_FILE} for why this exists. Returns empty string
+     * if no learned value (first boot, or file missing).
+     */
+    private String readLearnedSdUuid() {
+        File f = new File(LEARNED_SD_UUID_FILE);
+        if (!f.exists() || !f.canRead()) return "";
+        try (BufferedReader r = new BufferedReader(new FileReader(f))) {
+            String line = r.readLine();
+            return line != null ? line.trim() : "";
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    /**
+     * Persist the UUID of a volume just confirmed as SD. Idempotent — re-writes
+     * are cheap and harmless. We only record on a successful mount, so this
+     * value only ever describes a real, working SD card.
+     */
+    private void learnSdUuid(String uuid) {
+        if (uuid == null || uuid.isEmpty()) return;
+        if (uuid.equalsIgnoreCase(readLearnedSdUuid())) return;  // unchanged, skip write
+        try (FileWriter w = new FileWriter(LEARNED_SD_UUID_FILE, false)) {
+            w.write(uuid);
+            // 0644 — daemon (UID 2000) writes, app process needs to read on
+            // the rare path where it walks classifyPublicVolume itself.
+            try { new File(LEARNED_SD_UUID_FILE).setReadable(true, false); } catch (Exception ignored) {}
+            logInfo("Learned SD UUID for future classification: " + uuid);
+        } catch (Exception e) {
+            logDebug("learnSdUuid write failed: " + e.getMessage());
+        }
+    }
+
+
     /**
      * Initialize storage directories.
      * IMPORTANT: Sets world-readable permissions so the UI app can access recordings.
@@ -681,10 +964,11 @@ public class StorageManager {
         internalTripsDir.setReadable(true, false);
         internalTripsDir.setExecutable(true, false);
         
-        // Initialize SD card directories if available
+        // Initialize SD card and USB directories if available
         initSdCardDirectories();
+        initUsbDirectories();
     }
-    
+
     /**
      * Initialize SD card directories if SD card is available.
      */
@@ -696,138 +980,138 @@ public class StorageManager {
             sdCardTripsDir = null;
             return;
         }
-        
-        File sdBaseDir = new File(sdCardPath, "Overdrive");
-        
-        // Always try to create directories (mkdirs is idempotent)
-        // This handles the case where SD card was remounted
-        boolean baseCreated = sdBaseDir.mkdirs();
-        if (!sdBaseDir.exists()) {
-            logError("Failed to create SD card base directory: " + sdBaseDir.getAbsolutePath());
+        File[] dirs = initVolumeDirectories(sdCardPath, "SD card");
+        if (dirs != null) {
+            sdCardRecordingsDir   = dirs[0];
+            sdCardSurveillanceDir = dirs[1];
+            sdCardProximityDir    = dirs[2];
+            sdCardTripsDir        = dirs[3];
+        }
+    }
+
+    /**
+     * Initialize USB directories if USB drive is available.
+     */
+    private void initUsbDirectories() {
+        if (!usbAvailable || usbPath == null) {
+            usbRecordingsDir = null;
+            usbSurveillanceDir = null;
+            usbProximityDir = null;
+            usbTripsDir = null;
             return;
         }
+        File[] dirs = initVolumeDirectories(usbPath, "USB");
+        if (dirs != null) {
+            usbRecordingsDir   = dirs[0];
+            usbSurveillanceDir = dirs[1];
+            usbProximityDir    = dirs[2];
+            usbTripsDir        = dirs[3];
+        }
+    }
+
+    /**
+     * Build {@code <volumePath>/Overdrive/{recordings,surveillance,proximity,trips}}
+     * with world rwx so the app UID can read them. Returns the four dirs in
+     * order, or null if the base couldn't be created.
+     */
+    private File[] initVolumeDirectories(String volumePath, String label) {
+        File base = new File(volumePath, "Overdrive");
+        boolean baseCreated = base.mkdirs();
+        if (!base.exists()) {
+            logError("Failed to create " + label + " base directory: " + base.getAbsolutePath());
+            return null;
+        }
         if (baseCreated) {
-            logInfo("Created SD card base directory: " + sdBaseDir.getAbsolutePath());
+            logInfo("Created " + label + " base directory: " + base.getAbsolutePath());
         }
-        sdBaseDir.setReadable(true, false);
-        sdBaseDir.setWritable(true, false);
-        sdBaseDir.setExecutable(true, false);
-        
-        sdCardRecordingsDir = new File(sdBaseDir, RECORDINGS_SUBDIR);
-        boolean recCreated = sdCardRecordingsDir.mkdirs();
-        if (!sdCardRecordingsDir.exists()) {
-            logError("Failed to create SD card recordings directory: " + sdCardRecordingsDir.getAbsolutePath());
-        } else {
-            if (recCreated) {
-                logInfo("Created SD card recordings directory: " + sdCardRecordingsDir.getAbsolutePath());
-            }
-            sdCardRecordingsDir.setReadable(true, false);
-            sdCardRecordingsDir.setWritable(true, false);
-            sdCardRecordingsDir.setExecutable(true, false);
+        base.setReadable(true, false);
+        base.setWritable(true, false);
+        base.setExecutable(true, false);
+
+        File rec = makeChildDir(base, RECORDINGS_SUBDIR, label + " recordings");
+        File surv = makeChildDir(base, SURVEILLANCE_SUBDIR, label + " surveillance");
+        File prox = makeChildDir(base, PROXIMITY_SUBDIR, label + " proximity");
+        File trips = makeChildDir(base, TRIPS_SUBDIR, label + " trips");
+
+        if (surv != null && surv.exists() && !surv.canWrite()) {
+            logError(label + " surveillance directory exists but is not writable: " + surv.getAbsolutePath());
         }
-        
-        sdCardSurveillanceDir = new File(sdBaseDir, SURVEILLANCE_SUBDIR);
-        boolean survCreated = sdCardSurveillanceDir.mkdirs();
-        if (!sdCardSurveillanceDir.exists()) {
-            logError("Failed to create SD card surveillance directory: " + sdCardSurveillanceDir.getAbsolutePath());
-        } else {
-            if (survCreated) {
-                logInfo("Created SD card surveillance directory: " + sdCardSurveillanceDir.getAbsolutePath());
-            }
-            sdCardSurveillanceDir.setReadable(true, false);
-            sdCardSurveillanceDir.setWritable(true, false);
-            sdCardSurveillanceDir.setExecutable(true, false);
+        return new File[]{rec, surv, prox, trips};
+    }
+
+    private File makeChildDir(File parent, String name, String label) {
+        File dir = new File(parent, name);
+        boolean created = dir.mkdirs();
+        if (!dir.exists()) {
+            logError("Failed to create " + label + " directory: " + dir.getAbsolutePath());
+            return dir;
         }
-        
-        sdCardProximityDir = new File(sdBaseDir, PROXIMITY_SUBDIR);
-        boolean proxCreated = sdCardProximityDir.mkdirs();
-        if (!sdCardProximityDir.exists()) {
-            logError("Failed to create SD card proximity directory: " + sdCardProximityDir.getAbsolutePath());
-        } else {
-            if (proxCreated) {
-                logInfo("Created SD card proximity directory: " + sdCardProximityDir.getAbsolutePath());
-            }
-            sdCardProximityDir.setReadable(true, false);
-            sdCardProximityDir.setWritable(true, false);
-            sdCardProximityDir.setExecutable(true, false);
+        if (created) {
+            logInfo("Created " + label + " directory: " + dir.getAbsolutePath());
         }
-        
-        sdCardTripsDir = new File(sdBaseDir, TRIPS_SUBDIR);
-        boolean tripsCreated = sdCardTripsDir.mkdirs();
-        if (!sdCardTripsDir.exists()) {
-            logError("Failed to create SD card trips directory: " + sdCardTripsDir.getAbsolutePath());
-        } else {
-            if (tripsCreated) {
-                logInfo("Created SD card trips directory: " + sdCardTripsDir.getAbsolutePath());
-            }
-            sdCardTripsDir.setReadable(true, false);
-            sdCardTripsDir.setWritable(true, false);
-            sdCardTripsDir.setExecutable(true, false);
-        }
-        
-        // Verify directories are actually writable
-        if (sdCardSurveillanceDir != null && sdCardSurveillanceDir.exists()) {
-            if (!sdCardSurveillanceDir.canWrite()) {
-                logError("SD card surveillance directory exists but is not writable: " + sdCardSurveillanceDir.getAbsolutePath());
-            } else {
-                logInfo("SD card surveillance directory verified writable: " + sdCardSurveillanceDir.getAbsolutePath());
-            }
-        }
+        dir.setReadable(true, false);
+        dir.setWritable(true, false);
+        dir.setExecutable(true, false);
+        return dir;
     }
     
     /**
+     * Resolve the active directory for one (category, type) pair, falling
+     * back to internal when the requested external volume isn't ready.
+     * Logs the fallback only when we actually downgraded (else the boot path
+     * spams "fell back" lines for users who never selected SD/USB).
+     */
+    private File resolveActive(StorageType type,
+                               File internalDir, File sdDir, File usbDir,
+                               String label) {
+        if (type == StorageType.SD_CARD) {
+            if (sdCardAvailable && sdDir != null) return sdDir;
+            logWarn("SD card not available for " + label + ", falling back to internal storage");
+            return internalDir;
+        }
+        if (type == StorageType.USB) {
+            if (usbAvailable && usbDir != null) return usbDir;
+            logWarn("USB not available for " + label + ", falling back to internal storage");
+            return internalDir;
+        }
+        return internalDir;
+    }
+
+    /**
      * Update active directories based on storage type selection.
-     * Falls back to internal storage if SD card is not available.
+     * Falls back to internal storage if the selected external volume is not
+     * available. Per-category recording-active guard prevents files from
+     * being split across volumes when the user changes storage mid-recording.
      */
     private void updateActiveDirectories() {
         // Recordings directory
-        // CRITICAL: Don't switch while recording is active to prevent split files
         if (recordingActive.get()) {
             logDebug("Recording active - skipping recordings directory update");
-        } else if (recordingsStorageType == StorageType.SD_CARD && sdCardAvailable && sdCardRecordingsDir != null) {
-            recordingsDir = sdCardRecordingsDir;
-            logInfo("Recordings using SD card: " + recordingsDir.getAbsolutePath());
         } else {
-            recordingsDir = internalRecordingsDir;
-            if (recordingsStorageType == StorageType.SD_CARD) {
-                logWarn("SD card not available for recordings, falling back to internal storage");
-            }
+            recordingsDir = resolveActive(recordingsStorageType,
+                internalRecordingsDir, sdCardRecordingsDir, usbRecordingsDir, "recordings");
+            logInfo("Recordings using " + recordingsStorageType + ": " + recordingsDir.getAbsolutePath());
         }
-        
+
         // Surveillance directory
-        // CRITICAL: Don't switch while surveillance is active to prevent split files
         if (surveillanceActive.get()) {
             logDebug("Surveillance active - skipping surveillance directory update");
-        } else if (surveillanceStorageType == StorageType.SD_CARD && sdCardAvailable && sdCardSurveillanceDir != null) {
-            surveillanceDir = sdCardSurveillanceDir;
-            logInfo("Surveillance using SD card: " + surveillanceDir.getAbsolutePath());
         } else {
-            surveillanceDir = internalSurveillanceDir;
-            if (surveillanceStorageType == StorageType.SD_CARD) {
-                logWarn("SD card not available for surveillance, falling back to internal storage");
-            }
+            surveillanceDir = resolveActive(surveillanceStorageType,
+                internalSurveillanceDir, sdCardSurveillanceDir, usbSurveillanceDir, "surveillance");
+            logInfo("Surveillance using " + surveillanceStorageType + ": " + surveillanceDir.getAbsolutePath());
         }
-        
+
         // Proximity always uses same storage as surveillance
         if (!surveillanceActive.get()) {
-            if (surveillanceStorageType == StorageType.SD_CARD && sdCardAvailable && sdCardProximityDir != null) {
-                proximityDir = sdCardProximityDir;
-            } else {
-                proximityDir = internalProximityDir;
-            }
+            proximityDir = resolveActive(surveillanceStorageType,
+                internalProximityDir, sdCardProximityDir, usbProximityDir, "proximity");
         }
-        
-        // Trips directory
-        // Trip telemetry files are small — no recording-active check needed
-        if (tripsStorageType == StorageType.SD_CARD && sdCardAvailable && sdCardTripsDir != null) {
-            tripsDir = sdCardTripsDir;
-            logInfo("Trips using SD card: " + tripsDir.getAbsolutePath());
-        } else {
-            tripsDir = internalTripsDir;
-            if (tripsStorageType == StorageType.SD_CARD) {
-                logWarn("SD card not available for trips, falling back to internal storage");
-            }
-        }
+
+        // Trips directory — trip telemetry files are small, no active guard
+        tripsDir = resolveActive(tripsStorageType,
+            internalTripsDir, sdCardTripsDir, usbTripsDir, "trips");
+        logInfo("Trips using " + tripsStorageType + ": " + tripsDir.getAbsolutePath());
     }
     
     /**
@@ -854,23 +1138,17 @@ public class StorageManager {
                     tripsLimitMb = storage.optLong("tripsLimitMb", DEFAULT_TRIPS_LIMIT_MB);
                     
                     // Load storage type selection
-                    String recStorageType = storage.optString("recordingsStorageType", "INTERNAL");
-                    String survStorageType = storage.optString("surveillanceStorageType", "INTERNAL");
-                    String tripsStorageTypeStr = storage.optString("tripsStorageType", "INTERNAL");
-                    
-                    recordingsStorageType = "SD_CARD".equals(recStorageType) ? StorageType.SD_CARD : StorageType.INTERNAL;
-                    surveillanceStorageType = "SD_CARD".equals(survStorageType) ? StorageType.SD_CARD : StorageType.INTERNAL;
-                    tripsStorageType = "SD_CARD".equals(tripsStorageTypeStr) ? StorageType.SD_CARD : StorageType.INTERNAL;
-                    
-                    // Clamp to valid range based on storage type
-                    long maxRecLimit = recordingsStorageType == StorageType.SD_CARD ? MAX_LIMIT_MB_SD_CARD : MAX_LIMIT_MB_INTERNAL;
-                    long maxSurvLimit = surveillanceStorageType == StorageType.SD_CARD ? MAX_LIMIT_MB_SD_CARD : MAX_LIMIT_MB_INTERNAL;
-                    long maxTripsLimit = tripsStorageType == StorageType.SD_CARD ? MAX_LIMIT_MB_SD_CARD : MAX_LIMIT_MB_INTERNAL;
-                    
-                    recordingsLimitMb = Math.max(MIN_LIMIT_MB, Math.min(maxRecLimit, recordingsLimitMb));
-                    surveillanceLimitMb = Math.max(MIN_LIMIT_MB, Math.min(maxSurvLimit, surveillanceLimitMb));
-                    proximityLimitMb = Math.max(MIN_LIMIT_MB, Math.min(maxSurvLimit, proximityLimitMb));
-                    tripsLimitMb = Math.max(MIN_LIMIT_MB, Math.min(maxTripsLimit, tripsLimitMb));
+                    recordingsStorageType   = parseStorageType(storage.optString("recordingsStorageType", "INTERNAL"));
+                    surveillanceStorageType = parseStorageType(storage.optString("surveillanceStorageType", "INTERNAL"));
+                    tripsStorageType        = parseStorageType(storage.optString("tripsStorageType", "INTERNAL"));
+
+                    // Clamp to dynamic max — limit may have been persisted against
+                    // a different volume (e.g., user swapped a 128GB SD for a 32GB
+                    // one), so re-check against the current effective ceiling.
+                    recordingsLimitMb   = Math.max(MIN_LIMIT_MB, Math.min(getEffectiveMaxLimitMb(recordingsStorageType),   recordingsLimitMb));
+                    surveillanceLimitMb = Math.max(MIN_LIMIT_MB, Math.min(getEffectiveMaxLimitMb(surveillanceStorageType), surveillanceLimitMb));
+                    proximityLimitMb    = Math.max(MIN_LIMIT_MB, Math.min(getEffectiveMaxLimitMb(surveillanceStorageType), proximityLimitMb));
+                    tripsLimitMb        = Math.max(MIN_LIMIT_MB, Math.min(getEffectiveMaxLimitMb(tripsStorageType),        tripsLimitMb));
                     
                     logInfo("Loaded storage config: recordings=" + recordingsLimitMb + "MB (" + recordingsStorageType + 
                         "), surveillance=" + surveillanceLimitMb + "MB (" + surveillanceStorageType + 
@@ -1102,26 +1380,22 @@ public class StorageManager {
     }
     
     public void setRecordingsLimitMb(long limitMb) {
-        long maxLimit = recordingsStorageType == StorageType.SD_CARD ? MAX_LIMIT_MB_SD_CARD : MAX_LIMIT_MB_INTERNAL;
-        recordingsLimitMb = Math.max(MIN_LIMIT_MB, Math.min(maxLimit, limitMb));
+        recordingsLimitMb = Math.max(MIN_LIMIT_MB, Math.min(getEffectiveMaxLimitMb(recordingsStorageType), limitMb));
         saveConfig();
     }
-    
+
     public void setSurveillanceLimitMb(long limitMb) {
-        long maxLimit = surveillanceStorageType == StorageType.SD_CARD ? MAX_LIMIT_MB_SD_CARD : MAX_LIMIT_MB_INTERNAL;
-        surveillanceLimitMb = Math.max(MIN_LIMIT_MB, Math.min(maxLimit, limitMb));
+        surveillanceLimitMb = Math.max(MIN_LIMIT_MB, Math.min(getEffectiveMaxLimitMb(surveillanceStorageType), limitMb));
         saveConfig();
     }
-    
+
     public void setProximityLimitMb(long limitMb) {
-        long maxLimit = surveillanceStorageType == StorageType.SD_CARD ? MAX_LIMIT_MB_SD_CARD : MAX_LIMIT_MB_INTERNAL;
-        proximityLimitMb = Math.max(MIN_LIMIT_MB, Math.min(maxLimit, limitMb));
+        proximityLimitMb = Math.max(MIN_LIMIT_MB, Math.min(getEffectiveMaxLimitMb(surveillanceStorageType), limitMb));
         saveConfig();
     }
-    
+
     public void setTripsLimitMb(long limitMb) {
-        long maxLimit = tripsStorageType == StorageType.SD_CARD ? MAX_LIMIT_MB_SD_CARD : MAX_LIMIT_MB_INTERNAL;
-        tripsLimitMb = Math.max(MIN_LIMIT_MB, Math.min(maxLimit, limitMb));
+        tripsLimitMb = Math.max(MIN_LIMIT_MB, Math.min(getEffectiveMaxLimitMb(tripsStorageType), limitMb));
         saveConfig();
     }
     
@@ -1145,27 +1419,20 @@ public class StorageManager {
      * @return true if successfully changed, false if SD card not available
      */
     public boolean setRecordingsStorageType(StorageType type) {
-        if (type == StorageType.SD_CARD) {
-            // Try to mount SD card if not available (same as surveillance)
-            if (!sdCardAvailable) {
-                logInfo("SD card not available, attempting to mount...");
-                if (!ensureSdCardMounted(true)) {  // Force mount
-                    logWarn("Cannot set recordings to SD card - SD card mount failed");
-                    return false;
-                }
-            }
-        }
-        
+        if (!ensureExternalAvailable(type, "recordings")) return false;
+
         recordingsStorageType = type;
+        // Re-clamp the persisted limit against the new volume's effective max
+        // (e.g., user switches from SD to USB, USB is smaller). Limit may
+        // need to shrink before updateActiveDirectories runs cleanup.
+        recordingsLimitMb = Math.max(MIN_LIMIT_MB, Math.min(getEffectiveMaxLimitMb(type), recordingsLimitMb));
         updateActiveDirectories();
         saveConfig();
         logInfo("Recordings storage type set to: " + type);
-        
-        // SOTA: Auto-enable CDR cleanup when using SD card
+
         if (type == StorageType.SD_CARD) {
             autoEnableCdrCleanup();
         }
-        
         return true;
     }
     
@@ -1175,27 +1442,18 @@ public class StorageManager {
      * @return true if successfully changed, false if SD card not available
      */
     public boolean setSurveillanceStorageType(StorageType type) {
-        if (type == StorageType.SD_CARD) {
-            // Try to mount SD card if not available
-            if (!sdCardAvailable) {
-                logInfo("SD card not available, attempting to mount...");
-                if (!ensureSdCardMounted(true)) {  // Force mount
-                    logWarn("Cannot set surveillance to SD card - SD card mount failed");
-                    return false;
-                }
-            }
-        }
-        
+        if (!ensureExternalAvailable(type, "surveillance")) return false;
+
         surveillanceStorageType = type;
+        surveillanceLimitMb = Math.max(MIN_LIMIT_MB, Math.min(getEffectiveMaxLimitMb(type), surveillanceLimitMb));
+        proximityLimitMb    = Math.max(MIN_LIMIT_MB, Math.min(getEffectiveMaxLimitMb(type), proximityLimitMb));
         updateActiveDirectories();
         saveConfig();
         logInfo("Surveillance storage type set to: " + type);
-        
-        // SOTA: Auto-enable CDR cleanup when using SD card
+
         if (type == StorageType.SD_CARD) {
             autoEnableCdrCleanup();
         }
-        
         return true;
     }
     
@@ -1206,23 +1464,42 @@ public class StorageManager {
      * @return true if successfully changed, false if SD card not available
      */
     public boolean setTripsStorageType(StorageType type) {
-        if (type == StorageType.SD_CARD) {
-            // Try to mount SD card if not available
-            if (!sdCardAvailable) {
-                logInfo("SD card not available, attempting to mount...");
-                if (!ensureSdCardMounted(true)) {  // Force mount
-                    logWarn("Cannot set trips to SD card - SD card mount failed");
-                    return false;
-                }
-            }
-        }
-        
+        if (!ensureExternalAvailable(type, "trips")) return false;
+
         tripsStorageType = type;
+        tripsLimitMb = Math.max(MIN_LIMIT_MB, Math.min(getEffectiveMaxLimitMb(type), tripsLimitMb));
         updateActiveDirectories();
         saveConfig();
         logInfo("Trips storage type set to: " + type);
-        
         return true;
+    }
+
+    /**
+     * Helper: ensure the requested external volume is available before we
+     * accept a storage-type change. INTERNAL is always OK. SD/USB get a
+     * mount attempt; refusing the change is preferable to silently writing
+     * to internal under a label that says "SD card".
+     */
+    private boolean ensureExternalAvailable(StorageType type, String label) {
+        if (type == StorageType.SD_CARD) {
+            if (sdCardAvailable) return true;
+            logInfo("SD card not available, attempting to mount for " + label + "...");
+            if (!ensureSdCardMounted(true)) {
+                logWarn("Cannot set " + label + " to SD card - mount failed");
+                return false;
+            }
+            return true;
+        }
+        if (type == StorageType.USB) {
+            if (usbAvailable) return true;
+            logInfo("USB not available, attempting to mount for " + label + "...");
+            if (!ensureUsbMounted(true)) {
+                logWarn("Cannot set " + label + " to USB - mount failed");
+                return false;
+            }
+            return true;
+        }
+        return true;  // INTERNAL
     }
     
     /**
@@ -1253,14 +1530,34 @@ public class StorageManager {
         }
     }
     
-    // ==================== SD Card Info ====================
-    
+    // ==================== Volume Info ====================
+
     public boolean isSdCardAvailable() {
         return sdCardAvailable;
     }
-    
+
     public String getSdCardPath() {
         return sdCardPath;
+    }
+
+    public boolean isUsbAvailable() {
+        return usbAvailable;
+    }
+
+    public String getUsbPath() {
+        return usbPath;
+    }
+
+    /**
+     * Re-detect both SD and USB. Public alias mostly used by polling
+     * watchdogs / API handlers that want to refresh state on demand.
+     */
+    public void refreshUsb() {
+        discoverVolumes();
+        initSdCardDirectories();
+        initUsbDirectories();
+        updateActiveDirectories();
+        logInfo("Volume refresh complete. SD=" + sdCardAvailable + ", USB=" + usbAvailable);
     }
     
     // ==================== All Storage Locations (for scanning) ====================
@@ -1274,19 +1571,19 @@ public class StorageManager {
      * Callers should iterate all returned directories to find all files.
      */
     public List<File> getAllRecordingsDirs() {
-        return getAllDirsForType(recordingsDir, internalRecordingsDir, sdCardRecordingsDir);
+        return getAllDirsForType(recordingsDir, internalRecordingsDir, sdCardRecordingsDir, usbRecordingsDir);
     }
-    
+
     public List<File> getAllSurveillanceDirs() {
-        return getAllDirsForType(surveillanceDir, internalSurveillanceDir, sdCardSurveillanceDir);
+        return getAllDirsForType(surveillanceDir, internalSurveillanceDir, sdCardSurveillanceDir, usbSurveillanceDir);
     }
 
     public List<File> getAllProximityDirs() {
-        return getAllDirsForType(proximityDir, internalProximityDir, sdCardProximityDir);
+        return getAllDirsForType(proximityDir, internalProximityDir, sdCardProximityDir, usbProximityDir);
     }
 
     public List<File> getAllTripsDirs() {
-        return getAllDirsForType(tripsDir, internalTripsDir, sdCardTripsDir);
+        return getAllDirsForType(tripsDir, internalTripsDir, sdCardTripsDir, usbTripsDir);
     }
 
     /**
@@ -1400,28 +1697,26 @@ public class StorageManager {
      * Build a deduplicated list of directories: active first, then alternates.
      * Skips null entries and directories that match the active one.
      */
-    private List<File> getAllDirsForType(File activeDir, File internalDir, File sdCardDir) {
+    private List<File> getAllDirsForType(File activeDir, File internalDir, File sdCardDir, File usbDir) {
         List<File> dirs = new ArrayList<>();
         Set<String> seen = new HashSet<>();
-        
-        // Active directory first (always included)
+
         if (activeDir != null) {
             dirs.add(activeDir);
             seen.add(activeDir.getAbsolutePath());
         }
-        
-        // Internal directory (if different from active)
         if (internalDir != null && !seen.contains(internalDir.getAbsolutePath())) {
             dirs.add(internalDir);
             seen.add(internalDir.getAbsolutePath());
         }
-        
-        // SD card directory (if different from active)
         if (sdCardDir != null && !seen.contains(sdCardDir.getAbsolutePath())) {
             dirs.add(sdCardDir);
             seen.add(sdCardDir.getAbsolutePath());
         }
-        
+        if (usbDir != null && !seen.contains(usbDir.getAbsolutePath())) {
+            dirs.add(usbDir);
+            seen.add(usbDir.getAbsolutePath());
+        }
         return dirs;
     }
     
@@ -1489,21 +1784,96 @@ public class StorageManager {
     }
     
     /**
-     * Refresh SD card detection and update directories.
-     * Call this when SD card may have been inserted/removed.
+     * Refresh SD card AND USB detection and update directories.
+     * Call this when either volume may have been inserted/removed.
+     * (Kept under the historical name for callers that still reference it.)
      */
     public void refreshSdCard() {
-        discoverSdCard();
+        discoverVolumes();
         initSdCardDirectories();
+        initUsbDirectories();
         updateActiveDirectories();
-        logInfo("SD card refresh complete. Available: " + sdCardAvailable);
+        logInfo("Volume refresh complete. SD=" + sdCardAvailable + ", USB=" + usbAvailable);
     }
-    
+
     /**
-     * Get max limit based on storage type.
+     * Get available space on USB drive in bytes.
+     */
+    public long getUsbFreeSpace() {
+        if (usbPath == null) return 0;
+        try {
+            File d = new File(usbPath);
+            if (!d.exists() || !d.isDirectory()) return 0;
+            StatFs stat = new StatFs(usbPath);
+            return stat.getAvailableBytes();
+        } catch (Exception e) {
+            logWarn("Could not get USB free space: " + e.getMessage());
+            return 0;
+        }
+    }
+
+    /**
+     * Get total space on USB drive in bytes.
+     */
+    public long getUsbTotalSpace() {
+        if (usbPath == null) return 0;
+        try {
+            File d = new File(usbPath);
+            if (!d.exists() || !d.isDirectory()) return 0;
+            StatFs stat = new StatFs(usbPath);
+            return stat.getTotalBytes();
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
+    /**
+     * Effective max-limit ceiling in MB for the requested storage type.
+     *
+     * Pulled live from StatFs each call so card swaps and capacity changes
+     * reflect immediately in the slider — but capped per-category at
+     * PER_CATEGORY_SHARE of the volume so the four categories sharing a
+     * single FS can't overcommit it 4x.
+     *
+     * When the requested SD/USB volume is unmounted, falls back to the
+     * INTERNAL ceiling rather than the absurd MAX_LIMIT_MB_FALLBACK
+     * sentinel — the runtime fall-back path lands writes on internal,
+     * so capping at internal's true total stops the user from persisting
+     * a 100GB limit against a missing 32GB stick. INTERNAL itself
+     * returning <=0 (StatFs literally unreadable) keeps the sentinel.
+     */
+    public long getEffectiveMaxLimitMb(StorageType type) {
+        long totalBytes;
+        switch (type) {
+            case SD_CARD: totalBytes = sdCardAvailable ? getSdCardTotalSpace() : 0; break;
+            case USB:     totalBytes = usbAvailable    ? getUsbTotalSpace()    : 0; break;
+            case INTERNAL:
+            default:      totalBytes = getInternalTotalSpace(); break;
+        }
+        if (totalBytes <= 0) {
+            if (type == StorageType.INTERNAL) return MAX_LIMIT_MB_FALLBACK;
+            // Unmounted SD/USB: clamp to internal volume's ceiling so a save
+            // while the volume is missing can't persist a value larger than
+            // the fallback target can ever hold.
+            long internalBytes = getInternalTotalSpace();
+            if (internalBytes <= 0) return MAX_LIMIT_MB_FALLBACK;
+            long internalUsableMb = (internalBytes / 1024L / 1024L) - VOLUME_HEADROOM_MB;
+            if (internalUsableMb <= 0) return MIN_LIMIT_MB;
+            return Math.max(MIN_LIMIT_MB, (long)(internalUsableMb * PER_CATEGORY_SHARE));
+        }
+
+        long usableMb = (totalBytes / 1024L / 1024L) - VOLUME_HEADROOM_MB;
+        if (usableMb <= 0) return MIN_LIMIT_MB;
+        long perCategoryMb = (long)(usableMb * PER_CATEGORY_SHARE);
+        return Math.max(MIN_LIMIT_MB, perCategoryMb);
+    }
+
+    /**
+     * Backwards-compatible: returns the dynamic max for the given type.
+     * Old callers that passed a {@link StorageType} keep working.
      */
     public long getMaxLimitMb(StorageType type) {
-        return type == StorageType.SD_CARD ? MAX_LIMIT_MB_SD_CARD : MAX_LIMIT_MB_INTERNAL;
+        return getEffectiveMaxLimitMb(type);
     }
     
     // ==================== Storage Stats ====================
@@ -1894,16 +2264,29 @@ public class StorageManager {
         return MIN_LIMIT_MB;
     }
     
+    /**
+     * Static fallback ceiling. Use the instance methods
+     * {@link #getEffectiveMaxLimitMb(StorageType)} / {@link #getMaxLimitMb(StorageType)}
+     * for the live, volume-aware ceiling. These statics are kept only
+     * for legacy callers that don't have an instance handy.
+     */
     public static long getMaxLimitMb() {
-        return MAX_LIMIT_MB_INTERNAL;
+        return MAX_LIMIT_MB_FALLBACK;
     }
-    
+
     public static long getMaxLimitMbInternal() {
-        return MAX_LIMIT_MB_INTERNAL;
+        StorageManager sm = instance;
+        return sm != null ? sm.getEffectiveMaxLimitMb(StorageType.INTERNAL) : MAX_LIMIT_MB_FALLBACK;
     }
-    
+
     public static long getMaxLimitMbSdCard() {
-        return MAX_LIMIT_MB_SD_CARD;
+        StorageManager sm = instance;
+        return sm != null ? sm.getEffectiveMaxLimitMb(StorageType.SD_CARD) : MAX_LIMIT_MB_FALLBACK;
+    }
+
+    public static long getMaxLimitMbUsb() {
+        StorageManager sm = instance;
+        return sm != null ? sm.getEffectiveMaxLimitMb(StorageType.USB) : MAX_LIMIT_MB_FALLBACK;
     }
     
     // ==================== Event-Driven Cleanup (SOTA) ====================
@@ -1921,9 +2304,19 @@ public class StorageManager {
     public void onRecordingFileSaved() {
         // Fix directory permissions in case they were reset
         fixDirectoryPermissions(recordingsDir);
-        
+
         // FIX: Removed broadcastRecentFiles() — specific file already broadcast by onFileSaved()
-        
+
+        // Gate destructive cleanup on encoder write state. If a recording is
+        // mid-flight, deferring this delete burst is what keeps the SD card
+        // available for the encoder's disk writer. The deferred queue is
+        // drained the next time we observe encoder=idle, so nothing is lost.
+        if (isEncoderWriting()) {
+            deferredCleanupDirs.add(DEFERRED_RECORDINGS);
+            logDebug("Recording file saved during active write — deferring cleanup");
+            return;
+        }
+
         asyncCleanupExecutor.execute(() -> {
             synchronized (cleanupLock) {
                 try {
@@ -1958,14 +2351,23 @@ public class StorageManager {
     public void onSurveillanceFileSaved() {
         // Fix directory permissions in case they were reset
         fixDirectoryPermissions(surveillanceDir);
-        
+
         // FIX: Removed broadcastRecentFiles() call that re-scanned ALL files modified
         // in the last 60 seconds. This caused duplicate MediaScanner broadcasts —
         // if two events saved 20 seconds apart, the second save re-broadcast the first.
         // Over days of parking, this list grows to hundreds of files, causing massive
         // CPU spikes on every new event. The specific file is already broadcast by
         // onFileSaved() → broadcastFile(file) before this method is called.
-        
+
+        // Defer destructive cleanup if encoder is mid-write. See onRecordingFileSaved
+        // for rationale — SD card I/O contention against the encoder's disk writer
+        // is what produces the freeze+skip artifact in the recorded MP4.
+        if (isEncoderWriting()) {
+            deferredCleanupDirs.add(DEFERRED_SURVEILLANCE);
+            logDebug("Surveillance file saved during active write — deferring cleanup");
+            return;
+        }
+
         asyncCleanupExecutor.execute(() -> {
             synchronized (cleanupLock) {
                 try {
@@ -2000,9 +2402,15 @@ public class StorageManager {
     public void onProximityFileSaved() {
         // Fix directory permissions in case they were reset
         fixDirectoryPermissions(proximityDir);
-        
+
         // FIX: Removed broadcastRecentFiles() — specific file already broadcast by onFileSaved()
-        
+
+        if (isEncoderWriting()) {
+            deferredCleanupDirs.add(DEFERRED_PROXIMITY);
+            logDebug("Proximity file saved during active write — deferring cleanup");
+            return;
+        }
+
         asyncCleanupExecutor.execute(() -> {
             synchronized (cleanupLock) {
                 try {
@@ -2037,7 +2445,13 @@ public class StorageManager {
     public void onTripFileSaved() {
         // Fix directory permissions in case they were reset
         fixDirectoryPermissions(tripsDir);
-        
+
+        if (isEncoderWriting()) {
+            deferredCleanupDirs.add(DEFERRED_TRIPS);
+            logDebug("Trip file saved during active write — deferring cleanup");
+            return;
+        }
+
         asyncCleanupExecutor.execute(() -> {
             synchronized (cleanupLock) {
                 try {
@@ -2151,13 +2565,25 @@ public class StorageManager {
         }
         
         logInfo("Processing saved file: " + file.getName() + " (" + formatSize(file.length()) + ")");
-        
+
         // 1. Make file readable by all (chmod 666)
         makeFileReadable(file);
-        
-        // 2. Broadcast to MediaScanner
-        broadcastFile(file);
-        
+
+        // 2. Broadcast to MediaScanner. This spawns shell processes
+        // (am broadcast + content insert) which compete for I/O bandwidth.
+        // While the encoder is mid-write, defer to the background cleanup
+        // executor so the disk writer keeps priority. (Audit P2.)
+        if (isEncoderWriting()) {
+            final File f = file;
+            asyncCleanupExecutor.execute(() -> {
+                try { broadcastFile(f); } catch (Exception e) {
+                    logWarn("Deferred broadcastFile error: " + e.getMessage());
+                }
+            });
+        } else {
+            broadcastFile(file);
+        }
+
         // 3. Trigger appropriate cleanup based on directory
         String path = file.getAbsolutePath();
         if (path.contains(RECORDINGS_SUBDIR)) {
@@ -2202,17 +2628,105 @@ public class StorageManager {
         }
         
         cleanupScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "StorageCleanup");
+            Thread t = new Thread(() -> {
+                // Same low-priority strategy as asyncCleanupExecutor — the
+                // periodic tick must never preempt the disk writer.
+                try {
+                    android.os.Process.setThreadPriority(
+                            android.os.Process.THREAD_PRIORITY_BACKGROUND);
+                } catch (Throwable ignored) {}
+                r.run();
+            }, "StorageCleanup");
             t.setDaemon(true);
+            t.setPriority(Thread.MIN_PRIORITY);
             return t;
         });
         
         cleanupScheduler.scheduleAtFixedRate(() -> {
             try {
-                // Run unconditionally — not gated on active recording. This catches
-                // dirs that grew past the limit while the daemon was offline (crash
-                // mid-recording, or user lowering the limit) and keeps the user's
-                // configured limit honored even when nothing is currently writing.
+                // Don't run un-gated cleanup before the encoder probe is wired.
+                // Daemon-init ordering: startPeriodicCleanup() fires early
+                // (before pipeline.init), so the first scheduled tick at
+                // T+30s could land before the probe is bound and would treat
+                // an active recording as "encoder idle" → run the destructive
+                // cleanup right through the recording. (Audit P1.)
+                if (!probeWired.get()) {
+                    logDebug("Periodic cleanup tick skipped — encoder probe not wired yet");
+                    return;
+                }
+                // SOTA: skip the entire pass while the encoder is writing. The
+                // 19-files / 118 MB delete burst observed in field logs while
+                // recording was active produced a 2.8 sec mosaic+swap stall on
+                // the GL thread (encoder backpressured eglSwap because the disk
+                // writer was starved by cleanup I/O). Deferring is safe: the
+                // dir is added to deferredCleanupDirs so the next tick (or the
+                // next save event after recording finishes) drains it.
+                //
+                // Edge case: a HARD storage situation (disk literally full, can't
+                // even write the next muxer chunk) needs a way out. We honor
+                // that by forcing a cleanup pass when current usage exceeds the
+                // limit by >5% — at that point eglSwap will fail anyway, so
+                // unblocking storage is the lesser evil. Below that threshold,
+                // the encoder write wins.
+                if (isEncoderWriting()) {
+                    // Per-dir over-limit ratio. Old code used MAX(limits)/20 as
+                    // the denominator, which let a small dir (e.g., 100 MB
+                    // recordings) grow many tens of MB over its OWN limit
+                    // before triggering. Per-dir ratio gives every dir an
+                    // independent, fair escape (audit Finding "storage drift").
+                    long recBytes = getRecordingsSize();
+                    long survBytes = getSurveillanceSize();
+                    long tripsBytes = getTripsSize();
+                    long recLim = recordingsLimitMb * 1024 * 1024;
+                    long survLim = surveillanceLimitMb * 1024 * 1024;
+                    long tripsLim = tripsLimitMb * 1024 * 1024;
+                    boolean recHard  = recLim   > 0 && recBytes   > recLim   * 21 / 20;  // >5% over OWN limit
+                    boolean survHard = survLim  > 0 && survBytes  > survLim  * 21 / 20;
+                    boolean tripsHard= tripsLim > 0 && tripsBytes > tripsLim * 21 / 20;
+
+                    // Free-disk emergency: if ANY active volume is critically
+                    // low, continuing to write is going to fail anyway. Force
+                    // cleanup regardless of probe. The min across all
+                    // categories' active volumes covers the case where
+                    // surveillance is on USB while recordings are on internal —
+                    // a starved surveillance volume must still trigger.
+                    long minFree = Long.MAX_VALUE;
+                    for (StorageType t : new StorageType[]{
+                            recordingsStorageType, surveillanceStorageType, tripsStorageType}) {
+                        long f;
+                        switch (t) {
+                            case SD_CARD: f = getSdCardFreeSpace(); break;
+                            case USB:     f = getUsbFreeSpace();    break;
+                            case INTERNAL:
+                            default:      f = getInternalFreeSpace(); break;
+                        }
+                        if (f > 0 && f < minFree) minFree = f;
+                    }
+                    long sdFree = (minFree == Long.MAX_VALUE) ? 0 : minFree;
+                    boolean diskCritical = sdFree > 0 && sdFree < 200L * 1024 * 1024;  // <200MB free
+
+                    boolean hardOverlimit = recHard || survHard || tripsHard || diskCritical;
+                    if (hardOverlimit) {
+                        logWarn("Periodic cleanup forced during recording: "
+                            + "rec=" + formatSize(recBytes) + "/" + formatSize(recLim) + (recHard ? " HARD" : "")
+                            + " surv=" + formatSize(survBytes) + "/" + formatSize(survLim) + (survHard ? " HARD" : "")
+                            + " trips=" + formatSize(tripsBytes) + "/" + formatSize(tripsLim) + (tripsHard ? " HARD" : "")
+                            + " sdFree=" + formatSize(sdFree) + (diskCritical ? " CRITICAL" : ""));
+                    } else {
+                        // Mark all dirs that are at risk so we drain them later.
+                        if (recBytes > recLim * 0.9) deferredCleanupDirs.add(DEFERRED_RECORDINGS);
+                        if (survBytes > survLim * 0.9) deferredCleanupDirs.add(DEFERRED_SURVEILLANCE);
+                        if (tripsBytes > tripsLim * 0.9) deferredCleanupDirs.add(DEFERRED_TRIPS);
+                        return;
+                    }
+                }
+
+                // Encoder idle: drain any deferred work first so storage limits
+                // re-converge after a long recording.
+                drainDeferredCleanupIfDue();
+
+                // Standard periodic pass (catches dirs that grew past the limit
+                // while the daemon was offline, or after a manual limit change).
                 synchronized (cleanupLock) {
                     long currentSize = getRecordingsSize();
                     long limitBytes = recordingsLimitMb * 1024 * 1024;
@@ -2251,6 +2765,76 @@ public class StorageManager {
     }
     
     /**
+     * Drain any cleanup that was deferred because the encoder was mid-write.
+     * Called from the periodic tick AND from each onXxxFileSaved path, so a
+     * deferred backlog never sits indefinitely. Safe to call when the queue
+     * is empty (early-exits on empty set).
+     */
+    private void drainDeferredCleanupIfDue() {
+        if (deferredCleanupDirs.isEmpty()) return;
+        if (isEncoderWriting()) return;  // still busy, try later
+        // Snapshot+clear so a concurrent add (e.g. a periodic tick that fires
+        // while we're draining) doesn't lose the new mark.
+        java.util.Set<String> toRun = new java.util.HashSet<>(deferredCleanupDirs);
+        deferredCleanupDirs.removeAll(toRun);
+        logInfo("Draining deferred cleanup: " + toRun);
+
+        // Per-dir try/catch: a failure on one dir must NOT cause the others
+        // to be re-marked. The previous catch-all re-added the entire toRun
+        // snapshot on any exception, including dirs that had already been
+        // cleaned successfully — wasting the next tick on idempotent re-runs
+        // (audit P1).
+        if (toRun.contains(DEFERRED_RECORDINGS)) {
+            try {
+                synchronized (cleanupLock) {
+                    if (getRecordingsSize() > recordingsLimitMb * 1024 * 1024) {
+                        ensureRecordingsSpace(0);
+                    }
+                }
+            } catch (Exception e) {
+                logWarn("Deferred recordings cleanup error: " + e.getMessage());
+                deferredCleanupDirs.add(DEFERRED_RECORDINGS);
+            }
+        }
+        if (toRun.contains(DEFERRED_SURVEILLANCE)) {
+            try {
+                synchronized (cleanupLock) {
+                    if (getSurveillanceSize() > surveillanceLimitMb * 1024 * 1024) {
+                        ensureSurveillanceSpace(0);
+                    }
+                }
+            } catch (Exception e) {
+                logWarn("Deferred surveillance cleanup error: " + e.getMessage());
+                deferredCleanupDirs.add(DEFERRED_SURVEILLANCE);
+            }
+        }
+        if (toRun.contains(DEFERRED_PROXIMITY)) {
+            try {
+                synchronized (cleanupLock) {
+                    if (getProximitySize() > proximityLimitMb * 1024 * 1024) {
+                        ensureProximitySpace(0);
+                    }
+                }
+            } catch (Exception e) {
+                logWarn("Deferred proximity cleanup error: " + e.getMessage());
+                deferredCleanupDirs.add(DEFERRED_PROXIMITY);
+            }
+        }
+        if (toRun.contains(DEFERRED_TRIPS)) {
+            try {
+                synchronized (cleanupLock) {
+                    if (getTripsSize() > tripsLimitMb * 1024 * 1024) {
+                        ensureTripsSpace(0);
+                    }
+                }
+            } catch (Exception e) {
+                logWarn("Deferred trips cleanup error: " + e.getMessage());
+                deferredCleanupDirs.add(DEFERRED_TRIPS);
+            }
+        }
+    }
+
+    /**
      * Stop periodic cleanup.
      */
     public void stopPeriodicCleanup() {
@@ -2269,28 +2853,38 @@ public class StorageManager {
     }
 
     /**
-     * Start SD card mount watchdog for sentry mode.
-     * Periodically checks if the SD card is still mounted and re-mounts it if the
-     * system unmounted it (BYD/Android tends to unmount SD when ACC is off).
+     * Start SD card / USB mount watchdog for sentry mode.
+     * Periodically checks if the configured external volume(s) are still
+     * mounted and re-mounts them if the system unmounted them (BYD/Android
+     * tends to unmount SD when ACC is off; USB drops on bus glitches).
      *
-     * Call this when entering sentry mode with SD card storage selected.
+     * Call this when entering sentry mode with an external volume selected.
+     * The single watchdog now covers BOTH SD and USB so a USB-only config
+     * doesn't go un-watched and silently fall back to internal forever.
      */
     public void startSdCardWatchdog() {
-        // Start watchdog if ANY storage type uses SD card (not just surveillance).
-        // The watchdog keeps the SD card mounted so recordings, events, and trips
-        // remain accessible via the HTTP server even when surveillance is suppressed.
-        boolean anyOnSd = surveillanceStorageType == StorageType.SD_CARD ||
-                          recordingsStorageType == StorageType.SD_CARD ||
-                          tripsStorageType == StorageType.SD_CARD;
-        if (!anyOnSd) {
-            logDebug("SD watchdog not needed - no storage type uses SD card");
+        // Start watchdog if ANY storage type uses SD or USB (not just surveillance).
+        // The watchdog keeps the external volume mounted so recordings, events,
+        // and trips remain accessible via the HTTP server even when surveillance
+        // is suppressed.
+        boolean anyOnSd  = surveillanceStorageType == StorageType.SD_CARD ||
+                          recordingsStorageType   == StorageType.SD_CARD ||
+                          tripsStorageType        == StorageType.SD_CARD;
+        boolean anyOnUsb = surveillanceStorageType == StorageType.USB ||
+                          recordingsStorageType   == StorageType.USB ||
+                          tripsStorageType        == StorageType.USB;
+        if (!anyOnSd && !anyOnUsb) {
+            logDebug("Volume watchdog not needed - no storage type uses SD or USB");
             return;
         }
 
         stopSdCardWatchdog();  // Stop any existing watchdog first
 
+        final boolean watchSd = anyOnSd;
+        final boolean watchUsb = anyOnUsb;
+
         sdCardWatchdog = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "SdCardWatchdog");
+            Thread t = new Thread(r, "VolumeWatchdog");
             t.setDaemon(true);
             t.setPriority(Thread.NORM_PRIORITY);  // Normal priority - mount is critical
             return t;
@@ -2298,20 +2892,20 @@ public class StorageManager {
 
         sdCardWatchdog.scheduleAtFixedRate(() -> {
             try {
-                if (!isSdCardMounted()) {
+                if (watchSd && !isSdCardMounted()) {
                     sdWatchdogConsecutiveFailures++;
-                    
+
                     // Only log verbosely for the first few failures, then quiet down
                     boolean shouldLog = sdWatchdogConsecutiveFailures <= SD_WATCHDOG_MAX_VERBOSE_FAILURES ||
                                         sdWatchdogConsecutiveFailures % SD_WATCHDOG_QUIET_LOG_INTERVAL == 0;
-                    
+
                     if (shouldLog) {
-                        logWarn("SD card watchdog: card unmounted, attempting remount... (attempt #" + 
+                        logWarn("SD card watchdog: card unmounted, attempting remount... (attempt #" +
                             sdWatchdogConsecutiveFailures + ")");
                     }
-                    
+
                     if (ensureSdCardMounted(true)) {
-                        logInfo("SD card watchdog: remounted successfully after " + 
+                        logInfo("SD card watchdog: remounted successfully after " +
                             sdWatchdogConsecutiveFailures + " attempts");
                         sdWatchdogConsecutiveFailures = 0;
 
@@ -2325,7 +2919,7 @@ public class StorageManager {
                                 com.overdrive.app.daemon.CameraDaemon.getGpuPipeline();
                             if (pipeline != null && pipeline.getSentry() != null) {
                                 pipeline.getSentry().setEventOutputDir(getSurveillanceDir());
-                                logInfo("SD card watchdog: updated sentry output dir to " + 
+                                logInfo("SD card watchdog: updated sentry output dir to " +
                                     getSurveillanceDir().getAbsolutePath());
                             }
                         } catch (Exception e) {
@@ -2334,19 +2928,62 @@ public class StorageManager {
                     } else if (shouldLog) {
                         logError("SD card watchdog: remount FAILED - surveillance may use internal fallback");
                     }
-                } else {
+                } else if (watchSd) {
                     // Card is mounted — reset failure counter
                     if (sdWatchdogConsecutiveFailures > 0) {
                         logInfo("SD card watchdog: card is mounted again");
                         sdWatchdogConsecutiveFailures = 0;
                     }
                 }
+
+                // USB watchdog branch — independent state machine but shares
+                // the schedule. Per user spec: USB-only configs must also fall
+                // back to internal transparently when the stick disappears
+                // mid-recording, but ALSO get a remount attempt when the
+                // bus settles. Without this branch a USB-only surveillance
+                // config that loses its drive stays on internal forever.
+                if (watchUsb && !isUsbMounted()) {
+                    usbWatchdogConsecutiveFailures++;
+                    boolean shouldLogUsb = usbWatchdogConsecutiveFailures <= SD_WATCHDOG_MAX_VERBOSE_FAILURES ||
+                                           usbWatchdogConsecutiveFailures % SD_WATCHDOG_QUIET_LOG_INTERVAL == 0;
+                    if (shouldLogUsb) {
+                        logWarn("USB watchdog: drive unmounted, attempting remount... (attempt #" +
+                            usbWatchdogConsecutiveFailures + ")");
+                    }
+                    if (ensureUsbMounted(true)) {
+                        logInfo("USB watchdog: remounted successfully after " +
+                            usbWatchdogConsecutiveFailures + " attempts");
+                        usbWatchdogConsecutiveFailures = 0;
+                        initUsbDirectories();
+                        updateActiveDirectories();
+                        try {
+                            com.overdrive.app.surveillance.GpuSurveillancePipeline pipeline =
+                                com.overdrive.app.daemon.CameraDaemon.getGpuPipeline();
+                            if (pipeline != null && pipeline.getSentry() != null
+                                    && surveillanceStorageType == StorageType.USB) {
+                                pipeline.getSentry().setEventOutputDir(getSurveillanceDir());
+                                logInfo("USB watchdog: updated sentry output dir to " +
+                                    getSurveillanceDir().getAbsolutePath());
+                            }
+                        } catch (Exception e) {
+                            logWarn("USB watchdog: could not update sentry dir: " + e.getMessage());
+                        }
+                    } else if (shouldLogUsb) {
+                        logError("USB watchdog: remount FAILED - surveillance may use internal fallback");
+                    }
+                } else if (watchUsb) {
+                    if (usbWatchdogConsecutiveFailures > 0) {
+                        logInfo("USB watchdog: drive is mounted again");
+                        usbWatchdogConsecutiveFailures = 0;
+                    }
+                }
             } catch (Exception e) {
-                logWarn("SD card watchdog error: " + e.getMessage());
+                logWarn("Volume watchdog error: " + e.getMessage());
             }
         }, SD_WATCHDOG_INTERVAL_SECONDS, SD_WATCHDOG_INTERVAL_SECONDS, TimeUnit.SECONDS);
 
-        logInfo("Started SD card mount watchdog (interval=" + SD_WATCHDOG_INTERVAL_SECONDS + "s)");
+        logInfo("Started volume mount watchdog (interval=" + SD_WATCHDOG_INTERVAL_SECONDS +
+            "s, sd=" + watchSd + ", usb=" + watchUsb + ")");
     }
 
     /**
@@ -2374,6 +3011,39 @@ public class StorageManager {
      */
     public void setRecordingActive(boolean active) {
         recordingActive.set(active);
+    }
+
+    /**
+     * Wires the authoritative "encoder is currently writing" probe used by
+     * the cleanup gate. Should point at HardwareEventRecorderGpu.isWritingToFile.
+     * Pipeline init wires this once; release-and-reinit cycles can re-wire.
+     * Passing null reverts to the default (always false → cleanup never blocked).
+     */
+    public void setEncoderWritingProbe(java.util.function.BooleanSupplier probe) {
+        this.encoderWritingProbe = probe != null ? probe : () -> false;
+        if (probe != null) {
+            probeWired.set(true);
+        }
+    }
+
+    /**
+     * True when the encoder is actively writing packets to disk. The cleanup
+     * paths (post-save, periodic, sidecar) consult this before running
+     * destructive deletes; if true, the cleanup is deferred to the deferred
+     * queue and drained on the next non-recording pass.
+     *
+     * Cheap (volatile read) — safe to call from any thread, every iteration.
+     */
+    private boolean isEncoderWriting() {
+        try {
+            return encoderWritingProbe.getAsBoolean();
+        } catch (Exception e) {
+            // A buggy probe must never block cleanup forever — fail open on
+            // recoverable exceptions. Errors (OOM, StackOverflow, LinkageError)
+            // propagate; "treat the JVM as healthy and run a delete burst" is
+            // the wrong default response to a process that's already broken.
+            return false;
+        }
     }
 
     /**

@@ -55,6 +55,10 @@ class SurveillanceConfigManager(
         private const val KEY_PRE_RECORD_SECONDS = "preRecordSeconds"
         private const val KEY_POST_RECORD_SECONDS = "postRecordSeconds"
         private const val KEY_TG_SEND_START_PING = "telegramSendStartPing"
+        // KEY_TG_NOTICES / KEY_TG_ALERTS / KEY_TG_CRITICAL moved to the
+        // telegram section as tier{Notices,Alerts,Critical} — see
+        // UnifiedTelegramConfig. Kept out of this section so a stale write
+        // here can't override the new home of the tier toggles.
         
         // V2 Pipeline keys
         private const val KEY_ENVIRONMENT_PRESET = "environmentPreset"
@@ -120,6 +124,20 @@ class SurveillanceConfigManager(
      */
     fun saveConfig(config: SurveillanceConfig): Boolean {
         return try {
+            // Tier toggles (telegramNotices/Alerts/Critical) used to live in
+            // this section but moved to the telegram section. Trigger the
+            // one-shot migration BEFORE we serialize+save: serializeConfig no
+            // longer writes those keys, so a save here would otherwise
+            // permanently erase them from the surveillance section before
+            // anyone read them out for migration. Idempotent — no-op once the
+            // _tierMigrated marker is set.
+            try {
+                com.overdrive.app.telegram.config.UnifiedTelegramConfig.load()
+            } catch (ignored: Exception) {
+                // Migration failure shouldn't block a config save. The user's
+                // intent on the surveillance config takes priority, and the
+                // tier-migration latch ensures we don't loop on this.
+            }
             val json = serializeConfig(config)
             val success = UnifiedConfigManager.setSurveillance(json)
             if (success) {
@@ -170,6 +188,8 @@ class SurveillanceConfigManager(
             put(KEY_PRE_RECORD_SECONDS, config.preRecordSeconds)
             put(KEY_POST_RECORD_SECONDS, config.postRecordSeconds)
             put(KEY_TG_SEND_START_PING, config.isTelegramSendStartPing)
+            // tierNotices/tierAlerts/tierCritical now live on the telegram
+            // section (see UnifiedTelegramConfig). Skipped here.
             
             // V2 Pipeline settings
             put(KEY_ENVIRONMENT_PRESET, config.environmentPreset)
@@ -259,6 +279,10 @@ class SurveillanceConfigManager(
         if (json.has(KEY_POST_RECORD_SECONDS)) config.setPostRecordSeconds(json.optInt(KEY_POST_RECORD_SECONDS, 10))
         if (json.has(KEY_TG_SEND_START_PING))
             config.setTelegramSendStartPing(json.optBoolean(KEY_TG_SEND_START_PING, false))
+        // tierNotices/tierAlerts/tierCritical now live on the telegram
+        // section (UnifiedTelegramConfig). UnifiedTelegramConfig.load() runs
+        // a one-shot migration that copies the old surveillance.telegram*
+        // values into the new home, so older configs upgrade transparently.
         
         // V2 Pipeline settings
         if (json.has(KEY_ENVIRONMENT_PRESET)) config.setEnvironmentPreset(json.optString(KEY_ENVIRONMENT_PRESET, "outdoor"))

@@ -352,12 +352,29 @@ public class UpdateApiHandler {
                         writeProgress(phase, -1, m, null);
                     }
                     @Override public void onDownloadProgress(int percent) {
+                        // Coalesce: AppUpdater fires this on every percent
+                        // change (up to 100 times) but writeProgress is a
+                        // synchronous full-file rewrite. Skipping smaller
+                        // steps keeps the download throughput from being
+                        // gated by /data/local/tmp write latency. Keep all
+                        // edge transitions (-1 → first-real, 99 → 100,
+                        // first-real after 0).
+                        long now = System.currentTimeMillis();
+                        boolean atEdge = percent < 0 || percent >= 99
+                                || lastWrittenPercent < 0;
+                        boolean stepEnough = (percent - lastWrittenPercent) >= 2;
+                        boolean timeEnough = (now - lastWrittenAt) >= 500;
+                        if (!(atEdge || stepEnough || timeEnough)) return;
+                        lastWrittenPercent = percent;
+                        lastWrittenAt = now;
                         writeProgress("downloading", percent,
                                 percent < 0
                                     ? Messages.get("messages.update_downloading_indeterminate")
                                     : Messages.get("messages.update_downloading_with_percent", percent),
                                 null);
                     }
+                    private int lastWrittenPercent = -1;
+                    private long lastWrittenAt = 0;
                     @Override public void onSuccess() {
                         writeProgress("installing", 100,
                                 Messages.get("messages.update_installing_finishing"), null);
@@ -394,6 +411,31 @@ public class UpdateApiHandler {
         if (json == null || json.isEmpty()) {
             HttpResponse.sendJsonError(out, Messages.get("errors.update_progress_unreadable"));
             return;
+        }
+        // Stale-recovery: if the daemon was killed mid-download (low memory,
+        // crash) the progress file's last writer is gone but the JSON is
+        // frozen at "phase=downloading, percent=42". The webapp would poll
+        // forever showing the wrong state. Detect by comparing ts; anything
+        // older than 5 min in a non-terminal phase is a stuck remnant.
+        // Terminal phases (error, installing@100) are kept as-is since the
+        // user still wants to see the outcome.
+        try {
+            JSONObject parsed = new JSONObject(json);
+            long ts = parsed.optLong("ts", 0);
+            String phase = parsed.optString("phase", "");
+            boolean terminal = "error".equals(phase) || "idle".equals(phase)
+                    || ("installing".equals(phase) && parsed.optInt("percent", -1) == 100);
+            if (!terminal && ts > 0 && (System.currentTimeMillis() - ts) > 5 * 60 * 1000L) {
+                JSONObject idle = new JSONObject();
+                idle.put("phase", "idle");
+                idle.put("percent", -1);
+                idle.put("message", "");
+                HttpResponse.sendJson(out, idle.toString());
+                return;
+            }
+        } catch (Exception ignored) {
+            // Malformed JSON falls through to the existing pass-through —
+            // we'd rather hand the webapp a confusing payload than a 500.
         }
         HttpResponse.sendJson(out, json);
     }

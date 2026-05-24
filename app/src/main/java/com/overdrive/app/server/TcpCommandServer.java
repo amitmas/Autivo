@@ -339,15 +339,17 @@ public class TcpCommandServer {
                 break;
 
             case "setRecordingsStorageType":
-                // Set recordings storage type: INTERNAL or SD_CARD
+                // Set recordings storage type: INTERNAL, SD_CARD, or USB
                 String recStorageTypeValue = cmd.optString("value", "").toUpperCase();
-                if (recStorageTypeValue.equals("INTERNAL") || recStorageTypeValue.equals("SD_CARD")) {
+                com.overdrive.app.storage.StorageManager.StorageType recType = null;
+                switch (recStorageTypeValue) {
+                    case "INTERNAL": recType = com.overdrive.app.storage.StorageManager.StorageType.INTERNAL; break;
+                    case "SD_CARD":  recType = com.overdrive.app.storage.StorageManager.StorageType.SD_CARD;  break;
+                    case "USB":      recType = com.overdrive.app.storage.StorageManager.StorageType.USB;      break;
+                }
+                if (recType != null) {
                     com.overdrive.app.storage.StorageManager storageManager =
                         com.overdrive.app.storage.StorageManager.getInstance();
-                    com.overdrive.app.storage.StorageManager.StorageType recType =
-                        "SD_CARD".equals(recStorageTypeValue) ?
-                            com.overdrive.app.storage.StorageManager.StorageType.SD_CARD :
-                            com.overdrive.app.storage.StorageManager.StorageType.INTERNAL;
                     boolean recSuccess = storageManager.setRecordingsStorageType(recType);
                     if (recSuccess) {
                         response.put("status", "ok");
@@ -357,11 +359,11 @@ public class TcpCommandServer {
                         CameraDaemon.log("Recordings storage type set to " + recStorageTypeValue + " via TCP IPC");
                     } else {
                         response.put("status", "error");
-                        response.put("message", "SD card not available");
+                        response.put("message", recType.name() + " not available");
                     }
                 } else {
                     response.put("status", "error");
-                    response.put("message", "Invalid storage type. Use INTERNAL or SD_CARD");
+                    response.put("message", "Invalid storage type. Use INTERNAL, SD_CARD, or USB");
                 }
                 break;
 

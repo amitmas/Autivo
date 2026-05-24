@@ -80,14 +80,6 @@ public class ExternalStorageCleaner {
 
     // ==================== Constants ====================
     
-    // Known SD card mount paths
-    private static final String[] SD_CARD_PATHS = {
-        "/storage/external_sd",
-        "/storage/sdcard1",
-        "/mnt/external_sd",
-        "/mnt/sdcard/external_sd"
-    };
-    
     // Known BYD CDR (dashcam) recording directories
     private static final String[] CDR_SUBDIRS = {
         "Recorder/Normal",    // BYD built-in dashcam - normal recordings
@@ -176,64 +168,36 @@ public class ExternalStorageCleaner {
         sdCardPath = null;
         cdrPath = null;
         sdCardAvailable = false;
-        
-        // Method 1: Check BYD system property for SD card UUID
-        String sdUuid = getSystemProperty("sys.byd.mSdcardUuid");
-        String sdExists = getSystemProperty("sys.byd.isSDExist");
-        
-        if ("true".equalsIgnoreCase(sdExists) && !sdUuid.isEmpty()) {
-            String uuidPath = "/storage/" + sdUuid;
-            File uuidDir = new File(uuidPath);
-            if (uuidDir.exists() && uuidDir.isDirectory()) {
-                sdCardPath = uuidPath;
-                logInfo("Found SD card via UUID: " + sdCardPath);
+
+        // SOTA: Delegate SD discovery to StorageManager so we share the
+        // type-aware classifier (mmcblk* = SD, sd* = USB) and never latch
+        // onto a USB stick. The CDR/dashcam files are inherently SD-bound,
+        // so a USB drive must NOT be considered here even if it's mounted.
+        try {
+            com.overdrive.app.storage.StorageManager sm =
+                com.overdrive.app.storage.StorageManager.getInstance();
+            if (sm.isSdCardAvailable()) {
+                sdCardPath = sm.getSdCardPath();
+                logInfo("Using SD card from StorageManager: " + sdCardPath);
             }
+        } catch (Exception e) {
+            logDebug("StorageManager lookup failed: " + e.getMessage());
         }
-        
-        // Method 2: Check mounted public volumes via 'sm list-volumes'
+
+        // Fallback to BYD prop directly (SD-specific).
         if (sdCardPath == null) {
-            try {
-                Process listProcess = Runtime.getRuntime().exec(new String[]{"sm", "list-volumes", "all"});
-                BufferedReader reader = new BufferedReader(new InputStreamReader(listProcess.getInputStream()));
-                String line;
-                
-                while ((line = reader.readLine()) != null) {
-                    // Parse lines like: "public:8,97 mounted 3661-3064"
-                    line = line.trim();
-                    if (line.startsWith("public:") && line.contains("mounted")) {
-                        String[] parts = line.split("\\s+");
-                        if (parts.length >= 3) {
-                            String volumeUuid = parts[2];  // e.g., "3661-3064"
-                            String mountPath = "/storage/" + volumeUuid;
-                            File mountDir = new File(mountPath);
-                            
-                            if (mountDir.exists() && mountDir.isDirectory()) {
-                                sdCardPath = mountPath;
-                                logInfo("Found SD card via sm list-volumes: " + sdCardPath);
-                                break;
-                            }
-                        }
-                    }
-                }
-                reader.close();
-                listProcess.waitFor();
-            } catch (Exception e) {
-                logDebug("Could not check sm list-volumes: " + e.getMessage());
-            }
-        }
-        
-        // Method 3: Check known paths
-        if (sdCardPath == null) {
-            for (String path : SD_CARD_PATHS) {
-                File dir = new File(path);
-                if (dir.exists() && dir.isDirectory() && dir.canRead()) {
-                    sdCardPath = path;
-                    logInfo("Found SD card at: " + sdCardPath);
-                    break;
+            String sdUuid = getSystemProperty("sys.byd.mSdcardUuid");
+            String sdExists = getSystemProperty("sys.byd.isSDExist");
+            if ("true".equalsIgnoreCase(sdExists) && !sdUuid.isEmpty()) {
+                String uuidPath = "/storage/" + sdUuid;
+                File uuidDir = new File(uuidPath);
+                if (uuidDir.exists() && uuidDir.isDirectory()) {
+                    sdCardPath = uuidPath;
+                    logInfo("Found SD card via UUID: " + sdCardPath);
                 }
             }
         }
-        
+
         if (sdCardPath == null) {
             logWarn("No SD card found");
             return;

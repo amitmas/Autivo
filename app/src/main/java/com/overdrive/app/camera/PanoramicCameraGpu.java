@@ -1,6 +1,5 @@
 package com.overdrive.app.camera;
 
-import android.graphics.Bitmap;
 import android.graphics.ImageFormat;
 import android.hardware.HardwareBuffer;
 import android.media.Image;
@@ -127,6 +126,9 @@ public class PanoramicCameraGpu {
     private com.overdrive.app.streaming.GpuStreamScaler streamScaler;  // Stream scaler (optional)
     private HardwareEventRecorderGpu streamEncoder;  // Stream encoder (optional)
     private GpuDownscaler downscaler;
+    /** Lazy-allocated full-resolution sampler for the camera-mapping dialog.
+     *  Lives on the GL handler; allocates GL resources on first use. */
+    private HighResPreviewSampler highResSampler;
     private SurveillanceEngineGpu sentry;
     private FoveatedCropper foveatedCropper;  // High-res AI crop from raw strip
     
@@ -222,21 +224,32 @@ public class PanoramicCameraGpu {
 
     private int targetFps = 15;  // Desired frame rate for camera
     private final float[] quadrantStripOffsetX;
-    
+
+    // One-shot mismatch warning for HAL-emitted dims vs. configured strip.
+    // The HAL silently delivers whatever it wants; we want to know if Tang
+    // returns 720 against a Seal-configured 960 ImageReader (mosaic geometry
+    // would be wrong). volatile because the GL thread sets it on first frame.
+    private volatile boolean emittedDimsLogged = false;
+
     /**
      * Creates a GPU-based panoramic camera.
-     * 
+     *
      * @param width Camera width (typically 5120)
-     * @param height Camera height (typically 960)
+     * @param height Camera height (typically 960 on Seal, 720 on Tang)
      */
     public PanoramicCameraGpu(int width, int height) {
         this(width, height, null);
     }
 
+    /**
+     * @param quadrantStripOffsetX Per-quadrant strip-X offsets. Null = legacy
+     *     Seal default. Forwarded to the foveated cropper so its
+     *     {@code centerX} math picks the slice the user mapped to each role.
+     */
     public PanoramicCameraGpu(int width, int height, float[] quadrantStripOffsetX) {
         this.width = width;
         this.height = height;
-        this.quadrantStripOffsetX = quadrantStripOffsetX != null && quadrantStripOffsetX.length == 4
+        this.quadrantStripOffsetX = (quadrantStripOffsetX != null && quadrantStripOffsetX.length == 4)
             ? quadrantStripOffsetX.clone()
             : null;
     }
@@ -438,6 +451,8 @@ public class PanoramicCameraGpu {
         }
         
         // Initialize foveated cropper for high-res AI crops
+        // Pass strip dims and per-quadrant offsets so the foveated crop math
+        // is correct on Tang (5120x720) and on user-remapped Seal layouts.
         foveatedCropper = new FoveatedCropper(width, height, quadrantStripOffsetX);
         foveatedCropper.init();
         
@@ -464,8 +479,17 @@ public class PanoramicCameraGpu {
         glHandler.post(() -> {
             try {
                 recorder.init(eglCore, encoder);
+                // Wire the HAL-contention probe so the recorder's safety valve
+                // only fires when the BYD native AVM app is actively sharing
+                // the camera. In normal solo operation the valve stays inert
+                // and eglSwapBuffers handles encoder backpressure natively —
+                // no more 1-in-N drops at 25–30 fps.
+                recorder.setHalContentionProbe(() -> {
+                    BydCameraCoordinator c = cameraCoordinator;
+                    return c != null && c.isNativeAppActive();
+                });
                 logger.info( "Recorder initialized on GL thread");
-                
+
                 // Notify pipeline that recorder is ready
                 if (recorderInitCallback != null) {
                     recorderInitCallback.run();
@@ -775,6 +799,50 @@ public class PanoramicCameraGpu {
     // these from another thread will leak the gralloc slot and stall the HAL.
     private Image currentBoundImage;             // @GuardedBy(GL thread)
     private HardwareBuffer currentBoundHwBuffer; // @GuardedBy(GL thread)
+    // HAL-provided sensor timestamp (ns) of the currently bound image,
+    // captured from Image.getTimestamp() inside consumeLatestImageAndBind.
+    // Fed to eglPresentationTimeANDROID so MediaCodec produces honest PTS.
+    //
+    // BYD DiLink 5.0 HAL specifics observed in field probes:
+    //   - On the very first frame, hwTs ≈ 52ms (an uptime offset, not a
+    //     real sensor time).
+    //   - Subsequent frames return the same value, OR micro-advance by
+    //     a few hundred ns per frame, never tracking real cadence.
+    //
+    // Strategy:
+    //   1. Trust hwTs only if it advances by a plausible per-frame interval
+    //      (>= MIN_PER_FRAME_NS). Tiny advances (a few hundred ns) are not
+    //      camera frame cadence and are treated as "stuck".
+    //   2. After STUCK_HW_TS_FRAMES consecutive non-advancing frames, latch
+    //      permanently into nanoTime() mode for the session.
+    //   3. Cross-domain monotonic guard: lastAcceptedPtsNs is only a valid
+    //      monotonicity reference *within the same clock domain*. The HAL
+    //      uses an uptime-style clock; System.nanoTime() uses CLOCK_MONOTONIC
+    //      which has a different epoch. Mixing them with a naive +1us guard
+    //      anchors PTS to the larger of the two and produces the
+    //      "187 packets in 0.0 sec" symptom (PTS only advances 1us per
+    //      frame across the latch boundary). Solution: tag each accepted
+    //      PTS with its domain and only enforce the +1us guard within the
+    //      same domain. On a cross-domain transition, accept the new
+    //      candidate as-is and re-anchor.
+    //   4. One-shot info log on the very first frame to verify deployment.
+    private long currentFrameTimestampNs = 0;     // @GuardedBy(GL thread)
+    private long lastHwTsSeenNs = 0;              // @GuardedBy(GL thread)
+    private long lastAcceptedPtsNs = 0;           // @GuardedBy(GL thread)
+    private int  ptsDomain = PTS_DOMAIN_NONE;     // @GuardedBy(GL thread)
+    private int  stuckHwTsRunLength = 0;          // @GuardedBy(GL thread)
+    private boolean hwTsLatchedFallback = false;  // @GuardedBy(GL thread)
+    private boolean ptsSourceLogged = false;      // @GuardedBy(GL thread)
+    private static final int STUCK_HW_TS_FRAMES = 10;
+    // Minimum hwTs advance per frame to be considered "real" cadence. At
+    // 30 fps the inter-frame interval is ~33ms; at the 10 fps floor it's
+    // ~100ms. 1 ms is the smallest plausible per-frame delta on any sane
+    // sensor — anything below that is the BYD HAL micro-advancing a stuck
+    // counter, not the actual frame timestamp.
+    private static final long MIN_PER_FRAME_HW_ADVANCE_NS = 1_000_000L;
+    private static final int PTS_DOMAIN_NONE = 0;
+    private static final int PTS_DOMAIN_HW   = 1;
+    private static final int PTS_DOMAIN_NANO = 2;
 
     private boolean consumeLatestImageAndBind() {
         ImageReader reader = cameraImageReader;
@@ -789,6 +857,26 @@ public class PanoramicCameraGpu {
                 return false;
             }
             irAcquireOkCount++;
+            // SOTA cross-vehicle sanity: log once per session if HAL-emitted
+            // dims differ from the configured strip. Mosaic offsets, foveated
+            // crop math, and encoder geometry all assume the configured size.
+            // A silent mismatch (e.g., Tang HAL ignoring our 960 request and
+            // emitting 720 anyway) would record corrupted mosaics — surface
+            // it loudly so the operator can pick a different camera profile.
+            if (!emittedDimsLogged) {
+                int emittedW = image.getWidth();
+                int emittedH = image.getHeight();
+                if (emittedW != width || emittedH != height) {
+                    logger.warn("HAL emitted " + emittedW + "x" + emittedH
+                        + " but pipeline configured " + width + "x" + height
+                        + " — mosaic/foveated geometry assumes the configured size."
+                        + " Pick a different camera profile if this looks wrong.");
+                } else {
+                    logger.info("HAL emitted " + emittedW + "x" + emittedH
+                        + " (matches configured " + width + "x" + height + ")");
+                }
+                emittedDimsLogged = true;
+            }
             hwBuffer = image.getHardwareBuffer();
             if (hwBuffer == null) {
                 logger.warn("Image.getHardwareBuffer() returned null — dropping frame");
@@ -808,6 +896,12 @@ public class PanoramicCameraGpu {
             // Transfer ownership of this image+hwBuffer into the held slots.
             currentBoundImage = image;
             currentBoundHwBuffer = hwBuffer;
+            // Capture the HAL timestamp BEFORE we close the image. The
+            // BYD DiLink 5.0 HAL on the PRIVATE ImageReader path returns a
+            // constant non-zero value, so we can't trust hwTs blindly — we
+            // detect the stuck pattern and latch into nanoTime() once
+            // confirmed. See field comment on hwTsLatchedFallback.
+            currentFrameTimestampNs = nextFrameTimestampNs(image);
             transferredOwnership = true;
             return true;
         } catch (Throwable t) {
@@ -826,6 +920,98 @@ public class PanoramicCameraGpu {
                     try { image.close(); } catch (Throwable ignored) {}
                 }
             }
+        }
+    }
+
+    /**
+     * Resolve the per-frame PTS source. Trusts Image.getTimestamp() only as
+     * long as it advances by at least MIN_PER_FRAME_HW_ADVANCE_NS per frame;
+     * micro-advance (BYD HAL behavior) and constant values both count as
+     * "stuck". After STUCK_HW_TS_FRAMES consecutive stuck frames the session
+     * latches permanently into System.nanoTime() mode.
+     *
+     * The output is strictly monotonic *within a clock domain*. Across a
+     * domain transition (HW→NANO when the latch fires) we re-anchor cleanly
+     * rather than apply the +1us guard, because the previous-accepted value
+     * was in a different clock epoch — applying +1us across that boundary
+     * is the bug that produced "187 packets in 0.0 sec" (every frame after
+     * the latch was clamped to lastAcceptedPtsNs + 1us).
+     *
+     * MUST be called from the GL thread (renderLoop).
+     */
+    private long nextFrameTimestampNs(Image image) {
+        long candidate;
+        int candidateDomain;
+
+        if (hwTsLatchedFallback) {
+            candidate = System.nanoTime();
+            candidateDomain = PTS_DOMAIN_NANO;
+        } else {
+            long hwTs = 0;
+            try { hwTs = image.getTimestamp(); } catch (Throwable ignored) {}
+            if (!ptsSourceLogged) {
+                logger.info("PTS source probe: first hwTs=" + hwTs + "ns, mode="
+                    + (hwTs > 0 ? "hwClock(advance-checked)" : "hwClock(zero-on-first-frame)"));
+                ptsSourceLogged = true;
+            }
+            long advance = hwTs - lastHwTsSeenNs;
+            boolean firstSeed = (lastHwTsSeenNs == 0 && hwTs > 0);
+            boolean realAdvance = advance >= MIN_PER_FRAME_HW_ADVANCE_NS;
+
+            if (firstSeed || realAdvance) {
+                // Plausible per-frame advance — trust hwTs.
+                lastHwTsSeenNs = hwTs;
+                stuckHwTsRunLength = 0;
+                candidate = hwTs;
+                candidateDomain = PTS_DOMAIN_HW;
+            } else {
+                // Stuck, micro-advancing, or rewinding. Substitute nanoTime
+                // now and count the run; latch after STUCK_HW_TS_FRAMES.
+                stuckHwTsRunLength++;
+                if (stuckHwTsRunLength == STUCK_HW_TS_FRAMES) {
+                    hwTsLatchedFallback = true;
+                    logger.warn("HAL timestamp stuck near " + lastHwTsSeenNs + "ns ("
+                            + "advance=" + advance + "ns < " + MIN_PER_FRAME_HW_ADVANCE_NS
+                            + "ns/frame) for " + stuckHwTsRunLength + " frames — "
+                            + "latching to System.nanoTime() for the rest of the "
+                            + "session (BYD PRIVATE-ImageReader HAL doesn't honor "
+                            + "the timestamp contract)");
+                }
+                candidate = System.nanoTime();
+                candidateDomain = PTS_DOMAIN_NANO;
+            }
+        }
+
+        if (candidateDomain != ptsDomain) {
+            // Cross-domain transition — re-anchor. The previous lastAccepted
+            // was in a different clock epoch, so the standard monotonic
+            // guard would clamp this candidate to (oldEpoch + 1us) and pin
+            // PTS forever. Trust the new domain, log once at INFO so we
+            // can see the transition in field logs.
+            if (ptsDomain != PTS_DOMAIN_NONE) {
+                logger.info("PTS domain transition: "
+                        + domainName(ptsDomain) + " → " + domainName(candidateDomain)
+                        + " (re-anchoring at " + candidate + "ns)");
+            }
+            ptsDomain = candidateDomain;
+            lastAcceptedPtsNs = candidate;
+            return candidate;
+        }
+        // Same-domain monotonic guard. MediaCodec rejects non-increasing
+        // PTS, so any duplicate or rewind within the same domain gets
+        // bumped by +1us.
+        if (candidate <= lastAcceptedPtsNs) {
+            candidate = lastAcceptedPtsNs + 1_000L;
+        }
+        lastAcceptedPtsNs = candidate;
+        return candidate;
+    }
+
+    private static String domainName(int domain) {
+        switch (domain) {
+            case PTS_DOMAIN_HW:   return "HW";
+            case PTS_DOMAIN_NANO: return "NANO";
+            default:              return "NONE";
         }
     }
 
@@ -942,7 +1128,7 @@ public class PanoramicCameraGpu {
                         lastDataCameraId = currentId;
                         
                         // During auto-probe: accept the first camera with non-black panoramic data.
-                        // The wide panoramic strip geometry is the identifier on BYD — no other
+                        // The 5120x960 resolution IS the panoramic strip identifier on BYD — no other
                         // camera output uses this resolution with real image data. The luma-based
                         // strip check was producing false negatives in low-light/uniform scenes.
                         if (autoProbeCameras) {
@@ -1058,7 +1244,12 @@ public class PanoramicCameraGpu {
             HardwareEventRecorderGpu localEncoder = encoder;
             long stageBeforeMosaicNs = System.nanoTime();
             if (localRecorder != null) {
-                localRecorder.drawFrame(cameraTextureId);
+                // Pass the HAL-provided sensor timestamp straight through to
+                // eglPresentationTimeANDROID. Replaces the old TBC EMA path:
+                // the encoder now produces PTS values that exactly mirror real
+                // camera cadence, eliminating the rubber-banding/snapback the
+                // EMA introduced at 15+ fps.
+                localRecorder.drawFrame(cameraTextureId, currentFrameTimestampNs);
 
                 // CRITICAL: Drain encoder immediately after frame submission
                 // This prevents eglSwapBuffers from blocking when encoder buffers fill up
@@ -1093,6 +1284,14 @@ public class PanoramicCameraGpu {
                         localEncoder.release();
                         localEncoder.init();
                         localRecorder.init(eglCore, localEncoder);
+                        // Re-wire the contention probe — release() restored
+                        // the inert default, and we don't want a contention
+                        // event right after recovery to silently ignore the
+                        // BYD AVM's signal-loss risk.
+                        localRecorder.setHalContentionProbe(() -> {
+                            BydCameraCoordinator c = cameraCoordinator;
+                            return c != null && c.isNativeAppActive();
+                        });
                         localRecorder.clearReinitFlag();
                         logger.info("Encoder reinitialized successfully after surface loss");
                     } catch (Exception reinitEx) {
@@ -1144,10 +1343,18 @@ public class PanoramicCameraGpu {
             long stageAfterAiSubmitNs = stageBeforeAiReadbackNs;
             if (sentry != null && sentry.isActive() && downscaler != null && aiLaneWorker != null) {
                 boolean aiFrameTurn = (frameCounter % AI_READBACK_FRAME_MODULO == 0);
-                if (!aiFrameTurn || aiLaneWorker.isBusy()) {
-                    // Not this frame's turn, or the worker is still processing
-                    // the previous frame. Skip readback — let GL thread fly
-                    // through mosaic+swap to drain the ImageReader pool.
+                // Three-way gate: own cadence (frame-modulo), worker idle,
+                // and Adreno not mid-OpenCL. The third check is the new
+                // one — without it, glReadPixels on the next line would
+                // implicitly join the GPU command queue and block until
+                // the YOLO inference finished, producing ~250 ms stalls.
+                // sentry.isAiGpuJobInFlight() is a volatile read; cheap
+                // enough to call every iteration.
+                if (!aiFrameTurn || aiLaneWorker.isBusy() || sentry.isAiGpuJobInFlight()) {
+                    // Not this frame's turn, the worker is still processing
+                    // the previous frame, or the Adreno is mid-YOLO. Skip
+                    // readback so the GL thread can keep mosaic+swap flowing
+                    // and drain the ImageReader pool at HAL rate.
                     stageWindowAiReadbackSkips++;
                 } else {
                     try {
@@ -1168,6 +1375,29 @@ public class PanoramicCameraGpu {
                     } catch (Exception e) {
                         logger.warn("AI lane error: " + (e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName()));
                     }
+                }
+            }
+
+            // PASS 3: Service the foveated mailbox.
+            //
+            // Old design posted foveated crops to glHandler from the AI worker
+            // and blocked, contending with this very render loop's self-post
+            // for handler slots. New design pulls the crop INTO the render
+            // loop: AI worker marks a request flag, this code services at
+            // most one request per frame on the same GL thread that just ran
+            // mosaic+swap. No handler-queue contention, no posted Runnables.
+            //
+            // Gated on isAiGpuJobInFlight: crop's glReadPixels can implicitly
+            // sync against the OpenCL command queue on Adreno even with
+            // glFlush() instead of glFinish(). Staying conservative — if YOLO
+            // is mid-inference, defer the crop one frame. Worst case the AI
+            // worker sees a slot that's one tick older; V2 motion runs at
+            // 10Hz so that's <100ms of staleness, invisible.
+            if (sentry != null && sentry.isActive() && !sentry.isAiGpuJobInFlight()) {
+                try {
+                    sentry.serviceFoveatedRequestsOnGlThread();
+                } catch (Throwable t) {
+                    logger.warn("Foveated service error: " + t.getMessage());
                 }
             }
 
@@ -1767,7 +1997,7 @@ public class PanoramicCameraGpu {
     public void stop() {
         logger.info( "Stopping GPU camera pipeline...");
         running = false;
-        
+
         // Stop watchdog
         if (watchdogThread != null) {
             watchdogThread.interrupt();
@@ -1987,6 +2217,17 @@ public class PanoramicCameraGpu {
             aiLaneWorker = null;
         }
 
+        // Tear down the dialog-preview sampler. It owns its own EGL context
+        // (shared with our eglCore) on its own HandlerThread; if we don't
+        // release it the context outlives this pipeline instance and leaks
+        // EGL handles every time the daemon restarts.
+        synchronized (this) {
+            if (highResSampler != null) {
+                try { highResSampler.release(); } catch (Throwable ignored) {}
+                highResSampler = null;
+            }
+        }
+
         // Release foveated cropper before GL context is destroyed
         if (foveatedCropper != null) {
             foveatedCropper.release();
@@ -2060,7 +2301,27 @@ public class PanoramicCameraGpu {
     public boolean isRunning() {
         return running;
     }
-    
+
+    /**
+     * True once the camera HAL has delivered at least one frame and the GL
+     * thread has bound it to {@code cameraTextureId}. Used by the
+     * camera-mapping dialog to decide whether a sync readback would actually
+     * see real content vs. an uninitialized black texture.
+     */
+    public boolean isFirstFrameReceived() {
+        return firstFrameReceived;
+    }
+
+    /**
+     * Number of frames the GL thread has consumed from the HAL since
+     * {@code start()}. Combined with {@link #isFirstFrameReceived()} this
+     * lets callers wait for the BYD HAL warmup probe (frames 1–15 are
+     * cold/dim on most builds) before sampling.
+     */
+    public int getFrameCounter() {
+        return frameCounter;
+    }
+
     /**
      * Sets the AVMCamera surface mode for addPreviewSurface().
      * Must be called before start(). Default is 0 (works on Seal).
@@ -2243,106 +2504,132 @@ public class PanoramicCameraGpu {
     }
     
     /**
-     * Gets the latest JPEG frame for a specific camera (for HTTP snapshot).
-     * 
-     * @param cameraId Camera ID (1-4)
-     * @return JPEG byte array, or null if not available
+     * Gets the latest JPEG frame for a specific camera view.
+     *
+     * <p>Delegates to the surveillance engine's published mosaic JPEG —
+     * no GL-thread work, no AVMCamera open, no concurrent HAL claim. The
+     * engine encodes the mosaic on its own worker thread once per surveillance
+     * cycle (see {@link SurveillanceEngineGpu#getLatestMosaicJpeg()}); this
+     * call decodes that JPEG and crops the requested quadrant.
+     *
+     * <p>Returns null if the engine hasn't published a JPEG yet (surveillance
+     * not running, or first frames still warming up). Callers should treat
+     * null as "no frame available" and retry, NOT trigger any side-effect
+     * that would touch the camera HAL.
+     *
+     * @param cameraId 0=full mosaic, 1=Front, 2=Right, 3=Rear, 4=Left
+     * @return JPEG bytes, or null when no published mosaic is available
      */
     public byte[] getLatestJpegFrame(int cameraId) {
-        if (!running || glHandler == null || downscaler == null || cameraTextureId == 0 || !probeComplete) {
+        SurveillanceEngineGpu engine = sentry;
+        if (engine == null) return null;
+        byte[] mosaicJpeg = engine.getLatestMosaicJpeg();
+        if (mosaicJpeg == null || mosaicJpeg.length == 0) return null;
+        if (cameraId == 0) return mosaicJpeg;
+        return cropMosaicJpegQuadrant(mosaicJpeg, cameraId);
+    }
+
+    /**
+     * Sample the live camera texture at FULL encoder resolution and return
+     * a JPEG of the 2x2 mosaic. Seal: 2560×1920. Tang: 2560×1440.
+     *
+     * <p><b>Recording-safe.</b> Runs on a dedicated GL thread with a shared
+     * EGL context — does NOT block the camera GL thread, the encoder draw,
+     * or {@code eglSwapBuffers}. The shared context lets us sample the
+     * camera's OES texture concurrently while it's being updated by the HAL.
+     * Same pattern {@link com.overdrive.app.surveillance.GpuDownscaler} uses
+     * for the AI lane.
+     *
+     * <p>Independent of {@link SurveillanceEngineGpu}. Works whenever the
+     * camera pipeline is running, including proximity-guard mode.
+     *
+     * @return JPEG bytes, or null when the camera isn't running yet / EGL
+     *     context isn't available.
+     */
+    public byte[] sampleFullResMosaicJpeg() {
+        HighResPreviewSampler sampler = ensureHighResSampler();
+        if (sampler == null || cameraTextureId == 0) {
+            logger.warn("sampleFullResMosaicJpeg early-exit sampler="
+                    + (sampler != null) + " textureId=" + cameraTextureId);
             return null;
         }
+        float[] offsets = quadrantStripOffsetX != null
+                ? quadrantStripOffsetX.clone()
+                : new float[]{0.75f, 0.50f, 0.00f, 0.25f};
+        return sampler.sampleFullMosaicJpeg(cameraTextureId, width, height, offsets);
+    }
 
-        final Object lock = new Object();
-        final byte[][] resultHolder = new byte[1][];
+    /**
+     * Sample one camera tile from the raw strip at FULL per-camera resolution.
+     * Seal: 1280×960. Tang: 1280×720. Recording-safe — same threading model
+     * as {@link #sampleFullResMosaicJpeg}.
+     *
+     * @param sliceOffsetX strip-X offset for the slice (0.00, 0.25, 0.50, 0.75)
+     */
+    public byte[] samplePerQuadrantJpeg(float sliceOffsetX) {
+        HighResPreviewSampler sampler = ensureHighResSampler();
+        if (sampler == null || cameraTextureId == 0) {
+            logger.warn("samplePerQuadrantJpeg early-exit sampler="
+                    + (sampler != null) + " textureId=" + cameraTextureId);
+            return null;
+        }
+        return sampler.samplePerQuadrantJpeg(cameraTextureId, width, height, sliceOffsetX);
+    }
 
-        glHandler.post(() -> {
-            try {
-                byte[] mosaicRgb = downscaler.readPixelsDirect(cameraTextureId);
-                if (mosaicRgb == null) {
-                    return;
-                }
+    /**
+     * Lazily allocate the high-res sampler with a shared EGL context.
+     * Returns null when the camera isn't running yet (no EGL core).
+     * Allocation is one-shot — sampler thread + EGL context outlive the
+     * dialog session and absorb subsequent requests cheaply.
+     */
+    private synchronized HighResPreviewSampler ensureHighResSampler() {
+        if (highResSampler != null) return highResSampler;
+        if (eglCore == null) return null;
+        android.opengl.EGLContext sharedContext = eglCore.getContext();
+        if (sharedContext == null
+                || sharedContext == android.opengl.EGL14.EGL_NO_CONTEXT) {
+            return null;
+        }
+        try {
+            highResSampler = new HighResPreviewSampler(sharedContext);
+            return highResSampler;
+        } catch (Throwable t) {
+            logger.warn("ensureHighResSampler failed: " + t.getMessage());
+            return null;
+        }
+    }
 
-                final int mosaicWidth = 640;
-                final int mosaicHeight = 480;
-                final int quadrantWidth = mosaicWidth / 2;
-                final int quadrantHeight = mosaicHeight / 2;
-
-                int cropX = 0;
-                int cropY = 0;
-                int outputWidth = mosaicWidth;
-                int outputHeight = mosaicHeight;
-
-                switch (cameraId) {
-                    case 1: // Front (top-left)
-                        cropX = 0;
-                        cropY = 0;
-                        outputWidth = quadrantWidth;
-                        outputHeight = quadrantHeight;
-                        break;
-                    case 2: // Right (top-right)
-                        cropX = quadrantWidth;
-                        cropY = 0;
-                        outputWidth = quadrantWidth;
-                        outputHeight = quadrantHeight;
-                        break;
-                    case 3: // Rear (bottom-left)
-                        cropX = 0;
-                        cropY = quadrantHeight;
-                        outputWidth = quadrantWidth;
-                        outputHeight = quadrantHeight;
-                        break;
-                    case 4: // Left (bottom-right)
-                        cropX = quadrantWidth;
-                        cropY = quadrantHeight;
-                        outputWidth = quadrantWidth;
-                        outputHeight = quadrantHeight;
-                        break;
-                    case 0: // Full mosaic preview
-                    default:
-                        break;
-                }
-
-                int[] pixels = new int[outputWidth * outputHeight];
-                int dst = 0;
-                for (int y = 0; y < outputHeight; y++) {
-                    int srcY = cropY + y;
-                    for (int x = 0; x < outputWidth; x++) {
-                        int srcX = cropX + x;
-                        int srcIdx = (srcY * mosaicWidth + srcX) * 3;
-                        if (srcIdx + 2 >= mosaicRgb.length) {
-                            pixels[dst++] = 0xFF000000;
-                            continue;
-                        }
-                        int r = mosaicRgb[srcIdx] & 0xFF;
-                        int g = mosaicRgb[srcIdx + 1] & 0xFF;
-                        int b = mosaicRgb[srcIdx + 2] & 0xFF;
-                        pixels[dst++] = 0xFF000000 | (r << 16) | (g << 8) | b;
-                    }
-                }
-
-                Bitmap bitmap = Bitmap.createBitmap(pixels, outputWidth, outputHeight, Bitmap.Config.ARGB_8888);
-                java.io.ByteArrayOutputStream jpegOut = new java.io.ByteArrayOutputStream();
-                bitmap.compress(Bitmap.CompressFormat.JPEG, 82, jpegOut);
-                bitmap.recycle();
-                resultHolder[0] = jpegOut.toByteArray();
-            } catch (Exception e) {
-                logger.warn("getLatestJpegFrame failed: " + e.getMessage());
-            } finally {
-                synchronized (lock) {
-                    lock.notifyAll();
-                }
+    /**
+     * Crops a 2×2-mosaic JPEG into the requested quadrant. Called on the
+     * HTTP worker thread; no GL involvement. Quadrant indices match the
+     * existing snapshot endpoint contract: 1=TL, 2=TR, 3=BL, 4=BR.
+     */
+    private static byte[] cropMosaicJpegQuadrant(byte[] mosaicJpeg, int cameraId) {
+        if (cameraId < 1 || cameraId > 4) return null;
+        android.graphics.Bitmap mosaic = null;
+        android.graphics.Bitmap quadrant = null;
+        try {
+            mosaic = android.graphics.BitmapFactory.decodeByteArray(
+                    mosaicJpeg, 0, mosaicJpeg.length);
+            if (mosaic == null) return null;
+            int qW = Math.max(1, mosaic.getWidth() / 2);
+            int qH = Math.max(1, mosaic.getHeight() / 2);
+            int x = (cameraId == 2 || cameraId == 4) ? qW : 0;
+            int y = (cameraId == 3 || cameraId == 4) ? qH : 0;
+            quadrant = android.graphics.Bitmap.createBitmap(mosaic, x, y, qW, qH);
+            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+            quadrant.compress(android.graphics.Bitmap.CompressFormat.JPEG, 82, out);
+            return out.toByteArray();
+        } catch (Exception e) {
+            return null;
+        } finally {
+            if (quadrant != null) {
+                try { quadrant.recycle(); } catch (Exception ignored) {}
             }
-        });
-
-        synchronized (lock) {
-            try {
-                lock.wait(600);
-            } catch (InterruptedException ignored) {
-                Thread.currentThread().interrupt();
+            if (mosaic != null) {
+                try { mosaic.recycle(); } catch (Exception ignored) {}
             }
         }
-        return resultHolder[0];
     }
     
     /**

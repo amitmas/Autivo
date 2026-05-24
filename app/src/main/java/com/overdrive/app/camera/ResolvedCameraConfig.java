@@ -12,6 +12,13 @@ import java.util.Set;
  * Fully resolved runtime camera configuration.
  */
 public final class ResolvedCameraConfig {
+    private static final PanoramicSlice[] LEGACY_SLICE_FALLBACK = {
+        PanoramicSlice.SLICE_4, // PANO_FRONT
+        PanoramicSlice.SLICE_3, // PANO_RIGHT
+        PanoramicSlice.SLICE_1, // PANO_REAR
+        PanoramicSlice.SLICE_2  // PANO_LEFT
+    };
+
     private final CameraProfile profile;
     private final String selectedProfileId;
     private final boolean autoProfile;
@@ -96,9 +103,14 @@ public final class ResolvedCameraConfig {
         return new EnumMap<>(roleMappings);
     }
 
+    /**
+     * Resolves panoramic role → slice. Always returns a non-null slice for
+     * every PANO_* role: profile defaults first, then user mappings (which may
+     * override), then any unused slice as last-resort fallback. Guarantees
+     * {@link #getQuadrantStripOffsetX()} can never NPE.
+     */
     private EnumMap<CameraRole, PanoramicSlice> buildResolvedPanoramicSlices() {
         EnumMap<CameraRole, PanoramicSlice> resolved = new EnumMap<>(CameraRole.class);
-        EnumMap<CameraRole, PanoramicSlice> defaults = new EnumMap<>(CameraRole.class);
         Set<PanoramicSlice> used = new HashSet<>();
         CameraRole[] panoRoles = new CameraRole[] {
                 CameraRole.PANO_FRONT,
@@ -107,32 +119,40 @@ public final class ResolvedCameraConfig {
                 CameraRole.PANO_LEFT
         };
 
-        for (CameraRole role : panoRoles) {
-            CameraSourceRef defaultSource = profile.getDefaultRoleMappings().get(role);
-            if (defaultSource != null && defaultSource.getPanoramicSlice() != null) {
-                defaults.put(role, defaultSource.getPanoramicSlice());
-            }
+        EnumMap<CameraRole, PanoramicSlice> defaults = new EnumMap<>(CameraRole.class);
+        EnumMap<CameraRole, CameraSourceRef> profileDefaults = profile != null
+                ? profile.getDefaultRoleMappings()
+                : new EnumMap<>(CameraRole.class);
+        for (int i = 0; i < panoRoles.length; i++) {
+            CameraRole role = panoRoles[i];
+            CameraSourceRef src = profileDefaults.get(role);
+            PanoramicSlice slice = src != null ? src.getPanoramicSlice() : null;
+            defaults.put(role, slice != null ? slice : LEGACY_SLICE_FALLBACK[i]);
         }
 
+        // First pass: honor user role mappings if they point at a slice.
         for (CameraRole role : panoRoles) {
-            CameraSourceRef mappedSource = roleMappings.get(role);
-            PanoramicSlice slice = mappedSource != null ? mappedSource.getPanoramicSlice() : null;
+            CameraSourceRef mapped = roleMappings.get(role);
+            PanoramicSlice slice = mapped != null ? mapped.getPanoramicSlice() : null;
             if (slice != null && !used.contains(slice)) {
                 resolved.put(role, slice);
                 used.add(slice);
             }
         }
 
+        // Second pass: fill remaining roles from profile defaults if unused.
         for (CameraRole role : panoRoles) {
             if (resolved.containsKey(role)) continue;
-
             PanoramicSlice fallback = defaults.get(role);
             if (fallback != null && !used.contains(fallback)) {
                 resolved.put(role, fallback);
                 used.add(fallback);
-                continue;
             }
+        }
 
+        // Third pass: any role still unmapped grabs the next unused slice.
+        for (CameraRole role : panoRoles) {
+            if (resolved.containsKey(role)) continue;
             for (PanoramicSlice candidate : PanoramicSlice.values()) {
                 if (!used.contains(candidate)) {
                     resolved.put(role, candidate);
@@ -140,9 +160,13 @@ public final class ResolvedCameraConfig {
                     break;
                 }
             }
+        }
 
-            if (!resolved.containsKey(role) && fallback != null) {
-                resolved.put(role, fallback);
+        // Final guard: if all slices are somehow exhausted (impossible with 4
+        // roles + 4 slices but defensive), fall back to legacy mapping.
+        for (int i = 0; i < panoRoles.length; i++) {
+            if (!resolved.containsKey(panoRoles[i])) {
+                resolved.put(panoRoles[i], LEGACY_SLICE_FALLBACK[i]);
             }
         }
 

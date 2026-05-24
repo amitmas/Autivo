@@ -244,6 +244,23 @@
             android:screenOrientation="unspecified"
             android:configChanges="orientation|screenSize|keyboardHidden" />
 
+        <!-- Screen Deterrent: fullscreen warning shown on motion while ACC off.
+             Launched via `am start` from byd_cam_daemon (UID 2000) AFTER the
+             daemon wakes the panel via PowerManager.TurnBacklightOn. Uses
+             singleInstance so repeat launches during sustained motion are
+             coalesced (Activity already running just bumps onNewIntent / stays
+             up while the deadline keeps extending). -->
+        <activity
+            android:name="com.overdrive.app.DeterrentActivity"
+            android:exported="true"
+            android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
+            android:excludeFromRecents="true"
+            android:launchMode="singleInstance"
+            android:screenOrientation="unspecified"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|fontScale|locale|layoutDirection|uiMode|density"
+            android:showOnLockScreen="true"
+            android:turnScreenOn="true" />
+
         <!-- Location Starter Activity - Transparent, starts Location service and finishes immediately -->
         <!-- Used by SentryDaemon to restart Location service without bringing app to foreground -->
         <activity

@@ -60,8 +60,14 @@ BYD.surveillance = {
         sdCardPath: null,
         sdCardFreeSpace: 0,
         sdCardTotalSpace: 0,
+        usbAvailable: false,
+        usbPath: null,
+        usbFreeSpace: 0,
+        usbTotalSpace: 0,
+        // Dynamic per-volume ceilings (live StatFs from server)
         maxLimitMb: 100000,
-        maxLimitMbSdCard: 100000
+        maxLimitMbSdCard: 100000,
+        maxLimitMbUsb: 100000
     },
     cdrInfo: null,
     cdrConfig: {
@@ -207,16 +213,25 @@ BYD.surveillance = {
             if (data.success) {
                 this.config.surveillanceLimitMb = data.surveillanceLimitMb || 500;
                 this.config.surveillanceStorageType = data.surveillanceStorageType || 'INTERNAL';
-                
-                // Update storage info
+
+                // SD card info
                 this.storageInfo.sdCardAvailable = data.sdCardAvailable || false;
                 this.storageInfo.sdCardPath = data.sdCardPath || null;
                 this.storageInfo.sdCardFreeSpace = data.sdCardFreeSpace || 0;
                 this.storageInfo.sdCardTotalSpace = data.sdCardTotalSpace || 0;
-                this.storageInfo.maxLimitMb = data.maxLimitMb || 100000;
+
+                // USB info
+                this.storageInfo.usbAvailable = data.usbAvailable || false;
+                this.storageInfo.usbPath = data.usbPath || null;
+                this.storageInfo.usbFreeSpace = data.usbFreeSpace || 0;
+                this.storageInfo.usbTotalSpace = data.usbTotalSpace || 0;
+
+                // Dynamic ceilings
+                this.storageInfo.maxLimitMb       = data.maxLimitMb       || 100000;
                 this.storageInfo.maxLimitMbSdCard = data.maxLimitMbSdCard || 100000;
+                this.storageInfo.maxLimitMbUsb    = data.maxLimitMbUsb    || 100000;
                 this.storageInfo.surveillancePath = data.surveillancePath || '';
-                
+
                 this.updateStorageLimitUI();
                 this.updateStorageTypeUI();
             }
@@ -318,15 +333,20 @@ BYD.surveillance = {
         } catch (e) { /* best-effort */ }
     },
     
+    effectiveMaxLimitMb() {
+        switch (this.config.surveillanceStorageType) {
+            case 'SD_CARD': return this.storageInfo.maxLimitMbSdCard;
+            case 'USB':     return this.storageInfo.maxLimitMbUsb;
+            default:        return this.storageInfo.maxLimitMb;
+        }
+    },
+
     updateStorageLimitUI() {
         const slider = document.getElementById('survLimitSlider');
         const value = document.getElementById('survLimitValue');
-        
-        // Update slider max based on storage type
-        const maxLimit = this.config.surveillanceStorageType === 'SD_CARD' 
-            ? this.storageInfo.maxLimitMbSdCard 
-            : this.storageInfo.maxLimitMb;
-        
+
+        const maxLimit = this.effectiveMaxLimitMb();
+
         if (slider) {
             slider.max = maxLimit;
             slider.value = Math.min(this.config.surveillanceLimitMb, maxLimit);
@@ -335,8 +355,7 @@ BYD.surveillance = {
             const mb = this.config.surveillanceLimitMb;
             value.textContent = mb >= 1000 ? (mb / 1000) + ' GB' : mb + ' MB';
         }
-        
-        // Update range labels
+
         const minLabel = document.getElementById('survLimitMin');
         const maxLabel = document.getElementById('survLimitMax');
         if (minLabel) minLabel.textContent = BYD.i18n.t('surveillance.limit_min_default');
@@ -344,30 +363,27 @@ BYD.surveillance = {
     },
     
     updateStorageTypeUI() {
-        // Update storage type buttons
-        document.querySelectorAll('#survStorageTypeBtns .btn-toggle').forEach(btn => 
+        document.querySelectorAll('#survStorageTypeBtns .btn-toggle').forEach(btn =>
             btn.classList.toggle('active', btn.dataset.value === this.config.surveillanceStorageType));
-        
-        // Update SD card button state
+
         const sdCardBtn = document.getElementById('btnSurvSdCard');
         if (sdCardBtn) {
             sdCardBtn.disabled = !this.storageInfo.sdCardAvailable;
-            if (!this.storageInfo.sdCardAvailable) {
-                sdCardBtn.title = BYD.i18n.t('recording.sd_card_unavailable');
-            } else {
-                sdCardBtn.title = '';
-            }
+            sdCardBtn.title = this.storageInfo.sdCardAvailable ? '' : BYD.i18n.t('recording.sd_card_unavailable');
         }
-        
-        // Show/hide SD card status
-        const statusEl = document.getElementById('survSdCardStatus');
-        if (statusEl) {
-            statusEl.style.display = 'block';
-            
+        const usbBtn = document.getElementById('btnSurvUsb');
+        if (usbBtn) {
+            usbBtn.disabled = !this.storageInfo.usbAvailable;
+            usbBtn.title = this.storageInfo.usbAvailable ? '' : BYD.i18n.t('recording.usb_unavailable');
+        }
+
+        // SD card status block
+        const sdStatusEl = document.getElementById('survSdCardStatus');
+        if (sdStatusEl) {
+            sdStatusEl.style.display = 'block';
             const dotEl = document.getElementById('survSdStatusDot');
             const textEl = document.getElementById('survSdStatusText');
             const spaceEl = document.getElementById('survSdSpaceInfo');
-            
             if (this.storageInfo.sdCardAvailable) {
                 if (dotEl) dotEl.className = 'sd-status-dot online';
                 if (textEl) textEl.textContent = BYD.i18n.t('recording.sd_card_available');
@@ -383,7 +399,28 @@ BYD.surveillance = {
             }
         }
 
-        // Update storage path display
+        // USB status block
+        const usbStatusEl = document.getElementById('survUsbStatus');
+        if (usbStatusEl) {
+            usbStatusEl.style.display = 'block';
+            const dotEl = document.getElementById('survUsbStatusDot');
+            const textEl = document.getElementById('survUsbStatusText');
+            const spaceEl = document.getElementById('survUsbSpaceInfo');
+            if (this.storageInfo.usbAvailable) {
+                if (dotEl) dotEl.className = 'sd-status-dot online';
+                if (textEl) textEl.textContent = BYD.i18n.t('recording.usb_available');
+                if (spaceEl) {
+                    spaceEl.style.display = 'block';
+                    document.getElementById('survUsbFree').textContent = BYD.i18n.t('recording.size_free', {size: this.formatSize(this.storageInfo.usbFreeSpace)});
+                    document.getElementById('survUsbTotal').textContent = BYD.i18n.t('recording.size_total', {size: this.formatSize(this.storageInfo.usbTotalSpace)});
+                }
+            } else {
+                if (dotEl) dotEl.className = 'sd-status-dot offline';
+                if (textEl) textEl.textContent = BYD.i18n.t('recording.usb_not_detected');
+                if (spaceEl) spaceEl.style.display = 'none';
+            }
+        }
+
         const pathEl = document.getElementById('survStoragePath');
         if (pathEl && this.storageInfo.surveillancePath) {
             const shortPath = this.storageInfo.surveillancePath.replace('/storage/emulated/0/', '');
@@ -403,17 +440,23 @@ BYD.surveillance = {
             if (BYD.utils && BYD.utils.toast) BYD.utils.toast(BYD.i18n.t('recording.sd_card_unavailable'), 'error');
             return;
         }
-        
+        if (type === 'USB' && !this.storageInfo.usbAvailable) {
+            if (BYD.utils && BYD.utils.toast) BYD.utils.toast(BYD.i18n.t('recording.usb_unavailable'), 'error');
+            return;
+        }
+
         this.config.surveillanceStorageType = type;
-        document.querySelectorAll('#survStorageTypeBtns .btn-toggle').forEach(btn => 
+        document.querySelectorAll('#survStorageTypeBtns .btn-toggle').forEach(btn =>
             btn.classList.toggle('active', btn.dataset.value === type));
-        
-        // Update slider max when storage type changes
+
+        // Re-clamp limit to the new volume's effective max so we don't
+        // ship a value larger than the destination volume can hold.
+        const newMax = this.effectiveMaxLimitMb();
+        if (this.config.surveillanceLimitMb > newMax) {
+            this.config.surveillanceLimitMb = newMax;
+        }
         this.updateStorageLimitUI();
-        
-        // Show/hide CDR cleanup card
         this.updateCdrCleanupVisibility();
-        
         this.markChanged();
         var _su = document.getElementById('storageUnsaved'); if (_su) _su.classList.add('show');
     },
@@ -681,7 +724,7 @@ BYD.surveillance = {
         } catch (e) {
             console.warn('Failed to load config:', e);
         }
-        
+
         // Load storage settings
         await this.loadStorageSettings();
     },
@@ -756,22 +799,39 @@ BYD.surveillance = {
     },
 
     updateUI() {
-        document.getElementById('survEnabled').checked = this.config.enabled;
-        
+        // Null-guard every top-level DOM read. updateUI is reused on
+        // notifications.html (via initTelegramOnly) which only mounts the
+        // Telegram subset of these controls — without the guards, the very
+        // first missing element threw and aborted the function before it
+        // reached the v2Telegram* checkboxes, leaving the toggles blank
+        // after a page reload even when the persisted value was true.
+        const survEnabled = document.getElementById('survEnabled');
+        if (survEnabled) survEnabled.checked = this.config.enabled;
+
         const badge = document.getElementById('survStatusBadge');
-        badge.textContent = this.config.enabled ? BYD.i18n.t('surveillance.badge_on') : BYD.i18n.t('surveillance.badge_off');
-        badge.className = 'status-badge ' + (this.config.enabled ? 'active' : 'inactive');
+        if (badge) {
+            badge.textContent = this.config.enabled ? BYD.i18n.t('surveillance.badge_on') : BYD.i18n.t('surveillance.badge_off');
+            badge.className = 'status-badge ' + (this.config.enabled ? 'active' : 'inactive');
+        }
 
-        document.getElementById('preRecSlider').value = this.config.preRecordSeconds;
-        document.getElementById('preRecValue').textContent = this.config.preRecordSeconds + 's';
-        document.getElementById('preLabel').textContent = BYD.i18n.t('surveillance.before_seconds', {n: this.config.preRecordSeconds});
-        document.getElementById('timelinePre').style.flex = this.config.preRecordSeconds / 10;
+        const preRecSlider = document.getElementById('preRecSlider');
+        if (preRecSlider) preRecSlider.value = this.config.preRecordSeconds;
+        const preRecValue = document.getElementById('preRecValue');
+        if (preRecValue) preRecValue.textContent = this.config.preRecordSeconds + 's';
+        const preLabel = document.getElementById('preLabel');
+        if (preLabel) preLabel.textContent = BYD.i18n.t('surveillance.before_seconds', {n: this.config.preRecordSeconds});
+        const timelinePre = document.getElementById('timelinePre');
+        if (timelinePre) timelinePre.style.flex = this.config.preRecordSeconds / 10;
 
-        document.getElementById('postRecSlider').value = this.config.postRecordSeconds;
-        document.getElementById('postRecValue').textContent = this.config.postRecordSeconds + 's';
-        document.getElementById('postLabel').textContent = BYD.i18n.t('surveillance.after_seconds', {n: this.config.postRecordSeconds});
-        document.getElementById('timelinePost').style.flex = this.config.postRecordSeconds / 20;
-        
+        const postRecSlider = document.getElementById('postRecSlider');
+        if (postRecSlider) postRecSlider.value = this.config.postRecordSeconds;
+        const postRecValue = document.getElementById('postRecValue');
+        if (postRecValue) postRecValue.textContent = this.config.postRecordSeconds + 's';
+        const postLabel = document.getElementById('postLabel');
+        if (postLabel) postLabel.textContent = BYD.i18n.t('surveillance.after_seconds', {n: this.config.postRecordSeconds});
+        const timelinePost = document.getElementById('timelinePost');
+        if (timelinePost) timelinePost.style.flex = this.config.postRecordSeconds / 20;
+
         // New tier picker (replaces #bitrateBtns).
         document.querySelectorAll('#survQualityBtns .btn-toggle').forEach(btn =>
             btn.classList.toggle('active', btn.dataset.value === this.config.recordingQuality));
@@ -786,25 +846,28 @@ BYD.surveillance = {
         this.renderActiveEstimate();
 
         this.updateStorageLimitUI();
-        
+
         // V2 Motion Detection UI
         this.updateV2UI();
-        
+
         // Deterrent Action UI
         this.updateDeterrentUI();
-        
+
         // Reset Apply button state after UI update (no unsaved changes after load)
         this.hasUnsavedChanges = false;
-        document.getElementById('btnApply').disabled = true;
+        const btnApply = document.getElementById('btnApply');
+        if (btnApply) btnApply.disabled = true;
         var _du = document.getElementById('detectionUnsaved'); if (_du) _du.classList.remove('show');
-        document.getElementById('recordingUnsaved').classList.remove('show');
+        var _ru = document.getElementById('recordingUnsaved'); if (_ru) _ru.classList.remove('show');
         var _su2 = document.getElementById('storageUnsaved'); if (_su2) _su2.classList.remove('show');
     },
 
     updateCheckboxStyles() {
         ['detectPerson', 'detectCar', 'detectBike'].forEach(id => {
             const cb = document.getElementById(id);
-            cb.parentElement.classList.toggle('active', cb.checked);
+            if (cb && cb.parentElement) {
+                cb.parentElement.classList.toggle('active', cb.checked);
+            }
         });
     },
 
@@ -1189,38 +1252,66 @@ BYD.surveillance = {
             prev[k] = this.savedConfig ? this.savedConfig[k] : undefined;
             body[k] = this.config[k];
         }
+        const self = this;
+        // Tier toggles share IDs with the surveillance.html version. Map the
+        // config keys we just sent to their checkbox elements so we can
+        // re-paint after the network round-trip — Chrome 58 WebView can
+        // visually drop the click flip when the synchronous AndroidBridge
+        // POST resolves in the same microtask as the change event, leaving
+        // the slider stuck on the old position even though the underlying
+        // checkbox.checked is correct. Re-asserting .checked from the
+        // authoritative this.config value forces a paint pass.
+        const fieldToToggleId = {
+            telegramSendStartPing: 'v2TelegramSendStartPing',
+            telegramNotices:       'v2TelegramNotices',
+            telegramAlerts:        'v2TelegramAlerts',
+            telegramCritical:      'v2TelegramCritical'
+        };
+        function repaintToggles() {
+            for (let i = 0; i < fields.length; i++) {
+                const k = fields[i];
+                const id = fieldToToggleId[k];
+                if (!id) continue;
+                const el = document.getElementById(id);
+                if (!el) continue;
+                const want = !!self.config[k];
+                // Toggle .checked twice — assigning the same value is a
+                // no-op on most engines and won't cause a re-paint, so
+                // flip-then-restore around a forced reflow on the slider
+                // sibling.
+                const slider = el.parentNode && el.parentNode.querySelector('.toggle-slider');
+                el.checked = !want;
+                if (slider) { void slider.offsetHeight; }
+                el.checked = want;
+            }
+        }
+        function safeToast(key, fallback, kind) {
+            if (!(BYD.utils && BYD.utils.toast)) return;
+            const localized = BYD.i18n && BYD.i18n.t ? BYD.i18n.t(key) : null;
+            BYD.utils.toast(localized || fallback, kind);
+        }
         fetch('/api/surveillance/config', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(body)
         }).then(r => r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status)))
           .then(() => {
-              if (this.savedConfig) {
+              if (self.savedConfig) {
                   for (let i = 0; i < fields.length; i++) {
-                      this.savedConfig[fields[i]] = this.config[fields[i]];
+                      self.savedConfig[fields[i]] = self.config[fields[i]];
                   }
               }
-              this.markChanged();
-              if (BYD.utils && BYD.utils.toast) {
-                  BYD.utils.toast(BYD.i18n.t('telegram.prefs_saved'), 'success');
-              }
+              self.markChanged();
+              repaintToggles();
+              safeToast('telegram.prefs_saved', 'Preferences saved', 'success');
           })
           .catch(() => {
               for (let i = 0; i < fields.length; i++) {
                   const k = fields[i];
-                  if (prev[k] !== undefined) this.config[k] = prev[k];
+                  if (prev[k] !== undefined) self.config[k] = prev[k];
               }
-              const tg = document.getElementById('v2TelegramSendStartPing');
-              if (tg) tg.checked = !!this.config.telegramSendStartPing;
-              const tn = document.getElementById('v2TelegramNotices');
-              if (tn) tn.checked = this.config.telegramNotices === true;
-              const ta = document.getElementById('v2TelegramAlerts');
-              if (ta) ta.checked = this.config.telegramAlerts !== false;
-              const tc = document.getElementById('v2TelegramCritical');
-              if (tc) tc.checked = this.config.telegramCritical !== false;
-              if (BYD.utils && BYD.utils.toast) {
-                  BYD.utils.toast(BYD.i18n.t('telegram.prefs_save_failed'), 'error');
-              }
+              repaintToggles();
+              safeToast('telegram.prefs_save_failed', 'Could not save preferences', 'error');
           });
     },
 
@@ -1665,19 +1756,34 @@ BYD.surveillance = {
         const fd = document.getElementById('v2FilterDebugLog');
         if (fd) fd.checked = this.config.filterDebugLog;
 
+        // Paint a checkbox + force the adjacent .toggle-slider to re-evaluate
+        // its `:checked + .toggle-slider` style. Plain `el.checked = true`
+        // sets the property correctly but Chrome 58 WebView may not
+        // invalidate the sibling slider's style until the element is
+        // interacted with — slider stays in OFF position even though the
+        // underlying checkbox is checked. Flip-reflow-restore forces the
+        // style recompute. Harmless on every other engine.
+        const setToggle = (el, want) => {
+            if (!el) return;
+            const slider = el.parentNode && el.parentNode.querySelector('.toggle-slider');
+            el.checked = !want;
+            if (slider) { void slider.offsetHeight; }
+            el.checked = !!want;
+        };
+
         // Telegram start-ping opt-in
-        const tg = document.getElementById('v2TelegramSendStartPing');
-        if (tg) tg.checked = !!this.config.telegramSendStartPing;
+        setToggle(document.getElementById('v2TelegramSendStartPing'),
+                  !!this.config.telegramSendStartPing);
 
         // Per-tier Telegram filter — null-coalesce to the documented defaults
         // so configs saved before these fields existed render correctly
         // (notices off, alerts on, critical on).
-        const tn = document.getElementById('v2TelegramNotices');
-        if (tn) tn.checked = this.config.telegramNotices === true;
-        const ta = document.getElementById('v2TelegramAlerts');
-        if (ta) ta.checked = this.config.telegramAlerts !== false;
-        const tc = document.getElementById('v2TelegramCritical');
-        if (tc) tc.checked = this.config.telegramCritical !== false;
+        setToggle(document.getElementById('v2TelegramNotices'),
+                  this.config.telegramNotices === true);
+        setToggle(document.getElementById('v2TelegramAlerts'),
+                  this.config.telegramAlerts !== false);
+        setToggle(document.getElementById('v2TelegramCritical'),
+                  this.config.telegramCritical !== false);
         
         // Object detection checkboxes
         const dp = document.getElementById('detectPerson');
@@ -1715,6 +1821,13 @@ BYD.surveillance = {
             'enabled',
             'scheduleEnabled', 'scheduleRules',
             'deterrentAction', 'deterrentCooldownSeconds'
+            // Screen deterrent fields (screenDeterrentEnabled / Duration /
+            // Message / image) are intentionally OUT of the tab map: they
+            // save immediately on change via updateScreenDeterrent + the
+            // image upload endpoint, so they never participate in the
+            // Apply-button dirty diff. Listing them here would cause Apply
+            // to enable the moment the user toggles, even though the value
+            // was already persisted.
         ],
         detection: [
             'environmentPreset',
@@ -1856,6 +1969,14 @@ BYD.surveillance = {
      */
     async initTelegramOnly() {
         await this.loadConfig();
+        // Snapshot savedConfig so _persistTelegramFields' dirty-tracking +
+        // failure-revert path has something to compare against. Without
+        // this snapshot, prev[k] is undefined for every field on the
+        // notifications page, which makes the failure path unable to
+        // revert to a known-good value (it skips the revert entirely
+        // because of `if (prev[k] !== undefined)`). Mirrors what the
+        // full init() path on surveillance.html does.
+        this.savedConfig = JSON.parse(JSON.stringify(this.config));
         this.updateUI();
         this.refreshTelegramAvailability();
         // Re-poll the pairing state when the user comes back to this tab —
@@ -1974,6 +2095,357 @@ BYD.surveillance = {
             const needsCloud = action !== 'silent';
             const configured = this.config.bydCloudEnabled;
             warning.style.display = (needsCloud && !configured) ? 'block' : 'none';
+        }
+
+        this.updateScreenDeterrentUI();
+    },
+
+    // ── Screen Deterrent ───────────────────────────────────────────────────
+
+    /**
+     * Save a screen-deterrent field. Toggling enabled or duration applies
+     * immediately (no Apply button), matching the cloud deterrent's UX.
+     * 'message' is debounced via queueScreenDeterrentMessage to avoid one
+     * POST per keystroke.
+     */
+    updateScreenDeterrent: function(field, value) {
+        var body = {};
+        if (field === 'enabled') {
+            this.config.screenDeterrentEnabled = !!value;
+            // ALSO update savedConfig in lock-step: this field saves
+            // immediately and is not a "pending change". Without this, the
+            // dirty diff (run on tab switch / visibility change) would see
+            // config.X != savedConfig.X and re-enable Apply.
+            if (this.savedConfig) this.savedConfig.screenDeterrentEnabled = !!value;
+            body.screenDeterrentEnabled = !!value;
+        } else if (field === 'duration') {
+            var v = parseInt(value, 10);
+            if (!isFinite(v) || v < 3) v = 3;
+            if (v > 30) v = 30;
+            this.config.screenDeterrentDurationSeconds = v;
+            if (this.savedConfig) this.savedConfig.screenDeterrentDurationSeconds = v;
+            body.screenDeterrentDurationSeconds = v;
+            var label = document.getElementById('screenDeterrentDurationValue');
+            if (label) label.textContent = v + 's';
+        } else if (field === 'message') {
+            this.config.screenDeterrentMessage = String(value || '');
+            if (this.savedConfig) this.savedConfig.screenDeterrentMessage = this.config.screenDeterrentMessage;
+            body.screenDeterrentMessage = this.config.screenDeterrentMessage;
+        } else {
+            return;
+        }
+
+        fetch('/api/surveillance/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body)
+        }).then(function() {
+            // Mirror into savedConfig so the Apply-button dirty diff stays
+            // clean. We just persisted these values; they're no longer
+            // pending changes.
+            if (BYD.surveillance.savedConfig) {
+                if ('screenDeterrentEnabled' in body)
+                    BYD.surveillance.savedConfig.screenDeterrentEnabled = body.screenDeterrentEnabled;
+                if ('screenDeterrentDurationSeconds' in body)
+                    BYD.surveillance.savedConfig.screenDeterrentDurationSeconds = body.screenDeterrentDurationSeconds;
+                if ('screenDeterrentMessage' in body)
+                    BYD.surveillance.savedConfig.screenDeterrentMessage = body.screenDeterrentMessage;
+            }
+            BYD.surveillance.updateScreenDeterrentUI();
+            if (BYD.surveillance.markChanged) BYD.surveillance.markChanged();
+        }).catch(function(e) {
+            console.warn('Failed to save screen deterrent:', e);
+        });
+    },
+
+    /**
+     * Update only the slider label as the user drags. The actual save is
+     * triggered by onchange (drag end) so we don't fire one POST per
+     * pointer-move event — a one-second drag would otherwise invalidate UCM
+     * cache 30 times across all daemon processes.
+     */
+    previewScreenDeterrentDuration: function(value) {
+        var v = parseInt(value, 10);
+        if (!isFinite(v)) return;
+        var label = document.getElementById('screenDeterrentDurationValue');
+        if (label) label.textContent = v + 's';
+    },
+
+    queueScreenDeterrentMessage: function(value) {
+        // Debounce text input — fire after 600ms idle.
+        if (this._screenDeterrentMsgTimer) {
+            clearTimeout(this._screenDeterrentMsgTimer);
+        }
+        var self = this;
+        this._screenDeterrentMsgTimer = setTimeout(function() {
+            self.updateScreenDeterrent('message', value);
+        }, 600);
+    },
+
+    /**
+     * Upload-fail UX. We use the toast system for transient errors (network,
+     * server, parse) so the user can keep interacting with the page; the
+     * blocking native alert() leaked the loopback origin into a system
+     * dialog and broke the dark Material surface.
+     */
+    _uploadToastError: function(reasonKey, reasonFallback) {
+        if (!(BYD.utils && BYD.utils.toast)) return;
+        var t = BYD.i18n && BYD.i18n.t ? BYD.i18n.t.bind(BYD.i18n) : null;
+        var headline = (t && t('surveillance.screen_deterrent_upload_failed')) || 'Upload failed';
+        var detail = (t && reasonKey && t(reasonKey)) || reasonFallback || '';
+        BYD.utils.toast(detail ? headline + ' — ' + detail : headline, 'error', 4500);
+    },
+
+    uploadScreenDeterrentImage: function(file) {
+        // Always reset the <input> value so the same file can be re-selected
+        // later. Without this, picking the same image twice silently no-ops
+        // because the change event doesn't fire on identical values.
+        try {
+            var fileInput = document.getElementById('screenDeterrentFile');
+            if (fileInput) fileInput.value = '';
+        } catch (_) {}
+
+        if (!file) {
+            console.warn('[deterrent] upload: no file');
+            return;
+        }
+        console.log('[deterrent] upload start:', file.name, file.size, file.type);
+
+        if (file.size > 8 * 1024 * 1024) {
+            this._uploadToastError('surveillance.screen_deterrent_too_large',
+                                   'Image too large (max 8 MB)');
+            return;
+        }
+        if (file.size === 0) {
+            this._uploadToastError('surveillance.screen_deterrent_empty_file',
+                                   'The selected file is empty');
+            return;
+        }
+
+        var self = this;
+        var reader = new FileReader();
+
+        reader.onerror = function(e) {
+            console.error('[deterrent] FileReader error:', e);
+            self._uploadToastError('surveillance.screen_deterrent_read_failed',
+                                   'Could not read the file');
+        };
+
+        reader.onload = function(e) {
+            // result is "data:image/<type>;base64,...."
+            var dataUrl = e.target.result;
+            if (!dataUrl) {
+                console.error('[deterrent] FileReader returned empty result');
+                self._uploadToastError('surveillance.screen_deterrent_read_failed',
+                                       'Could not read the file');
+                return;
+            }
+            console.log('[deterrent] read OK, posting...', dataUrl.length, 'chars');
+
+            // Use fetch(), NOT XMLHttpRequest. Reason: inside the in-app
+            // WebView, the WebViewClient.shouldInterceptRequest path
+            // (WebViewFragment.kt) only fires HTTP GETs against the daemon —
+            // Android's WebResourceRequest API doesn't expose the request
+            // body to the intercept callback, so an XHR POST gets silently
+            // converted to a GET, the daemon returns the existing image
+            // bytes (or 404), and the upload code parses them as a failed
+            // JSON response → "Upload failed" toast.
+            //
+            // fetch() POSTs go through the INJECT_JS patch in
+            // WebViewFragment.kt which routes them via
+            // AndroidBridge.httpRequest — that bridge writes the body to
+            // outputStream cleanly and returns the daemon's JSON.
+            // External-tunnel browsers don't have AndroidBridge; their
+            // fetch() goes over the network unmodified, also fine.
+            fetch('/api/surveillance/screen-deterrent/image', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ filename: file.name, dataBase64: dataUrl })
+            }).then(function (resp) {
+                console.log('[deterrent] upload response status:', resp.status);
+                if (!resp.ok) {
+                    throw new Error('HTTP ' + resp.status);
+                }
+                return resp.json();
+            }).then(function (data) {
+                if (data && data.success) {
+                    console.log('[deterrent] upload success:', data.path);
+                    self.config.screenDeterrentImagePath = data.path;
+                    self.config.screenDeterrentHasImage = true;
+                    self.updateScreenDeterrentUI();
+                    if (BYD.utils && BYD.utils.toast) {
+                        var tt = BYD.i18n && BYD.i18n.t ? BYD.i18n.t('surveillance.screen_deterrent_upload_ok') : null;
+                        BYD.utils.toast(tt || 'Image uploaded', 'success');
+                    }
+                } else {
+                    self._uploadToastError(null, (data && data.error) || '');
+                }
+            }).catch(function (err) {
+                console.error('[deterrent] upload failed:', err && err.message);
+                var msg = err && err.message ? err.message : '';
+                if (msg.indexOf('HTTP ') === 0) {
+                    self._uploadToastError(null, 'Server returned ' + msg);
+                } else {
+                    self._uploadToastError('surveillance.screen_deterrent_network_error',
+                                           msg || 'Network error');
+                }
+            });
+        };
+
+        try {
+            reader.readAsDataURL(file);
+        } catch (err) {
+            console.error('[deterrent] readAsDataURL threw:', err);
+            this._uploadToastError(null, err && err.message);
+        }
+    },
+
+    clearScreenDeterrentImage: async function() {
+        // Destructive action — themed confirm dialog matches the rest of
+        // the page (white system-modal popups looked out of place against
+        // the dark Material surface and leaked the loopback origin into
+        // the title bar).
+        var t = (BYD.i18n && BYD.i18n.t) ? BYD.i18n.t.bind(BYD.i18n) : null;
+        if (BYD.utils && BYD.utils.confirmDialog) {
+            var ok = await BYD.utils.confirmDialog({
+                title: (t && t('surveillance.screen_deterrent_remove_title')) || 'Remove image?',
+                body: (t && t('surveillance.screen_deterrent_remove_body'))
+                    || 'The deterrent will fall back to the default red screen.',
+                confirmLabel: (t && t('surveillance.screen_deterrent_remove')) || 'Remove image',
+                cancelLabel: (t && t('common.cancel')) || 'Cancel',
+                danger: true
+            });
+            if (!ok) return;
+        } else if (typeof confirm === 'function') {
+            // Pre-modal-helper fallback (older bundles / very early init).
+            var legacy = (t && t('surveillance.screen_deterrent_remove_confirm'))
+                || 'Remove the uploaded image? This cannot be undone.';
+            if (!confirm(legacy)) return;
+        }
+        var self = this;
+        fetch('/api/surveillance/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ clearScreenDeterrentImage: true })
+        }).then(function() {
+            self.config.screenDeterrentImagePath = '';
+            self.config.screenDeterrentHasImage = false;
+            self.updateScreenDeterrentUI();
+        }).catch(function(e) {
+            console.warn('Failed to clear screen deterrent image:', e);
+        });
+    },
+
+    updateScreenDeterrentUI: function() {
+        var enabled = !!this.config.screenDeterrentEnabled;
+        var dur = parseInt(this.config.screenDeterrentDurationSeconds, 10);
+        if (!isFinite(dur)) dur = 8;
+        var msg = this.config.screenDeterrentMessage || '';
+        var hasImage = !!this.config.screenDeterrentHasImage;
+        var imagePath = this.config.screenDeterrentImagePath || '';
+
+        var cb = document.getElementById('screenDeterrentEnabled');
+        if (cb) cb.checked = enabled;
+
+        var slider = document.getElementById('screenDeterrentDurationSlider');
+        if (slider) slider.value = dur;
+        var label = document.getElementById('screenDeterrentDurationValue');
+        if (label) label.textContent = dur + 's';
+
+        var msgInput = document.getElementById('screenDeterrentMessage');
+        if (msgInput && msgInput.value !== msg) msgInput.value = msg;
+        // Mutex: when a custom image is set, the message field is ignored at
+        // render time. Visually disable it AND show an explicit override
+        // banner inside the "Custom content" group so the user can't miss it.
+        if (msgInput) {
+            msgInput.disabled = hasImage;
+            msgInput.style.opacity = hasImage ? '0.5' : '';
+        }
+        var overrideBanner = document.getElementById('screenDeterrentOverrideBanner');
+        if (overrideBanner) {
+            overrideBanner.style.display = hasImage ? '' : 'none';
+        }
+
+        var badge = document.getElementById('screenDeterrentBadge');
+        if (badge) {
+            badge.textContent = enabled
+                ? BYD.i18n.t('surveillance.screen_deterrent_on_badge')
+                : BYD.i18n.t('surveillance.screen_deterrent_off_badge');
+            badge.className = 'status-badge ' + (enabled ? 'active' : 'inactive');
+        }
+
+        var clearBtn = document.getElementById('screenDeterrentClearBtn');
+        if (clearBtn) clearBtn.style.display = hasImage ? '' : 'none';
+
+        // When an asset is already uploaded, the Upload button becomes
+        // "Replace image" so the user understands picking a new file
+        // overwrites the current asset (the latest upload is the only one
+        // we keep — server cleans up siblings on every upload).
+        var uploadLabel = document.getElementById('screenDeterrentUploadLabel');
+        if (uploadLabel && BYD.i18n && BYD.i18n.t) {
+            uploadLabel.textContent = hasImage
+                ? BYD.i18n.t('surveillance.screen_deterrent_replace')
+                : BYD.i18n.t('surveillance.screen_deterrent_upload');
+        }
+
+        var preview = document.getElementById('screenDeterrentPreview');
+        var previewImg = document.getElementById('screenDeterrentPreviewImg');
+        if (preview && previewImg) {
+            if (hasImage && imagePath) {
+                // Load preview via fetch → Blob → URL.createObjectURL.
+                //
+                // Why not <img src="/api/...">: the BYD head-unit WebView
+                // (Chrome 58) silently fails to render an <img> whose URL
+                // routes through shouldInterceptRequest with a streamed
+                // binary response — same firmware quirk that breaks
+                // autoplay video without a Range hop.
+                //
+                // Why not XHR + arraybuffer + base64 data URL: btoa on a
+                // 200KB+ string from a String.fromCharCode loop is O(n²)
+                // and the resulting data: URL crosses Chrome 58's
+                // attribute-length budget in some builds, leaving <img>
+                // with a "broken image" glyph.
+                //
+                // fetch().then(res => res.blob()) → createObjectURL is the
+                // pattern events.js uses for recording thumbnails on the
+                // same WebView and is known good. revoke the previous URL
+                // before assigning a new one to avoid leaking blob handles
+                // across reloads.
+                var self = this;
+                if (this._lastDeterrentBlobUrl) {
+                    try { URL.revokeObjectURL(this._lastDeterrentBlobUrl); } catch (_) {}
+                    this._lastDeterrentBlobUrl = null;
+                }
+                fetch('/api/surveillance/screen-deterrent/image?t=' + Date.now(), {
+                    cache: 'no-store',
+                    credentials: 'same-origin'
+                }).then(function (res) {
+                    if (!res.ok) throw new Error('HTTP ' + res.status);
+                    return res.blob();
+                }).then(function (blob) {
+                    if (!blob || blob.size === 0) throw new Error('empty blob');
+                    var url = URL.createObjectURL(blob);
+                    self._lastDeterrentBlobUrl = url;
+                    previewImg.onload = function () {
+                        preview.style.display = '';
+                    };
+                    previewImg.onerror = function () {
+                        console.warn('[deterrent] preview <img> failed to decode blob');
+                        preview.style.display = 'none';
+                    };
+                    previewImg.src = url;
+                }).catch(function (err) {
+                    console.warn('[deterrent] preview load failed:', err && err.message);
+                    preview.style.display = 'none';
+                });
+            } else {
+                if (this._lastDeterrentBlobUrl) {
+                    try { URL.revokeObjectURL(this._lastDeterrentBlobUrl); } catch (_) {}
+                    this._lastDeterrentBlobUrl = null;
+                }
+                preview.style.display = 'none';
+                previewImg.removeAttribute('src');
+            }
         }
     }
 };
@@ -2219,7 +2691,20 @@ window.BydCloud = {
     },
 
     async clearCredentials() {
-        if (!confirm(BYD.i18n.t('surveillance.confirm_clear_byd_creds'))) return;
+        var t = (BYD.i18n && BYD.i18n.t) ? BYD.i18n.t.bind(BYD.i18n) : null;
+        if (BYD.utils && BYD.utils.confirmDialog) {
+            var ok = await BYD.utils.confirmDialog({
+                title: (t && t('surveillance.byd_clear_creds_title')) || 'Clear BYD Cloud credentials?',
+                body: (t && t('surveillance.byd_clear_creds_body'))
+                    || 'Deterrent actions (flash lights, horn) will stop working until you set up again.',
+                confirmLabel: (t && t('common.clear')) || 'Clear',
+                cancelLabel: (t && t('common.cancel')) || 'Cancel',
+                danger: true
+            });
+            if (!ok) return;
+        } else if (typeof confirm === 'function') {
+            if (!confirm(BYD.i18n.t('surveillance.confirm_clear_byd_creds'))) return;
+        }
 
         try {
             await fetch('/api/bydcloud/clear', { method: 'POST' });

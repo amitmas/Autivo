@@ -2,7 +2,9 @@ package com.overdrive.app.telegram;
 
 import android.util.Log;
 
+import com.overdrive.app.config.UnifiedConfigManager;
 import com.overdrive.app.server.Messages;
+import com.overdrive.app.telegram.config.UnifiedTelegramConfig;
 import com.overdrive.app.telegram.event.CriticalEvent;
 import com.overdrive.app.telegram.event.MotionEvent;
 import com.overdrive.app.telegram.event.TelegramEventBus;
@@ -41,6 +43,46 @@ public class TelegramNotifier {
         t.setDaemon(true);
         return t;
     });
+
+    /**
+     * Notification category — chosen at the emit site so the gate can run
+     * before IPC, even when the daemon isn't alive (TelegramBotDaemon only
+     * runs during ACC OFF). Aligned with the toggles in
+     * Notifications → Telegram and the daemon-side gate in
+     * TelegramBotDaemon.processIpcCommand.
+     */
+    public enum Category { CRITICAL, CONNECTIVITY, MOTION, VIDEO }
+
+    /**
+     * Read the matching pref directly from the unified config so a toggle
+     * the user just flipped from the web UI is honored on the very next
+     * event — independent of whether TelegramBotDaemon is alive. Without
+     * this we'd be relying on the daemon-side gate, which is moot when the
+     * daemon isn't running and the IPC call would have been dropped on the
+     * floor regardless.
+     *
+     * forceReload() bypasses the per-process mtime cache so a write made
+     * by the daemon UID (2000) is visible from the app UID immediately.
+     * Called on the IPC executor thread, never on the UI thread.
+     */
+    private static boolean isEnabled(Category category) {
+        try {
+            UnifiedConfigManager.forceReload();
+            switch (category) {
+                case CRITICAL:     return UnifiedTelegramConfig.isCriticalAlerts();
+                case CONNECTIVITY: return UnifiedTelegramConfig.isConnectivity();
+                case MOTION:       return UnifiedTelegramConfig.isMotionText();
+                case VIDEO:        return UnifiedTelegramConfig.isVideoUploads();
+                default:           return true;
+            }
+        } catch (Exception e) {
+            // Fail-open: if the config read blips, prefer delivering the
+            // message over silently dropping it. The daemon-side gate is
+            // the belt-and-suspenders backstop.
+            Log.w(TAG, "isEnabled read error: " + e.getMessage());
+            return true;
+        }
+    }
     
     /**
      * Notify that a video recording was finalized.
@@ -50,14 +92,18 @@ public class TelegramNotifier {
      * @param durationSeconds Duration in seconds
      */
     public static void notifyVideoRecorded(String filePath, String aiDetection, int durationSeconds) {
-        // Publish to in-app event bus
+        // Publish to in-app event bus (independent of Telegram delivery)
         TelegramEventBus.getInstance().publish(
                 new VideoEvent(filePath, aiDetection, durationSeconds)
         );
-        
+
         // Send via IPC to daemon
         executor.execute(() -> {
             try {
+                if (!isEnabled(Category.VIDEO)) {
+                    Log.d(TAG, "notifyVideoRecorded skipped — videoUploads disabled");
+                    return;
+                }
                 JSONObject cmd = new JSONObject();
                 cmd.put("cmd", "sendVideo");
                 cmd.put("path", filePath);
@@ -80,15 +126,19 @@ public class TelegramNotifier {
      */
     public static void notifyTunnelUrl(String url, boolean isNew) {
         Log.i(TAG, "notifyTunnelUrl called: url=" + url + ", isNew=" + isNew);
-        
+
         // Publish to in-app event bus
         TelegramEventBus.getInstance().publish(
                 new TunnelEvent(url, isNew)
         );
-        
+
         // Send via IPC to daemon
         executor.execute(() -> {
             try {
+                if (!isEnabled(Category.CONNECTIVITY)) {
+                    Log.d(TAG, "notifyTunnelUrl skipped — connectivity updates disabled");
+                    return;
+                }
                 Log.i(TAG, "Sending tunnel URL via IPC to port " + IPC_PORT);
                 JSONObject cmd = new JSONObject();
                 cmd.put("cmd", "notifyTunnel");
@@ -148,6 +198,10 @@ public class TelegramNotifier {
         // Send via IPC to daemon (legacy + new fields)
         executor.execute(() -> {
             try {
+                if (!isEnabled(Category.MOTION)) {
+                    Log.d(TAG, "notifyMotion skipped — motion text alerts disabled");
+                    return;
+                }
                 JSONObject cmd = new JSONObject();
                 cmd.put("cmd", "notifyMotion");
                 cmd.put("detection", aiDetection != null ? aiDetection : "motion");
@@ -185,6 +239,10 @@ public class TelegramNotifier {
                                              String closestProximity, String camera) {
         executor.execute(() -> {
             try {
+                if (!isEnabled(Category.MOTION)) {
+                    Log.d(TAG, "notifyMotionFinalized skipped — motion text alerts disabled");
+                    return;
+                }
                 JSONObject cmd = new JSONObject();
                 cmd.put("cmd", "notifyMotionFinalized");
                 if (videoFilename != null && !videoFilename.isEmpty()) {
@@ -253,10 +311,14 @@ public class TelegramNotifier {
         TelegramEventBus.getInstance().publish(
                 new CriticalEvent(type, details)
         );
-        
+
         // Send via IPC to daemon
         executor.execute(() -> {
             try {
+                if (!isEnabled(Category.CRITICAL)) {
+                    Log.d(TAG, "notifyCritical skipped — critical alerts disabled");
+                    return;
+                }
                 JSONObject cmd = new JSONObject();
                 cmd.put("cmd", "notifyCritical");
                 cmd.put("type", type.name());
@@ -269,44 +331,74 @@ public class TelegramNotifier {
     }
     
     /**
-     * Send a custom text message via the daemon.
+     * Send a custom text message via the daemon. Defaults to the
+     * {@code CRITICAL} category so a user who turns off "critical alerts"
+     * silences these too. Use {@link #sendMessage(String, String)} to
+     * declare a different category.
      */
     public static void sendMessage(String text) {
+        sendMessage(text, "CRITICAL");
+    }
+
+    /**
+     * Send a custom text message in a specific notification category.
+     * The daemon checks the matching toggle (criticalAlerts /
+     * connectivity / motionText / videoUploads) and drops the message
+     * with status="skipped" when disabled.
+     *
+     * @param text     message body (Telegram-Markdown allowed)
+     * @param category one of "CRITICAL", "MOTION", "CONNECTIVITY", "VIDEO";
+     *                 unknown values fall back to CRITICAL
+     */
+    public static void sendMessage(String text, String category) {
         executor.execute(() -> {
             try {
+                Category cat;
+                try { cat = (category != null) ? Category.valueOf(category) : Category.CRITICAL; }
+                catch (IllegalArgumentException iae) { cat = Category.CRITICAL; }
+                if (!isEnabled(cat)) {
+                    Log.d(TAG, "sendMessage skipped — " + cat + " disabled");
+                    return;
+                }
                 JSONObject cmd = new JSONObject();
                 cmd.put("cmd", "sendMessage");
                 cmd.put("text", text);
+                cmd.put("category", cat.name());
                 sendIpc(cmd);
             } catch (Exception e) {
                 Log.e(TAG, "sendMessage IPC error", e);
             }
         });
     }
-    
+
     /**
      * Notify proximity alert (Proximity Guard recording started).
-     * 
+     *
      * @param timestamp Event timestamp in milliseconds
      * @param triggerLevel Trigger level ("RED" or "YELLOW")
      */
     public static void sendProximityAlert(long timestamp, String triggerLevel) {
         executor.execute(() -> {
             try {
+                if (!isEnabled(Category.CRITICAL)) {
+                    Log.d(TAG, "sendProximityAlert skipped — critical alerts disabled");
+                    return;
+                }
                 java.text.SimpleDateFormat sdf = new java.text.SimpleDateFormat(
                     "yyyy-MM-dd HH:mm:ss", java.util.Locale.US);
                 String timeStr = sdf.format(new java.util.Date(timestamp));
-                
+
                 String distance = triggerLevel.equals("RED") ? "0-0.5m" : "0-0.8m";
 
                 String message = Messages.get("telegram.proximity_alert",
                         timeStr, triggerLevel, distance);
-                
+
                 JSONObject cmd = new JSONObject();
                 cmd.put("cmd", "sendMessage");
                 cmd.put("text", message);
+                cmd.put("category", "CRITICAL");
                 sendIpc(cmd);
-                
+
                 Log.i(TAG, "Proximity alert sent: " + triggerLevel);
             } catch (Exception e) {
                 Log.e(TAG, "sendProximityAlert IPC error", e);

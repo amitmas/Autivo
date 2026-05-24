@@ -54,7 +54,6 @@ public class GpuStreamScaler {
     private final int outputHeight;
     private final float[] quadrantStripOffsetX;
     private final String fragmentShader;
-
     private static final float[] DEFAULT_QUADRANT_STRIP_OFFSET_X = {
         0.75f, 0.50f, 0.00f, 0.25f
     };
@@ -85,61 +84,13 @@ public class GpuStreamScaler {
         "    vTexCoord = aTexCoord;\n" +
         "}\n";
     
-    // Fragment shader - supports 4-cam mosaic, 3-cam mosaic, APA passthrough, single view, raw strip
-    // uViewMode: 0=Mosaic, 1=Front, 2=Right, 3=Rear, 4=Left, 5=Raw strip
-    // uApaMode: 0.0=4-camera, 1.0=APA passthrough, 2.0=3-camera mosaic
-    private static final String FRAGMENT_SHADER =
-        "#extension GL_OES_EGL_image_external : require\n" +
-        "precision mediump float;\n" +
-        "uniform samplerExternalOES uCameraTex;\n" +
-        "uniform int uViewMode;\n" +
-        "uniform float uApaMode;\n" +
-        "varying vec2 vTexCoord;\n" +
-        "void main() {\n" +
-        "    vec2 samplePos;\n" +
-        "    if (uViewMode == 5) {\n" +
-        "        samplePos = vTexCoord;\n" +
-        "    } else if (uApaMode > 1.5) {\n" +
-        "        // 3-camera: TL=Front, BL=Rear, Right=Side\n" +
-        "        if (uViewMode == 1) { samplePos = vec2(0.75 + vTexCoord.x * 0.25, vTexCoord.y); }\n" +  // Front
-        "        else if (uViewMode == 3) { samplePos = vec2(vTexCoord.x * 0.25, vTexCoord.y); }\n" +     // Rear
-        "        else if (uViewMode == 2 || uViewMode == 4) { samplePos = vec2(0.25 + vTexCoord.x * 0.5, vTexCoord.y); }\n" + // Side
-        "        else {\n" +
-        "            // Mosaic for 3-cam\n" +
-        "            if (vTexCoord.x < 0.5) {\n" +
-        "                float lx = vTexCoord.x * 0.5;\n" +
-        "                float ly = mod(vTexCoord.y, 0.5) * 2.0;\n" +
-        "                if (vTexCoord.y < 0.5) { samplePos = vec2(lx + 0.75, ly); }\n" +
-        "                else { samplePos = vec2(lx, ly); }\n" +
-        "            } else {\n" +
-        "                samplePos = vec2(0.25 + (vTexCoord.x - 0.5) * 1.0 * 0.5, vTexCoord.y);\n" +
-        "            }\n" +
-        "        }\n" +
-        "    } else if (uApaMode > 0.5) {\n" +
-        "        samplePos = vTexCoord;\n" +
-        "    } else if (uViewMode == 0) {\n" +
-        "        vec2 gridPos = step(0.5, vTexCoord);\n" +
-        "        float stripOffsetX = 0.75 - (gridPos.x * 0.25) - (gridPos.y * 0.75) + (gridPos.x * gridPos.y * 0.50);\n" +
-        "        float localX = mod(vTexCoord.x, 0.5) * 0.5;\n" +
-        "        float localY = mod(vTexCoord.y, 0.5) * 2.0;\n" +
-        "        samplePos = vec2(localX + stripOffsetX, localY);\n" +
-        "    } else {\n" +
-        "        float stripIndex;\n" +
-        "        if (uViewMode == 1) stripIndex = 3.0;\n" +
-        "        else if (uViewMode == 2) stripIndex = 2.0;\n" +
-        "        else if (uViewMode == 3) stripIndex = 0.0;\n" +
-        "        else stripIndex = 1.0;\n" +
-        "        float startX = stripIndex * 0.25;\n" +
-        "        samplePos = vec2(startX + (vTexCoord.x * 0.25), vTexCoord.y);\n" +
-        "    }\n" +
-        "    gl_FragColor = texture2D(uCameraTex, samplePos);\n" +
-        "}\n";
-    
+    /** Fragment shader is profile-baked at construction via
+     *  {@link #buildFragmentShader(float[])}. Single-view modes use the four
+     *  per-quadrant offsets so streaming a single direction picks the slice
+     *  that the user mapped to that role. */
+
     public GpuStreamScaler(int outputWidth, int outputHeight) {
-        this.outputWidth = outputWidth;
-        this.outputHeight = outputHeight;
-        this.quadrantStripOffsetX = DEFAULT_QUADRANT_STRIP_OFFSET_X.clone();
-        this.fragmentShader = buildFragmentShader(this.quadrantStripOffsetX);
+        this(outputWidth, outputHeight, null);
     }
 
     public GpuStreamScaler(int outputWidth, int outputHeight, float[] quadrantStripOffsetX) {
@@ -170,7 +121,7 @@ public class GpuStreamScaler {
         // Create EGL surface from encoder surface
         encoderSurface = eglCore.createWindowSurface(encoderInputSurface);
         
-        // Compile shaders
+        // Compile shaders (profile-baked)
         programId = GlUtil.createProgram(VERTEX_SHADER, fragmentShader);
         if (programId == 0) {
             throw new RuntimeException("Failed to create shader program");
@@ -294,6 +245,11 @@ public class GpuStreamScaler {
         return quadrantStripOffsetX.clone();
     }
 
+    /**
+     * Build the stream fragment shader with per-quadrant strip-X offsets baked
+     * in. Order: {Front, Right, Rear, Left}. Single-view modes (uViewMode 1-4)
+     * pick the slice mapped to that role; uViewMode 0 = mosaic; 5 = raw.
+     */
     private static String buildFragmentShader(float[] offsets) {
         return String.format(Locale.US,
             "#extension GL_OES_EGL_image_external : require\n" +
@@ -306,8 +262,8 @@ public class GpuStreamScaler {
             "    vec2 samplePos;\n" +
             "    float frontOffset = %.5ff;\n" +
             "    float rightOffset = %.5ff;\n" +
-            "    float rearOffset = %.5ff;\n" +
-            "    float leftOffset = %.5ff;\n" +
+            "    float rearOffset  = %.5ff;\n" +
+            "    float leftOffset  = %.5ff;\n" +
             "    if (uViewMode == 5) {\n" +
             "        samplePos = vTexCoord;\n" +
             "    } else if (uApaMode > 1.5) {\n" +
@@ -321,7 +277,7 @@ public class GpuStreamScaler {
             "                if (vTexCoord.y < 0.5) { samplePos = vec2(lx + 0.75, ly); }\n" +
             "                else { samplePos = vec2(lx, ly); }\n" +
             "            } else {\n" +
-            "                samplePos = vec2(0.25 + (vTexCoord.x - 0.5) * 1.0 * 0.5, vTexCoord.y);\n" +
+            "                samplePos = vec2(0.25 + (vTexCoord.x - 0.5) * 0.5, vTexCoord.y);\n" +
             "            }\n" +
             "        }\n" +
             "    } else if (uApaMode > 0.5) {\n" +

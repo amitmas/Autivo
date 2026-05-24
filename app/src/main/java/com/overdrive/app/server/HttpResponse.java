@@ -241,21 +241,32 @@ public class HttpResponse {
     }
     
     /**
-     * Send an image file with caching headers.
+     * Send an image file with default 24h cache headers.
      */
     public static void sendImage(OutputStream out, java.io.File file, String contentType) throws Exception {
+        sendImage(out, file, contentType, "public, max-age=86400");
+    }
+
+    /**
+     * Send an image file with a caller-specified Cache-Control. Use
+     * "no-cache" for assets that change in place (e.g. user-uploaded
+     * deterrent image) — otherwise WebViews and external clients will
+     * keep the previous version up to 24h even after a re-upload.
+     */
+    public static void sendImage(OutputStream out, java.io.File file, String contentType,
+                                  String cacheControl) throws Exception {
         if (!file.exists()) {
             sendError(out, 404, "Image not found");
             return;
         }
-        
+
         String headers = "HTTP/1.1 200 OK\r\n" +
                         "Content-Type: " + contentType + "\r\n" +
                         "Content-Length: " + file.length() + "\r\n" +
-                        "Cache-Control: public, max-age=86400\r\n" +
+                        "Cache-Control: " + cacheControl + "\r\n" +
                         "Connection: close\r\n\r\n";
         out.write(headers.getBytes());
-        
+
         try (java.io.FileInputStream fis = new java.io.FileInputStream(file)) {
             byte[] buffer = new byte[8192];
             int count;

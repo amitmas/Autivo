@@ -6,8 +6,8 @@ import org.json.JSONObject;
 /**
  * Raw quarter-slice from the merged panoramic strip.
  *
- * These are intentionally neutral physical slices, not logical directions.
- * Logical front/right/rear/left is derived by mapping camera roles to slices.
+ * Neutral physical slices, not logical directions. Logical front/right/rear/left
+ * is derived by mapping camera roles to slices.
  */
 public enum PanoramicSlice {
     SLICE_1("slice1", "Merged slice 1", 0, 0.00f),

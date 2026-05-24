@@ -28,6 +28,8 @@
     <string name="cd_play_pause">Çalışma/Aravalı</string>
     <string name="cd_player_prev">Önceki kayıt</string>
     <string name="cd_player_next">Sonraki kayıt</string>
+    <string name="cd_player_maximize">Oyuncunu en üst seviyeye çıkar</string>
+    <string name="cd_player_minimize">Dışarı çıkış tam ekran</string>
     <string name="cd_delete">Sil</string>
     <string name="cd_expand">Genişle</string>
     <string name="cd_configure">Yapılandırma</string>
@@ -63,6 +65,20 @@
     <string name="camera_option_4">Kamera 4</string>
     <string name="camera_option_5">Kamera 5</string>
     <string name="camera_selection_hint">Otomatik olarak her çubukta trim için doğru kamera seçilir. Kamera 1 = BYD Seal, Kamera 0 = Atto trimler. Kurulumun yürürlüğe girmesi için kamera kimliğini değiştirdikten sonra daemon\'u yeniden başlatın.</string>
+    <string name="camera_mapping_title">Kamera Haritası</string>
+    <string name="camera_role_label">Rol haritası</string>
+    <string name="camera_candidate_previous">Önceki</string>
+    <string name="camera_candidate_next">İleri</string>
+    <string name="camera_preview_unavailable">Ön görünüm henüz mevcut değil. Başka bir aday deneyin veya daemon yeniden başlatıldıktan sonra iletişim kutusunu yeniden açarak yenilenti yapın.</string>
+    <string name="camera_mapping_save">Haritayı kaydet</string>
+    <string name="camera_mapping_clear">Açık bir rol</string>
+    <string name="camera_mapping_saved">Kamera haritası kaydedildi.</string>
+    <string name="camera_mapping_cleared">Kamera rol haritası temizlendi.</string>
+    <string name="camera_mapping_summary_format">Panoramik akış: Kamera %1$d · %2$dx%3$d</string>
+    <string name="camera_mapping_summary_probing">Panoramik akış: Miras otomatik tespit / araştırma</string>
+    <string name="camera_mapping_current_format">Akım haritası: %1$s</string>
+    <string name="camera_mapping_current_none">Akım haritası: Otomatik / Varsayılan</string>
+    <string name="camera_mapping_hint">OverDrive varsayılan olarak eski başlangıç davranışını korur, ancak şimdi birleşik panoramik şeridi düzgün kalibre etmenizi sağlar. Her çiğ birleşik parçayı önceden görüntüleyin, mantıksal 360 rollerini aracınızda ön/sağ/arktaki/sol gösterilen parçaya haritasınız ve daemon bu düzeni kaydetme, akış ve AI için yeniden başlatıldıktan sonra tekrar kullanacaktır.</string>
     <string name="dashboard_scan_to_connect">Bağlantı için taray</string>
     <string name="dashboard_qr_waiting">Tünel için bekliyordum...</string>
     <string name="dashboard_daemons_running_default">0/5 Çıkıyor</string>
@@ -216,6 +232,8 @@
     <string name="toast_restarting_camera_daemon">Kamera demonu yeniden başlatmak...</string>
     <string name="toast_camera_daemon_restarting">Kamera demonu tam sonda ile yeniden başlatılıyor</string>
     <string name="toast_camera_restart_failed">Yapılandırma temizlendi ama daemon yeniden başlatılamadı. Lütfen elle yeniden başlatın.</string>
+    <string name="toast_camera_settings_saved_restarting">Kamera ayarları kaydedildi  kamera demonu yeniden başlatmak...</string>
+    <string name="toast_camera_settings_restart_failed">Kamera ayarları kaydedildi ama daemon yeniden başlatılamadı.</string>
     <string name="toast_failed_with_message_x">Başarısız: %1$s</string>
     <string name="toast_soh_reset_success">SOH tahminini yeniden ayarlamak  sonraki verilerden yeniden hesaplanacak</string>
     <string name="toast_soh_reset_failed_no_daemon">Yeniden ayarlama başarısız  daemon cevap vermiyor ve dosya yazılamaz</string>
@@ -273,6 +291,14 @@
     <string name="tunnel_label_cloudflared">Bulutlu</string>
     <string name="tunnel_label_zrok">Zrok</string>
     <string name="tunnel_label_tailscale">Tailscale</string>
+    <string name="daemon_name_camera">Kamera Daemon</string>
+    <string name="daemon_name_surveillance">Gözlem Daemon</string>
+    <string name="daemon_name_acc_surveillance">ACC Denetim</string>
+    <string name="daemon_name_singbox">Sing-box Proxy</string>
+    <string name="daemon_name_cloudflared">Cloudflared Tunel</string>
+    <string name="daemon_name_zrok">Zrok Tunel</string>
+    <string name="daemon_name_tailscale">Tailscale Tunel</string>
+    <string name="daemon_name_telegram">Telegram Bot</string>
     <string name="clip_label_access_code">Erişim Kodu</string>
     <string name="clip_label_url">URL</string>
     <string name="toast_no_config_needed">%1$s için yapılandırma gerekmez</string>

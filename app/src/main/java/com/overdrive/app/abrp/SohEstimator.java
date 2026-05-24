@@ -52,6 +52,13 @@ public class SohEstimator {
     private double calibrationSoh = -1;
     private long calibrationTimestampMs = 0;
 
+    // Throttling state for the SOH-rail-saturation warning. Bumped on every
+    // computeLiveSoh() that hits the 60% / 110% clamp; reset when a value lands
+    // inside the rails. We log once per SATURATION_WARN_PERIOD consecutive
+    // saturated samples so a wrong nominal pick is surfaced without flooding.
+    private int saturationStreak = 0;
+    private static final int SATURATION_WARN_PERIOD = 30;
+
     // True when fuel signals (getFuelPercentageValue / getFuelDrivingRangeValue)
     // are at BEV sentinels. Set by autoDetectCarModel before the SOC heuristic
     // runs so we can suppress the PHEV-kWh-bug detector on real BEVs whose
@@ -99,8 +106,22 @@ public class SohEstimator {
                     + MIN_PLAUSIBLE_KWH + "-" + MAX_PLAUSIBLE_KWH + " range");
                 return;
             }
+            double previous = this.nominalCapacityKwh;
             this.nominalCapacityKwh = capacityKwh;
             this.nominalSource = "user";
+            // SOH was computed against the previous nominal. Carrying it
+            // forward would make getBatteryRemainPowerKwh / SoC-fallback
+            // energy math drift until live SOH re-converges. Drop it so
+            // consumers see a clean slate and re-seed against the new pack.
+            if (Math.abs(previous - capacityKwh) > 0.01) {
+                this.currentSoh = -1;
+                this.calibrationSoh = -1;
+                this.calibrationTimestampMs = 0;
+                this.liveHistory.clear();
+                this.saturationStreak = 0;
+                invalidateActiveTripKwhBaseline("user nominal changed " +
+                    String.format("%.1f", previous) + "→" + String.format("%.1f", capacityKwh) + " kWh");
+            }
             try {
                 UnifiedConfigManager.updateValues("vehicle",
                     java.util.Collections.singletonMap("nominalKwh", (Object) capacityKwh));
@@ -109,6 +130,11 @@ public class SohEstimator {
             }
             persistEstimate();
             logger.info("User-set nominal capacity: " + capacityKwh + " kWh");
+            try {
+                seedInitialEstimate();
+            } catch (Throwable t) {
+                logger.debug("seedInitialEstimate after user override failed: " + t.getMessage());
+            }
         }
     }
 
@@ -128,8 +154,18 @@ public class SohEstimator {
             } catch (Throwable t) {
                 logger.warn("Failed to clear user nominalKwh: " + t.getMessage());
             }
+            double previous = this.nominalCapacityKwh;
             this.nominalCapacityKwh = 0;
             this.nominalSource = "unset";
+            this.currentSoh = -1;
+            this.calibrationSoh = -1;
+            this.calibrationTimestampMs = 0;
+            this.liveHistory.clear();
+            this.saturationStreak = 0;
+            if (previous > 0) {
+                invalidateActiveTripKwhBaseline("user nominal cleared (was "
+                    + String.format("%.1f", previous) + " kWh)");
+            }
             // persistEstimate() early-returns when both currentSoh and nominalCapacityKwh
             // are <= 0, so the stale keys would survive on disk. Strip them explicitly.
             try {
@@ -681,6 +717,32 @@ public class SohEstimator {
     }
 
     /**
+     * Drop the active trip's kwhStart/kwhEnd baseline. Both readings are taken
+     * via getBatteryRemainPowerKwh, which is computed against currentSoh ×
+     * nominalCapacityKwh — so any nominal/SOH change mid-trip leaves the two
+     * endpoints in different unit systems. Wiping them forces the trip to
+     * fall through to TripAnalyticsManager's SoC-delta estimate, which uses a
+     * single (post-change) nominal × SOH for both ends.
+     */
+    private void invalidateActiveTripKwhBaseline(String reason) {
+        try {
+            com.overdrive.app.trips.TripAnalyticsManager mgr =
+                com.overdrive.app.daemon.CameraDaemon.getTripAnalyticsManager();
+            if (mgr == null || !mgr.isTripActive()) return;
+            com.overdrive.app.trips.TripRecord active = mgr.getActiveTrip();
+            if (active == null) return;
+            if (active.kwhStart == 0 && active.kwhEnd == 0) return;
+            logger.info("Invalidating active trip kWh baseline (" + reason + ") — "
+                + "kwhStart=" + String.format("%.2f", active.kwhStart)
+                + " kwhEnd=" + String.format("%.2f", active.kwhEnd));
+            active.kwhStart = 0;
+            active.kwhEnd = 0;
+        } catch (Throwable t) {
+            logger.debug("invalidateActiveTripKwhBaseline noop: " + t.getMessage());
+        }
+    }
+
+    /**
      * Compute live SOH from one tick of BMS data WITHOUT side effects.
      * Used by both updateFromEnergy() and any read-only consumer.
      */
@@ -691,10 +753,23 @@ public class SohEstimator {
         double scale = displayToAbsoluteSocScale(highCellVoltage);
         double absSoc = scaleDisplaySoc(socPercent, scale);
         double impliedTotalCap = remainKwh / (absSoc / 100.0);
-        double soh = (impliedTotalCap / nominalCapacityKwh) * 100.0;
-        if (soh < 60.0) return 60.0;
-        if (soh > 110.0) return 110.0;
-        return soh;
+        double rawSoh = (impliedTotalCap / nominalCapacityKwh) * 100.0;
+        boolean saturated = (rawSoh < 60.0 || rawSoh > 110.0);
+        if (saturated) {
+            saturationStreak++;
+            if (saturationStreak == 1 || saturationStreak % SATURATION_WARN_PERIOD == 0) {
+                logger.warn("SOH saturated at " + (rawSoh < 60.0 ? "60%" : "110%")
+                    + " rail (raw=" + String.format("%.1f", rawSoh)
+                    + "%, nominal=" + String.format("%.1f", nominalCapacityKwh) + " kWh"
+                    + ", source=" + nominalSource + ", streak=" + saturationStreak
+                    + ") — likely wrong nominal capacity selected");
+            }
+        } else {
+            saturationStreak = 0;
+        }
+        if (rawSoh < 60.0) return 60.0;
+        if (rawSoh > 110.0) return 110.0;
+        return rawSoh;
     }
 
     /**
@@ -969,12 +1044,17 @@ public class SohEstimator {
 
     public void reset() {
         synchronized (autoDetectLock) {
+            double previous = nominalCapacityKwh;
             currentSoh = -1;
             calibrationSoh = -1;
             calibrationTimestampMs = 0;
             nominalCapacityKwh = 0;
             nominalSource = "unset";
             liveHistory.clear();
+            saturationStreak = 0;
+            if (previous > 0) {
+                invalidateActiveTripKwhBaseline("SohEstimator.reset()");
+            }
 
             File sohFile = new File(SOH_FILE);
             if (sohFile.exists()) {

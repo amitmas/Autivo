@@ -48,6 +48,19 @@ class YoloDetector(private val context: Context) {
     private var gpuDelegate: GpuDelegate? = null
     private var isGpuEnabled = false
 
+    // True from the moment we hand work to interp.run() until the result
+    // tensor has been read back. On the GPU delegate path (Adreno 610),
+    // interp.run() returns as soon as the OpenCL command is enqueued, but
+    // the actual GPU work is still draining — anything that touches the
+    // GPU during that window (glReadPixels for the AI lane, mosaic shader
+    // for the next encoder frame) will block until the queue drains and
+    // produces the 280ms aiReadback stalls seen in field logs. The GL
+    // thread checks isGpuJobInFlight() before issuing a fresh readback so
+    // the pipeline isn't piled up with blocking GL ops behind the YOLO
+    // OpenCL job.
+    @Volatile
+    private var gpuJobInFlight: Boolean = false
+
     // Monitor that mutually excludes inference (interp.run) from
     // close() / re-init. Without it, a UI/IPC-thread close() can free
     // the native TFLite interpreter while aiExecutor is mid-detect,
@@ -261,38 +274,52 @@ class YoloDetector(private val context: Context) {
         // brief contention with close() is fine — close happens rarely
         // (toggle off, daemon shutdown).
         val output: FloatArray
-        synchronized(interpLock) {
-            val interp = interpreter ?: return emptyList()
+        gpuJobInFlight = true
+        try {
+            synchronized(interpLock) {
+                val interp = interpreter ?: return emptyList()
 
-            // Reuse the shaped TensorBuffer across calls. Re-allocate only on
-            // dimension change (rare). Same for the float output array.
-            var sb = shapedBuffer
-            if (sb == null || shapedBufferW != width || shapedBufferH != height) {
-                sb = TensorBuffer.createFixedSize(intArrayOf(height, width, 3), DataType.UINT8)
-                shapedBuffer = sb
-                shapedBufferW = width
-                shapedBufferH = height
+                // Reuse the shaped TensorBuffer across calls. Re-allocate only on
+                // dimension change (rare). Same for the float output array.
+                var sb = shapedBuffer
+                if (sb == null || shapedBufferW != width || shapedBufferH != height) {
+                    sb = TensorBuffer.createFixedSize(intArrayOf(height, width, 3), DataType.UINT8)
+                    shapedBuffer = sb
+                    shapedBufferW = width
+                    shapedBufferH = height
+                }
+                sb.loadBuffer(ByteBuffer.wrap(processedData))
+
+                inputImageBuffer!!.load(sb)
+
+                // SOTA: Process with native C++ ops (bilinear resize + UINT8->FLOAT32 normalize)
+                val tensorImage = imageProcessor.process(inputImageBuffer)
+
+                // Run inference (GPU accelerated). On the OpenCL delegate path,
+                // interp.run() returns once the command is enqueued — the
+                // actual GPU work is draining. The asFloatBuffer().get() below
+                // is what forces the sync (it blocks until the result tensor
+                // is filled). gpuJobInFlight stays true across both so the GL
+                // thread knows the Adreno is busy.
+                outputBuffer!!.rewind()
+                interp.run(tensorImage.buffer, outputBuffer)
+
+                // Parse output. The .get() call below is the implicit GPU sync.
+                outputBuffer!!.rewind()
+                var fo = floatOutput
+                if (fo == null || fo.size != 84 * 8400) {
+                    fo = FloatArray(84 * 8400)
+                    floatOutput = fo
+                }
+                outputBuffer!!.asFloatBuffer().get(fo)
+                output = fo
             }
-            sb.loadBuffer(ByteBuffer.wrap(processedData))
-
-            inputImageBuffer!!.load(sb)
-
-            // SOTA: Process with native C++ ops (bilinear resize + UINT8->FLOAT32 normalize)
-            val tensorImage = imageProcessor.process(inputImageBuffer)
-
-            // Run inference (GPU accelerated)
-            outputBuffer!!.rewind()
-            interp.run(tensorImage.buffer, outputBuffer)
-
-            // Parse output
-            outputBuffer!!.rewind()
-            var fo = floatOutput
-            if (fo == null || fo.size != 84 * 8400) {
-                fo = FloatArray(84 * 8400)
-                floatOutput = fo
-            }
-            outputBuffer!!.asFloatBuffer().get(fo)
-            output = fo
+        } finally {
+            // Cleared inside finally so any exception path (interpreter null,
+            // OOM, native crash propagated as RuntimeException) still releases
+            // the GL thread instead of permanently parking it behind a stale
+            // flag.
+            gpuJobInFlight = false
         }
 
         return parseOutput(
@@ -517,6 +544,16 @@ class YoloDetector(private val context: Context) {
      * Check if GPU is enabled
      */
     fun isGpuEnabled(): Boolean = isGpuEnabled
+
+    /**
+     * Returns true while a YOLO inference is using the GPU. The GL thread
+     * checks this before issuing glReadPixels for the AI lane — if the
+     * Adreno is mid-OpenCL the readback would block until the OpenCL
+     * queue drains (~250 ms in field logs). Skipping the readback lets
+     * the GL render loop keep up at 26 fps and the dropped frame is
+     * absorbed cheaply by acquireLatestImage on the next iteration.
+     */
+    fun isGpuJobInFlight(): Boolean = gpuJobInFlight
     
     /**
      * Clean up resources
@@ -536,5 +573,8 @@ class YoloDetector(private val context: Context) {
             shapedBufferH = -1
             // floatOutput is shape-independent; safe to keep pooled.
         }
+        // Clear after lock release so a GL thread observing this flag never
+        // sees a stale `true` against a closed interpreter.
+        gpuJobInFlight = false
     }
 }

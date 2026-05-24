@@ -1,10 +1,12 @@
 package com.overdrive.app.server;
 
+import com.overdrive.app.config.UnifiedConfigManager;
 import com.overdrive.app.daemon.CameraDaemon;
+
+import org.json.JSONObject;
 
 import java.io.File;
 import java.io.FileInputStream;
-import java.io.FileOutputStream;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
@@ -13,10 +15,19 @@ import java.util.Set;
 /**
  * Cross-process locale persistence for the Overdrive daemon.
  *
- * <p>The HTTP server runs as UID 2000 (shell), which cannot read app-private
- * SharedPreferences. We use the same cross-UID-readable file pattern as
- * {@code ZrokLauncher}: a plain text file under {@code /data/local/tmp/.overdrive/}
- * that both the daemon and the Kotlin settings UI can read and write.
+ * <p>Backed by {@link UnifiedConfigManager} under the {@code nativeShell}
+ * section. Both the app process (UID 10xxx, runs the picker dialog) and the
+ * daemon process (UID 2000, runs the HTTP server + {@link Messages}) read
+ * and write the same {@code overdrive_config.json}, which the daemon creates
+ * with {@code 0666} so the app UID can write to the existing file even
+ * though it can't create new files in {@code /data/local/tmp/}.
+ *
+ * <p>This replaces an earlier design that wrote a plain-text file at
+ * {@code /data/local/tmp/.overdrive/locale}. That path required the picker's
+ * UID to {@code mkdir} {@code /data/local/tmp/.overdrive/}, which the app
+ * UID can't do — the write silently failed and the language reverted to
+ * the system locale on next cold start. {@link #migrateLegacyIfNeeded()}
+ * imports any value left over from that scheme on first call.
  *
  * <p>The locale chosen here drives:
  * <ul>
@@ -38,15 +49,55 @@ public final class LocaleManager {
     private static final Set<String> SUPPORTED_SET = new HashSet<>(SUPPORTED);
     private static final String DEFAULT_LANG = "en";
 
-    private static final String STATE_DIR = "/data/local/tmp/.overdrive";
-    private static final String STATE_FILE = STATE_DIR + "/locale";
+    /** Section + key inside {@link UnifiedConfigManager}. */
+    private static final String K_LOCALE = "locale";
 
-    /** In-memory cache so we don't disk-read on every request. */
+    /**
+     * Legacy file from before locale moved to {@link UnifiedConfigManager}.
+     * Imported once (best-effort) and then deleted. The mkdirs on this path
+     * fails from the app UID, which is exactly the bug we're migrating away
+     * from — so reads stay best-effort and the migration is a one-shot.
+     */
+    private static final String LEGACY_STATE_FILE = "/data/local/tmp/.overdrive/locale";
+    private static volatile boolean legacyMigrationChecked = false;
+
+    /** In-memory cache so we don't re-parse the unified config on every request. */
     private static volatile String cachedLocale;
     private static volatile long cachedAt;
     private static final long CACHE_TTL_MS = 5_000L;
 
     private LocaleManager() {}
+
+    /**
+     * One-shot import of any locale picked before this build. Idempotent —
+     * after the first successful migration the legacy file is removed and
+     * the in-process latch keeps subsequent calls O(1). Failure to delete
+     * the legacy file (cross-UID perm denial) is fine: a later call from
+     * the privileged UID can clean up.
+     */
+    private static synchronized void migrateLegacyIfNeeded() {
+        if (legacyMigrationChecked) return;
+        legacyMigrationChecked = true;
+        try {
+            JSONObject section = UnifiedConfigManager.getNativeShell();
+            if (section.has(K_LOCALE)) return;
+            File f = new File(LEGACY_STATE_FILE);
+            if (!f.exists() || !f.canRead()) return;
+            try (FileInputStream fis = new FileInputStream(f)) {
+                byte[] buf = new byte[16];
+                int n = fis.read(buf);
+                if (n <= 0) return;
+                String tag = new String(buf, 0, n, "UTF-8").trim();
+                if (!AUTO_TAG.equals(tag) && !isSupported(tag)) return;
+                JSONObject delta = new JSONObject();
+                delta.put(K_LOCALE, tag);
+                UnifiedConfigManager.updateSection("nativeShell", delta);
+            }
+            try { f.delete(); } catch (Exception ignored) {}
+        } catch (Exception e) {
+            CameraDaemon.log("LocaleManager.migrateLegacy: " + e.getMessage());
+        }
+    }
 
     /**
      * Resolve any tag (e.g. "zh-Hans-CN", "pt", "no") to one of {@link #SUPPORTED}.
@@ -93,24 +144,16 @@ public final class LocaleManager {
      * and message catalogs should keep using {@link #get()}.
      */
     public static String getRaw() {
-        synchronized (LocaleManager.class) {
-            try {
-                File f = new File(STATE_FILE);
-                if (f.exists() && f.canRead()) {
-                    try (FileInputStream fis = new FileInputStream(f)) {
-                        byte[] buf = new byte[16];
-                        int n = fis.read(buf);
-                        if (n > 0) {
-                            String tag = new String(buf, 0, n, "UTF-8").trim();
-                            if (AUTO_TAG.equals(tag) || isSupported(tag)) return tag;
-                        }
-                    }
-                }
-            } catch (Exception e) {
-                CameraDaemon.log("LocaleManager.getRaw: " + e.getMessage());
-            }
-            return null;
+        migrateLegacyIfNeeded();
+        try {
+            JSONObject section = UnifiedConfigManager.getNativeShell();
+            String tag = section.optString(K_LOCALE, "");
+            if (tag.isEmpty()) return null;
+            if (AUTO_TAG.equals(tag) || isSupported(tag)) return tag;
+        } catch (Exception e) {
+            CameraDaemon.log("LocaleManager.getRaw: " + e.getMessage());
         }
+        return null;
     }
 
     /**
@@ -128,20 +171,15 @@ public final class LocaleManager {
      * resolve via the device default each call (cache invalidated on write).
      */
     public static void setAuto() {
-        synchronized (LocaleManager.class) {
-            try {
-                File dir = new File(STATE_DIR);
-                if (!dir.exists()) dir.mkdirs();
-                try (FileOutputStream fos = new FileOutputStream(STATE_FILE)) {
-                    fos.write(AUTO_TAG.getBytes("UTF-8"));
-                }
-                new File(STATE_FILE).setReadable(true, false);
-                cachedLocale = null;
-                cachedAt = 0L;
-                Messages.invalidate();
-            } catch (Exception e) {
-                CameraDaemon.log("LocaleManager.setAuto: " + e.getMessage());
-            }
+        try {
+            JSONObject delta = new JSONObject();
+            delta.put(K_LOCALE, AUTO_TAG);
+            UnifiedConfigManager.updateSection("nativeShell", delta);
+            cachedLocale = null;
+            cachedAt = 0L;
+            Messages.invalidate();
+        } catch (Exception e) {
+            CameraDaemon.log("LocaleManager.setAuto: " + e.getMessage());
         }
     }
 
@@ -185,36 +223,26 @@ public final class LocaleManager {
     public static String get() {
         long now = System.currentTimeMillis();
         if (cachedLocale != null && now - cachedAt < CACHE_TTL_MS) return cachedLocale;
-        synchronized (LocaleManager.class) {
-            String resolved = DEFAULT_LANG;
-            try {
-                File f = new File(STATE_FILE);
-                String raw = null;
-                if (f.exists() && f.canRead()) {
-                    try (FileInputStream fis = new FileInputStream(f)) {
-                        byte[] buf = new byte[16];
-                        int n = fis.read(buf);
-                        if (n > 0) raw = new String(buf, 0, n, "UTF-8").trim();
-                    }
-                }
-                if (raw != null && !raw.isEmpty() && !AUTO_TAG.equals(raw) && isSupported(raw)) {
-                    resolved = raw;
-                } else {
-                    // Auto / unset → resolve from Locale.getDefault(). The
-                    // daemon process inherits the BYD system locale at fork.
-                    java.util.Locale def = java.util.Locale.getDefault();
-                    String tag = def.getLanguage();
-                    String region = def.getCountry();
-                    if (region != null && !region.isEmpty()) tag = tag + "-" + region;
-                    resolved = resolve(tag);
-                }
-            } catch (Exception e) {
-                CameraDaemon.log("LocaleManager.get: " + e.getMessage());
+        String resolved = DEFAULT_LANG;
+        try {
+            String raw = getRaw();
+            if (raw != null && !AUTO_TAG.equals(raw) && isSupported(raw)) {
+                resolved = raw;
+            } else {
+                // Auto / unset → resolve from Locale.getDefault(). The
+                // daemon process inherits the BYD system locale at fork.
+                java.util.Locale def = java.util.Locale.getDefault();
+                String tag = def.getLanguage();
+                String region = def.getCountry();
+                if (region != null && !region.isEmpty()) tag = tag + "-" + region;
+                resolved = resolve(tag);
             }
-            cachedLocale = resolved;
-            cachedAt = now;
-            return resolved;
+        } catch (Exception e) {
+            CameraDaemon.log("LocaleManager.get: " + e.getMessage());
         }
+        cachedLocale = resolved;
+        cachedAt = now;
+        return resolved;
     }
 
     /**
@@ -232,23 +260,17 @@ public final class LocaleManager {
             return get();
         }
         String resolved = resolve(tag);
-        synchronized (LocaleManager.class) {
-            try {
-                File dir = new File(STATE_DIR);
-                if (!dir.exists()) dir.mkdirs();
-                try (FileOutputStream fos = new FileOutputStream(STATE_FILE)) {
-                    fos.write(resolved.getBytes("UTF-8"));
-                }
-                // World-readable so the Android UI process can read it too.
-                new File(STATE_FILE).setReadable(true, false);
-                cachedLocale = resolved;
-                cachedAt = System.currentTimeMillis();
-                // Drop any cached Messages catalog so the next server-side
-                // i18n lookup loads the new locale's JSON.
-                Messages.invalidate();
-            } catch (Exception e) {
-                CameraDaemon.log("LocaleManager.set: " + e.getMessage());
-            }
+        try {
+            JSONObject delta = new JSONObject();
+            delta.put(K_LOCALE, resolved);
+            UnifiedConfigManager.updateSection("nativeShell", delta);
+            cachedLocale = resolved;
+            cachedAt = System.currentTimeMillis();
+            // Drop any cached Messages catalog so the next server-side
+            // i18n lookup loads the new locale's JSON.
+            Messages.invalidate();
+        } catch (Exception e) {
+            CameraDaemon.log("LocaleManager.set: " + e.getMessage());
         }
         return resolved;
     }

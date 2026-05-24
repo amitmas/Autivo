@@ -28,6 +28,8 @@
     <string name="cd_play_pause">Reprodução/pausa</string>
     <string name="cd_player_prev">Gravação anterior</string>
     <string name="cd_player_next">Próxima gravação</string>
+    <string name="cd_player_maximize">Maximizar o jogador</string>
+    <string name="cd_player_minimize">Saída em tela completa</string>
     <string name="cd_delete">Excluir</string>
     <string name="cd_expand">Expandir</string>
     <string name="cd_configure">Configuração</string>
@@ -63,6 +65,20 @@
     <string name="camera_option_4">Câmara 4</string>
     <string name="camera_option_5">Câmara 5</string>
     <string name="camera_selection_hint">Auto escolhe a câmera certa para o seu equipamento em cada bot. câmera 1 = BYD Seal, câmera 0 = Atto equipamentos. Reiniciar o daemon após alterar o ID da câmera para a configuração entrar em vigor.</string>
+    <string name="camera_mapping_title">Mapeamento com câmera</string>
+    <string name="camera_role_label">Mapeamento de funções</string>
+    <string name="camera_candidate_previous">Anterior</string>
+    <string name="camera_candidate_next">Próximo</string>
+    <string name="camera_preview_unavailable">A pré-visualização ainda não está disponível. Tente outro candidato ou atualize reabrindo a caixa de diálogo após o reinicio do demônio.</string>
+    <string name="camera_mapping_save">Salvar mapeamento</string>
+    <string name="camera_mapping_clear">Função clara</string>
+    <string name="camera_mapping_saved">Mapeamento da câmera guardado.</string>
+    <string name="camera_mapping_cleared">O mapeamento de papel da câmera foi eliminado.</string>
+    <string name="camera_mapping_summary_format">Fluxo panorâmico: câmera %1$d · %2$dx%3$d</string>
+    <string name="camera_mapping_summary_probing">Fluxo panorâmico: auto-detecção / sondas de legado</string>
+    <string name="camera_mapping_current_format">Mapeamento de corrente: %1$s</string>
+    <string name="camera_mapping_current_none">Mapeamento de corrente: automático / padrão</string>
+    <string name="camera_mapping_hint">O OverDrive mantém o comportamento de inicialização herdado por padrão, mas agora permite que você calibre a faixa panorâmica combinada corretamente. Visualize cada faixa combinada crua, mapeie as funções lógicas 360 para a faixa que realmente mostra diante/direita/ traseira/esquerda no seu veículo, e o demônio reutilizará esse layout para gravação, streaming e IA após a reinicialização.</string>
     <string name="dashboard_scan_to_connect">Escanar para Conectar</string>
     <string name="dashboard_qr_waiting">À espera do túnel...</string>
     <string name="dashboard_daemons_running_default">0/5 Correndo</string>
@@ -216,6 +232,8 @@
     <string name="toast_restarting_camera_daemon">Reiniciar o demônio da câmara...</string>
     <string name="toast_camera_daemon_restarting">Démon da câmera reinicia com sonda completa</string>
     <string name="toast_camera_restart_failed">Configuração limpa, mas reinicialização daemon falhou.</string>
+    <string name="toast_camera_settings_saved_restarting">As configurações da câmera foram salvas.</string>
+    <string name="toast_camera_settings_restart_failed">As configurações da câmera foram salvas, mas o reinicialização da demônio falhou.</string>
     <string name="toast_failed_with_message_x">Falha: %1$s</string>
     <string name="toast_soh_reset_success">Reset estimativa SOH  recalculará a partir dos próximos dados</string>
     <string name="toast_soh_reset_failed_no_daemon">Reset falhou  daemon não responde e arquivo não pode ser escrito</string>
@@ -273,6 +291,14 @@
     <string name="tunnel_label_cloudflared">Com nuvens</string>
     <string name="tunnel_label_zrok">Zrok</string>
     <string name="tunnel_label_tailscale">Tailscale</string>
+    <string name="daemon_name_camera">Daemon da câmara</string>
+    <string name="daemon_name_surveillance">Daemon de vigilância</string>
+    <string name="daemon_name_acc_surveillance">ACC Supervisão</string>
+    <string name="daemon_name_singbox">Sing-box Proxy</string>
+    <string name="daemon_name_cloudflared">Túnel Cloudflared</string>
+    <string name="daemon_name_zrok">Túnel Zrok</string>
+    <string name="daemon_name_tailscale">Túnel Tailscale</string>
+    <string name="daemon_name_telegram">Telegram Bot</string>
     <string name="clip_label_access_code">Código de acesso</string>
     <string name="clip_label_url">URL</string>
     <string name="toast_no_config_needed">Nenhuma configuração necessária para o %1$s</string>

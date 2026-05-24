@@ -28,6 +28,8 @@
     <string name="cd_play_pause">Juego / Pausa</string>
     <string name="cd_player_prev">Grabación anterior</string>
     <string name="cd_player_next">siguiente grabación.</string>
+    <string name="cd_player_maximize">Maximizar el jugador</string>
+    <string name="cd_player_minimize">Salida en pantalla completa</string>
     <string name="cd_delete">Eliminar</string>
     <string name="cd_expand">Expansión</string>
     <string name="cd_configure">Configuración</string>
@@ -63,6 +65,20 @@
     <string name="camera_option_4">La cámara 4</string>
     <string name="camera_option_5">La cámara 5</string>
     <string name="camera_selection_hint">Auto elige la cámara adecuada para su recorte en cada arranque. Cámara 1 = BYD Seal, cámara 0 = Atto recorte. Reiniciar el demonio después de cambiar la identificación de la cámara para que la configuración entre en vigor.</string>
+    <string name="camera_mapping_title">Mapeo de la cámara</string>
+    <string name="camera_role_label">Mapeo de roles</string>
+    <string name="camera_candidate_previous">Anteriormente</string>
+    <string name="camera_candidate_next">Siguiente</string>
+    <string name="camera_preview_unavailable">Prueba otro candidato o actualiza reabriendo el diálogo después de que el demonio se reinicie.</string>
+    <string name="camera_mapping_save">Guardar el mapeo</string>
+    <string name="camera_mapping_clear">Un papel claro</string>
+    <string name="camera_mapping_saved">El mapeo de la cámara salvado.</string>
+    <string name="camera_mapping_cleared">El mapeo de la función de la cámara está despejado.</string>
+    <string name="camera_mapping_summary_format">Flujo panorámico: cámara %1$d · %2$dx%3$d</string>
+    <string name="camera_mapping_summary_probing">Flujo panorámico: Autodetección / sondeo de herencia</string>
+    <string name="camera_mapping_current_format">Mapeo de corriente: %1$s</string>
+    <string name="camera_mapping_current_none">Mapeo de corriente: automático / predeterminado</string>
+    <string name="camera_mapping_hint">OverDrive mantiene el comportamiento de arranque heredado por defecto, pero ahora le permite calibrar correctamente la banda panorámica fusionada. Preview cada rebanada cruda, mapa los roles lógicos 360 a la rebanada que realmente muestra delante / derecha / atrás / izquierda en su vehículo, y el demonio volverá a usar ese diseño para la grabación, transmisión y IA después de reiniciar.</string>
     <string name="dashboard_scan_to_connect">Escanear para conectar</string>
     <string name="dashboard_qr_waiting">Esperando el túnel...</string>
     <string name="dashboard_daemons_running_default">0/5 Correr</string>
@@ -216,6 +232,8 @@
     <string name="toast_restarting_camera_daemon">Reiniciar el demonio de la cámara...</string>
     <string name="toast_camera_daemon_restarting">Daemon de la cámara reinicia con la sonda completa</string>
     <string name="toast_camera_restart_failed">Configuración eliminada pero reinicio del daemon falló. Por favor reinicie manualmente.</string>
+    <string name="toast_camera_settings_saved_restarting">Configuración de la cámara guardado  reiniciar la cámara daemon...</string>
+    <string name="toast_camera_settings_restart_failed">Las configuraciones de la cámara fueron guardadas, pero el reinicio del daemon falló.</string>
     <string name="toast_failed_with_message_x">Fallido: %1$s</string>
     <string name="toast_soh_reset_success">Reset de la estimación SOH  se recalculará a partir de los próximos datos</string>
     <string name="toast_soh_reset_failed_no_daemon">Reset falló  daemon no responde y el archivo no se puede escribir</string>
@@ -273,6 +291,14 @@
     <string name="tunnel_label_cloudflared">No se puede hacer nada.</string>
     <string name="tunnel_label_zrok">Zrok</string>
     <string name="tunnel_label_tailscale">Tailscale</string>
+    <string name="daemon_name_camera">Daemon de la cámara</string>
+    <string name="daemon_name_surveillance">Daemon de vigilancia</string>
+    <string name="daemon_name_acc_surveillance">ACC Supervisión</string>
+    <string name="daemon_name_singbox">Sing-box Proxy</string>
+    <string name="daemon_name_cloudflared">Túnel Cloudflared</string>
+    <string name="daemon_name_zrok">Túnel Zrok</string>
+    <string name="daemon_name_tailscale">Túnel Tailscale</string>
+    <string name="daemon_name_telegram">Telegram Bot</string>
     <string name="clip_label_access_code">Código de acceso</string>
     <string name="clip_label_url">URL</string>
     <string name="toast_no_config_needed">No se necesita ninguna configuración para %1$s</string>

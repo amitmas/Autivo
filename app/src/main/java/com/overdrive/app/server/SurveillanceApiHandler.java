@@ -72,7 +72,218 @@ public class SurveillanceApiHandler {
             sendCameraPreview(path, out);
             return true;
         }
+        if (cleanPath.equals("/api/surveillance/prepare-restart") && method.equals("POST")) {
+            handlePrepareRestart(out);
+            return true;
+        }
+        if (cleanPath.equals("/api/surveillance/abort-restart") && method.equals("POST")) {
+            // Companion to prepare-restart: if the dialog's SIGKILL fails
+            // and the daemon survives, this lets the client unstick the
+            // shutdown latch so future preview requests work again without
+            // needing a manual daemon restart.
+            shutdownInProgress = false;
+            CameraDaemon.log("abort-restart: shutdown latch cleared");
+            HttpResponse.sendJsonSuccess(out);
+            return true;
+        }
+        if (cleanPath.equals("/api/surveillance/screen-deterrent/image") && method.equals("POST")) {
+            handleScreenDeterrentImageUpload(out, body);
+            return true;
+        }
+        if (cleanPath.equals("/api/surveillance/screen-deterrent/image") && method.equals("GET")) {
+            handleScreenDeterrentImageGet(out);
+            return true;
+        }
         return false;
+    }
+
+    /**
+     * Only files inside this directory + with this filename prefix can be
+     * served or deleted by the deterrent endpoints. Without this lock, an
+     * attacker who could touch UCM (world-writable JSON) could redirect
+     * screenDeterrentImagePath at /etc/* and have the web server stream or
+     * delete arbitrary readable files.
+     */
+    private static final String SCREEN_DETERRENT_DIR = "/data/local/tmp/.overdrive";
+    private static final String SCREEN_DETERRENT_PREFIX = "screen_deterrent_asset.";
+
+    private static boolean isAllowedDeterrentPath(String path) {
+        if (path == null || path.isEmpty()) return false;
+        try {
+            java.io.File f = new java.io.File(path).getCanonicalFile();
+            java.io.File parent = f.getParentFile();
+            java.io.File expected = new java.io.File(SCREEN_DETERRENT_DIR).getCanonicalFile();
+            return parent != null
+                && parent.equals(expected)
+                && f.getName().startsWith(SCREEN_DETERRENT_PREFIX);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private static void handleScreenDeterrentImageGet(OutputStream out) throws Exception {
+        String path = com.overdrive.app.config.UnifiedConfigManager.getSurveillance()
+                .optString("screenDeterrentImagePath", "");
+        if (path.isEmpty()) {
+            HttpResponse.sendError(out, 404, "No deterrent image set");
+            return;
+        }
+        if (!isAllowedDeterrentPath(path)) {
+            HttpResponse.sendError(out, 403, "Forbidden");
+            return;
+        }
+        java.io.File f = new java.io.File(path);
+        if (!f.exists() || f.length() == 0) {
+            HttpResponse.sendError(out, 404, "Deterrent image missing");
+            return;
+        }
+
+        String contentType;
+        String lower = path.toLowerCase();
+        if (lower.endsWith(".gif")) contentType = "image/gif";
+        else if (lower.endsWith(".webp")) contentType = "image/webp";
+        else if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) contentType = "image/jpeg";
+        else contentType = "image/png";
+
+        // no-cache: the deterrent asset changes in place when the user
+        // re-uploads. Without this, second-viewer clients (Telegram preview,
+        // a shared-link tunnel viewer, etc.) keep the previous image cached
+        // for 24h and the cache-bust query param only helps the uploader's
+        // own browser session.
+        HttpResponse.sendImage(out, f, contentType, "no-cache");
+    }
+
+    /**
+     * Accept a base64-encoded image/GIF for the screen deterrent. JSON body:
+     *   { "filename": "warning.gif", "dataBase64": "<base64>" }
+     *
+     * Persists to /data/local/tmp/.overdrive/screen_deterrent_asset.<ext>
+     * world-readable so the daemon UID 2000 can decode it. Updates
+     * surveillance.screenDeterrentImagePath in unified config on success.
+     */
+    private static void handleScreenDeterrentImageUpload(OutputStream out, String body) throws Exception {
+        if (body == null || body.isEmpty()) {
+            HttpResponse.sendJsonError(out, "Empty request body");
+            return;
+        }
+
+        JSONObject req;
+        try {
+            req = new JSONObject(body);
+        } catch (Exception e) {
+            HttpResponse.sendJsonError(out, "Invalid JSON");
+            return;
+        }
+
+        String filename = req.optString("filename", "image.png");
+        String dataB64 = req.optString("dataBase64", "");
+        if (dataB64.isEmpty()) {
+            HttpResponse.sendJsonError(out, "Missing dataBase64");
+            return;
+        }
+
+        // Strip optional "data:image/png;base64," prefix the browser may include.
+        int comma = dataB64.indexOf(',');
+        if (dataB64.startsWith("data:") && comma > 0) {
+            dataB64 = dataB64.substring(comma + 1);
+        }
+
+        byte[] data;
+        try {
+            data = android.util.Base64.decode(dataB64, android.util.Base64.DEFAULT);
+        } catch (Exception e) {
+            HttpResponse.sendJsonError(out, "Invalid base64");
+            return;
+        }
+
+        // Reject 0-byte uploads — they'd pass the path-restriction checks
+        // later but produce a "current asset" preview that's broken.
+        if (data.length == 0) {
+            HttpResponse.sendJsonError(out, "Empty file");
+            return;
+        }
+        // Cap at 8 MB — anything bigger is unlikely to be a deterrent asset
+        // and the GIF Movie API can't handle huge files anyway.
+        if (data.length > 8 * 1024 * 1024) {
+            HttpResponse.sendJsonError(out, "File too large (max 8MB)");
+            return;
+        }
+
+        // Determine extension from filename (default .png).
+        String ext = "png";
+        int dot = filename.lastIndexOf('.');
+        if (dot > 0 && dot < filename.length() - 1) {
+            String e = filename.substring(dot + 1).toLowerCase();
+            if (e.equals("png") || e.equals("jpg") || e.equals("jpeg")
+                    || e.equals("webp") || e.equals("gif")) {
+                ext = e;
+            }
+        }
+
+        java.io.File dir = new java.io.File("/data/local/tmp/.overdrive");
+        if (!dir.exists()) {
+            dir.mkdirs();
+            try { dir.setReadable(true, false); dir.setExecutable(true, false); } catch (Exception ignored) {}
+        }
+
+        // Atomic write: stream into a .tmp sibling, fsync, then rename. If
+        // anything fails (disk full, permission denied, IOException) we
+        // bail before touching the previous asset, so the user doesn't lose
+        // their working image to a botched upload.
+        java.io.File outFile = new java.io.File(dir, "screen_deterrent_asset." + ext);
+        java.io.File tmpFile = new java.io.File(dir, "screen_deterrent_asset." + ext + ".tmp");
+        try (java.io.FileOutputStream fos = new java.io.FileOutputStream(tmpFile)) {
+            fos.write(data);
+            fos.getFD().sync();
+        } catch (Throwable t) {
+            try { tmpFile.delete(); } catch (Exception ignored) {}
+            HttpResponse.sendJsonError(out, "Write failed: " + t.getMessage());
+            return;
+        }
+        try { tmpFile.setReadable(true, false); } catch (Exception ignored) {}
+
+        // Stage successful — now clean up any previous assets and atomically
+        // swap in the new one. The "latest only" invariant: one and only
+        // one screen_deterrent_asset.<ext> file ever exists on disk after
+        // an upload completes. We delete:
+        //   1. Live asset files for OTHER extensions (only one can exist)
+        //   2. Stale .tmp files for OTHER extensions (from previous crashed
+        //      uploads — never cleaned up otherwise)
+        // The same-extension live file is overwritten by tmpFile.renameTo()
+        // below; our own .tmp is the source of the rename.
+        for (String oldExt : new String[]{"png", "jpg", "jpeg", "webp", "gif"}) {
+            if (oldExt.equals(ext)) continue;
+            java.io.File oldFile = new java.io.File(dir, "screen_deterrent_asset." + oldExt);
+            if (oldFile.exists()) {
+                try { oldFile.delete(); } catch (Exception ignored) {}
+            }
+            java.io.File staleTmp = new java.io.File(dir, "screen_deterrent_asset." + oldExt + ".tmp");
+            if (staleTmp.exists()) {
+                try { staleTmp.delete(); } catch (Exception ignored) {}
+            }
+        }
+        if (!tmpFile.renameTo(outFile)) {
+            // Rename failed — try a copy fallback (e.g. cross-fs which can't
+            // happen here but doesn't hurt to be defensive).
+            try { tmpFile.delete(); } catch (Exception ignored) {}
+            HttpResponse.sendJsonError(out, "Rename failed");
+            return;
+        }
+        // World-readable so byd_cam_daemon (UID 2000) can read it.
+        try { outFile.setReadable(true, false); } catch (Exception ignored) {}
+
+        com.overdrive.app.config.UnifiedConfigManager.updateValues(
+                "surveillance",
+                java.util.Collections.singletonMap("screenDeterrentImagePath", outFile.getAbsolutePath()));
+
+        CameraDaemon.log("Screen deterrent asset uploaded: " + outFile.getAbsolutePath()
+                + " (" + data.length + " bytes)");
+
+        JSONObject resp = new JSONObject();
+        resp.put("success", true);
+        resp.put("path", outFile.getAbsolutePath());
+        resp.put("size", data.length);
+        HttpResponse.sendJson(out, resp.toString());
     }
     
     private static void sendConfig(OutputStream out) throws Exception {
@@ -200,10 +411,31 @@ public class SurveillanceApiHandler {
         config.put("inSafeZone", safeMgr.isInSafeZone());
         config.put("safeZoneName", safeMgr.getCurrentZoneName());
         
-        // SOTA: Deterrent action setting
-        JSONObject survConfig = com.overdrive.app.config.UnifiedConfigManager.getSurveillance();
+        // SOTA: Deterrent action setting. forceReload because the daemon
+        // process (byd_cam_daemon) writes screenDeterrentImagePath via the
+        // upload endpoint; without forceReload the in-memory UCM cache here
+        // can be stale until the next file mtime tick is observed.
+        JSONObject survConfig = com.overdrive.app.config.UnifiedConfigManager
+                .forceReload().optJSONObject("surveillance");
+        if (survConfig == null) survConfig = new JSONObject();
         config.put("deterrentAction", survConfig.optString("deterrentAction", "silent"));
         config.put("deterrentCooldownSeconds", survConfig.optInt("deterrentCooldownSeconds", 60));
+        config.put("screenDeterrentEnabled", survConfig.optBoolean("screenDeterrentEnabled", false));
+        config.put("screenDeterrentDurationSeconds", survConfig.optInt("screenDeterrentDurationSeconds", 8));
+        config.put("screenDeterrentMessage", survConfig.optString("screenDeterrentMessage", ""));
+        // Verify the file actually exists before claiming hasImage=true.
+        // Without this check, a stale UCM pointer (file deleted out-of-band)
+        // makes the UI show a broken preview spinner forever.
+        String imgPath = survConfig.optString("screenDeterrentImagePath", "");
+        boolean hasImage = false;
+        if (!imgPath.isEmpty()) {
+            try {
+                java.io.File f = new java.io.File(imgPath);
+                hasImage = f.exists() && f.length() > 0;
+            } catch (Exception ignored) {}
+        }
+        config.put("screenDeterrentImagePath", imgPath);
+        config.put("screenDeterrentHasImage", hasImage);
         
         // SOTA: BYD Cloud connection status
         JSONObject bydCloud = com.overdrive.app.config.UnifiedConfigManager.getBydCloud();
@@ -225,9 +457,16 @@ public class SurveillanceApiHandler {
             config.put("motionHeatmap", sentryConfig.isMotionHeatmapEnabled());
             config.put("filterDebugLog", sentryConfig.isFilterDebugLogEnabled());
             config.put("telegramSendStartPing", sentryConfig.isTelegramSendStartPing());
-            config.put("telegramNotices", sentryConfig.isTelegramNotices());
-            config.put("telegramAlerts", sentryConfig.isTelegramAlerts());
-            config.put("telegramCritical", sentryConfig.isTelegramCritical());
+            // Per-tier filter now lives in the telegram unified-config section
+            // (see UnifiedTelegramConfig.K_TIER_*). Wire format on
+            // /api/surveillance/config keeps the legacy key names so the web
+            // UI doesn't need to know the storage moved.
+            config.put("telegramNotices",
+                    com.overdrive.app.telegram.config.UnifiedTelegramConfig.isTierNotices());
+            config.put("telegramAlerts",
+                    com.overdrive.app.telegram.config.UnifiedTelegramConfig.isTierAlerts());
+            config.put("telegramCritical",
+                    com.overdrive.app.telegram.config.UnifiedTelegramConfig.isTierCritical());
             config.put("shadowFilter", sentryConfig.getShadowFilterMode());
 
             // Per-quadrant overrides (sensitivity / detection zone). Each
@@ -320,9 +559,21 @@ public class SurveillanceApiHandler {
             config.put("motionHeatmap", false);
             config.put("filterDebugLog", false);
             config.put("telegramSendStartPing", false);
+            // Tier toggles live on the telegram unified-config section, so
+            // they're available even when SurveillanceConfig isn't loaded.
+            config.put("telegramNotices",
+                    com.overdrive.app.telegram.config.UnifiedTelegramConfig.isTierNotices());
+            config.put("telegramAlerts",
+                    com.overdrive.app.telegram.config.UnifiedTelegramConfig.isTierAlerts());
+            config.put("telegramCritical",
+                    com.overdrive.app.telegram.config.UnifiedTelegramConfig.isTierCritical());
             config.put("shadowFilter", 2);
         }
 
+        // Merge resolved camera profile summary so the diagnostics camera-
+        // mapping dialog can populate role list, current mappings, and
+        // preview candidates in a single round-trip. Failures are non-fatal —
+        // the rest of the config response still ships.
         try {
             com.overdrive.app.camera.ResolvedCameraConfig resolvedCamera =
                 com.overdrive.app.camera.CameraConfigResolver.resolve();
@@ -336,7 +587,7 @@ public class SurveillanceApiHandler {
         } catch (Exception e) {
             CameraDaemon.log("Failed to resolve camera profile summary: " + e.getMessage());
         }
-        
+
         response.put("config", config);
         HttpResponse.sendJson(out, response.toString());
     }
@@ -353,48 +604,74 @@ public class SurveillanceApiHandler {
     
     private static void handleConfigPost(OutputStream out, String body) throws Exception {
         GpuSurveillancePipeline gpuPipeline = CameraDaemon.getGpuPipeline();
-        
+
         try {
             JSONObject configJson = new JSONObject(body);
-            boolean cameraConfigChanged = false;
 
-            if (configJson.has("cameraProfile") || configJson.optBoolean("clearCameraProfile", false)) {
+            // ---- Camera profile selection (vehicle class) ----
+            if (configJson.has("cameraProfile")
+                    || configJson.optBoolean("clearCameraProfile", false)) {
                 String requestedProfile = configJson.optBoolean("clearCameraProfile", false)
                     ? com.overdrive.app.camera.CameraProfiles.PROFILE_AUTO
-                    : configJson.optString("cameraProfile", com.overdrive.app.camera.CameraProfiles.PROFILE_AUTO);
-                if (com.overdrive.app.camera.CameraConfigResolver.saveCameraProfile(requestedProfile)) {
-                    cameraConfigChanged = true;
+                    : configJson.optString("cameraProfile",
+                        com.overdrive.app.camera.CameraProfiles.PROFILE_AUTO);
+                if (com.overdrive.app.camera.CameraConfigResolver
+                        .saveCameraProfile(requestedProfile)) {
                     CameraDaemon.log("Camera profile saved: " + requestedProfile);
                 }
             }
 
+            // ---- Camera role → source mapping (diagnostics camera-mapping dialog) ----
+            // Single-role write: { cameraRoleMapping: { role: "panoFront",
+            //   source: { kind: "panoramicSlice", slice: "slice4" } } }
+            //   - or { kind: "direct", cameraId: 2 }
+            //   - or { kind: "panoramicVirtual", view: "front" }
+            // Or clear: { cameraRoleMapping: { role: "panoFront", clear: true } }
             if (configJson.has("cameraRoleMapping")) {
                 JSONObject mappingJson = configJson.optJSONObject("cameraRoleMapping");
-                if (mappingJson != null) {
-                    com.overdrive.app.camera.CameraRole role = com.overdrive.app.camera.CameraRole
-                        .fromKey(mappingJson.optString("role", null));
-                    if (role != null) {
-                        if (mappingJson.optBoolean("clear", false)) {
-                            if (com.overdrive.app.camera.CameraConfigResolver.clearRoleMapping(role)) {
-                                cameraConfigChanged = true;
-                            }
-                        } else {
-                            com.overdrive.app.camera.CameraSourceRef source = com.overdrive.app.camera.CameraSourceRef
-                                .fromJson(mappingJson.optJSONObject("source"));
-                            if (source != null && com.overdrive.app.camera.CameraConfigResolver.saveRoleMapping(role, source)) {
-                                cameraConfigChanged = true;
-                            }
-                        }
+                if (mappingJson == null) {
+                    HttpResponse.sendJsonError(out, "Invalid cameraRoleMapping payload");
+                    return;
+                }
+                com.overdrive.app.camera.CameraRole role =
+                    com.overdrive.app.camera.CameraRole.fromKey(
+                        mappingJson.optString("role", null));
+                if (role == null) {
+                    HttpResponse.sendJsonError(out,
+                        "Unknown role: " + mappingJson.optString("role", "(missing)"));
+                    return;
+                }
+                if (mappingJson.optBoolean("clear", false)) {
+                    if (!com.overdrive.app.camera.CameraConfigResolver.clearRoleMapping(role)) {
+                        HttpResponse.sendJsonError(out, "Failed to clear role mapping");
+                        return;
+                    }
+                } else {
+                    com.overdrive.app.camera.CameraSourceRef source =
+                        com.overdrive.app.camera.CameraSourceRef.fromJson(
+                            mappingJson.optJSONObject("source"));
+                    if (source == null) {
+                        HttpResponse.sendJsonError(out,
+                            "Invalid or missing source for role " + role.getKey());
+                        return;
+                    }
+                    if (!com.overdrive.app.camera.CameraConfigResolver
+                            .saveRoleMapping(role, source)) {
+                        HttpResponse.sendJsonError(out,
+                            "Failed to save role mapping for " + role.getKey());
+                        return;
                     }
                 }
             }
+
+            // ---- Bulk reset: revert all role mappings to profile defaults ----
             if (configJson.optBoolean("clearCameraRoleMappings", false)) {
-                for (com.overdrive.app.camera.CameraRole role : com.overdrive.app.camera.CameraRole.values()) {
+                for (com.overdrive.app.camera.CameraRole role
+                        : com.overdrive.app.camera.CameraRole.values()) {
                     com.overdrive.app.camera.CameraConfigResolver.clearRoleMapping(role);
                 }
-                cameraConfigChanged = true;
             }
-            
+
             SurveillanceEngineGpu sentry = null;
             if (gpuPipeline != null) {
                 sentry = gpuPipeline.getSentry();
@@ -531,6 +808,64 @@ public class SurveillanceApiHandler {
                     com.overdrive.app.config.UnifiedConfigManager.updateValues(
                             "surveillance", java.util.Collections.singletonMap("deterrentCooldownSeconds", cooldown));
                 }
+            }
+
+            // SOTA: Screen deterrent (independent of cloud deterrent — both can be on)
+            if (configJson.has("screenDeterrentEnabled")) {
+                boolean enabled = configJson.optBoolean("screenDeterrentEnabled", false);
+                com.overdrive.app.config.UnifiedConfigManager.updateValues(
+                        "surveillance", java.util.Collections.singletonMap("screenDeterrentEnabled", enabled));
+                CameraDaemon.log("Screen deterrent enabled: " + enabled);
+                try {
+                    com.overdrive.app.surveillance.ScreenDeterrent.getInstance().reset();
+                } catch (Exception ignored) {}
+            }
+
+            if (configJson.has("screenDeterrentDurationSeconds")) {
+                int dur = configJson.optInt("screenDeterrentDurationSeconds", 8);
+                if (dur >= 3 && dur <= 30) {
+                    com.overdrive.app.config.UnifiedConfigManager.updateValues(
+                            "surveillance", java.util.Collections.singletonMap("screenDeterrentDurationSeconds", dur));
+                }
+            }
+
+            if (configJson.has("screenDeterrentMessage")) {
+                String msg = configJson.optString("screenDeterrentMessage", "");
+                if (msg.length() > 120) msg = msg.substring(0, 120);
+                com.overdrive.app.config.UnifiedConfigManager.updateValues(
+                        "surveillance", java.util.Collections.singletonMap("screenDeterrentMessage", msg));
+            }
+
+            if (configJson.has("clearScreenDeterrentImage") && configJson.optBoolean("clearScreenDeterrentImage", false)) {
+                String existing = com.overdrive.app.config.UnifiedConfigManager.getSurveillance()
+                        .optString("screenDeterrentImagePath", "");
+                // Defense in depth: delete EVERY known-shape file in the
+                // deterrent dir, not just the path UCM points at. This way,
+                // if a previous upload's .tmp leaked or UCM was out of sync
+                // with disk (e.g. the user upgraded mid-upload), Clear
+                // genuinely leaves no asset behind. Path-restriction prevents
+                // any escape from the .overdrive directory.
+                java.io.File dir = new java.io.File(SCREEN_DETERRENT_DIR);
+                if (dir.isDirectory()) {
+                    for (String oldExt : new String[]{"png", "jpg", "jpeg", "webp", "gif"}) {
+                        java.io.File f = new java.io.File(dir, SCREEN_DETERRENT_PREFIX + oldExt);
+                        if (f.exists() && isAllowedDeterrentPath(f.getAbsolutePath())) {
+                            try { f.delete(); } catch (Exception ignored) {}
+                        }
+                        java.io.File t = new java.io.File(dir, SCREEN_DETERRENT_PREFIX + oldExt + ".tmp");
+                        if (t.exists() && isAllowedDeterrentPath(t.getAbsolutePath())) {
+                            try { t.delete(); } catch (Exception ignored) {}
+                        }
+                    }
+                }
+                // Also delete the path UCM points at, in case it's a different
+                // shape than the prefix loop above caught (legacy / migration).
+                if (!existing.isEmpty() && isAllowedDeterrentPath(existing)) {
+                    try { new java.io.File(existing).delete(); } catch (Exception ignored) {}
+                }
+                com.overdrive.app.config.UnifiedConfigManager.updateValues(
+                        "surveillance", java.util.Collections.singletonMap("screenDeterrentImagePath", ""));
+                CameraDaemon.log("Screen deterrent image cleared");
             }
             
             // SOTA: Handle distance slider (1-5) - ONLY controls minObjectSize (AI detection range)
@@ -700,23 +1035,24 @@ public class SurveillanceApiHandler {
                         configJson.optBoolean("telegramSendStartPing", false));
                 configChanged = true;
             }
-            // Per-tier Telegram filter — mirrors push tier toggles. Defaults
-            // (notices=false, alerts=true, critical=true) match the field
-            // initializers on SurveillanceConfig.
+            // Per-tier Telegram filter — persisted in the telegram section
+            // of unified config so NotificationGate.shouldTelegram() picks
+            // the new value up immediately via forceReload(), instead of
+            // waiting for the next camera-daemon restart.
             if (configJson.has("telegramNotices")) {
-                sentryConfig.setTelegramNotices(
+                com.overdrive.app.telegram.config.UnifiedTelegramConfig.setBoolean(
+                        com.overdrive.app.telegram.config.UnifiedTelegramConfig.K_TIER_NOTICES,
                         configJson.optBoolean("telegramNotices", false));
-                configChanged = true;
             }
             if (configJson.has("telegramAlerts")) {
-                sentryConfig.setTelegramAlerts(
+                com.overdrive.app.telegram.config.UnifiedTelegramConfig.setBoolean(
+                        com.overdrive.app.telegram.config.UnifiedTelegramConfig.K_TIER_ALERTS,
                         configJson.optBoolean("telegramAlerts", true));
-                configChanged = true;
             }
             if (configJson.has("telegramCritical")) {
-                sentryConfig.setTelegramCritical(
+                com.overdrive.app.telegram.config.UnifiedTelegramConfig.setBoolean(
+                        com.overdrive.app.telegram.config.UnifiedTelegramConfig.K_TIER_CRITICAL,
                         configJson.optBoolean("telegramCritical", true));
-                configChanged = true;
             }
             
             // Per-quadrant ROI polygons
@@ -877,7 +1213,9 @@ public class SurveillanceApiHandler {
                 }
             }
             
-            // Manual camera ID override
+            // Manual camera ID override. Saved width/height come from the
+            // resolved profile so the persisted record stays self-consistent
+            // (Tang manual-override keeps Tang's 720 height, not Seal's 960).
             if (configJson.has("manualCameraId")) {
                 int camId = configJson.optInt("manualCameraId", -1);
                 if (camId >= 0 && camId <= 5) {
@@ -896,10 +1234,11 @@ public class SurveillanceApiHandler {
                     } catch (Exception e) {
                         CameraDaemon.log("Failed to save manual camera ID: " + e.getMessage());
                     }
-                    cameraConfigChanged = true;
+                    configChanged = true;
                 }
             }
-            if (configJson.has("clearManualCameraId") && configJson.optBoolean("clearManualCameraId", false)) {
+            if (configJson.has("clearManualCameraId")
+                    && configJson.optBoolean("clearManualCameraId", false)) {
                 try {
                     com.overdrive.app.camera.ResolvedCameraConfig resolvedCamera =
                         com.overdrive.app.camera.CameraConfigResolver.resolve();
@@ -915,9 +1254,9 @@ public class SurveillanceApiHandler {
                 } catch (Exception e) {
                     CameraDaemon.log("Failed to clear manual camera ID: " + e.getMessage());
                 }
-                cameraConfigChanged = true;
+                configChanged = true;
             }
-            
+
             if (configChanged) {
                 try {
                     // Apply config to the running surveillance engine
@@ -999,99 +1338,6 @@ public class SurveillanceApiHandler {
             HttpResponse.sendJsonError(out, e.getMessage());
         }
     }
-
-    private static void sendCameraPreview(String path, OutputStream out) throws Exception {
-        com.overdrive.app.camera.ResolvedCameraConfig resolvedCamera =
-            com.overdrive.app.camera.CameraConfigResolver.resolve();
-        String kind = getQueryParam(path, "kind");
-        byte[] jpegBytes = null;
-
-        if ("direct".equalsIgnoreCase(kind)) {
-            int cameraId = safeParseInt(getQueryParam(path, "cameraId"), -1);
-            if (cameraId < 0 || cameraId > 5) {
-                HttpResponse.sendJsonError(out, "Invalid direct camera ID");
-                return;
-            }
-            int width = safeParseInt(getQueryParam(path, "width"), resolvedCamera.getProfile().getDirectPreviewWidth());
-            int height = safeParseInt(getQueryParam(path, "height"), resolvedCamera.getProfile().getDirectPreviewHeight());
-            jpegBytes = com.overdrive.app.camera.CameraPreviewHelper
-                .captureDirectPreviewJpeg(cameraId, width, height);
-        } else if ("panoramicSlice".equalsIgnoreCase(kind)) {
-            com.overdrive.app.camera.PanoramicSlice slice = com.overdrive.app.camera.PanoramicSlice
-                .fromId(getQueryParam(path, "slice"));
-            if (slice == null) {
-                HttpResponse.sendJsonError(out, "Invalid panoramic slice");
-                return;
-            }
-            jpegBytes = com.overdrive.app.camera.CameraPreviewHelper.capturePanoramicSliceJpeg(
-                resolvedCamera.getPanoCameraId(),
-                resolvedCamera.getPanoWidth(),
-                resolvedCamera.getPanoHeight(),
-                slice
-            );
-        } else {
-            com.overdrive.app.camera.CameraVirtualView view = com.overdrive.app.camera.CameraVirtualView
-                .fromId(getQueryParam(path, "view"));
-            if (view == null) {
-                HttpResponse.sendJsonError(out, "Invalid panoramic view");
-                return;
-            }
-            GpuSurveillancePipeline gpuPipeline = CameraDaemon.getGpuPipeline();
-            if (gpuPipeline == null) {
-                HttpResponse.sendJsonError(out, "GPU pipeline unavailable");
-                return;
-            }
-            try {
-                if (!gpuPipeline.isRunning()) {
-                    gpuPipeline.start(false);
-                    Thread.sleep(1200);
-                }
-            } catch (Exception e) {
-                CameraDaemon.log("Camera preview auto-start failed: " + e.getMessage());
-            }
-            if (gpuPipeline.getCamera() != null) {
-                jpegBytes = gpuPipeline.getCamera().getLatestJpegFrame(view.getStreamViewMode());
-            }
-        }
-
-        if (jpegBytes == null || jpegBytes.length == 0) {
-            HttpResponse.sendJsonError(out, "Preview unavailable");
-            return;
-        }
-
-        String header = "HTTP/1.1 200 OK\r\n" +
-                "Content-Type: image/jpeg\r\n" +
-                "Content-Length: " + jpegBytes.length + "\r\n" +
-                "Cache-Control: no-cache\r\n" +
-                "Access-Control-Allow-Origin: *\r\n" +
-                "\r\n";
-        out.write(header.getBytes());
-        out.write(jpegBytes);
-        out.flush();
-    }
-
-    private static String getQueryParam(String path, String key) {
-        if (path == null) return null;
-        int queryStart = path.indexOf('?');
-        if (queryStart < 0 || queryStart >= path.length() - 1) return null;
-        String[] pairs = path.substring(queryStart + 1).split("&");
-        for (String pair : pairs) {
-            String[] kv = pair.split("=", 2);
-            if (kv.length == 2 && key.equalsIgnoreCase(kv[0])) {
-                return java.net.URLDecoder.decode(kv[1], java.nio.charset.StandardCharsets.UTF_8);
-            }
-        }
-        return null;
-    }
-
-    private static int safeParseInt(String value, int defaultValue) {
-        if (value == null) return defaultValue;
-        try {
-            return Integer.parseInt(value);
-        } catch (NumberFormatException e) {
-            return defaultValue;
-        }
-    }
     
     private static void handleEnable(OutputStream out) throws Exception {
         // SOTA: Only persist the preference. Surveillance should only activate on ACC OFF.
@@ -1111,6 +1357,73 @@ public class SurveillanceApiHandler {
     private static void handleDisable(OutputStream out) throws Exception {
         CameraDaemon.disableSurveillance();
         com.overdrive.app.config.UnifiedConfigManager.setSurveillanceEnabled(false);
+        HttpResponse.sendJsonSuccess(out);
+    }
+
+    /**
+     * Graceful pre-restart flush. Called by the camera-mapping dialog
+     * BEFORE killing the daemon, so the running pipeline finalizes any
+     * in-flight recording (writes the MP4 moov atom, flushes the H264
+     * circular buffer, closes encoder + EGL surfaces) instead of being
+     * SIGKILL'd mid-write.
+     *
+     * <p>Synchronous: blocks until pipeline.stop() returns. Bounded by the
+     * pipeline's own teardown timeline (typically 1-2 s) — the dialog's
+     * 4 s read timeout covers it.
+     */
+    private static void handlePrepareRestart(OutputStream out) throws Exception {
+        // Mark shutdown so future cold-start requests fall through to
+        // "Preview unavailable" instead of looping the dialog on 503.
+        // Critical: must be set BEFORE we wait on coldStartInProgress —
+        // otherwise a new sendCameraPreview can start another cold-start
+        // immediately after the existing one releases the flag, and we'd
+        // race in a circle.
+        shutdownInProgress = true;
+        // CAS: take ownership of the cold-start flag. If a panoramic-slice
+        // preview kicked off a cold-start, wait briefly for it to finish
+        // before stop() — running stop() concurrently with start() leaks
+        // encoder/EGL.
+        //
+        // If cold-start is still in flight after 3 s, we ABANDON this
+        // prepare-restart instead of force-taking the flag (which would
+        // race the still-running start and corrupt the encoder anyway).
+        // The dialog proceeds with kill+relaunch; the fresh JVM recovers
+        // cleanly. Worst case: one corrupt MP4 from the kill, no worse
+        // than racing a half-initialized pipeline.
+        long deadline = System.currentTimeMillis() + 3000;
+        boolean tookFlag = false;
+        while (true) {
+            if (coldStartInProgress.compareAndSet(false, true)) {
+                tookFlag = true;
+                break;
+            }
+            if (System.currentTimeMillis() > deadline) {
+                CameraDaemon.log("prepare-restart: cold-start still in flight after 3s — "
+                        + "abandoning graceful stop, dialog will SIGKILL anyway");
+                break;
+            }
+            try {
+                Thread.sleep(50);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+        if (!tookFlag) {
+            HttpResponse.sendJsonSuccess(out);
+            return;
+        }
+        try {
+            GpuSurveillancePipeline pipeline = CameraDaemon.getGpuPipeline();
+            if (pipeline != null && pipeline.isRunning()) {
+                CameraDaemon.log("prepare-restart: stopping pipeline gracefully");
+                pipeline.stop();
+            }
+        } catch (Exception e) {
+            CameraDaemon.log("prepare-restart: pipeline.stop failed: " + e.getMessage());
+        } finally {
+            coldStartInProgress.set(false);
+        }
         HttpResponse.sendJsonSuccess(out);
     }
     
@@ -1359,5 +1672,223 @@ public class SurveillanceApiHandler {
             // Storage not available
         }
         return null;
+    }
+
+    // ==================== Camera-preview cold-start single-flight ====================
+    //
+    // The camera-mapping dialog renders preview tiles in sequence (Prev/Next
+    // navigation, ~2s polling cadence). Without coordination, each unmapped-
+    // pipeline request would call gpuPipeline.start(false) + Thread.sleep on
+    // the HTTP worker; multiple in-flight requests stacked starts and burned
+    // 6+ seconds of HTTP-thread time per dialog open.
+    //
+    // Single-flight gate — first request triggers an async start on a
+    // dedicated executor and returns 503 Retry-After=2s. Subsequent requests
+    // also return 503 until the pipeline is up. No HTTP worker ever blocks on
+    // a HAL warm-up.
+    private static final java.util.concurrent.atomic.AtomicBoolean coldStartInProgress =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
+    // Set by prepare-restart to mark the daemon as "shutting down for a
+    // restart that the dialog is about to SIGKILL through". When true,
+    // requestColdStartAsync returns false → sendCameraPreview falls through
+    // to "Preview unavailable" instead of looping the dialog on 503 while
+    // the daemon dies. The flag isn't cleared on this daemon (the kill is
+    // imminent); the relaunched JVM resets it naturally.
+    private static volatile boolean shutdownInProgress = false;
+    private static final java.util.concurrent.ExecutorService coldStartExecutor =
+        java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "CameraPreviewColdStart");
+            t.setDaemon(true);
+            return t;
+        });
+
+    private static boolean requestColdStartAsync(GpuSurveillancePipeline pipeline) {
+        if (pipeline == null) return false;
+        // If a shutdown is in flight, do not promise the dialog that
+        // warming-up will eventually serve a frame — the daemon is about
+        // to die. Tell sendCameraPreview to send "Preview unavailable" so
+        // the dialog stops polling.
+        if (shutdownInProgress) return false;
+        // CAS: if another cold-start is already in flight, that's fine —
+        // the existing executor task will finish and serve subsequent
+        // requests. Tell caller to send 503 retry.
+        if (!coldStartInProgress.compareAndSet(false, true)) return true;
+        coldStartExecutor.execute(() -> {
+            try {
+                CameraDaemon.log("camera-preview: cold-starting pipeline (single-flight)");
+                pipeline.start(false);
+            } catch (Exception e) {
+                CameraDaemon.log("camera-preview cold start failed: " + e.getMessage());
+            } finally {
+                coldStartInProgress.set(false);
+            }
+        });
+        return true;
+    }
+
+    private static void sendWarmingUp(OutputStream out) throws Exception {
+        String body = "{\"success\":false,\"error\":\"warming-up\",\"retryAfterMs\":2000}";
+        byte[] payload = body.getBytes("UTF-8");
+        String header = "HTTP/1.1 503 Service Unavailable\r\n" +
+                "Content-Type: application/json\r\n" +
+                "Content-Length: " + payload.length + "\r\n" +
+                "Retry-After: 2\r\n" +
+                "Cache-Control: no-cache\r\n" +
+                "Access-Control-Allow-Origin: *\r\n" +
+                "Connection: close\r\n\r\n";
+        out.write(header.getBytes());
+        out.write(payload);
+        out.flush();
+    }
+
+    /**
+     * GET /api/surveillance/camera-preview?kind=&...
+     *
+     * Three preview kinds for the diagnostics camera-mapping dialog:
+     *   kind=direct&cameraId=N[&width=W&height=H]   — direct AVMCamera open;
+     *      refused when surveillance pipeline currently holds the same
+     *      cameraId (multi-claim crashes the BYD HAL — event 1002).
+     *   kind=panoramicSlice&slice=sliceN            — quadrant of the live
+     *      mosaic JPEG published by SurveillanceEngineGpu. Zero camera open,
+     *      zero GL work — volatile read + JPEG decode/crop on HTTP worker.
+     *   kind=panoramic&view=front|right|rear|left   — same as panoramicSlice
+     *      but keyed by virtual view (legacy view-mode mapping).
+     *
+     * On cold pipeline (proximity-guard mode, surveillance idle) the
+     * panoramic kinds trigger a single-flight cold-start and return 503
+     * Retry-After=2s. Direct kind never auto-starts the pipeline.
+     */
+    private static void sendCameraPreview(String path, OutputStream out) throws Exception {
+        com.overdrive.app.camera.ResolvedCameraConfig resolvedCamera =
+            com.overdrive.app.camera.CameraConfigResolver.resolve();
+        String kind = getQueryParam(path, "kind");
+        GpuSurveillancePipeline gpuPipeline = CameraDaemon.getGpuPipeline();
+        byte[] jpegBytes = null;
+
+        if ("direct".equalsIgnoreCase(kind)) {
+            int cameraId = safeParseInt(getQueryParam(path, "cameraId"), -1);
+            if (cameraId < 0 || cameraId > 5) {
+                HttpResponse.sendJsonError(out, "Invalid direct camera ID");
+                return;
+            }
+            int width = safeParseInt(getQueryParam(path, "width"),
+                    resolvedCamera.getProfile().getDirectPreviewWidth());
+            int height = safeParseInt(getQueryParam(path, "height"),
+                    resolvedCamera.getProfile().getDirectPreviewHeight());
+
+            // For the panoramic camera ID, ALWAYS route to the 2x2 mosaic
+            // sampler — never call captureDirectPreviewJpeg. The BYD HAL
+            // delivers a 5120×960 raw strip on this camera ID, and an
+            // ImageReader sized to (1280×960) just squashes the strip
+            // horizontally → wide compressed image, not the 2x2 mosaic
+            // the user expects to see. The mosaic sampler renders the
+            // proper 2560×1920 (Seal) / 2560×1440 (Tang) 2x2 grid via
+            // a sync FBO on its own GL thread (recording-safe).
+            //
+            // Cold-start the pipeline if it's not running (fresh install /
+            // proximity-guard mode before first dialog open).
+            if (cameraId == resolvedCamera.getPanoCameraId() && gpuPipeline != null) {
+                if (!gpuPipeline.isRunning()) {
+                    if (requestColdStartAsync(gpuPipeline)) {
+                        sendWarmingUp(out);
+                        return;
+                    }
+                }
+                if (gpuPipeline.getCamera() != null) {
+                    jpegBytes = gpuPipeline.getCamera().sampleFullResMosaicJpeg();
+                }
+            } else {
+                // Other direct cameras (front-facing, dashcam, cabin, etc.)
+                // are single-feed and ImageReader-sizing works correctly.
+                jpegBytes = com.overdrive.app.camera.CameraPreviewHelper
+                    .captureDirectPreviewJpeg(cameraId, width, height);
+            }
+        } else if ("panoramicSlice".equalsIgnoreCase(kind)) {
+            com.overdrive.app.camera.PanoramicSlice slice =
+                com.overdrive.app.camera.PanoramicSlice.fromId(getQueryParam(path, "slice"));
+            if (slice == null) {
+                HttpResponse.sendJsonError(out, "Invalid panoramic slice");
+                return;
+            }
+            jpegBytes = com.overdrive.app.camera.CameraPreviewHelper.capturePanoramicSliceJpeg(slice);
+            if (jpegBytes == null && gpuPipeline != null) {
+                if (!gpuPipeline.isRunning()) {
+                    if (requestColdStartAsync(gpuPipeline)) {
+                        sendWarmingUp(out);
+                        return;
+                    }
+                }
+                // Pipeline running, capturePanoramicSliceJpeg already tried
+                // both engine-mosaic and high-res slice render via
+                // CameraPreviewHelper. If both came back null the camera
+                // texture isn't bound yet (cold HAL warmup) — tell dialog
+                // to retry.
+                if (jpegBytes == null) {
+                    sendWarmingUp(out);
+                    return;
+                }
+            }
+        } else {
+            com.overdrive.app.camera.CameraVirtualView view =
+                com.overdrive.app.camera.CameraVirtualView.fromId(getQueryParam(path, "view"));
+            if (view == null) {
+                HttpResponse.sendJsonError(out, "Invalid panoramic view");
+                return;
+            }
+            jpegBytes = com.overdrive.app.camera.CameraPreviewHelper.capturePanoramicViewJpeg(view);
+            if (jpegBytes == null && gpuPipeline != null) {
+                boolean cold = !gpuPipeline.isRunning();
+                if (cold && requestColdStartAsync(gpuPipeline)) {
+                    sendWarmingUp(out);
+                    return;
+                }
+                if (!cold) {
+                    sendWarmingUp(out);
+                    return;
+                }
+            }
+        }
+
+        if (jpegBytes == null || jpegBytes.length == 0) {
+            HttpResponse.sendJsonError(out, "Preview unavailable");
+            return;
+        }
+
+        String header = "HTTP/1.1 200 OK\r\n" +
+                "Content-Type: image/jpeg\r\n" +
+                "Content-Length: " + jpegBytes.length + "\r\n" +
+                "Cache-Control: no-cache\r\n" +
+                "Access-Control-Allow-Origin: *\r\n" +
+                "\r\n";
+        out.write(header.getBytes());
+        out.write(jpegBytes);
+        out.flush();
+    }
+
+    private static String getQueryParam(String path, String key) {
+        if (path == null) return null;
+        int queryStart = path.indexOf('?');
+        if (queryStart < 0 || queryStart >= path.length() - 1) return null;
+        String[] pairs = path.substring(queryStart + 1).split("&");
+        for (String pair : pairs) {
+            String[] kv = pair.split("=", 2);
+            if (kv.length == 2 && key.equalsIgnoreCase(kv[0])) {
+                try {
+                    return java.net.URLDecoder.decode(kv[1], "UTF-8");
+                } catch (java.io.UnsupportedEncodingException e) {
+                    return kv[1];
+                }
+            }
+        }
+        return null;
+    }
+
+    private static int safeParseInt(String value, int defaultValue) {
+        if (value == null) return defaultValue;
+        try {
+            return Integer.parseInt(value);
+        } catch (NumberFormatException e) {
+            return defaultValue;
+        }
     }
 }

@@ -28,6 +28,8 @@
     <string name="cd_play_pause">Spiel/Pause</string>
     <string name="cd_player_prev">Voraufnahme.</string>
     <string name="cd_player_next">Nächste Aufnahme</string>
+    <string name="cd_player_maximize">Maximieren Sie den Spieler</string>
+    <string name="cd_player_minimize">Vollbildschirm Ausfahrt</string>
     <string name="cd_delete">Löschen</string>
     <string name="cd_expand">Erweiterung</string>
     <string name="cd_configure">Konfiguration</string>
@@ -63,6 +65,20 @@
     <string name="camera_option_4">Kamera 4</string>
     <string name="camera_option_5">Kamera 5</string>
     <string name="camera_selection_hint">Die Kamera 1 = BYD Seal, Kamera 0 = Atto Trims. Neustart den Daemon, nachdem Sie die Kamera-ID geändert haben, damit die Einstellung wirksam wird.</string>
+    <string name="camera_mapping_title">Kamera-Mapping</string>
+    <string name="camera_role_label">Funktionskartenbildung</string>
+    <string name="camera_candidate_previous">Vorherige</string>
+    <string name="camera_candidate_next">Weiter</string>
+    <string name="camera_preview_unavailable">Eine Vorschau ist noch nicht verfügbar. Versuchen Sie einen anderen Kandidaten oder aktualisieren Sie den Dialog erneut, nachdem der Daemon neu gestartet wurde.</string>
+    <string name="camera_mapping_save">Speichern Sie Kartierung</string>
+    <string name="camera_mapping_clear">Eine klare Rolle</string>
+    <string name="camera_mapping_saved">Kamera-Mapping gespeichert.</string>
+    <string name="camera_mapping_cleared">Kamera-Roll-Mapping gelöscht.</string>
+    <string name="camera_mapping_summary_format">Panoramastrom: Kamera %1$d · %2$dx%3$d</string>
+    <string name="camera_mapping_summary_probing">Panorama-Strom: Vermächtnis-Autodetektion / Sonde</string>
+    <string name="camera_mapping_current_format">Aktuelle Kartierung: %1$s</string>
+    <string name="camera_mapping_current_none">Aktuelle Kartierung: automatisch / standardmäßig</string>
+    <string name="camera_mapping_hint">OverDrive behält das vergangene Startup-Verhalten standardmäßig, aber jetzt können Sie den zusammengesetzten Panorama-Strip ordnungsgemäß kalibrieren. Vorlesen Sie jede rohe zusammengesetzte Scheibe, mappen Sie die logischen 360-Rollen auf die Scheibe, die tatsächlich vorne/rechts/hinter/links auf Ihrem Fahrzeug zeigt, und der Daemon wird dieses Layout nach dem Neustart für Aufnahme, Streaming und KI wiederverwenden.</string>
     <string name="dashboard_scan_to_connect">Scan für die Verbindung</string>
     <string name="dashboard_qr_waiting">Ich warte auf den Tunnel...</string>
     <string name="dashboard_daemons_running_default">0/5 Laufen</string>
@@ -216,6 +232,8 @@
     <string name="toast_restarting_camera_daemon">Der Kamera-Demon neu starten...</string>
     <string name="toast_camera_daemon_restarting">Kamera-Demon mit voller Sonde neu gestartet</string>
     <string name="toast_camera_restart_failed">Konfiguration gelöscht, aber Daemon-Wiederstart gescheitert. Bitte manuell neu starten.</string>
+    <string name="toast_camera_settings_saved_restarting">Kamera-Einstellungen gespeichert  Neustart Kamera-Demon...</string>
+    <string name="toast_camera_settings_restart_failed">Die Kamera-Einstellungen wurden gespeichert, aber der Daemon-Wiederstart ist gescheitert.</string>
     <string name="toast_failed_with_message_x">Versagt: %1$s</string>
     <string name="toast_soh_reset_success">SOH-Schätzungsreset  wird aus den nächsten Daten neu berechnet</string>
     <string name="toast_soh_reset_failed_no_daemon">Wiederherstellen fehlgeschlagen  Daemon nicht reagieren und Datei nicht schreibbar</string>
@@ -273,6 +291,14 @@
     <string name="tunnel_label_cloudflared">Wolkenblatt</string>
     <string name="tunnel_label_zrok">Zrok</string>
     <string name="tunnel_label_tailscale">Tailscale</string>
+    <string name="daemon_name_camera">Kamera-Daemon</string>
+    <string name="daemon_name_surveillance">Überwachungs-Daemon</string>
+    <string name="daemon_name_acc_surveillance">ACC Überwachung</string>
+    <string name="daemon_name_singbox">Sing-box Proxy</string>
+    <string name="daemon_name_cloudflared">Cloudflared Tunnel</string>
+    <string name="daemon_name_zrok">Zrok Tunnel</string>
+    <string name="daemon_name_tailscale">Tailscale Tunnel</string>
+    <string name="daemon_name_telegram">Telegram Bot</string>
     <string name="clip_label_access_code">Zugriffscode</string>
     <string name="clip_label_url">URL</string>
     <string name="toast_no_config_needed">Keine Konfiguration für %1$s erforderlich</string>

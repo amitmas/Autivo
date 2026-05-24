@@ -29,6 +29,7 @@ import com.overdrive.app.ui.dashboard.DashboardInsightProvider
 import com.overdrive.app.ui.model.DaemonState
 import com.overdrive.app.ui.model.DaemonStatus
 import com.overdrive.app.ui.model.DaemonType
+import com.overdrive.app.ui.model.localizedName
 import com.overdrive.app.ui.util.QrCodeGenerator
 import com.overdrive.app.ui.util.RecordingScanner
 import com.overdrive.app.ui.viewmodel.DaemonsViewModel
@@ -705,7 +706,7 @@ class DashboardFragment : Fragment() {
         DaemonType.CLOUDFLARED_TUNNEL -> getString(R.string.tunnel_label_cloudflared)
         DaemonType.ZROK_TUNNEL -> getString(R.string.tunnel_label_zrok)
         DaemonType.TAILSCALE_TUNNEL -> getString(R.string.tunnel_label_tailscale)
-        else -> type.displayName
+        else -> type.localizedName(requireContext())
     }
 
     private fun renderQr(url: String?) {

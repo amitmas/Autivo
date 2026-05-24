@@ -28,6 +28,8 @@
     <string name="cd_play_pause">播放/休息</string>
     <string name="cd_player_prev">上一个录制</string>
     <string name="cd_player_next">下一个录制</string>
+    <string name="cd_player_maximize">最大化玩家</string>
+    <string name="cd_player_minimize">出口全屏幕</string>
     <string name="cd_delete">删除</string>
     <string name="cd_expand">扩展</string>
     <string name="cd_configure">配置</string>
@@ -63,6 +65,20 @@
     <string name="camera_option_4">摄像头4</string>
     <string name="camera_option_5">摄像头5</string>
     <string name="camera_selection_hint">机器自动选择适合您的装饰的相机.相机1=BYD Seal,相机0=Atto装饰. 改变相机的身份证后重新启动.</string>
+    <string name="camera_mapping_title">摄像机映射</string>
+    <string name="camera_role_label">角色映射</string>
+    <string name="camera_candidate_previous">上一篇:</string>
+    <string name="camera_candidate_next">下一步</string>
+    <string name="camera_preview_unavailable">预览暂未可用. 试试另一个候选人或更新,在妖怪重新启动后重新打开对话框.</string>
+    <string name="camera_mapping_save">保存地图</string>
+    <string name="camera_mapping_clear">显而易见的作用</string>
+    <string name="camera_mapping_saved">摄像机的映射保存.</string>
+    <string name="camera_mapping_cleared">摄像头角色映射清除.</string>
+    <string name="camera_mapping_summary_format">全景流:摄像头%1$d ·%2$dx%3$d</string>
+    <string name="camera_mapping_summary_probing">全景流:遗产自动检测/探测</string>
+    <string name="camera_mapping_current_format">电流映射:%1$s</string>
+    <string name="camera_mapping_current_none">当前映射:自动 /默认</string>
+    <string name="camera_mapping_hint">OverDrive默认保留了传统的启动行为,但现在允许您正确校准合并的全景带. 预览每个原始合并的片段,将逻辑的360角色映射到实际显示车辆前/右/后/左的片段,然后恶魔将重新使用该布局进行录音,流媒体和AI重新启动后.</string>
     <string name="dashboard_scan_to_connect">扫描到连接</string>
     <string name="dashboard_qr_waiting">等待道...</string>
     <string name="dashboard_daemons_running_default">0/5 运行</string>
@@ -216,6 +232,8 @@
     <string name="toast_restarting_camera_daemon">重新启动摄像头妖怪...</string>
     <string name="toast_camera_daemon_restarting">摄像头子重新启动</string>
     <string name="toast_camera_restart_failed">配置已清除,但 daemon 重启失败.请手动重启.</string>
+    <string name="toast_camera_settings_saved_restarting">保存了摄像头设置,重新启动了摄像头...</string>
+    <string name="toast_camera_settings_restart_failed">摄像头设置被保存了,但 daemon 重启失败了.请手动重启.</string>
     <string name="toast_failed_with_message_x">失败:%1$s</string>
     <string name="toast_soh_reset_success">SOH估计重置 将从下一个数据中重新计算</string>
     <string name="toast_soh_reset_failed_no_daemon">重置失败 魔鬼不响应和文件无法编写</string>
@@ -273,6 +291,14 @@
     <string name="tunnel_label_cloudflared">云的</string>
     <string name="tunnel_label_zrok">Zrok</string>
     <string name="tunnel_label_tailscale">Tailscale</string>
+    <string name="daemon_name_camera">摄像头 Daemon</string>
+    <string name="daemon_name_surveillance">监控 Daemon</string>
+    <string name="daemon_name_acc_surveillance">ACC 监控</string>
+    <string name="daemon_name_singbox">Sing-box 代理</string>
+    <string name="daemon_name_cloudflared">Cloudflared 隧道</string>
+    <string name="daemon_name_zrok">Zrok 隧道</string>
+    <string name="daemon_name_tailscale">Tailscale 隧道</string>
+    <string name="daemon_name_telegram">Telegram 机器人</string>
     <string name="clip_label_access_code">访问代码</string>
     <string name="clip_label_url">URL</string>
     <string name="toast_no_config_needed">对于%1$s没有配置</string>

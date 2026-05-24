@@ -4,6 +4,9 @@ import com.overdrive.app.camera.CameraProfiles
 
 /**
  * Shared constants for the BYD Champ application.
+ *
+ * Panoramic dimensions default to the legacy Seal/Atto profile. Runtime
+ * geometry is resolved per vehicle via CameraConfigResolver.
  */
 object Constants {
     
@@ -17,10 +20,10 @@ object Constants {
     const val DEFAULT_OUTPUT_DIR = "/sdcard/DCIM/BYDCam"
     const val LOG_DIR = "/data/local/tmp"
     
-    // Camera Configuration
-    val PANO_WIDTH = CameraProfiles.getLegacyDefault().panoWidth
+    // Camera Configuration (legacy Seal/Atto defaults)
+    val PANO_WIDTH  = CameraProfiles.getLegacyDefault().panoWidth
     val PANO_HEIGHT = CameraProfiles.getLegacyDefault().panoHeight
-    val VIEW_WIDTH = PANO_WIDTH / 4
+    val VIEW_WIDTH  = PANO_WIDTH / 4
     val VIEW_HEIGHT = PANO_HEIGHT
     const val FRAME_RATE = 25
     const val BITRATE = 4_000_000
@@ -35,7 +38,11 @@ object Constants {
     const val STREAM_JPEG_QUALITY = 40
     const val STREAM_INTERVAL_MS = 100L
     
-    // VPS Configuration - removed for open source release
+    // VPS Configuration - REMOVED (keeping only for reference)
+    // const val VPS_API_URL = "http://35.211.235.83/api/device"
+    // const val RTMP_BASE_URL = "rtmp://35.211.235.83:1935/live"
+    // const val PUBLISHER_PASSWORD = "byd-cam-secret-2024"
+    // const val HEARTBEAT_INTERVAL_MS = 30_000L
     
     // Timeouts
     const val DAEMON_START_TIMEOUT_MS = 10_000L

@@ -65,6 +65,20 @@
     <string name="camera_option_4">กล้อง 4</string>
     <string name="camera_option_5">กล้อง 5</string>
     <string name="camera_selection_hint">โหมดอัตโนมัติจะเลือกกล้องให้เหมาะกับรุ่นรถของคุณทุกครั้งที่เปิดเครื่อง กล้อง 1 = BYD Seal, กล้อง 0 = รุ่น Atto ต้องรีสตาร์ทระบบเบื้องหลัง (Daemon) หลังเปลี่ยน ID กล้องเพื่อให้การตั้งค่ามีผล</string>
+    <string name="camera_mapping_title">แผนที่กล้อง</string>
+    <string name="camera_role_label">แผนที่บทบาท</string>
+    <string name="camera_candidate_previous">ก่อนหน้านี้</string>
+    <string name="camera_candidate_next">ถัดไป</string>
+    <string name="camera_preview_unavailable">ภาพล่วงหน้ายังไม่มี ลองสมัครคนใหม่หรืออัพเดทใหม่ โดยเปิดหน้าโต้ตอบอีกครั้งหลังจาก daemon restarts</string>
+    <string name="camera_mapping_save">เก็บแผนที่</string>
+    <string name="camera_mapping_clear">รับบทที่ชัดเจน</string>
+    <string name="camera_mapping_saved">แผนที่กล้องเก็บไว้</string>
+    <string name="camera_mapping_cleared">แผนที่หน้าที่กล้องเรียบร้อย</string>
+    <string name="camera_mapping_summary_format">ช่องทาง Panoramic Stream: กล้อง %1$d · %2$dx%3$d</string>
+    <string name="camera_mapping_summary_probing">แหล่งทัศน์: การตรวจสอบอัตโนมัติ / ตรวจสอบอัตโนมัติ</string>
+    <string name="camera_mapping_current_format">แผนที่ปัจจุบัน: %1$s</string>
+    <string name="camera_mapping_current_none">แผนที่ปัจจุบัน: อัตโนมัติ / แผนที่ตั้ง</string>
+    <string name="camera_mapping_hint">OverDrive รักษาพฤติกรรมการเริ่มต้นที่เดิมโดย मुलभूत แต่ตอนนี้คุณสามารถปรับระดับกระดาษปานอารามิกที่ผสมกันได้อย่างถูกต้อง ดูก่อนฉากผสมละเอียดละเอียดละเอียดละเอียดละเอียดละเอียดละเอียดละเอียดละเอียดละเอียดละเอียดละเอียดละเอียดละเอียดละเอียดละเอียดละเอียดละเอียดละเอียดละเอียดละเอียดละเอียดละเอียดละเอียดละเอียดละเอียดละเอียดละเอียดละเอียดละเอียดละเอียดละเอียดละเอียดละเอียดละเอียดละเอียดละเอียดละเอียดละเอียดละเอียดละเอียดละเอียดละเอียดละเอียดละเอียดละเอียดละเอียด</string>
     <string name="dashboard_scan_to_connect">สแกนเพื่อเชื่อมต่อ</string>
     <string name="dashboard_qr_waiting">กำลังรอ Tunnel…</string>
     <string name="dashboard_daemons_running_default">ทำงาน 0/5</string>
@@ -218,6 +232,8 @@
     <string name="toast_restarting_camera_daemon">กำลังรีสตาร์ทระบบกล้อง…</string>
     <string name="toast_camera_daemon_restarting">ระบบกล้องกำลังรีสตาร์ทพร้อมตรวจสอบใหม่เต็มรูปแบบ</string>
     <string name="toast_camera_restart_failed">ล้างการตั้งค่าแล้ว แต่รีสตาร์ทระบบเบื้องหลังไม่สำเร็จ กรุณารีสตาร์ทด้วยตัวเอง</string>
+    <string name="toast_camera_settings_saved_restarting">การตั้งค่ากล้องถูกบันทึก  restarting camera daemon ...</string>
+    <string name="toast_camera_settings_restart_failed">การตั้งค่ากล้องถูกบันทึกไว้ แต่การเริ่มต้นใหม่ของ Daemon ได้ล้มเหลว</string>
     <string name="toast_failed_with_message_x">ล้มเหลว: %1$s</string>
     <string name="toast_soh_reset_success">รีเซ็ตค่า SOH แล้ว — ระบบจะคำนวณใหม่จากข้อมูลรอบหน้า</string>
     <string name="toast_soh_reset_failed_no_daemon">รีเซ็ตไม่สำเร็จ — ระบบเบื้องหลังไม่ตอบสนองและไฟล์เขียนไม่ได้</string>
@@ -275,6 +291,14 @@
     <string name="tunnel_label_cloudflared">Cloudflared</string>
     <string name="tunnel_label_zrok">Zrok</string>
     <string name="tunnel_label_tailscale">Tailscale</string>
+    <string name="daemon_name_camera">กล้อง Daemon</string>
+    <string name="daemon_name_surveillance">Daemon การสังเกต</string>
+    <string name="daemon_name_acc_surveillance">ACC การติดตาม</string>
+    <string name="daemon_name_singbox">Sing-box Proxy</string>
+    <string name="daemon_name_cloudflared">อุโมงค์ Cloudflared</string>
+    <string name="daemon_name_zrok">เส้นทาง Zrok</string>
+    <string name="daemon_name_tailscale">เส้นทาง Tailscale</string>
+    <string name="daemon_name_telegram">โบ๊ต Telegram</string>
     <string name="clip_label_access_code">รหัสเข้าถึง</string>
     <string name="clip_label_url">URL</string>
     <string name="toast_no_config_needed">ไม่ต้องตั้งค่าสำหรับ %1$s</string>
@@ -379,16 +403,16 @@
     <string name="settings_about_open_link_copied">หาเบราว์เซอร์ไม่เจอ คัดลอก URL แล้ว: %1$s</string>
     <string name="settings_about_support_kofi_title">สนับสนุนเวอร์ชันถัดไป ☕</string>
     <string name="settings_about_support_kofi_value">เลี้ยงกาแฟเราใน Ko-fi สักแก้ว จะได้มีแรงตื่นมาเขียนโค้ดต่อ</string>
-    <string name="settings_about_support_kofi_url" translatable="false">https://ko-fi.com/E1E71XALHX</string>
+    <string name="settings_about_support_kofi_url">https://ko-fi.com/E1E71XALHX</string>
     <string name="settings_about_license_title">ไลเซนส์</string>
     <string name="settings_about_license_value">MIT — Open Source กดดูเต็มๆ ได้เลย</string>
     <string name="settings_about_source_title">ซอร์สโค้ด (Source Code)</string>
     <string name="settings_about_source_value">github.com/yash-srivastava/Overdrive-release</string>
-    <string name="settings_about_license_url" translatable="false">https://github.com/yash-srivastava/Overdrive-release/blob/main/LICENSE</string>
-    <string name="settings_about_source_url" translatable="false">https://github.com/yash-srivastava/Overdrive-release</string>
+    <string name="settings_about_license_url">https://github.com/yash-srivastava/Overdrive-release/blob/main/LICENSE</string>
+    <string name="settings_about_source_url">https://github.com/yash-srivastava/Overdrive-release</string>
     <string name="settings_about_star_title">ไปกด ⭐ ให้ใน GitHub หน่อย</string>
     <string name="settings_about_star_value">ใช้เวลาแค่แป๊บเดียว แต่มันมีความหมายกับคนทำมากนะ</string>
-    <string name="settings_about_star_url" translatable="false">https://github.com/yash-srivastava/Overdrive-release</string>
+    <string name="settings_about_star_url">https://github.com/yash-srivastava/Overdrive-release</string>
     <string name="settings_about_thanks_title">ขอบคุณ</string>
     <string name="settings_about_thanks_subtitle">แอปนี้สร้างขึ้นมาได้เพราะความช่วยเหลือจากผู้ร่วมพัฒนาและคนสนับสนุนทุกคนเลยนะ</string>
     <string name="settings_about_contributors_title">ผู้ร่วมพัฒนา</string>
@@ -559,5 +583,4 @@
         <item quantity="one">%1$d ชม.</item>
         <item quantity="other">%1$d ชม.</item>
     </plurals>
-
 </resources>

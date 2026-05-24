@@ -338,6 +338,21 @@
         }, 1500);
     }
 
+    // Stall detection: track when the download percent last changed so we
+    // can replace the message with a stall hint after 60s of no progress.
+    // Reset when phase changes off downloading (so verify/install don't
+    // count their own pauses as stalls).
+    var _lastDlPercent = -2;
+    var _lastDlPercentAt = 0;
+    // Bar latch: once the download hits 100, hold the bar at 100 across
+    // the verify → stopping → installing transitions even though the
+    // backend reports percent=-1 for those phases. Without the latch, the
+    // bar visibly snaps from 100% to indeterminate-shimmer the moment the
+    // phase flips, which reads as "the bar broke" right after a successful
+    // download. The latch is dropped if we ever come back to a
+    // determinate downloading state (retry case).
+    var _holdAt100 = false;
+
     function renderProgress(p) {
         var phaseEl = $('updPhase');
         var msgEl = $('updMsg');
@@ -353,12 +368,46 @@
             error:            BYD.i18n.t('update.phase_error')
         };
         phaseEl.textContent = phaseLabels[p.phase] || p.phase || '';
-        if (msgEl) msgEl.textContent = p.message || '';
+
+        var msg = p.message || '';
+        // Stall hint while downloading. The poll runs every 1.5s so a
+        // genuine slow download still ticks; only a stuck transfer goes
+        // 60s without a percent change.
+        if (p.phase === 'downloading') {
+            var now = Date.now();
+            if (typeof p.percent === 'number' && p.percent !== _lastDlPercent) {
+                _lastDlPercent = p.percent;
+                _lastDlPercentAt = now;
+            } else if (_lastDlPercentAt === 0) {
+                _lastDlPercentAt = now;
+            }
+            if (now - _lastDlPercentAt > 60000) {
+                msg = BYD.i18n.t('update.download_stalled') ||
+                      'Download seems stuck — check the head unit’s connection or retry.';
+            }
+        } else {
+            // Reset the watch so a slow verify/install phase doesn't
+            // inherit the download's stall timer.
+            _lastDlPercent = -2;
+            _lastDlPercentAt = 0;
+        }
+        if (msgEl) msgEl.textContent = msg;
+
+        // Track whether we should latch at 100% for the post-download phases.
+        if (p.phase === 'downloading' && typeof p.percent === 'number' && p.percent >= 100) {
+            _holdAt100 = true;
+        } else if (p.phase === 'downloading' && typeof p.percent === 'number' && p.percent >= 0 && p.percent < 100) {
+            // Came back to determinate downloading (e.g. user clicked Retry).
+            _holdAt100 = false;
+        }
 
         if (fillEl) {
             if (typeof p.percent === 'number' && p.percent >= 0) {
                 fillEl.classList.remove('indeterminate');
                 fillEl.style.width = p.percent + '%';
+            } else if (_holdAt100 && p.phase !== 'error' && p.phase !== 'idle') {
+                fillEl.classList.remove('indeterminate');
+                fillEl.style.width = '100%';
             } else {
                 fillEl.classList.add('indeterminate');
             }

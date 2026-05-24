@@ -387,16 +387,23 @@ public class TripAnalyticsManager {
             if (energyUsed <= 0 && trip.socStart > 0 && trip.socEnd > 0 && trip.socStart > trip.socEnd) {
                 double nominalKwh = 0;
                 try {
-                    com.overdrive.app.abrp.SohEstimator soh = 
+                    com.overdrive.app.abrp.SohEstimator soh =
                         com.overdrive.app.monitor.SocHistoryDatabase.getInstance().getSohEstimator();
                     if (soh != null && soh.getNominalCapacityKwh() > 0) {
                         nominalKwh = soh.getNominalCapacityKwh();
-                        double sohPercent = soh.hasEstimate() ? soh.getCurrentSoh() : 100.0;
-                        // Actual usable capacity = nominal × SOH
+                        // BYD packs are LFP (Blade) and hold ≥98% SOH for the
+                        // first ~1500 cycles, so 100% is a fair default until
+                        // a live estimate seeds. The earlier 95% guess
+                        // would have under-reported energy/cost on fresh
+                        // packs. Note in the log when SOH is unseeded so a
+                        // wrong number can be traced back to this branch.
+                        boolean hasSoh = soh.hasEstimate();
+                        double sohPercent = hasSoh ? soh.getCurrentSoh() : 100.0;
                         double usableKwh = nominalKwh * (sohPercent / 100.0);
                         energyUsed = ((trip.socStart - trip.socEnd) / 100.0) * usableKwh;
-                        logger.info(String.format("Energy estimated from SoC: %.1f%% → %.1f%% = %.2f kWh (nominal=%.1f, SOH=%.1f%%)",
-                                trip.socStart, trip.socEnd, energyUsed, nominalKwh, sohPercent));
+                        logger.info(String.format("Energy estimated from SoC: %.1f%% → %.1f%% = %.2f kWh (nominal=%.1f, SOH=%.1f%%%s)",
+                                trip.socStart, trip.socEnd, energyUsed, nominalKwh, sohPercent,
+                                hasSoh ? "" : ", default — no SOH seeded yet (LFP)"));
                     }
                 } catch (Exception e) {
                     logger.warn("SohEstimator not available for energy estimation: " + e.getMessage());

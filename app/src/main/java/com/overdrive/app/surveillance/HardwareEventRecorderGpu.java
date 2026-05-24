@@ -140,36 +140,120 @@ public class HardwareEventRecorderGpu {
     // (which can be 50-100ms during garbage collection) from blocking the encoder,
     // which would cause the GPU to stall and drop camera frames.
     //
-    // Capacity reasoning: at worst-case 30 fps × ~256KB per packet, 300 entries
-    // = ~75 MB ceiling. SD stalls beyond ~10 seconds at 30 fps drop oldest
-    // non-keyframes (drop-policy in offerMuxerPacket). Daemon stays alive
-    // instead of OOMing.
-    private static final int MUXER_WRITE_QUEUE_CAPACITY = 300;
+    // Capacity reasoning (post-RC7): doubled from 300 to 600 because the
+    // original ceiling produced eglSwap backpressure when an SD-card delete
+    // burst (e.g. cleanup of 19 files / 118 MB observed in field logs) ran
+    // alongside the encoder writes. With RC5/RC8 we now defer cleanup during
+    // recording, but a real-world segment rotation (~50-200 ms muxer-stop
+    // pause) plus periodic GC pauses can still produce 5-15 frame backlogs
+    // at 30 fps. 600 entries × ~256 KB worst-case ≈ 150 MB ceiling — paid
+    // only under sustained backpressure that the drop-policy will reduce
+    // anyway. Memory cost is bounded by the pool's actual usage, not the
+    // capacity, so steady-state RAM is unchanged.
+    private static final int MUXER_WRITE_QUEUE_CAPACITY = 600;
 
-    private static class MuxerPacket {
-        final ByteBuffer data;
-        final MediaCodec.BufferInfo info;
-        MuxerPacket(ByteBuffer src, MediaCodec.BufferInfo srcInfo) {
-            // Deep copy — the encoder buffer is released immediately after
-            data = ByteBuffer.allocateDirect(srcInfo.size);
-            src.position(srcInfo.offset);
-            src.limit(srcInfo.offset + srcInfo.size);
-            data.put(src);
-            data.flip();
-            info = new MediaCodec.BufferInfo();
-            info.set(0, srcInfo.size, srcInfo.presentationTimeUs, srcInfo.flags);
-        }
+    /**
+     * Pooled muxer packet. Direct ByteBuffer allocation is the JNI hop that
+     * stalls the drainer on Adreno+lowmem hardware (5–50 ms native heap walk
+     * during a 76-packet pre-record flush). The pool reuses fixed-capacity
+     * direct buffers and only grows when a packet exceeds every existing
+     * pool slot — which is rare in steady state.
+     *
+     * Pool ownership: the drainer thread acquires (or grows) a packet via
+     * {@link #acquireMuxerPacket}, copies encoded bytes into it, and pushes
+     * to {@link #muxerWriteQueue}. The disk writer thread pulls, calls
+     * {@link MediaMuxer#writeSampleData}, then returns the packet via
+     * {@link #releaseMuxerPacket}. The drop-policy in offerMuxerPacket
+     * also returns evicted packets to the pool.
+     */
+    private static final class MuxerPacket {
+        ByteBuffer data;             // direct buffer, capacity == pool slot size
+        final MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+        int payloadSize;             // valid byte count inside data
 
         boolean isKeyFrame() {
             return (info.flags & MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0;
         }
+
+        /** Reset position/limit to expose the payload to MediaMuxer. */
+        void rewindForWrite() {
+            data.position(0);
+            data.limit(payloadSize);
+        }
     }
+
+    // Lock-free pool. Per-packet ceiling for the live encoder output mirrors
+    // the H264CircularBuffer's per-bitrate sizing — 1 MB hard cap covers
+    // worst-case 10 Mbps H.265 IDRs at 2560×1920. Pool grows on miss but
+    // never shrinks, bounding peak native heap to MUXER_WRITE_QUEUE_CAPACITY
+    // packets × 1 MB = 600 MB worst case (paid only under sustained
+    // backpressure; steady state is far smaller).
+    private static final int MUXER_PACKET_CEILING = 1024 * 1024;
+    private final java.util.concurrent.ConcurrentLinkedDeque<MuxerPacket> muxerPacketPool =
+        new java.util.concurrent.ConcurrentLinkedDeque<>();
+
+    private MuxerPacket acquireMuxerPacket(int requiredSize) {
+        // Walk pool looking for a packet whose buffer is large enough.
+        // ConcurrentLinkedDeque iteration is weakly consistent which is fine
+        // here — worst case we miss a fitting slot and allocate. The pool
+        // grows monotonically so misses become rare.
+        java.util.Iterator<MuxerPacket> it = muxerPacketPool.iterator();
+        while (it.hasNext()) {
+            MuxerPacket p = it.next();
+            if (p.data != null && p.data.capacity() >= requiredSize) {
+                if (muxerPacketPool.remove(p)) {
+                    return p;
+                }
+            }
+        }
+        // None fit — allocate a fresh packet sized to ceiling so future
+        // packets reuse it without re-allocating.
+        MuxerPacket fresh = new MuxerPacket();
+        int cap = Math.max(requiredSize, Math.min(MUXER_PACKET_CEILING, requiredSize * 2));
+        fresh.data = ByteBuffer.allocateDirect(cap);
+        return fresh;
+    }
+
+    private void releaseMuxerPacket(MuxerPacket p) {
+        if (p == null || p.data == null) return;
+        p.data.clear();
+        p.payloadSize = 0;
+        p.info.set(0, 0, 0, 0);
+        muxerPacketPool.offer(p);
+    }
+
+    private void fillMuxerPacket(MuxerPacket dst, ByteBuffer src, MediaCodec.BufferInfo srcInfo) {
+        dst.data.clear();
+        src.position(srcInfo.offset);
+        src.limit(srcInfo.offset + srcInfo.size);
+        dst.data.put(src);
+        dst.data.flip();
+        dst.payloadSize = srcInfo.size;
+        dst.info.set(0, srcInfo.size, srcInfo.presentationTimeUs, srcInfo.flags);
+    }
+
     // Use Deque for drop-oldest semantics. Bounded capacity prevents unbounded
-    // growth under SD-card backpressure.
+    // growth under SD-card backpressure. take() in the disk writer wakes
+    // immediately on push — no 4 ms poll-loop latency.
     private final java.util.concurrent.LinkedBlockingDeque<MuxerPacket> muxerWriteQueue =
         new java.util.concurrent.LinkedBlockingDeque<>(MUXER_WRITE_QUEUE_CAPACITY);
     private final java.util.concurrent.atomic.AtomicLong muxerDropCount =
         new java.util.concurrent.atomic.AtomicLong(0);
+
+    /**
+     * In-flight finalizer count. Bumped at the head of finalizeOldSegmentAsync,
+     * decremented in its finally block. closeEventRecording / release() drain
+     * this to zero (with timeout) so the caller can be sure no background
+     * thread is still holding a stale muxer or about to fire onFileSaved on
+     * a torn-down pipeline.
+     *
+     * Without this guard, a stop+restart cycle within ~150 ms of a rotation
+     * tick can race the finalizer's rename → onFileSaved into the new
+     * encoder's lifecycle (RC-audit Finding R1).
+     */
+    private final java.util.concurrent.atomic.AtomicInteger inFlightFinalizers =
+        new java.util.concurrent.atomic.AtomicInteger(0);
+    private final Object finalizerJoinLock = new Object();
 
     /**
      * Add a packet to the muxer write queue. If the queue is full, drop the
@@ -184,22 +268,27 @@ public class HardwareEventRecorderGpu {
         if (muxerWriteQueue.offer(packet)) {
             return;
         }
-        // Queue full. Walk from the head looking for a non-keyframe to drop.
+        // Queue full. Walk from the head looking for a non-keyframe to drop;
+        // dropped packets are returned to the pool so their direct buffer is
+        // reused immediately by the very packet trying to enter the queue.
         java.util.Iterator<MuxerPacket> it = muxerWriteQueue.iterator();
-        boolean dropped = false;
+        MuxerPacket evicted = null;
         while (it.hasNext()) {
             MuxerPacket head = it.next();
             if (!head.isKeyFrame()) {
                 it.remove();
-                dropped = true;
+                evicted = head;
                 break;
             }
         }
-        if (!dropped) {
+        if (evicted == null) {
             // All entries are keyframes — drop the oldest. This only happens
             // under multi-second SD stalls; the recording will have a gap
             // but the daemon stays alive.
-            muxerWriteQueue.pollFirst();
+            evicted = muxerWriteQueue.pollFirst();
+        }
+        if (evicted != null) {
+            releaseMuxerPacket(evicted);
         }
         // Now there's space.
         muxerWriteQueue.offer(packet);
@@ -341,7 +430,13 @@ public class HardwareEventRecorderGpu {
         format.setInteger(MediaFormat.KEY_BIT_RATE, bitrate);
         format.setInteger(MediaFormat.KEY_FRAME_RATE, fps);
         format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2);  // I-frame every 2 seconds
-        
+
+        // Bitrate mode left to encoder default (typically VBR). CBR was tried
+        // but caused recordings to freeze 5-6s in on the BYD DiLink 5.0 H.265
+        // encoder — the platform encoder doesn't honor the explicit
+        // BITRATE_MODE_CBR cleanly and produces malformed bitstream that
+        // stalls subsequent frames. Reverted.
+
         // Set max input size to prevent Qualcomm crashes
         format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, width * height * 3 / 2);
         
@@ -351,6 +446,28 @@ public class HardwareEventRecorderGpu {
             format.setInteger(MediaFormat.KEY_PRIORITY, 0);
         } catch (Exception e) {
             // Ignore if not supported
+        }
+
+        // KEY_OPERATING_RATE pins the platform encoder's processing rate to
+        // the configured fps. Without this, the SoC governor can briefly
+        // downclock the encoder/GPU between frames, causing periodic 100-200ms
+        // output gaps that propagate as eglSwap stalls (the encoder's input
+        // pool fills behind a transiently-slowed encode pipeline).
+        //
+        // Setting this to fps ≥ KEY_FRAME_RATE tells the encoder "commit to
+        // sustaining at least this throughput" — Qualcomm/Snapdragon platforms
+        // honor this by holding the encoder hardware at full frequency for
+        // the duration of the recording. Cost: marginally higher power; that
+        // tradeoff is correct here because we already have the encoder
+        // running continuously for the pre-record buffer.
+        //
+        // Available since API 23 (we're targeting min 28). Wrapped in try
+        // so non-Qualcomm or older platforms gracefully ignore it.
+        try {
+            format.setInteger(MediaFormat.KEY_OPERATING_RATE, fps);
+            logger.info("Encoder OPERATING_RATE pinned at " + fps);
+        } catch (Throwable t) {
+            logger.warn("Could not set OPERATING_RATE: " + t.getMessage());
         }
         
         // H.265 specific optimizations for Snapdragon 665
@@ -538,14 +655,27 @@ public class HardwareEventRecorderGpu {
                 // triggers emergency allocations under sustained load.
                 if (sharedPreRecordBuffer == null) {
                     logger.info("Allocating NEW pre-record buffer (" + desiredSec
-                        + " sec @ " + fps + "fps)...");
-                    sharedPreRecordBuffer = new H264CircularBuffer(desiredSec, fps);
+                        + " sec @ " + fps + "fps @ " + (bitrate / 1_000_000) + "Mbps)...");
+                    sharedPreRecordBuffer = new H264CircularBuffer(desiredSec, fps, bitrate);
                 } else {
                     long desiredUs = desiredSec * 1_000_000L;
-                    if (sharedPreRecordBuffer.getMaxDurationUs() != desiredUs) {
+                    // Reuse only when duration, fps AND bitrate match. The
+                    // bitrate check matters because the per-packet ceiling
+                    // is sized from bitrate at ctor time — a STANDARD-sized
+                    // pool reused at MAX silently drops every I-frame
+                    // (>525 KB at 10 Mbps H.265) and leaves the rolling
+                    // window with zero keyframes, breaking pre-record.
+                    boolean durationMismatch = sharedPreRecordBuffer.getMaxDurationUs() != desiredUs;
+                    boolean fpsMismatch = sharedPreRecordBuffer.getSizedForFps() != Math.max(10, Math.min(30, fps));
+                    boolean bitrateMismatch = sharedPreRecordBuffer.getSizedForBitrate() != Math.max(500_000, bitrate);
+                    if (durationMismatch || fpsMismatch || bitrateMismatch) {
                         logger.info("Resizing existing pre-record buffer to "
-                            + desiredSec + " sec @ " + fps + "fps");
-                        sharedPreRecordBuffer = new H264CircularBuffer(desiredSec, fps);
+                            + desiredSec + " sec @ " + fps + "fps @ "
+                            + (bitrate / 1_000_000) + "Mbps (was "
+                            + (sharedPreRecordBuffer.getMaxDurationUs() / 1_000_000L) + "s @ "
+                            + sharedPreRecordBuffer.getSizedForFps() + "fps @ "
+                            + (sharedPreRecordBuffer.getSizedForBitrate() / 1_000_000) + "Mbps)");
+                        sharedPreRecordBuffer = new H264CircularBuffer(desiredSec, fps, bitrate);
                     } else {
                         logger.info("Reusing EXISTING pre-record buffer (Zero-Allocation)");
                         sharedPreRecordBuffer.clear();  // Clear old data but keep allocated memory
@@ -580,15 +710,30 @@ public class HardwareEventRecorderGpu {
         this.preRecordDurationSeconds = clamped;
         synchronized (bufferLock) {
             if (sharedPreRecordBuffer != null) {
-                // SOTA: Check if duration actually changed before reallocating
                 long currentMaxDurationUs = clamped * 1_000_000L;
-                // Only recreate if duration is different (avoid 23MB allocation on every settings change)
-                if (sharedPreRecordBuffer.getMaxDurationUs() != currentMaxDurationUs) {
-                    logger.info("Pre-record duration changed, recreating buffer: " + clamped + " seconds");
-                    sharedPreRecordBuffer = new H264CircularBuffer(clamped, fps);
+                // Reuse only when duration, fps AND bitrate match. See the
+                // symmetric guard in HardwareEventRecorderGpu.init() for the
+                // rationale on each axis. Bitrate matters because the
+                // per-packet ceiling is sized from bitrate at ctor time —
+                // a quality bump after this object was built would otherwise
+                // start dropping I-frames silently.
+                int safeFps = Math.max(10, Math.min(30, fps));
+                int safeBitrate = Math.max(500_000, bitrate);
+                boolean durationMismatch = sharedPreRecordBuffer.getMaxDurationUs() != currentMaxDurationUs;
+                boolean fpsMismatch = sharedPreRecordBuffer.getSizedForFps() != safeFps;
+                boolean bitrateMismatch = sharedPreRecordBuffer.getSizedForBitrate() != safeBitrate;
+                if (durationMismatch || fpsMismatch || bitrateMismatch) {
+                    logger.info("Pre-record buffer recreate: " + clamped + " sec @ "
+                        + fps + "fps @ " + (bitrate / 1_000_000) + "Mbps (was "
+                        + (sharedPreRecordBuffer.getMaxDurationUs() / 1_000_000L) + "s @ "
+                        + sharedPreRecordBuffer.getSizedForFps() + "fps @ "
+                        + (sharedPreRecordBuffer.getSizedForBitrate() / 1_000_000) + "Mbps)");
+                    sharedPreRecordBuffer = new H264CircularBuffer(clamped, fps, bitrate);
                     preRecordBuffer = sharedPreRecordBuffer;
                 } else {
-                    logger.info("Pre-record buffer already at " + clamped + " seconds, clearing only");
+                    logger.info("Pre-record buffer already at " + clamped + "s @ "
+                        + safeFps + "fps @ " + (safeBitrate / 1_000_000)
+                        + "Mbps, clearing only");
                     sharedPreRecordBuffer.clear();
                 }
             }
@@ -941,10 +1086,20 @@ public class HardwareEventRecorderGpu {
         // last segment's frames on shutdown.
         //
         // Correct order:
-        //   1. Stop drainer thread (waits for current drain cycle to finish)
-        //   2. Do one final synchronous drain WITH isWritingToFile still true
-        //   3. THEN set isWritingToFile=false and close the muxer
-        
+        //   1. Wait for any in-flight rotation finalizers (audit Finding R1).
+        //   2. Stop drainer thread (waits for current drain cycle to finish)
+        //   3. Do one final synchronous drain WITH isWritingToFile still true
+        //   4. THEN set isWritingToFile=false and close the muxer
+        //
+        // Step 1 prevents a finalizer from racing this close path: a rapid
+        // stop within ~150 ms of a rotation tick used to fire onFileSaved
+        // for the previous segment AFTER the close path had already torn
+        // down the active recording, leaving cleanup in the wrong state.
+        // 2-second budget is generous; finalizer should complete in <500 ms.
+        if (!waitForFinalizers(2_000)) {
+            logger.warn("closeEventRecording proceeding with finalizers still in flight");
+        }
+
         recording = false;
         
         // Step 1: Stop drainer thread BEFORE touching the muxer.
@@ -987,6 +1142,7 @@ public class HardwareEventRecorderGpu {
             while ((packet = muxerWriteQueue.poll()) != null) {
                 if (muxerStarted && muxer != null) {
                     try {
+                        packet.rewindForWrite();
                         muxer.writeSampleData(trackIndex, packet.data, packet.info);
                         if (firstFramePtsUs < 0) firstFramePtsUs = packet.info.presentationTimeUs;
                         lastFramePtsUs = packet.info.presentationTimeUs;
@@ -995,9 +1151,11 @@ public class HardwareEventRecorderGpu {
                     } catch (Exception e) {
                         logger.warn("Final flush write error: " + e.getMessage());
                         writerAbortedCorrupt = true;
+                        releaseMuxerPacket(packet);
                         break;
                     }
                 }
+                releaseMuxerPacket(packet);
             }
             if (flushed > 0) {
                 logger.info("Final muxer queue flush: " + flushed + " frames written");
@@ -1032,6 +1190,20 @@ public class HardwareEventRecorderGpu {
                 trackIndex = -1;
             }
         }
+
+        // SOTA: Restart the drainer NOW — before the synchronous rename /
+        // onFileSaved / Telegram dispatch below. The encoder is still alive and
+        // the GL thread is still calling eglSwapBuffers every frame; without a
+        // live drainer, the encoder output queue fills, then the input queue
+        // fills, then eglSwapBuffers blocks for the entire duration of the
+        // post-stop housekeeping (observed: 76 ms = 255 ms mosaic+swap stage
+        // spike on the GL thread).
+        //
+        // Safe ordering: muxer is fully stopped+released, isWritingToFile is
+        // false under muxerLock, and writeSampleData paths gate on those, so
+        // the freshly-started drainer can only feed the pre-record circular
+        // buffer + streaming until the next event triggers a new muxer.
+        startDrainerThread();
 
         // Rename temp to final, quarantine if broken, or delete if empty.
         // SOTA: never promote a tempFile to a final .mp4 unless the muxer
@@ -1098,11 +1270,11 @@ public class HardwareEventRecorderGpu {
         segmentStartTime = 0;
         segmentNumber = 0;
         segmentBasePath = null;
-        
-        // Restart drainer thread — encoder is still alive, just not writing to file.
-        // Pre-record buffer and streaming still need draining.
-        startDrainerThread();
-        
+
+        // Drainer was already restarted above (right after muxer release) so
+        // the GL thread saw zero post-stop backpressure. No-op call here would
+        // log "Drainer thread already running" — just rely on the early start.
+
         if (fileClosedCallback != null) {
             fileClosedCallback.run();
         }
@@ -1213,9 +1385,19 @@ public class HardwareEventRecorderGpu {
     public void release() {
         // SOTA: Stop drainer thread first
         stopDrainerThread();
-        
+
         if (recording) {
             stopRecording();
+        }
+
+        // Wait for any in-flight rotation finalizers AFTER stopRecording so
+        // the close path's rename has already finished but rotation finalizers
+        // (which run on independent threads) are joined. Otherwise the
+        // pipeline tear-down can outpace a rename + onFileSaved that's still
+        // in flight, leaving the StorageManager probe with a dangling encoder
+        // ref. 3-second budget covers worst-case stop+release+rename.
+        if (!waitForFinalizers(3_000)) {
+            logger.warn("release() proceeding with finalizers still in flight");
         }
         
         if (encoder != null) {
@@ -1275,12 +1457,24 @@ public class HardwareEventRecorderGpu {
         
         drainerRunning = true;
         drainerThread = new Thread(() -> {
+            // Audit-driven: drainer is on the realtime-critical path. If it
+            // gets scheduled out for >50ms, the encoder's output pool fills
+            // and eglSwap on the GL thread backpressures. Bump Linux nice
+            // priority to match the disk writer (FOREGROUND, -2). Without
+            // this, drainer ran at default nice 0 and could be preempted by
+            // any other normal-priority work.
+            try {
+                android.os.Process.setThreadPriority(
+                        android.os.Process.THREAD_PRIORITY_FOREGROUND);
+                logger.debug("Drainer thread nice set to FOREGROUND");
+            } catch (Throwable t) {
+                logger.warn("Drainer thread priority bump failed: " + t.getMessage());
+            }
             logger.info("Encoder drainer thread started");
             while (drainerRunning) {
                 try {
                     // Drain the encoder (SD card I/O happens here, not on GL thread)
                     drainEncoderInternal();
-                    
                     // Don't burn CPU - wait a tiny bit for new frames
                     Thread.sleep(DRAIN_INTERVAL_MS);
                 } catch (InterruptedException e) {
@@ -1291,7 +1485,7 @@ public class HardwareEventRecorderGpu {
             }
             logger.info("Encoder drainer thread stopped");
         }, "GpuEncoderDrainer");
-        
+
         drainerThread.setPriority(Thread.NORM_PRIORITY);
         drainerThread.start();
         
@@ -1392,27 +1586,51 @@ public class HardwareEventRecorderGpu {
         final int[] consecutiveWriteFailures = {0};
         final int writeFailureAbortThreshold = 5;
         diskWriterThread = new Thread(() -> {
+            // Disk writer is on the realtime-critical path. If it falls
+            // behind, the muxer write queue saturates and eglSwap stalls
+            // the GL thread → freeze+skip in the encoded MP4.
+            //
+            // Audit P2: THREAD_PRIORITY_DISPLAY (-4) is @hide and SecurityException
+            // for non-system apps on most Android builds. THREAD_PRIORITY_FOREGROUND
+            // (-2) is the public, non-restricted equivalent that nudges the
+            // scheduler in our favor without requiring system-app status. The
+            // achieved gap vs. cleanup threads (background, +10) is still ~12
+            // nice points, which is what actually matters.
+            try {
+                android.os.Process.setThreadPriority(
+                        android.os.Process.THREAD_PRIORITY_FOREGROUND);
+                logger.debug("Disk writer thread nice set to FOREGROUND");
+            } catch (Throwable t) {
+                logger.warn("Disk writer thread priority bump failed: " + t.getMessage()
+                    + " (continuing at default)");
+            }
             logger.info("Disk writer thread started");
+            // SOTA: take(50ms) instead of poll()+sleep(4ms). The blocking take
+            // wakes the writer the instant the drainer pushes a packet, so the
+            // queue stays shallow and the encoder's input surface never fills.
+            // The 50 ms timeout is just a periodic liveness check so the loop
+            // can observe diskWriterRunning=false during teardown.
             while (diskWriterRunning || !muxerWriteQueue.isEmpty()) {
+                MuxerPacket packet = null;
                 try {
-                    MuxerPacket packet = muxerWriteQueue.poll();
-                    if (packet != null) {
-                        // SOTA: serialize against rotateSegment / closeEventRecording.
-                        // Without this lock, a concurrent muxer.stop() corrupts the
-                        // moov atom and produces a sized-but-unplayable .mp4.
-                        synchronized (muxerLock) {
-                            if (muxerStarted && muxer != null) {
-                                muxer.writeSampleData(trackIndex, packet.data, packet.info);
-                                if (firstFramePtsUs < 0) firstFramePtsUs = packet.info.presentationTimeUs;
-                                lastFramePtsUs = packet.info.presentationTimeUs;
-                                recordedFrames++;
-                                consecutiveWriteFailures[0] = 0;
-                            }
+                    packet = muxerWriteQueue.pollFirst(50,
+                            java.util.concurrent.TimeUnit.MILLISECONDS);
+                    if (packet == null) continue;
+                    // SOTA: serialize against rotateSegment / closeEventRecording.
+                    // Without this lock, a concurrent muxer.stop() corrupts the
+                    // moov atom and produces a sized-but-unplayable .mp4.
+                    synchronized (muxerLock) {
+                        if (muxerStarted && muxer != null) {
+                            packet.rewindForWrite();
+                            muxer.writeSampleData(trackIndex, packet.data, packet.info);
+                            if (firstFramePtsUs < 0) firstFramePtsUs = packet.info.presentationTimeUs;
+                            lastFramePtsUs = packet.info.presentationTimeUs;
+                            recordedFrames++;
+                            consecutiveWriteFailures[0] = 0;
                         }
-                    } else {
-                        // Queue empty — sleep briefly to avoid busy-waiting
-                        Thread.sleep(4);
                     }
+                    releaseMuxerPacket(packet);
+                    packet = null;
                 } catch (InterruptedException e) {
                     // Drain remaining packets before exiting. We deliberately do
                     // NOT write here: by the time the writer is interrupted, the
@@ -1420,8 +1638,10 @@ public class HardwareEventRecorderGpu {
                     // muxer.stop(), so any further writeSampleData would corrupt
                     // the moov. The close path drains the queue itself under the
                     // lock before stopping the muxer.
+                    if (packet != null) releaseMuxerPacket(packet);
                     break;
                 } catch (Exception e) {
+                    if (packet != null) releaseMuxerPacket(packet);
                     consecutiveWriteFailures[0]++;
                     logger.error("Disk writer error (#" + consecutiveWriteFailures[0]
                         + "): " + e.getMessage());
@@ -1435,8 +1655,12 @@ public class HardwareEventRecorderGpu {
                         // outputPath. The user must never see a final .mp4
                         // filename for a file whose moov was never written.
                         writerAbortedCorrupt = true;
-                        // Clear queue so the writer loop exits promptly
-                        muxerWriteQueue.clear();
+                        // Drain queue and recycle so the writer loop exits
+                        // promptly without leaking pooled buffers.
+                        MuxerPacket drained;
+                        while ((drained = muxerWriteQueue.poll()) != null) {
+                            releaseMuxerPacket(drained);
+                        }
                         diskWriterRunning = false;
                         // Don't call stopRecording() from here — that's a heavyweight
                         // operation that touches state owned by other threads. Just
@@ -1449,8 +1673,12 @@ public class HardwareEventRecorderGpu {
             logger.info("Disk writer thread stopped");
         }, "GpuDiskWriter");
         
-        // Lower priority than drainer — SD card I/O should never preempt encoder dequeue
-        diskWriterThread.setPriority(Thread.MIN_PRIORITY + 1);
+        // Java-level priority: NORM so the JVM thread scheduler doesn't deprioritize
+        // the writer relative to other normal-priority threads. The Linux-level
+        // nice value (set inside the Runnable above via Process.setThreadPriority)
+        // is what actually controls I/O scheduling on Android — the Java priority
+        // is mostly advisory.
+        diskWriterThread.setPriority(Thread.NORM_PRIORITY);
         diskWriterThread.start();
     }
     
@@ -1498,12 +1726,22 @@ public class HardwareEventRecorderGpu {
         // CRITICAL: Live frames must NOT be written until this flush completes.
         // The pre-record packets have older PTS values. If live frames (with current PTS)
         // are interleaved, the muxer sees non-monotonic timestamps and the MP4 is corrupt.
+        // Pre-record packets are drained in one pass into muxerWriteQueue.
+        // The earlier "staggered flush" experiment (FLUSH_PACKETS_PER_TICK)
+        // had a real bug: while flushInProgress=true for ~150ms, live frames
+        // produced by the encoder hit the `!flushInProgress` gate below
+        // (line ~1853) and were silently dropped — manifesting as recordings
+        // freezing 5-6s in. Reverted. The single-pass drain is safe because
+        // muxerWriteQueue.offerMuxerPacket() handles backpressure via its
+        // drop-non-keyframe policy, AND the disk writer is now FOREGROUND
+        // priority so it drains the burst quickly.
         if (flushInProgress && muxerStarted) {
             int flushedCount = 0;
             H264CircularBuffer.Packet queuedPacket;
             while ((queuedPacket = pendingFlushQueue.poll()) != null) {
-                // Push pre-record packets to the muxer write queue (same path as live frames)
-                offerMuxerPacket(new MuxerPacket(queuedPacket.data, queuedPacket.info));
+                MuxerPacket mp = acquireMuxerPacket(queuedPacket.info.size);
+                fillMuxerPacket(mp, queuedPacket.data, queuedPacket.info);
+                offerMuxerPacket(mp);
                 flushedCount++;
             }
             if (flushedCount > 0) {
@@ -1517,7 +1755,19 @@ public class HardwareEventRecorderGpu {
         // shutting down (e.g., we're inside the synchronous final drain in
         // closeEventRecording) the rotation logic would deadlock or produce a
         // stranded muxer. Skip in that case.
-        if (isWritingToFile && segmentStartTime > 0 && drainerRunning && diskWriterRunning) {
+        // Don't rotate if the disk writer has aborted on SD-card death. The
+        // hot-swap path would build a new muxer with no consumer (writer
+        // already exited), and queued packets would pile up in
+        // muxerWriteQueue forever. Stop the recording cleanly instead.
+        // (Audit Finding R3.)
+        if (writerAbortedCorrupt && isWritingToFile) {
+            logger.warn("Writer aborted — stopping recording, no rotation");
+            isWritingToFile = false;
+            recording = false;
+            return;
+        }
+        if (isWritingToFile && segmentStartTime > 0 && drainerRunning && diskWriterRunning
+                && !writerAbortedCorrupt) {
             long elapsed = System.currentTimeMillis() - segmentStartTime;
             if (elapsed >= SEGMENT_DURATION_MS) {
                 logger.info("Segment duration reached (" + (elapsed / 1000) + "s), rotating to new file...");
@@ -1526,7 +1776,7 @@ public class HardwareEventRecorderGpu {
         }
         
         MediaCodec.BufferInfo bufferInfo = reusableBufferInfo;
-        
+
         while (true) {
             int outputBufferIndex;
             try {
@@ -1598,9 +1848,14 @@ public class HardwareEventRecorderGpu {
                     // PATH A: Write to disk (if event recording active)
                     // SOTA: Don't write to muxer directly — push to the muxer write queue.
                     // The disk writer thread handles the actual SD card I/O, preventing
-                    // I/O stalls from blocking the encoder dequeue loop.
+                    // I/O stalls from blocking the encoder dequeue loop. Pooled
+                    // packet avoids per-frame ByteBuffer.allocateDirect on the
+                    // drainer thread (5–50 ms native heap stalls observed during
+                    // pre-record flush bursts).
                     if (isWritingToFile && muxerStarted && !flushInProgress) {
-                        offerMuxerPacket(new MuxerPacket(outputBuffer, bufferInfo));
+                        MuxerPacket mp = acquireMuxerPacket(bufferInfo.size);
+                        fillMuxerPacket(mp, outputBuffer, bufferInfo);
+                        offerMuxerPacket(mp);
                     }
                     
                     // PATH B: Send to network (if streaming)
@@ -1634,220 +1889,294 @@ public class HardwareEventRecorderGpu {
             return;
         }
 
-        logger.info("Rotating segment " + segmentNumber + " - closing current file");
+        // SOTA RC6: hot-swap segment rotation.
+        //
+        // Old design: stop the disk writer, drain queue, muxer.stop() (slow,
+        // 50-200ms), open new muxer, restart writer. Total lock hold ≥100ms
+        // during which no packet writes flow → muxerWriteQueue grows →
+        // encoder eglSwap stalls → freeze+skip in the encoded MP4.
+        //
+        // New design: keep the disk writer running across the rotation. We:
+        //   1. Compute the new path / tempFile and pre-construct the new
+        //      MediaMuxer + addTrack on the SAME thread (the drainer thread
+        //      that calls rotateSegment) but BEFORE acquiring muxerLock. The
+        //      MediaMuxer constructor opens an fd; addTrack is metadata-only.
+        //      Both are O(1) and don't block on existing writes.
+        //   2. Briefly take muxerLock. Drain remaining queue into OLD muxer.
+        //      Stash old muxer reference into a local. Atomically replace
+        //      this.muxer with the new muxer; call new.start() inside the
+        //      lock so the writer's next iteration sees a started muxer.
+        //   3. Release muxerLock. Disk writer resumes immediately on the
+        //      new muxer.
+        //   4. Hand the old muxer + identity to a background worker thread
+        //      that runs stop+release+rename. The 50-200ms cost happens
+        //      OFF the disk-writer's critical path.
+        //
+        // Lock window: ~5-30ms (drain only) instead of 100-300ms. The disk
+        // writer never stops/restarts. Encoder backpressure window collapses.
 
-        // SOTA: Capture the old segment's identity locally. Field-level state
-        // (tempFile / outputPath / recordedFrames / firstFramePtsUs / lastFramePtsUs)
-        // belongs to the *new* segment by the end of this method; we must not
-        // let the new segment's stats mask whether the old one was finalized
-        // cleanly.
+        logger.info("Rotating segment " + segmentNumber + " - hot-swap to new file");
+
+        // Capture old segment identity for the background finalizer.
         final File oldTemp = tempFile;
         final String oldOutputPath = outputPath;
-        final int oldRecordedFrames = recordedFrames;
-        final long oldFirstPtsUs = firstFramePtsUs;
-        final long oldLastPtsUs = lastFramePtsUs;
         final int oldSegmentNumber = segmentNumber;
 
-        // Step 1: stop the disk writer BEFORE touching the muxer.
-        // Without this, the writer may be inside muxer.writeSampleData() when
-        // we call muxer.stop(), corrupting the moov atom and leaving an
-        // unplayable but final-named .mp4 on disk. stopDiskWriterThread() also
-        // joins the thread, so by the time it returns no other thread is
-        // racing us.
-        stopDiskWriterThread();
+        // === Step 1: pre-construct the new muxer OFF the lock ===
+        segmentNumber++;
+        String newPath = nextSegmentPath(segmentBasePath);
+        File newTempFile = new File(newPath + ".tmp");
+        MediaMuxer newMuxer;
+        int newTrackIndex = -1;
+        try {
+            newMuxer = new MediaMuxer(newTempFile.getAbsolutePath(),
+                    MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
+            if (savedFormat != null) {
+                newTrackIndex = newMuxer.addTrack(savedFormat);
+            } else {
+                logger.error("Cannot rotate: savedFormat is null (encoder hasn't published format)");
+                newMuxer.release();
+                segmentNumber--;  // back out the bump
+                return;
+            }
+        } catch (Exception e) {
+            logger.error("Failed to pre-construct new segment muxer: " + e.getMessage(), e);
+            if (newTempFile.exists()) newTempFile.delete();
+            segmentNumber--;  // back out the bump
+            return;
+        }
 
-        boolean stopOk = false;
+        // === Step 2: brief lock window — drain, swap, start ===
+        final MediaMuxer oldMuxer;
+        final int oldTrackIndex;
+        final int oldRecordedFrames;
+        final long oldFirstPtsUs;
+        final long oldLastPtsUs;
+        boolean rotationOk = false;
         synchronized (muxerLock) {
-            // Step 2: drain any packets that the writer left in the queue
-            // straight into the still-live old muxer. Anything we drop here
-            // turns into a gap in the segment.
+            // Drain remaining queue into the OLD muxer. These packets have
+            // PTS values that belong to the old segment; writing them to the
+            // new muxer would break PTS monotonicity.
             MuxerPacket pkt;
             int drained = 0;
             while ((pkt = muxerWriteQueue.poll()) != null) {
                 if (muxerStarted && muxer != null) {
                     try {
+                        pkt.rewindForWrite();
                         muxer.writeSampleData(trackIndex, pkt.data, pkt.info);
                         if (firstFramePtsUs < 0) firstFramePtsUs = pkt.info.presentationTimeUs;
                         lastFramePtsUs = pkt.info.presentationTimeUs;
                         recordedFrames++;
                         drained++;
                     } catch (Exception e) {
-                        logger.warn("Rotation flush error: " + e.getMessage());
+                        logger.warn("Rotation drain error: " + e.getMessage());
                         writerAbortedCorrupt = true;
+                        releaseMuxerPacket(pkt);
                         break;
                     }
                 }
+                releaseMuxerPacket(pkt);
             }
             if (drained > 0) {
                 logger.debug("Rotation drained " + drained + " queued frames into old segment");
             }
 
-            // Step 3: stop the old muxer. Track success so we can quarantine
-            // the file if anything goes wrong — a swallowed exception here
-            // used to ship a sized-but-unplayable .mp4 to the user.
+            // Stash the old muxer + its stats so the background finalizer
+            // owns them. Anything we update on `this.*` from here on belongs
+            // to the new segment.
+            oldMuxer = muxer;
+            oldTrackIndex = trackIndex;
+            oldRecordedFrames = recordedFrames;
+            oldFirstPtsUs = firstFramePtsUs;
+            oldLastPtsUs = lastFramePtsUs;
+
+            // Hot-swap: this.muxer now points at the new muxer. The disk
+            // writer's next iteration will write to it.
             try {
-                if (muxerStarted && muxer != null) {
-                    muxer.stop();
+                newMuxer.start();
+                muxer = newMuxer;
+                trackIndex = newTrackIndex;
+                muxerStarted = true;
+                tempFile = newTempFile;
+                outputPath = newPath;
+                // Reset per-segment counters AFTER capturing oldFirstPtsUs etc.
+                // for the finalizer.
+                recordedFrames = 0;
+                firstFramePtsUs = -1;
+                lastFramePtsUs = -1;
+                segmentStartTime = System.currentTimeMillis();
+                rotationOk = true;
+            } catch (Exception e) {
+                logger.error("Failed to start new segment muxer: " + e.getMessage(), e);
+                // Restore the old muxer as the active one so the writer keeps
+                // writing to a still-valid target. The old segment continues
+                // until the next rotation attempt.
+                try { newMuxer.release(); } catch (Exception ignored) {}
+                if (newTempFile.exists()) newTempFile.delete();
+                segmentNumber--;  // back out the bump
+            }
+        }
+
+        if (!rotationOk) {
+            return;
+        }
+
+        // === Step 3: writer is already on the new muxer. Request keyframe. ===
+        // Without this, the new segment would start with P-frames referencing
+        // an I-frame that lives in the old (now-stopped) file. Players would
+        // render garbage until the next ~2-second I-frame interval.
+        requestSyncFrame();
+        logger.info("Segment " + segmentNumber + " started: " + newTempFile.getName());
+
+        // === Step 4: hand the old muxer to a background finalizer ===
+        // stop() takes 50-200ms (writes the moov atom). rename() is fast but
+        // blocks on metadata. Both happen off the realtime-critical path.
+        //
+        // Snapshot writerAbortedCorrupt at rotation time. The live volatile
+        // is shared across all in-flight finalizers; without snapshotting,
+        // a transient SD-card hiccup that flips the flag during finalizer N's
+        // stop() would also poison finalizer N+1's perfectly-fine segment
+        // because both check the same live flag (audit Finding R2).
+        finalizeOldSegmentAsync(oldMuxer, oldTemp, oldOutputPath,
+                oldSegmentNumber, oldRecordedFrames, oldFirstPtsUs, oldLastPtsUs,
+                writerAbortedCorrupt, new File(newPath));
+    }
+
+    /**
+     * Background worker that runs muxer.stop() + release() + rename for the
+     * old segment after the hot-swap. Idempotent rename failure handling and
+     * SegmentListener notification mirror the synchronous path's logic.
+     *
+     * Exceptions inside this lambda are logged and swallowed — the rotation
+     * has already succeeded for the new segment by the time we get here, so
+     * a finalizer failure shouldn't crash the process.
+     */
+    private void finalizeOldSegmentAsync(final MediaMuxer oldMuxer,
+                                         final File oldTemp, final String oldOutputPath,
+                                         final int oldSegmentNumber, final int oldRecordedFrames,
+                                         final long oldFirstPtsUs, final long oldLastPtsUs,
+                                         final boolean wasAbortedAtRotation,
+                                         final File newSegmentFile) {
+        // Increment BEFORE constructing the thread so a close() that arrives
+        // immediately after this method returns sees the in-flight count.
+        inFlightFinalizers.incrementAndGet();
+        Thread t = new Thread(() -> {
+          try {
+            try {
+                android.os.Process.setThreadPriority(
+                        android.os.Process.THREAD_PRIORITY_BACKGROUND);
+            } catch (Throwable ignored) {}
+
+            boolean stopOk = false;
+            try {
+                if (oldMuxer != null) {
+                    oldMuxer.stop();
                     stopOk = true;
                 }
             } catch (Exception e) {
-                logger.warn("Muxer stop error during rotation: " + e.getMessage());
-            } finally {
-                muxerStarted = false;
+                logger.warn("Old-segment muxer.stop error: " + e.getMessage());
             }
-
             try {
-                if (muxer != null) {
-                    muxer.release();
-                }
+                if (oldMuxer != null) oldMuxer.release();
             } catch (Exception e) {
-                logger.warn("Muxer release error during rotation: " + e.getMessage());
-            } finally {
-                muxer = null;
-                trackIndex = -1;
+                logger.warn("Old-segment muxer.release error: " + e.getMessage());
             }
-        }
 
-        // Step 4: finalize the old tempFile on disk — but ONLY rename to the
-        // final extension if the muxer actually finalized cleanly. Otherwise
-        // the file has no moov atom and would be a sized, named, unplayable
-        // .mp4 — exactly the bug we're fixing. Quarantine instead.
-        boolean segmentBroken = !stopOk || writerAbortedCorrupt;
-        // Tracks the .mp4 produced by THIS rotation (or null if none usable).
-        // Used to notify the SegmentListener after the new segment is open
-        // so the engine can flush hero/sidecar against the right filename.
-        File finalisedSegment = null;
-        if (oldTemp != null && oldTemp.exists()) {
-            if (!segmentBroken && oldRecordedFrames > 0 && oldTemp.length() > 1024) {
-                File finalFile = new File(oldOutputPath);
-                if (oldTemp.renameTo(finalFile)) {
-                    finalisedSegment = finalFile;
-                    float durationSec = (oldFirstPtsUs >= 0 && oldLastPtsUs > oldFirstPtsUs)
-                            ? (oldLastPtsUs - oldFirstPtsUs) / 1_000_000.0f
-                            : oldRecordedFrames / (float) fps;
-                    logger.info(String.format("Segment %d saved: %s (%d frames, %.1f sec, %d KB)",
-                            oldSegmentNumber, finalFile.getName(), oldRecordedFrames,
-                            durationSec, finalFile.length() / 1024));
-                    try {
-                        com.overdrive.app.storage.StorageManager.getInstance().onFileSaved(finalFile);
-                    } catch (Exception e) {
-                        logger.warn("onFileSaved error: " + e.getMessage());
+            // Use the snapshot taken at rotation time, NOT the live volatile.
+            // Otherwise a transient SD-card hiccup that flips the live flag
+            // during this finalizer's stop() would also poison the next
+            // finalizer's perfectly-fine segment. (Audit Finding R2.)
+            boolean segmentBroken = !stopOk || wasAbortedAtRotation;
+            File finalisedSegment = null;
+            if (oldTemp != null && oldTemp.exists()) {
+                if (!segmentBroken && oldRecordedFrames > 0 && oldTemp.length() > 1024) {
+                    File finalFile = new File(oldOutputPath);
+                    if (oldTemp.renameTo(finalFile)) {
+                        finalisedSegment = finalFile;
+                        float durationSec = (oldFirstPtsUs >= 0 && oldLastPtsUs > oldFirstPtsUs)
+                                ? (oldLastPtsUs - oldFirstPtsUs) / 1_000_000.0f
+                                : oldRecordedFrames / (float) fps;
+                        logger.info(String.format("Segment %d saved: %s (%d frames, %.1f sec, %d KB)",
+                                oldSegmentNumber, finalFile.getName(), oldRecordedFrames,
+                                durationSec, finalFile.length() / 1024));
+                        try {
+                            com.overdrive.app.storage.StorageManager.getInstance().onFileSaved(finalFile);
+                        } catch (Exception e) {
+                            logger.warn("onFileSaved error: " + e.getMessage());
+                        }
+                    } else {
+                        logger.error("Failed to rename segment " + oldSegmentNumber + " — deleting orphan");
+                        oldTemp.delete();
+                    }
+                } else if (segmentBroken) {
+                    File broken = new File(oldOutputPath + ".broken");
+                    if (!oldTemp.renameTo(broken)) {
+                        logger.warn("Quarantine rename failed; deleting broken tmp: " + oldTemp.getName());
+                        oldTemp.delete();
+                    } else {
+                        logger.warn("Quarantined broken segment " + oldSegmentNumber
+                                + " (stopOk=" + stopOk + ", writerAborted=" + wasAbortedAtRotation
+                                + ", " + (broken.length() / 1024) + " KB): " + broken.getName());
                     }
                 } else {
-                    logger.error("Failed to rename segment " + oldSegmentNumber + " — deleting orphan");
+                    logger.warn("Deleting empty segment " + oldSegmentNumber + " tmp file");
                     oldTemp.delete();
-                }
-            } else if (segmentBroken) {
-                // Quarantine the broken segment under a .broken.mp4 sidecar so
-                // an operator can tell *something* went wrong without it
-                // showing up in the recordings UI as a real .mp4.
-                File broken = new File(oldOutputPath + ".broken");
-                if (!oldTemp.renameTo(broken)) {
-                    logger.warn("Quarantine rename failed; deleting broken tmp: " + oldTemp.getName());
-                    oldTemp.delete();
-                } else {
-                    logger.warn("Quarantined broken segment " + oldSegmentNumber
-                            + " (stopOk=" + stopOk + ", writerAborted=" + writerAbortedCorrupt
-                            + ", " + (broken.length() / 1024) + " KB): " + broken.getName());
-                }
-            } else {
-                logger.warn("Deleting empty segment " + oldSegmentNumber + " tmp file");
-                oldTemp.delete();
-            }
-        }
-
-        // SOTA: if the SD card just died we should not optimistically open a new
-        // muxer and pretend recording continues — every subsequent write would
-        // fail and pile up another quarantined segment. Stop here; the next
-        // user-driven start will trigger a fresh recorder init.
-        if (writerAbortedCorrupt) {
-            logger.warn("Writer aborted — abandoning rotation, recording stopped");
-            isWritingToFile = false;
-            recording = false;
-            recordedFrames = 0;
-            firstFramePtsUs = -1;
-            lastFramePtsUs = -1;
-            segmentStartTime = 0;
-            segmentNumber = 0;
-            segmentBasePath = null;
-            return;
-        }
-
-        // Step 5: open the next segment. Each rotated segment gets a fresh
-        // yyyyMMdd_HHmmss timestamp (no _1, _2 suffixes) so it matches the
-        // naming convention used at recording start.
-        segmentNumber++;
-        String newPath = nextSegmentPath(segmentBasePath);
-
-        try {
-            this.outputPath = newPath;
-            tempFile = new File(newPath + ".tmp");
-            // Reset per-segment counters BEFORE the new muxer goes live so the
-            // disk writer (restarted below) records frames against the new
-            // file, not the old segment's totals.
-            recordedFrames = 0;
-            firstFramePtsUs = -1;
-            lastFramePtsUs = -1;
-            segmentStartTime = System.currentTimeMillis();
-
-            synchronized (muxerLock) {
-                muxer = new MediaMuxer(tempFile.getAbsolutePath(),
-                        MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
-
-                if (savedFormat != null) {
-                    trackIndex = muxer.addTrack(savedFormat);
-                    muxer.start();
-                    muxerStarted = true;
                 }
             }
 
-            // Request a keyframe immediately so the new segment is independently
-            // decodable from its first sample. Without this, the segment would
-            // start with P-frames referencing a previous I-frame that lives in
-            // the old (now closed) file, and players would render garbage until
-            // the next 2-second I-frame interval.
-            requestSyncFrame();
-
-            logger.info("Segment " + segmentNumber + " started: " + tempFile.getName());
-
-            // Notify the engine: old segment is finalised, new segment is open.
-            // Engine flushes hero JPEG + per-actor thumbs + JSON sidecar against
-            // closedSegment, then resets ThumbnailBuffer/EventTimelineCollector
-            // so the next 2 minutes of metadata accumulates against newSegment.
-            // Failing here would orphan the metadata, so swallow exceptions —
-            // the new segment is already open and writing.
+            // Notify the engine after the rename so consumers can read the
+            // finalised file. Same listener as the synchronous path.
             SegmentListener listener = segmentListener;
             if (listener != null) {
                 try {
-                    listener.onSegmentClosed(finalisedSegment, new File(newPath));
-                } catch (Throwable t) {
-                    logger.warn("SegmentListener error: " + t.getMessage());
+                    listener.onSegmentClosed(finalisedSegment, newSegmentFile);
+                } catch (Throwable th) {
+                    logger.warn("SegmentListener error: " + th.getMessage());
                 }
             }
+          } finally {
+            // Decrement and notify any close()/release() waiter. Must be in
+            // finally so an exception inside the body still releases the
+            // join. Without this, a buggy SegmentListener could lock the
+            // pipeline shutdown forever.
+            int remaining = inFlightFinalizers.decrementAndGet();
+            if (remaining == 0) {
+                synchronized (finalizerJoinLock) {
+                    finalizerJoinLock.notifyAll();
+                }
+            }
+          }
+        }, "GpuSegmentFinalizer-" + oldSegmentNumber);
+        t.setDaemon(true);
+        t.setPriority(Thread.NORM_PRIORITY - 1);
+        t.start();
+    }
 
-        } catch (Exception e) {
-            logger.error("Failed to start new segment — stopping recording", e);
-            // Clean up the failed tmp file
-            if (tempFile != null && tempFile.exists()) {
-                tempFile.delete();
-            }
-            synchronized (muxerLock) {
-                if (muxer != null) {
-                    try { muxer.release(); } catch (Exception ignored) {}
-                    muxer = null;
+    /**
+     * Wait for any in-flight segment finalizers to complete. Bounded by
+     * timeoutMs (returns false on timeout — caller must decide whether to
+     * proceed anyway). Called from closeEventRecording and release() so a
+     * rapid stop+restart can't race a still-running rename + onFileSaved.
+     */
+    private boolean waitForFinalizers(long timeoutMs) {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        synchronized (finalizerJoinLock) {
+            while (inFlightFinalizers.get() > 0) {
+                long remaining = deadline - System.currentTimeMillis();
+                if (remaining <= 0) {
+                    logger.warn("waitForFinalizers timed out with "
+                        + inFlightFinalizers.get() + " still in flight");
+                    return false;
                 }
-                muxerStarted = false;
-                trackIndex = -1;
+                try {
+                    finalizerJoinLock.wait(remaining);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return false;
+                }
             }
-            isWritingToFile = false;
-            recording = false;
-            return;
         }
-
-        // Step 6: bring the disk writer back online. It will pick up frames
-        // from the (now drained, then refilled by the drainer) queue and write
-        // them to the new muxer.
-        startDiskWriterThread();
+        return true;
     }
     
     /**

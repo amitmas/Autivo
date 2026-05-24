@@ -5,27 +5,90 @@ import android.graphics.BitmapFactory;
 import android.graphics.ImageFormat;
 import android.graphics.Rect;
 import android.graphics.YuvImage;
+import android.hardware.HardwareBuffer;
 import android.media.Image;
 import android.media.ImageReader;
 import android.os.Handler;
 import android.os.HandlerThread;
+import android.view.Surface;
 
 import com.overdrive.app.logging.DaemonLogger;
 
 import java.io.ByteArrayOutputStream;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * Best-effort preview capture for direct camera IDs.
+ * Best-effort preview capture for the diagnostics camera-mapping dialog.
+ *
+ * <p>Two paths:
+ * <ul>
+ *   <li><b>Direct AVMCamera</b> — opens the requested camera id via
+ *       {@code AVMCamera} reflection, attaches a YUV_420_888 ImageReader,
+ *       captures one frame, tears down. Reflection-only, no GL state.
+ *       Restricted to camera ids the GL surveillance pipeline isn't
+ *       currently holding — the BYD camera service can't multi-claim, and
+ *       a parallel open while the panoramic stream is live can take down
+ *       the camera HAL (event 1002). Callers must check holding state via
+ *       {@link #isCameraHeldByPipeline(int)} before invoking.</li>
+ *   <li><b>Panoramic slice / virtual view</b> — never opens a second camera.
+ *       Reads the surveillance engine's published mosaic JPEG and crops the
+ *       requested quadrant on the caller (HTTP worker) thread. Zero GL or
+ *       HAL impact.</li>
+ * </ul>
  */
 public final class CameraPreviewHelper {
     private static final DaemonLogger logger = DaemonLogger.getInstance("CameraPreviewHelper");
-    private static final int DEFAULT_TIMEOUT_MS = 1500;
+    // 800 ms = 8 frames at 10 fps. Tight enough that an HTTP worker holding
+    // a slow direct-preview path doesn't deplete the daemon's worker pool
+    // during a sustained Prev/Next session in the diagnostics dialog. The
+    // dialog re-fires on user navigation; one missed frame on the head unit
+    // is preferable to thread-pool starvation that blocks unrelated PWA
+    // requests (e.g. live MJPEG to the dashboard).
+    private static final int DEFAULT_TIMEOUT_MS = 800;
+
+    // Process-wide single-flight gate for direct AVMCamera previews. The
+    // BYD camera service is single-claim per id; two HTTP clients dialing
+    // the same dialog from two phones (or Phone + head unit) would race
+    // each other into AVMCamera.open and one of them would lose with a
+    // confusing "returned false" / null result. Instead, the second caller
+    // fast-fails to null and lets the API handler fall through to the
+    // panoramic-slice cache path.
+    private static final java.util.concurrent.atomic.AtomicBoolean directPreviewBusy =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
 
     private CameraPreviewHelper() {
+    }
+
+    /**
+     * True when the surveillance pipeline is running and has the given camera
+     * id open. Direct previews against this id are unsafe — caller should
+     * route through the panoramic-slice path or refuse the preview.
+     */
+    public static boolean isCameraHeldByPipeline(int cameraId) {
+        try {
+            com.overdrive.app.surveillance.GpuSurveillancePipeline p =
+                com.overdrive.app.daemon.CameraDaemon.getGpuPipeline();
+            if (p == null) {
+                logger.info("isCameraHeldByPipeline cam=" + cameraId + " p=null");
+                return false;
+            }
+            boolean running = p.isRunning();
+            com.overdrive.app.camera.PanoramicCameraGpu cam = p.getCamera();
+            int heldCamId = cam != null ? cam.getCameraId() : -1;
+            boolean result = running && cam != null && heldCamId == cameraId;
+            logger.info("isCameraHeldByPipeline cam=" + cameraId
+                    + " running=" + running + " heldCamId=" + heldCamId
+                    + " → " + result);
+            return result;
+        } catch (Exception e) {
+            // If the lookup itself fails we can't be sure — fail closed.
+            return true;
+        }
     }
 
     public static byte[] captureDirectPreviewJpeg(int cameraId, int preferredWidth, int preferredHeight) {
@@ -34,78 +97,182 @@ public final class CameraPreviewHelper {
 
     public static byte[] captureDirectPreviewJpeg(int cameraId, int preferredWidth, int preferredHeight,
                                                   int fps, int timeoutMs) {
-        int[][] candidates = new int[][] {
-            {preferredWidth, preferredHeight},
-            {1280, 960},
-            {1280, 720},
-            {960, 720},
-            {720, 480}
-        };
-        for (int[] candidate : candidates) {
-            if (candidate[0] <= 0 || candidate[1] <= 0) continue;
-            byte[] jpeg = captureWithSize(cameraId, candidate[0], candidate[1], fps, timeoutMs);
-            if (jpeg != null && jpeg.length > 0) {
-                return jpeg;
-            }
+        if (preferredWidth <= 0 || preferredHeight <= 0) return null;
+        if (isCameraHeldByPipeline(cameraId)) {
+            logger.info("Refusing direct preview for cam=" + cameraId
+                    + " — surveillance pipeline holds it (multi-claim crashes BYD HAL)");
+            return null;
         }
-        return null;
+        return captureWithSize(cameraId, preferredWidth, preferredHeight, fps, timeoutMs);
     }
 
     public static byte[] captureDirectPreviewJpegExact(int cameraId, int width, int height,
                                                        int fps, int timeoutMs) {
         if (width <= 0 || height <= 0) return null;
+        if (isCameraHeldByPipeline(cameraId)) {
+            logger.info("Refusing direct preview for cam=" + cameraId
+                    + " — surveillance pipeline holds it (multi-claim crashes BYD HAL)");
+            return null;
+        }
         return captureWithSize(cameraId, width, height, fps, timeoutMs);
     }
 
-    public static byte[] capturePanoramicSliceJpeg(int cameraId, int panoWidth, int panoHeight,
-                                                   PanoramicSlice slice) {
-        if (slice == null || panoWidth <= 0 || panoHeight <= 0) return null;
-
-        int[][] candidates = new int[][] {
-            {panoWidth, panoHeight},
-            {Math.max(1, panoWidth / 2), Math.max(1, panoHeight / 2)},
-            {Math.max(1, panoWidth / 4), Math.max(1, panoHeight / 4)}
-        };
-
-        for (int[] candidate : candidates) {
-            byte[] fullJpeg = captureDirectPreviewJpegExact(
-                cameraId,
-                candidate[0],
-                candidate[1],
-                10,
-                DEFAULT_TIMEOUT_MS
-            );
-            if (fullJpeg == null || fullJpeg.length == 0) continue;
-
-            byte[] cropped = cropJpegToSlice(fullJpeg, slice, 82);
-            if (cropped != null && cropped.length > 0) {
-                return cropped;
-            }
-        }
-
-        return null;
+    /**
+     * Crop the panoramic mosaic JPEG into the slice quadrant. Single-flight,
+     * zero camera open.
+     *
+     * <p>Two sources of the mosaic JPEG, in order of preference:
+     * <ol>
+     *   <li>Surveillance engine's pre-encoded {@code latestMosaicJpeg} —
+     *       published every 15 frames in {@code processFrame}, but ONLY when
+     *       sentry is active. Free read.</li>
+     *   <li>Sync GL readback from {@code PanoramicCameraGpu.getLatestJpegFrame(0)}
+     *       — works whenever the camera pipeline is running, regardless of
+     *       sentry state. Costs ~150 ms (FBO render + glReadPixels + JPEG).
+     *       This is the fallback path for proximity-guard mode where
+     *       surveillance is idle but the camera is still streaming.</li>
+     * </ol>
+     * Returns null when neither source can produce a frame (pipeline cold).
+     */
+    public static byte[] capturePanoramicSliceJpeg(PanoramicSlice slice) {
+        if (slice == null) return null;
+        // Preferred: direct GL render of the requested slice at full
+        // per-camera resolution (Seal 1280×960, Tang 1280×720). No mosaic
+        // round-trip, no quality loss from sub-sampling.
+        byte[] hiRes = highResSliceJpeg(slice);
+        if (hiRes != null && hiRes.length > 0) return hiRes;
+        // Fallback: crop the engine's pre-encoded 640×480 mosaic. Smaller
+        // and lower-quality but free when the engine is publishing.
+        byte[] mosaicJpeg = engineMosaicJpeg();
+        if (mosaicJpeg == null || mosaicJpeg.length == 0) return null;
+        return cropMosaicJpegToSlice(mosaicJpeg, slice);
     }
 
+    /** Direct GL render of one slice at full per-camera resolution. */
+    private static byte[] highResSliceJpeg(PanoramicSlice slice) {
+        try {
+            com.overdrive.app.surveillance.GpuSurveillancePipeline p =
+                com.overdrive.app.daemon.CameraDaemon.getGpuPipeline();
+            if (p == null) return null;
+            com.overdrive.app.camera.PanoramicCameraGpu cam = p.getCamera();
+            if (cam == null) return null;
+            return cam.samplePerQuadrantJpeg(slice.getStripOffsetX());
+        } catch (Throwable t) {
+            logger.warn("highResSliceJpeg failed: " + t.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Crop the published mosaic to one of the four virtual views (front /
+     * right / rear / left). Like {@link #capturePanoramicSliceJpeg} but keyed
+     * by virtual-view enum — the dialog uses this for the "panoramic" kind.
+     */
+    public static byte[] capturePanoramicViewJpeg(CameraVirtualView view) {
+        if (view == null) return null;
+        return capturePanoramicSliceJpeg(PanoramicSlice.fromLegacyView(view));
+    }
+
+    /** Volatile read of the engine's pre-encoded mosaic JPEG. */
+    private static byte[] engineMosaicJpeg() {
+        try {
+            com.overdrive.app.surveillance.GpuSurveillancePipeline p =
+                com.overdrive.app.daemon.CameraDaemon.getGpuPipeline();
+            if (p == null) return null;
+            // Gate on pipeline being currently running. The engine's
+            // latestMosaicJpeg is a volatile that survives across pipeline
+            // stop/start cycles — without this gate, opening the dialog
+            // after a stop returns a stale JPEG from the previous session
+            // until the new pipeline publishes its first mosaic.
+            if (!p.isRunning()) return null;
+            com.overdrive.app.surveillance.SurveillanceEngineGpu engine = p.getSentry();
+            if (engine == null) return null;
+            return engine.getLatestMosaicJpeg();
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
+     * Fallback when the engine isn't running (proximity-guard mode): post a
+     * sync GL readback to the camera's glHandler, encode JPEG. Costs ~150 ms
+     * but works whenever the camera pipeline is alive.
+     */
+    private static byte[] liveDownscalerMosaicJpeg() {
+        try {
+            com.overdrive.app.surveillance.GpuSurveillancePipeline p =
+                com.overdrive.app.daemon.CameraDaemon.getGpuPipeline();
+            if (p == null) return null;
+            com.overdrive.app.camera.PanoramicCameraGpu cam = p.getCamera();
+            if (cam == null) return null;
+            // cameraId=0 is the "full mosaic" code path in getLatestJpegFrame.
+            return cam.getLatestJpegFrame(0);
+        } catch (Exception e) {
+            logger.warn("liveDownscalerMosaicJpeg failed: " + e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Open AVMCamera at the requested id/size, capture one frame, tear down.
+     * Mirrors the order PanoramicCameraGpu uses: open → setCameraFps →
+     * addPreviewSurface → startPreview. Stop/close in reverse on every exit.
+     *
+     * <p>Process-wide serialized via {@link #directPreviewBusy}: only one
+     * caller can have a direct AVMCamera open at a time. Concurrent callers
+     * fast-fail to null so the API handler falls through to the panoramic-
+     * slice cache path instead of racing AVMCamera open() and getting a
+     * confusing single-claim rejection.
+     */
     private static byte[] captureWithSize(int cameraId, int width, int height, int fps, int timeoutMs) {
+        if (!directPreviewBusy.compareAndSet(false, true)) {
+            logger.info("Direct preview busy — refusing concurrent open for cam=" + cameraId);
+            return null;
+        }
+        try {
+            return captureWithSizeLocked(cameraId, width, height, fps, timeoutMs);
+        } finally {
+            directPreviewBusy.set(false);
+        }
+    }
+
+    private static byte[] captureWithSizeLocked(int cameraId, int width, int height, int fps, int timeoutMs) {
+        Class<?> avmClass;
+        try {
+            avmClass = Class.forName("android.hardware.AVMCamera");
+        } catch (ClassNotFoundException e) {
+            logger.warn("AVMCamera class unavailable — cannot capture preview");
+            return null;
+        }
+
         HandlerThread thread = null;
         ImageReader reader = null;
-        BinderCameraBackend backend = new BinderCameraBackend();
+        Surface readerSurface = null;
+        Object cameraObj = null;
+        // Tracks whether startPreview has actually run on cameraObj. The BYD
+        // HAL treats stopPreview-before-startPreview as undefined (random
+        // NPE inside JNI), so the outer finally must skip stopPreview when
+        // this is false.
+        boolean previewStarted = false;
         AtomicReference<Image> imageRef = new AtomicReference<>();
 
         try {
-            thread = new HandlerThread("DirectPreview-" + cameraId + "-" + width + "x" + height);
+            thread = new HandlerThread("AvmPreview-" + cameraId + "-" + width + "x" + height);
             thread.start();
             Handler handler = new Handler(thread.getLooper());
             CountDownLatch latch = new CountDownLatch(1);
 
-            reader = ImageReader.newInstance(width, height, ImageFormat.YUV_420_888, 2);
+            reader = createImageReader(width, height);
+            if (reader == null) return null;
+            readerSurface = reader.getSurface();
+
             reader.setOnImageAvailableListener(imageReader -> {
                 Image image = null;
                 try {
                     image = imageReader.acquireLatestImage();
                     if (image != null && imageRef.compareAndSet(null, image)) {
                         latch.countDown();
-                        image = null;
+                        image = null;  // ownership transferred to imageRef
                     }
                 } catch (Exception e) {
                     logger.debug("Preview image callback failed: " + e.getMessage());
@@ -116,37 +283,132 @@ public final class CameraPreviewHelper {
                 }
             }, handler);
 
-            if (!backend.startCamera(cameraId, reader.getSurface(), width, height, fps)) {
+            // Open carefully: if mOpen.invoke throws (InvocationTargetException
+            // from BYD HAL), cameraObj is non-null from the constructor but
+            // never opened. The outer finally must NOT call stopPreview/close
+            // on it. Use a try-finally to null cameraObj on any open failure.
+            boolean openSucceeded = false;
+            try {
+                try {
+                    Constructor<?> ctor = avmClass.getDeclaredConstructor(int.class);
+                    ctor.setAccessible(true);
+                    cameraObj = ctor.newInstance(cameraId);
+                    Method mOpen = avmClass.getDeclaredMethod("open");
+                    mOpen.setAccessible(true);
+                    Object openResult = mOpen.invoke(cameraObj);
+                    if (!(openResult instanceof Boolean) || !(Boolean) openResult) {
+                        logger.warn("AVMCamera.open(" + cameraId + ") returned " + openResult);
+                        return null;
+                    }
+                    openSucceeded = true;
+                    logger.info("AVMCamera opened cam=" + cameraId);
+                } catch (NoSuchMethodException nsme) {
+                    Method mStaticOpen = avmClass.getDeclaredMethod("open", int.class);
+                    mStaticOpen.setAccessible(true);
+                    cameraObj = mStaticOpen.invoke(null, cameraId);
+                    if (cameraObj == null) {
+                        logger.warn("AVMCamera.open(" + cameraId + ") factory returned null");
+                        return null;
+                    }
+                    openSucceeded = true;
+                    logger.info("AVMCamera opened (static factory) cam=" + cameraId);
+                }
+            } finally {
+                if (!openSucceeded) {
+                    // Open failed mid-flight (exception or open()=false).
+                    // Drop the reference so outer finally doesn't try to
+                    // stopPreview/close a never-opened AVMCamera.
+                    cameraObj = null;
+                }
+            }
+
+            // SOTA TOCTOU defense: re-check pipeline holding state immediately
+            // after open. If a sibling cold-start race grabbed the same id
+            // between our pre-check and now, back out cleanly — multi-claim
+            // crashes the BYD HAL (event 1002).
+            if (isCameraHeldByPipeline(cameraId)) {
+                logger.warn("Backing out direct preview cam=" + cameraId
+                        + " — pipeline acquired it during our open (TOCTOU race)");
+                // Close immediately — startPreview hasn't been called, so the
+                // outer finally's stopPreview-before-close sequence is
+                // undefined per the BYD HAL. Skip stopPreview; just close.
+                tryInvoke(avmClass, cameraObj, "close");
+                cameraObj = null;
+                return null;
+            }
+
+            AvmCameraHelper.setCameraFps(cameraObj, fps);
+
+            try {
+                Method mAddSurface = avmClass.getDeclaredMethod(
+                        "addPreviewSurface", Surface.class, int.class);
+                mAddSurface.setAccessible(true);
+                mAddSurface.invoke(cameraObj, readerSurface, 0);
+            } catch (Throwable t) {
+                logger.warn("addPreviewSurface failed cam=" + cameraId + ": " + t.getMessage());
+                // Surface attach failed — close camera directly (skip
+                // stopPreview which hasn't been started).
+                tryInvoke(avmClass, cameraObj, "close");
+                cameraObj = null;
+                return null;
+            }
+
+            try {
+                Method mStart = avmClass.getDeclaredMethod("startPreview");
+                mStart.setAccessible(true);
+                mStart.invoke(cameraObj);
+                previewStarted = true;
+            } catch (Throwable t) {
+                logger.warn("startPreview failed cam=" + cameraId + ": " + t.getMessage());
+                tryInvoke(avmClass, cameraObj, "close");
+                cameraObj = null;
                 return null;
             }
 
             if (!latch.await(timeoutMs, TimeUnit.MILLISECONDS)) {
-                logger.debug("Timed out waiting for preview frame cam=" + cameraId + " size=" + width + "x" + height);
+                logger.warn("No frame after " + timeoutMs + "ms cam=" + cameraId
+                        + " size=" + width + "x" + height);
                 return null;
             }
 
             Image image = imageRef.get();
-            if (image == null) {
-                return null;
-            }
+            if (image == null) return null;
             try {
-                return yuv420888ToJpeg(image, 80);
+                byte[] jpeg = imageToJpeg(image, 80);
+                logger.info("Captured preview cam=" + cameraId
+                        + " size=" + width + "x" + height
+                        + " bytes=" + (jpeg == null ? 0 : jpeg.length));
+                return jpeg;
             } finally {
                 try { image.close(); } catch (Exception ignored) {}
                 imageRef.set(null);
             }
         } catch (Exception e) {
-            logger.debug("Direct preview capture failed cam=" + cameraId + " size=" + width + "x" + height + ": " + e.getMessage());
+            logger.warn("Direct preview capture failed cam=" + cameraId
+                    + " size=" + width + "x" + height + ": "
+                    + e.getClass().getSimpleName() + ": " + e.getMessage());
             return null;
         } finally {
-            try { backend.stopCamera(); } catch (Exception ignored) {}
-            try { backend.disconnect(); } catch (Exception ignored) {}
-            if (reader != null) {
-                try { reader.close(); } catch (Exception ignored) {}
-            }
-            Image leaked = imageRef.getAndSet(null);
-            if (leaked != null) {
-                try { leaked.close(); } catch (Exception ignored) {}
+            // Teardown order matters:
+            //   1. Stop / close the camera so HAL stops dispatching frames.
+            //   2. Drain the HandlerThread so any in-flight
+            //      OnImageAvailableListener callback completes BEFORE we
+            //      close the ImageReader. Closing the reader before the
+            //      drain races acquireLatestImage() against a closed reader
+            //      (caught as IllegalStateException, but fragile).
+            //   3. Close the reader. The Surface is owned by the reader and
+            //      released by reader.close() — calling surface.release()
+            //      separately would be a double-release.
+            //   4. Close any leaked Image still held in imageRef.
+            if (cameraObj != null) {
+                // Only call stopPreview if startPreview actually ran. The
+                // BYD HAL throws / NPEs JNI when stopPreview is called on a
+                // never-previewing camera (e.g. setCameraFps threw between
+                // open and startPreview).
+                if (previewStarted) {
+                    tryInvoke(avmClass, cameraObj, "stopPreview");
+                }
+                tryInvoke(avmClass, cameraObj, "close");
             }
             if (thread != null) {
                 try {
@@ -156,7 +418,74 @@ public final class CameraPreviewHelper {
                     Thread.currentThread().interrupt();
                 }
             }
+            if (reader != null) {
+                try { reader.close(); } catch (Exception ignored) {}
+            }
+            // NOTE: readerSurface.release() intentionally omitted — the
+            // Surface is owned by the ImageReader and released when the
+            // reader is closed. Calling release() here would be a
+            // redundant release on an already-released surface.
+            Image leaked = imageRef.getAndSet(null);
+            if (leaked != null) {
+                try { leaked.close(); } catch (Exception ignored) {}
+            }
         }
+    }
+
+    /**
+     * YUV_420_888 ImageReader. PRIVATE format works for the GL pipeline
+     * because it samples via EGLImage, but we need CPU pixels for the JPEG
+     * encode path. Bitmap.wrapHardwareBuffer is API 29+; the BYD head unit
+     * runs API 28, so PRIVATE here would yield an undecodable frame.
+     */
+    private static ImageReader createImageReader(int width, int height) {
+        try {
+            return ImageReader.newInstance(width, height, ImageFormat.YUV_420_888, 2);
+        } catch (Throwable t) {
+            logger.warn("ImageReader YUV_420_888 creation failed at " + width + "x" + height
+                    + ": " + t.getMessage());
+            return null;
+        }
+    }
+
+    private static byte[] imageToJpeg(Image image, int quality) {
+        int format = image.getFormat();
+        if (format == ImageFormat.YUV_420_888) {
+            return yuv420888ToJpeg(image, quality);
+        }
+        if (android.os.Build.VERSION.SDK_INT >= 29) {
+            HardwareBuffer hwb = null;
+            try {
+                hwb = image.getHardwareBuffer();
+                if (hwb == null) return null;
+                Bitmap bmp = Bitmap.wrapHardwareBuffer(hwb,
+                        android.graphics.ColorSpace.get(android.graphics.ColorSpace.Named.SRGB));
+                if (bmp == null) return null;
+                Bitmap copy = bmp.copy(Bitmap.Config.ARGB_8888, false);
+                bmp.recycle();
+                if (copy == null) return null;
+                ByteArrayOutputStream out = new ByteArrayOutputStream();
+                copy.compress(Bitmap.CompressFormat.JPEG, quality, out);
+                copy.recycle();
+                return out.toByteArray();
+            } catch (Throwable t) {
+                logger.debug("PRIVATE → JPEG conversion failed: " + t.getMessage());
+                return null;
+            } finally {
+                if (hwb != null) {
+                    try { hwb.close(); } catch (Throwable ignored) {}
+                }
+            }
+        }
+        return null;
+    }
+
+    private static void tryInvoke(Class<?> cls, Object instance, String method) {
+        try {
+            Method m = cls.getDeclaredMethod(method);
+            m.setAccessible(true);
+            m.invoke(instance);
+        } catch (Throwable ignored) {}
     }
 
     private static byte[] yuv420888ToJpeg(Image image, int quality) {
@@ -167,29 +496,51 @@ public final class CameraPreviewHelper {
         return out.toByteArray();
     }
 
-    private static byte[] cropJpegToSlice(byte[] jpegBytes, PanoramicSlice slice, int quality) {
-        Bitmap bitmap = null;
+    /**
+     * Crop a 2×2-mosaic JPEG into the requested {@link PanoramicSlice}
+     * quadrant. Mosaic layout: TL=Front (slice4), TR=Right (slice3),
+     * BL=Rear (slice1), BR=Left (slice2) — strip-offset based, matches the
+     * GL mosaic shader's quadrant assignment.
+     */
+    public static byte[] cropMosaicJpegToSlice(byte[] mosaicJpegBytes, PanoramicSlice slice) {
+        if (mosaicJpegBytes == null || mosaicJpegBytes.length == 0 || slice == null) return null;
+        Bitmap mosaic = null;
         Bitmap cropped = null;
         try {
-            bitmap = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.length);
-            if (bitmap == null) return null;
+            mosaic = BitmapFactory.decodeByteArray(mosaicJpegBytes, 0, mosaicJpegBytes.length);
+            if (mosaic == null) return null;
 
-            int sliceWidth = Math.max(1, bitmap.getWidth() / 4);
-            int startX = Math.min(bitmap.getWidth() - sliceWidth, Math.max(0, slice.getIndex() * sliceWidth));
-            cropped = Bitmap.createBitmap(bitmap, startX, 0, sliceWidth, bitmap.getHeight());
+            int qW = Math.max(1, mosaic.getWidth() / 2);
+            int qH = Math.max(1, mosaic.getHeight() / 2);
+            int x, y;
+            switch (slice) {
+                case SLICE_4: x = 0;  y = 0;  break;   // Front → TL
+                case SLICE_3: x = qW; y = 0;  break;   // Right → TR
+                case SLICE_1: x = 0;  y = qH; break;   // Rear  → BL
+                case SLICE_2: x = qW; y = qH; break;   // Left  → BR
+                default:      x = 0;  y = 0;  break;
+            }
+            x = Math.max(0, Math.min(x, mosaic.getWidth() - 1));
+            y = Math.max(0, Math.min(y, mosaic.getHeight() - 1));
+            int cropW = Math.min(qW, mosaic.getWidth() - x);
+            int cropH = Math.min(qH, mosaic.getHeight() - y);
+            cropped = Bitmap.createBitmap(mosaic, x, y, cropW, cropH);
 
             ByteArrayOutputStream out = new ByteArrayOutputStream();
-            cropped.compress(Bitmap.CompressFormat.JPEG, quality, out);
+            cropped.compress(Bitmap.CompressFormat.JPEG, 82, out);
             return out.toByteArray();
         } catch (Exception e) {
-            logger.debug("Panoramic slice crop failed: " + e.getMessage());
+            logger.warn("cropMosaicJpegToSlice failed for " + slice + ": " + e.getMessage());
             return null;
         } finally {
-            if (cropped != null) {
+            // Bitmap.createBitmap may return the source instance when no
+            // transform is needed (e.g. degenerate crop covering full src).
+            // Guard against double-recycle.
+            if (cropped != null && cropped != mosaic) {
                 try { cropped.recycle(); } catch (Exception ignored) {}
             }
-            if (bitmap != null) {
-                try { bitmap.recycle(); } catch (Exception ignored) {}
+            if (mosaic != null) {
+                try { mosaic.recycle(); } catch (Exception ignored) {}
             }
         }
     }

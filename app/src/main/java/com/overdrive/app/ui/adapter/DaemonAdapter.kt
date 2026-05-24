@@ -14,6 +14,7 @@ import androidx.recyclerview.widget.RecyclerView
 import com.overdrive.app.ui.model.DaemonState
 import com.overdrive.app.ui.model.DaemonStatus
 import com.overdrive.app.ui.model.DaemonType
+import com.overdrive.app.ui.model.localizedName
 import com.google.android.material.switchmaterial.SwitchMaterial
 import com.overdrive.app.R
 
@@ -53,7 +54,7 @@ class DaemonAdapter(
         private val subprocessList: LinearLayout = itemView.findViewById(R.id.subprocessList)
 
         fun bind(state: DaemonState) {
-            tvDaemonName.text = getDaemonDisplayName(state.type)
+            tvDaemonName.text = state.type.localizedName(itemView.context)
             ivDaemonIcon.setImageResource(getDaemonIcon(state.type))
             
             // Build status text with uptime
@@ -204,19 +205,6 @@ class DaemonAdapter(
             }
         }
         
-        private fun getDaemonDisplayName(type: DaemonType): String {
-            return when (type) {
-                DaemonType.CAMERA_DAEMON -> "Camera Daemon"
-                DaemonType.SENTRY_DAEMON -> "Surveillance Daemon"
-                DaemonType.ACC_SENTRY_DAEMON -> "ACC Surveillance"
-                DaemonType.SINGBOX_PROXY -> "Sing-box Proxy"
-                DaemonType.CLOUDFLARED_TUNNEL -> "Cloudflared Tunnel"
-                DaemonType.ZROK_TUNNEL -> "Zrok Tunnel"
-                DaemonType.TAILSCALE_TUNNEL -> "Tailscale Tunnel"
-                DaemonType.TELEGRAM_DAEMON -> "Telegram Bot"
-            }
-        }
-
         @androidx.annotation.DrawableRes
         private fun getDaemonIcon(type: DaemonType): Int = when (type) {
             DaemonType.CAMERA_DAEMON -> R.drawable.ic_camera_select

@@ -28,6 +28,8 @@
     <string name="cd_play_pause">演奏/休憩</string>
     <string name="cd_player_prev">前の録画</string>
     <string name="cd_player_next">次の録画</string>
+    <string name="cd_player_maximize">プレイヤーを最大限に</string>
+    <string name="cd_player_minimize">出口フルスクリーン</string>
     <string name="cd_delete">削除</string>
     <string name="cd_expand">拡大する</string>
     <string name="cd_configure">設定</string>
@@ -63,6 +65,20 @@
     <string name="camera_option_4">カメラ4</string>
     <string name="camera_option_5">カメラ5</string>
     <string name="camera_selection_hint">カメラ1 = BYD Seal, カメラ0 = Atto トリム. 設定が有効になるために カメラIDを変更した後,デモンを再起動します.</string>
+    <string name="camera_mapping_title">カメラマッピング</string>
+    <string name="camera_role_label">役割マッピング</string>
+    <string name="camera_candidate_previous">前記</string>
+    <string name="camera_candidate_next">次へ</string>
+    <string name="camera_preview_unavailable">デイモンが再起動した後,ダイアログを再開して別の候補を試すかリフレッシュする.</string>
+    <string name="camera_mapping_save">マッピングを保存する</string>
+    <string name="camera_mapping_clear">明確な役割</string>
+    <string name="camera_mapping_saved">カメラマッピングが保存されました</string>
+    <string name="camera_mapping_cleared">カメラのロールマッピングがクリア</string>
+    <string name="camera_mapping_summary_format">パノラマストリーム:カメラ%1$d ·%2$dx%3$d</string>
+    <string name="camera_mapping_summary_probing">パノラマストリーム: 遺産自動検知/探査</string>
+    <string name="camera_mapping_current_format">現在のマッピング: %1$s</string>
+    <string name="camera_mapping_current_none">現在のマッピング:自動 / デフォルト</string>
+    <string name="camera_mapping_hint">OverDriveは,既知の起動動作をデフォルトで保持しますが,現在では,統合パノラマストライプを適切に校正することができます.各原始統合スライスをプリビューし,論理的な360の役割を実際に車両の前/右/後/左に表示するスライスにマップします.そしてデモンはそのレイアウトを再起動後録音,ストリーミング,AIに使用します.</string>
     <string name="dashboard_scan_to_connect">接続をスキャンする</string>
     <string name="dashboard_qr_waiting">トンネルを待ってる</string>
     <string name="dashboard_daemons_running_default">0/5 走る</string>
@@ -216,6 +232,8 @@
     <string name="toast_restarting_camera_daemon">カメラデモンを再起動する</string>
     <string name="toast_camera_daemon_restarting">完全な探査機でカメラデモンを再起動</string>
     <string name="toast_camera_restart_failed">設定がクリアが,デモン再起動が失敗しました. 手動で再起動してください.</string>
+    <string name="toast_camera_settings_saved_restarting">カメラの設定が保存された カメラのデモンを再起動する</string>
+    <string name="toast_camera_settings_restart_failed">カメラの設定が保存されましたが デイモン再起動は失敗しました</string>
     <string name="toast_failed_with_message_x">失敗: %1$s</string>
     <string name="toast_soh_reset_success">SOH推定リセット は次のデータから再計算されます</string>
     <string name="toast_soh_reset_failed_no_daemon">復元失敗  デイモン応答し,ファイルは書き換えられない</string>
@@ -273,6 +291,14 @@
     <string name="tunnel_label_cloudflared">雲が吹いた</string>
     <string name="tunnel_label_zrok">Zrok</string>
     <string name="tunnel_label_tailscale">Tailscale</string>
+    <string name="daemon_name_camera">カメラ Daemon</string>
+    <string name="daemon_name_surveillance">監視 Daemon</string>
+    <string name="daemon_name_acc_surveillance">ACC 監視</string>
+    <string name="daemon_name_singbox">Sing-box プロキシ</string>
+    <string name="daemon_name_cloudflared">Cloudflaredトンネル</string>
+    <string name="daemon_name_zrok">Zrokトンネル</string>
+    <string name="daemon_name_tailscale">Tailscaleトンネル</string>
+    <string name="daemon_name_telegram">Telegram ボット</string>
     <string name="clip_label_access_code">アクセスコード</string>
     <string name="clip_label_url">URL</string>
     <string name="toast_no_config_needed">%1$s の設定は必要ありません</string>

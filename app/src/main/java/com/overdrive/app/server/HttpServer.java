@@ -313,7 +313,16 @@ public class HttpServer {
             // Read POST body if present
             // SOTA: Loop read for large payloads (e.g., base64 image uploads)
             // BufferedReader.read() may return fewer chars than requested in a single call
+            // Hard cap at 16 MB — the largest legitimate payload is a base64-
+            // encoded 8 MB asset (~10.7 MB). Above this we 413 instead of
+            // letting an attacker allocate arbitrary heap on the GUI process.
+            final int MAX_BODY_BYTES = 16 * 1024 * 1024;
             String body = null;
+            if (contentLength > MAX_BODY_BYTES) {
+                HttpResponse.sendError(out, 413, "Payload too large");
+                client.close();
+                return;
+            }
             if (contentLength > 0) {
                 char[] bodyChars = new char[contentLength];
                 int totalRead = 0;

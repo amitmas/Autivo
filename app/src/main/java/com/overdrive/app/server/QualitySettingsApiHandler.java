@@ -197,30 +197,33 @@ public class QualitySettingsApiHandler {
     private static void sendStorageSettings(OutputStream out) throws Exception {
         StorageManager storage = StorageManager.getInstance();
         
-        // SOTA: Refresh SD card detection if not currently available
-        // This handles the case where SD card was inserted after app start
-        if (!storage.isSdCardAvailable()) {
-            storage.refreshSdCard();
+        // SOTA: Refresh SD/USB detection if either isn't currently available.
+        // Handles the case where the volume was inserted after app start.
+        if (!storage.isSdCardAvailable() || !storage.isUsbAvailable()) {
+            storage.refreshSdCard();  // refreshes both SD and USB
         }
-        
+
         JSONObject response = new JSONObject();
         response.put("success", true);
         response.put("recordingsLimitMb", storage.getRecordingsLimitMb());
         response.put("surveillanceLimitMb", storage.getSurveillanceLimitMb());
         response.put("minLimitMb", StorageManager.getMinLimitMb());
-        response.put("maxLimitMb", StorageManager.getMaxLimitMb());
-        response.put("maxLimitMbSdCard", StorageManager.getMaxLimitMbSdCard());
+
+        // Dynamic per-volume max from live StatFs (clamped to per-category share).
+        response.put("maxLimitMb", storage.getEffectiveMaxLimitMb(StorageManager.StorageType.INTERNAL));
+        response.put("maxLimitMbSdCard", storage.getEffectiveMaxLimitMb(StorageManager.StorageType.SD_CARD));
+        response.put("maxLimitMbUsb", storage.getEffectiveMaxLimitMb(StorageManager.StorageType.USB));
+
         response.put("recordingsPath", storage.getRecordingsPath());
         response.put("surveillancePath", storage.getSurveillancePath());
         response.put("recordingsSize", storage.getRecordingsSize());
         response.put("surveillanceSize", storage.getSurveillanceSize());
         response.put("recordingsCount", storage.getRecordingsCount());
         response.put("surveillanceCount", storage.getSurveillanceCount());
-        
-        // SOTA: Storage type selection
+
         response.put("recordingsStorageType", storage.getRecordingsStorageType().name());
         response.put("surveillanceStorageType", storage.getSurveillanceStorageType().name());
-        
+
         // SD card info
         response.put("sdCardAvailable", storage.isSdCardAvailable());
         response.put("sdCardPath", storage.getSdCardPath());
@@ -230,14 +233,38 @@ public class QualitySettingsApiHandler {
             response.put("sdCardFreeFormatted", StorageManager.formatSize(storage.getSdCardFreeSpace()));
             response.put("sdCardTotalFormatted", StorageManager.formatSize(storage.getSdCardTotalSpace()));
         }
-        
+
+        // USB info
+        response.put("usbAvailable", storage.isUsbAvailable());
+        response.put("usbPath", storage.getUsbPath());
+        if (storage.isUsbAvailable()) {
+            response.put("usbFreeSpace", storage.getUsbFreeSpace());
+            response.put("usbTotalSpace", storage.getUsbTotalSpace());
+            response.put("usbFreeFormatted", StorageManager.formatSize(storage.getUsbFreeSpace()));
+            response.put("usbTotalFormatted", StorageManager.formatSize(storage.getUsbTotalSpace()));
+        }
+
         // Internal storage info
         response.put("internalFreeSpace", storage.getInternalFreeSpace());
         response.put("internalTotalSpace", storage.getInternalTotalSpace());
         response.put("internalFreeFormatted", StorageManager.formatSize(storage.getInternalFreeSpace()));
         response.put("internalTotalFormatted", StorageManager.formatSize(storage.getInternalTotalSpace()));
-        
+
         HttpResponse.sendJson(out, response.toString());
+    }
+
+    /**
+     * Decode storage-type string from the API. Anything that isn't a known
+     * external-volume label falls back to INTERNAL — that includes empty
+     * strings and legacy "SDCARD" without the underscore.
+     */
+    private static StorageManager.StorageType parseStorageType(String s) {
+        if (s == null) return StorageManager.StorageType.INTERNAL;
+        switch (s.toUpperCase()) {
+            case "SD_CARD": return StorageManager.StorageType.SD_CARD;
+            case "USB":     return StorageManager.StorageType.USB;
+            default:        return StorageManager.StorageType.INTERNAL;
+        }
     }
     
     /**
@@ -252,41 +279,36 @@ public class QualitySettingsApiHandler {
             boolean storageTypeChanged = false;
             
             if (settings.has("recordingsStorageType")) {
-                String typeStr = settings.getString("recordingsStorageType").toUpperCase();
-                StorageManager.StorageType type = "SD_CARD".equals(typeStr) ? 
-                    StorageManager.StorageType.SD_CARD : StorageManager.StorageType.INTERNAL;
+                StorageManager.StorageType type = parseStorageType(settings.getString("recordingsStorageType"));
                 boolean success = storage.setRecordingsStorageType(type);
                 if (success) {
                     storageTypeChanged = true;
                     CameraDaemon.log("Recordings storage type set to: " + type);
                 } else {
-                    CameraDaemon.log("Failed to set recordings storage type to SD_CARD - not available");
+                    CameraDaemon.log("Failed to set recordings storage type to " + type + " - not available");
                 }
             }
-            
+
             if (settings.has("surveillanceStorageType")) {
-                String typeStr = settings.getString("surveillanceStorageType").toUpperCase();
-                StorageManager.StorageType type = "SD_CARD".equals(typeStr) ? 
-                    StorageManager.StorageType.SD_CARD : StorageManager.StorageType.INTERNAL;
+                StorageManager.StorageType type = parseStorageType(settings.getString("surveillanceStorageType"));
                 boolean success = storage.setSurveillanceStorageType(type);
                 if (success) {
                     storageTypeChanged = true;
                     CameraDaemon.log("Surveillance storage type set to: " + type);
-                    
-                    // Update running sentry engine's output directory to match new storage
+
                     try {
                         com.overdrive.app.surveillance.GpuSurveillancePipeline pipeline =
                             CameraDaemon.getGpuPipeline();
                         if (pipeline != null && pipeline.getSentry() != null) {
                             pipeline.getSentry().setEventOutputDir(storage.getSurveillanceDir());
-                            CameraDaemon.log("Updated sentry output dir: " + 
+                            CameraDaemon.log("Updated sentry output dir: " +
                                 storage.getSurveillanceDir().getAbsolutePath());
                         }
                     } catch (Exception e) {
                         CameraDaemon.log("Warning: could not update sentry output dir: " + e.getMessage());
                     }
                 } else {
-                    CameraDaemon.log("Failed to set surveillance storage type to SD_CARD - not available");
+                    CameraDaemon.log("Failed to set surveillance storage type to " + type + " - not available");
                 }
             }
             

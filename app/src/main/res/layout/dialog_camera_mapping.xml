@@ -1,4 +1,35 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+  Camera Mapping dialog layout.
+
+  Used by MainActivity.showCameraMappingDialog. Three blocks stacked
+  vertically in a scrollable column:
+    1. Header: 40dp icon + title + summary (tvCameraProfileSummary).
+    2. Role selector: spinnerCameraRole + tvCurrentRoleMapping.
+    3. Candidate navigator + preview: btnPrevCandidate / tvCandidateLabel /
+       btnNextCandidate, then a 280dp MaterialCardView holding
+       ivCameraCandidatePreview (fitCenter) layered with
+       tvCameraPreviewPlaceholder.
+    4. Action row: btnClearCameraRoleMapping (text) + btnSaveCameraRoleMapping
+       (filled), end-aligned.
+    5. Footer hint: camera_mapping_hint.
+
+  Preview surface notes:
+    - 280dp tall — taller than the PR's 210dp default so 4:3 panoramic
+      slices (1280×960 quadrants) display without horizontal cropping at
+      typical M3 alert-dialog widths (~560dp on the BYD landscape display),
+      and a future raw 5120×960 panoramic candidate would still be
+      letterboxed but visible.
+    - scaleType="fitCenter" — letterboxes instead of cropping. Operators
+      need to see the full slice / strip when calibrating which slice maps
+      to which logical role; cropping could hide the very edges that
+      distinguish e.g. "rear view" from "left view" on shared-pixel BYD
+      installs.
+
+  Styling follows dialog_camera_selection.xml for parity:
+  ?attr/colorSurfaceContainerHigh background, M3 typography, card_radius_standard /
+  card_gap_vertical dims.
+-->
 <ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
@@ -12,6 +43,7 @@
         android:orientation="vertical"
         android:padding="24dp">
 
+        <!-- Header: icon + title + resolved-stream summary -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
@@ -44,37 +76,58 @@
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:layout_marginTop="2dp"
+                    android:text="@string/camera_mapping_summary_probing"
                     android:textAppearance="@style/TextAppearance.Material3.BodySmall"
                     android:textColor="?attr/colorOnSurfaceVariant" />
             </LinearLayout>
         </LinearLayout>
 
-        <TextView
+        <!-- Role selector: label + spinner + current-mapping description -->
+        <com.google.android.material.card.MaterialCardView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="18dp"
-            android:text="@string/camera_role_label"
-            android:textAppearance="@style/TextAppearance.Material3.LabelLarge"
-            android:textColor="?attr/colorOnSurface" />
+            android:layout_marginTop="@dimen/card_gap_vertical"
+            app:cardBackgroundColor="?attr/colorSurfaceContainer"
+            app:cardCornerRadius="@dimen/card_radius_standard"
+            app:cardElevation="0dp"
+            app:strokeColor="?attr/colorOutlineVariant"
+            app:strokeWidth="1dp">
 
-        <Spinner
-            android:id="@+id/spinnerCameraRole"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="8dp" />
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:padding="14dp">
 
-        <TextView
-            android:id="@+id/tvCurrentRoleMapping"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="8dp"
-            android:textAppearance="@style/TextAppearance.Material3.BodySmall"
-            android:textColor="?attr/colorOnSurfaceVariant" />
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/camera_role_label"
+                    android:textAppearance="@style/TextAppearance.Material3.LabelLarge"
+                    android:textColor="?attr/colorOnSurface" />
 
+                <Spinner
+                    android:id="@+id/spinnerCameraRole"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp" />
+
+                <TextView
+                    android:id="@+id/tvCurrentRoleMapping"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:text="@string/camera_mapping_current_none"
+                    android:textAppearance="@style/TextAppearance.Material3.BodySmall"
+                    android:textColor="?attr/colorOnSurfaceVariant" />
+            </LinearLayout>
+        </com.google.android.material.card.MaterialCardView>
+
+        <!-- Candidate navigator -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="14dp"
+            android:layout_marginTop="@dimen/card_gap_vertical"
             android:gravity="center_vertical"
             android:orientation="horizontal">
 
@@ -89,8 +142,6 @@
                 android:id="@+id/tvCandidateLabel"
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
-                android:layout_marginStart="8dp"
-                android:layout_marginEnd="8dp"
                 android:layout_weight="1"
                 android:gravity="center"
                 android:textAppearance="@style/TextAppearance.Material3.BodyMedium"
@@ -104,10 +155,25 @@
                 android:text="@string/camera_candidate_next" />
         </LinearLayout>
 
+        <!-- Preview surface: 440dp MaterialCardView holding ImageView +
+             placeholder. ImageView fills the card with scaleType=fitCenter
+             (letterbox; preserves the full panoramic frame so the operator
+             can confirm which logical role corresponds to each slice).
+             Bumped from 280dp because the panoramic mosaic is 4:3 (640×480
+             source) and at 280dp each of the 4 quadrants was ~140dp tall —
+             too small to read distant content like license plates / faces.
+             At 440dp each quadrant is ~220dp tall, comfortably legible on
+             the BYD 15.6" landscape display. Placeholder text overlays in
+             the center until a JPEG arrives. -->
+        <!-- Card hugs the ImageView's intrinsic size. With adjustViewBounds=true
+             on the ImageView and a 4:3 (mosaic) or 4:3/16:9 (slice) JPEG
+             source, the ImageView naturally sizes to the image aspect
+             instead of being stretched into the wide card. The card grows
+             vertically with wrap_content, so no letterbox bars on the sides. -->
         <com.google.android.material.card.MaterialCardView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="12dp"
+            android:layout_marginTop="@dimen/card_gap_vertical"
             app:cardBackgroundColor="?attr/colorSurfaceContainer"
             app:cardCornerRadius="@dimen/card_radius_standard"
             app:cardElevation="0dp"
@@ -116,20 +182,32 @@
 
             <FrameLayout
                 android:layout_width="match_parent"
-                android:layout_height="210dp">
+                android:layout_height="wrap_content">
 
+                <!-- match_parent + adjustViewBounds=true + scaleType=fitCenter
+                     → the ImageView width is the card width, height is
+                     auto-derived from image aspect. maxHeight caps run-away
+                     vertical growth on a 16:9 (Tang slice) source while the
+                     dialog still has room above/below. -->
                 <ImageView
                     android:id="@+id/ivCameraCandidatePreview"
                     android:layout_width="match_parent"
-                    android:layout_height="match_parent"
+                    android:layout_height="wrap_content"
                     android:adjustViewBounds="true"
-                    android:background="?attr/colorSurfaceContainerHighest"
-                    android:scaleType="centerCrop" />
+                    android:contentDescription="@string/cd_camera"
+                    android:maxHeight="600dp"
+                    android:scaleType="fitCenter" />
 
+                <!-- Placeholder min-height keeps the card visible while the
+                     ImageView is empty (waiting for first JPEG). 280dp is
+                     enough for the "Preview unavailable" text without
+                     dwarfing the dialog. Once the ImageView has content,
+                     adjustViewBounds drives the FrameLayout height. -->
                 <TextView
                     android:id="@+id/tvCameraPreviewPlaceholder"
                     android:layout_width="match_parent"
-                    android:layout_height="match_parent"
+                    android:layout_height="wrap_content"
+                    android:minHeight="280dp"
                     android:gravity="center"
                     android:padding="16dp"
                     android:text="@string/camera_preview_unavailable"
@@ -138,10 +216,11 @@
             </FrameLayout>
         </com.google.android.material.card.MaterialCardView>
 
+        <!-- Action row: end-aligned Clear (text) + Save (filled). -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="14dp"
+            android:layout_marginTop="@dimen/card_gap_vertical"
             android:gravity="end"
             android:orientation="horizontal">
 
@@ -160,13 +239,13 @@
                 android:text="@string/camera_mapping_save" />
         </LinearLayout>
 
+        <!-- Hint footer -->
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="6dp"
+            android:layout_marginTop="@dimen/card_gap_vertical"
             android:text="@string/camera_mapping_hint"
             android:textAppearance="@style/TextAppearance.Material3.BodySmall"
             android:textColor="?attr/colorOnSurfaceVariant" />
-
     </LinearLayout>
 </ScrollView>

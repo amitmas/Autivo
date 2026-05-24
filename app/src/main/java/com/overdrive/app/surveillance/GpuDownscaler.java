@@ -70,9 +70,16 @@ public class GpuDownscaler {
     
     // Shared context from main thread
     private EGLContext sharedContext;
+
+    // Per-quadrant strip offsets and the runtime-baked fragment shader.
+    // Default mirrors legacy Seal/Atto layout. Pass quadrant offsets from
+    // ResolvedCameraConfig.getQuadrantStripOffsetX() to support Tang.
     private final float[] quadrantStripOffsetX;
     private final String fragmentShader;
-    
+    private static final float[] DEFAULT_QUADRANT_STRIP_OFFSET_X = {
+        0.75f, 0.50f, 0.00f, 0.25f
+    };
+
     // Shader program
     private int programId;
     private int aPositionLocation;
@@ -112,13 +119,9 @@ public class GpuDownscaler {
         "    vTexCoord = aTexCoord;\n" +
         "}\n";
     
-    private static final float[] DEFAULT_QUADRANT_STRIP_OFFSET_X = {
-        0.75f, 0.50f, 0.00f, 0.25f
-    };
-
     /**
      * Creates the async downscaler with shared EGL context.
-     * 
+     *
      * @param mainThreadContext EGL context from main render thread (for texture sharing)
      */
     public GpuDownscaler(EGLContext mainThreadContext) {
@@ -129,23 +132,21 @@ public class GpuDownscaler {
         this.sharedContext = mainThreadContext;
         this.quadrantStripOffsetX = normalizeOffsets(quadrantStripOffsetX);
         this.fragmentShader = buildFragmentShader(this.quadrantStripOffsetX);
-        
+
         // Start background thread
         renderThread = new HandlerThread("GpuDownscalerThread");
         renderThread.start();
         renderHandler = new Handler(renderThread.getLooper());
-        
+
         // Initialize EGL on background thread
         renderHandler.post(this::initGlOnThread);
     }
-    
+
     /**
      * Default constructor - call init() later with context.
      */
     public GpuDownscaler() {
-        this.sharedContext = null;
-        this.quadrantStripOffsetX = DEFAULT_QUADRANT_STRIP_OFFSET_X.clone();
-        this.fragmentShader = buildFragmentShader(this.quadrantStripOffsetX);
+        this((float[]) null);
     }
 
     public GpuDownscaler(float[] quadrantStripOffsetX) {
@@ -422,6 +423,20 @@ public class GpuDownscaler {
     private byte[] directRgbBuffer = null;
     private byte[] directScratchRgba = null;  // bulk-copy RGBA scratch for Y-flip pack
     private boolean directInitialized = false;
+
+    // Single-buffered SYNCHRONOUS readback path. Used by the camera-mapping
+    // dialog snapshot endpoint where surveillance may be off and the
+    // double-buffered async path would hand back null on the first call
+    // (no previous frame to read). This path renders to a dedicated FBO and
+    // reads back in the SAME call — glReadPixels is implicitly a sync point,
+    // so the bytes are guaranteed valid on return. Independent FBO/texture
+    // from the async path so the AI lane's ping-pong state isn't disturbed.
+    private int syncFbo = -1;
+    private int syncTexture = -1;
+    private ByteBuffer syncReadBuffer = null;
+    private byte[] syncRgbBuffer = null;
+    private byte[] syncScratchRgba = null;
+    private boolean syncInitialized = false;
     
     // Double-buffered async readback: eliminates glFinish() stall.
     // We maintain two FBOs. On frame N, we render to FBO[current] and read back
@@ -530,11 +545,16 @@ public class GpuDownscaler {
     
     private void initDirectFbo() {
         try {
-            directProgram = GlUtil.createProgram(VERTEX_SHADER, fragmentShader);
-            if (directProgram == 0) { logger.error("Direct FBO shader failed"); return; }
-            directAPosition = GLES20.glGetAttribLocation(directProgram, "aPosition");
-            directATexCoord = GLES20.glGetAttribLocation(directProgram, "aTexCoord");
-            directUCameraTex = GLES20.glGetUniformLocation(directProgram, "uCameraTex");
+            // Reuse the program if initSyncFbo already compiled it. Both
+            // paths use the same vertex+fragment shader source, so a second
+            // compile here would just leak the first program object.
+            if (directProgram <= 0) {
+                directProgram = GlUtil.createProgram(VERTEX_SHADER, fragmentShader);
+                if (directProgram == 0) { logger.error("Direct FBO shader failed"); return; }
+                directAPosition = GLES20.glGetAttribLocation(directProgram, "aPosition");
+                directATexCoord = GLES20.glGetAttribLocation(directProgram, "aTexCoord");
+                directUCameraTex = GLES20.glGetUniformLocation(directProgram, "uCameraTex");
+            }
             
             // Create FBO #1
             int[] texIds = new int[1];
@@ -600,7 +620,146 @@ public class GpuDownscaler {
             logger.error("Failed to init direct FBO: " + e.getMessage());
         }
     }
-    
+
+    /**
+     * Synchronous single-shot readback. Renders {@code cameraTextureId} into
+     * a dedicated 640x480 FBO and reads it back in the same call. Always
+     * returns valid bytes on success (no double-buffer warmup race). MUST be
+     * called from the GL thread that owns {@code cameraTextureId}.
+     *
+     * <p>Used by the camera-mapping dialog snapshot endpoint where surveillance
+     * may be off and the async {@link #readPixelsDirect(int)} would return
+     * null on its first call. Independent of the async path's FBO state, so
+     * calling this here doesn't disturb the AI lane's ping-pong cadence.
+     *
+     * <p>Cost: ~10-15 ms (glReadPixels stalls until the GPU finishes the
+     * render). Acceptable for one-shot dialog use; do NOT call per-frame.
+     *
+     * <p>Lazy-inits its FBO + program on first call. Reuses the existing
+     * {@code directProgram} if {@link #initDirectFbo()} ran first; otherwise
+     * compiles a fresh program. The shared shader source is the same
+     * fragment shader the async path uses.
+     *
+     * @return RGB byte[] of length WIDTH*HEIGHT*3, Y-flipped to image
+     *         convention. Null on init failure.
+     */
+    public byte[] readPixelsSync(int cameraTextureId) {
+        if (!syncInitialized) initSyncFbo();
+        if (!syncInitialized) return null;
+
+        int[] savedViewport = new int[4];
+        GLES20.glGetIntegerv(GLES20.GL_VIEWPORT, savedViewport, 0);
+
+        try {
+            // Render the camera OES texture into the sync FBO.
+            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, syncFbo);
+            GLES20.glViewport(0, 0, WIDTH, HEIGHT);
+            GLES20.glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+            GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT);
+
+            GLES20.glUseProgram(directProgram);
+            GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
+            GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, cameraTextureId);
+            GLES20.glUniform1i(directUCameraTex, 0);
+
+            GLES20.glEnableVertexAttribArray(directAPosition);
+            GLES20.glVertexAttribPointer(directAPosition, 2, GLES20.GL_FLOAT, false, 0, vertexBuffer);
+            GLES20.glEnableVertexAttribArray(directATexCoord);
+            GLES20.glVertexAttribPointer(directATexCoord, 2, GLES20.GL_FLOAT, false, 0, texCoordBuffer);
+
+            GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
+
+            GLES20.glDisableVertexAttribArray(directAPosition);
+            GLES20.glDisableVertexAttribArray(directATexCoord);
+
+            // Read back from the FBO we just rendered to. glReadPixels is a
+            // synchronization point — the GPU finishes the draw before this
+            // returns, so the bytes are guaranteed valid.
+            syncReadBuffer.clear();
+            GLES20.glReadPixels(0, 0, WIDTH, HEIGHT, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, syncReadBuffer);
+
+            syncReadBuffer.rewind();
+            syncReadBuffer.get(syncScratchRgba, 0, WIDTH * HEIGHT * 4);
+
+            byte[] src = syncScratchRgba;
+            byte[] dst = syncRgbBuffer;
+            final int rowRgbaBytes = WIDTH * 4;
+            int dstIdx = 0;
+            for (int y = HEIGHT - 1; y >= 0; y--) {
+                int srcRow = y * rowRgbaBytes;
+                for (int x = 0; x < WIDTH; x++) {
+                    int s = srcRow + (x << 2);
+                    dst[dstIdx++] = src[s];
+                    dst[dstIdx++] = src[s + 1];
+                    dst[dstIdx++] = src[s + 2];
+                }
+            }
+            return dst;
+        } catch (Throwable t) {
+            logger.warn("readPixelsSync failed: " + t.getClass().getSimpleName()
+                    + ": " + t.getMessage());
+            return null;
+        } finally {
+            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0);
+            GLES20.glViewport(savedViewport[0], savedViewport[1], savedViewport[2], savedViewport[3]);
+        }
+    }
+
+    private void initSyncFbo() {
+        try {
+            // Reuse the async path's compiled program if it exists. Otherwise
+            // compile our own copy from the shared shader source. The async
+            // and sync paths share the same vertex+fragment shader so this is
+            // safe regardless of which lazy-inits first.
+            if (directProgram <= 0) {
+                directProgram = GlUtil.createProgram(VERTEX_SHADER, fragmentShader);
+                if (directProgram == 0) {
+                    logger.error("Sync FBO shader failed");
+                    return;
+                }
+                directAPosition = GLES20.glGetAttribLocation(directProgram, "aPosition");
+                directATexCoord = GLES20.glGetAttribLocation(directProgram, "aTexCoord");
+                directUCameraTex = GLES20.glGetUniformLocation(directProgram, "uCameraTex");
+            }
+
+            int[] texIds = new int[1];
+            GLES20.glGenTextures(1, texIds, 0);
+            syncTexture = texIds[0];
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, syncTexture);
+            GLES20.glTexImage2D(GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA, WIDTH, HEIGHT, 0,
+                    GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, null);
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR);
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR);
+
+            int[] fboIds = new int[1];
+            GLES20.glGenFramebuffers(1, fboIds, 0);
+            syncFbo = fboIds[0];
+            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, syncFbo);
+            GLES20.glFramebufferTexture2D(GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0,
+                    GLES20.GL_TEXTURE_2D, syncTexture, 0);
+
+            int status = GLES20.glCheckFramebufferStatus(GLES20.GL_FRAMEBUFFER);
+            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0);
+            if (status != GLES20.GL_FRAMEBUFFER_COMPLETE) {
+                logger.error("Sync FBO incomplete: " + status);
+                return;
+            }
+
+            syncReadBuffer = ByteBuffer.allocateDirect(WIDTH * HEIGHT * 4);
+            syncReadBuffer.order(java.nio.ByteOrder.nativeOrder());
+            syncRgbBuffer = new byte[WIDTH * HEIGHT * 3];
+            syncScratchRgba = new byte[WIDTH * HEIGHT * 4];
+
+            if (vertexBuffer == null) vertexBuffer = GlUtil.createFloatBuffer(VERTEX_COORDS);
+            if (texCoordBuffer == null) texCoordBuffer = GlUtil.createFloatBuffer(TEX_COORDS);
+
+            syncInitialized = true;
+            logger.info("Synchronous FBO readback initialized (640x480)");
+        } catch (Exception e) {
+            logger.error("Failed to init sync FBO: " + e.getMessage());
+        }
+    }
+
     // Utility methods
     public static ByteBuffer getDirectBuffer(Image image) {
         if (image == null) return null;
@@ -633,7 +792,8 @@ public class GpuDownscaler {
     public void release() {
         initialized = false;
         directInitialized = false;
-        
+        syncInitialized = false;
+
         if (renderHandler != null) {
             renderHandler.post(() -> {
                 // Clean up double-buffered FBOs
@@ -652,6 +812,14 @@ public class GpuDownscaler {
                 if (directTexture2 >= 0) {
                     GLES20.glDeleteTextures(1, new int[]{directTexture2}, 0);
                     directTexture2 = -1;
+                }
+                if (syncFbo >= 0) {
+                    GLES20.glDeleteFramebuffers(1, new int[]{syncFbo}, 0);
+                    syncFbo = -1;
+                }
+                if (syncTexture >= 0) {
+                    GLES20.glDeleteTextures(1, new int[]{syncTexture}, 0);
+                    syncTexture = -1;
                 }
                 if (directProgram > 0) {
                     GLES20.glDeleteProgram(directProgram);
@@ -690,6 +858,10 @@ public class GpuDownscaler {
         return quadrantStripOffsetX.clone();
     }
 
+    /**
+     * Build the downscaler fragment shader with the four per-quadrant
+     * strip-X offsets baked in. Order: {Front=TL, Right=TR, Rear=BL, Left=BR}.
+     */
     private static String buildFragmentShader(float[] offsets) {
         return String.format(Locale.US,
             "#extension GL_OES_EGL_image_external : require\n" +
@@ -698,15 +870,15 @@ public class GpuDownscaler {
             "varying vec2 vTexCoord;\n" +
             "void main() {\n" +
             "    vec2 gridPos = step(0.5, vTexCoord);\n" +
-            "    float tlOffset = %.5ff;\n" +
-            "    float trOffset = %.5ff;\n" +
-            "    float blOffset = %.5ff;\n" +
-            "    float brOffset = %.5ff;\n" +
+            "    float frontOffset = %.5ff;\n" +
+            "    float rightOffset = %.5ff;\n" +
+            "    float rearOffset  = %.5ff;\n" +
+            "    float leftOffset  = %.5ff;\n" +
             "    float stripOffsetX;\n" +
             "    if (gridPos.x < 0.5) {\n" +
-            "        stripOffsetX = gridPos.y < 0.5 ? tlOffset : blOffset;\n" +
+            "        stripOffsetX = gridPos.y < 0.5 ? frontOffset : rearOffset;\n" +
             "    } else {\n" +
-            "        stripOffsetX = gridPos.y < 0.5 ? trOffset : brOffset;\n" +
+            "        stripOffsetX = gridPos.y < 0.5 ? rightOffset : leftOffset;\n" +
             "    }\n" +
             "    float localX = mod(vTexCoord.x, 0.5) * 0.5;\n" +
             "    float localY = mod(vTexCoord.y, 0.5) * 2.0;\n" +

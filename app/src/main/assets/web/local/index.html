@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-    <title>Dashboard - OverDrive</title>
+    <title data-i18n="app.dashboard_title">Dashboard - OverDrive</title>
     <link rel="icon" type="image/webp" href="../shared/app-icon-dark.webp">
     <link rel="manifest" href="/manifest.json">
     <link rel="apple-touch-icon" href="../shared/app-icon-dark.webp">
@@ -35,13 +35,28 @@
                 <section class="dash-hero">
                     <div class="dash-hero-copy">
                         <span class="dash-overline">OverDrive</span>
-                        <h1>Dashboard</h1>
-                        <p id="dashHeroSubtitle">Vehicle status, position and main controls.</p>
+                        <h1 data-i18n="dashboard.heading">Dashboard</h1>
+                        <p id="dashHeroSubtitle" data-i18n="dashboard.subtitle">Vehicle status, position and main controls.</p>
                     </div>
                     <div class="dash-hero-status">
-                        <span class="dash-chip" id="dashConnChip">Device --</span>
-                        <span class="dash-chip" id="dashSurvChip">Surveillance --</span>
-                        <span class="dash-chip" id="dashGpsChip">GPS --</span>
+                        <span class="dash-chip" id="dashConnChip" data-i18n="dashboard.chip_device_pending">Device --</span>
+                        <span class="dash-chip" id="dashSurvChip" data-i18n="dashboard.chip_surveillance_pending">Surveillance --</span>
+                        <span class="dash-chip" id="dashGpsChip" data-i18n="dashboard.chip_gps_pending">GPS --</span>
+                    </div>
+                </section>
+
+                <!--
+                  Vehicle hero card. Renders the user's selected GLB tinted in
+                  their selected paint colour, framed front-on so the front
+                  fascia faces the camera. mountVehicleCanvas + the existing
+                  applyVehicleSelection / overdrive:vehicle-changed pipeline
+                  drive (model, colour) — same source of truth as the sidebar
+                  EV-card. yawOffset = π/2 reuses the side rig and rotates the
+                  GLB to face the camera (no new view in ev-card-3d.js).
+                -->
+                <section class="dash-vehicle-card">
+                    <div class="dash-vehicle-canvas-wrap">
+                        <canvas id="dashHero3d" class="dash-vehicle-canvas" aria-hidden="true"></canvas>
                     </div>
                 </section>
 
@@ -49,10 +64,12 @@
                     <article class="dash-card dash-location-card">
                         <div class="dash-card-head">
                             <div>
-                                <span class="dash-card-kicker">Position</span>
-                                <h2>Vehicle location</h2>
+                                <span class="dash-card-kicker" data-i18n="dashboard.kicker_position">Position</span>
+                                <h2 data-i18n="dashboard.card_location">Vehicle location</h2>
                             </div>
-                            <a class="dash-icon-btn" href="live-view.html" aria-label="Open Live View">
+                            <a class="dash-icon-btn" href="live-view.html"
+                               data-i18n-attr="aria-label:dashboard.open_live_view"
+                               aria-label="Open Live View">
                                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18l6-6-6-6"/></svg>
                             </a>
                         </div>
@@ -61,47 +78,47 @@
                                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/></svg>
                             </div>
                             <div>
-                                <strong id="dashLocationValue">No GPS fix</strong>
-                                <span id="dashLocationMeta">Waiting for vehicle position</span>
+                                <strong id="dashLocationValue" data-i18n="dashboard.no_gps_fix">No GPS fix</strong>
+                                <span id="dashLocationMeta" data-i18n="dashboard.gps_waiting">Waiting for vehicle position</span>
                             </div>
                         </div>
                         <div class="dash-action-row">
-                            <a class="dash-secondary-btn" href="live-view.html">Open Live View</a>
-                            <button class="dash-secondary-btn" type="button" onclick="BYD.dashboard.openDirections()">Directions</button>
+                            <a class="dash-secondary-btn" href="live-view.html" data-i18n="dashboard.open_live_view">Open Live View</a>
+                            <button class="dash-secondary-btn" type="button" onclick="BYD.dashboard.openDirections()" data-i18n="dashboard.directions">Directions</button>
                         </div>
                     </article>
 
                     <article class="dash-card dash-actions-card">
                         <div class="dash-card-head">
                             <div>
-                                <span class="dash-card-kicker">Commands</span>
-                                <h2>Quick controls</h2>
+                                <span class="dash-card-kicker" data-i18n="dashboard.kicker_commands">Commands</span>
+                                <h2 data-i18n="dashboard.card_commands">Quick controls</h2>
                             </div>
                         </div>
                         <div class="dash-command-grid">
                             <button class="dash-command" type="button" onclick="BYD.dashboard.command(this, '/api/vehicle/lock')">
                                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>
-                                <span>Lock</span>
+                                <span data-i18n="dashboard.cmd_lock">Lock</span>
                             </button>
                             <button class="dash-command" type="button" onclick="BYD.dashboard.command(this, '/api/vehicle/unlock')">
                                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 7.5-2"/></svg>
-                                <span>Unlock</span>
+                                <span data-i18n="dashboard.cmd_unlock">Unlock</span>
                             </button>
                             <button class="dash-command" type="button" onclick="BYD.dashboard.command(this, '/api/vehicle/flash')">
                                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2 3 14h8l-1 8 11-13h-8l1-7z"/></svg>
-                                <span>Flash</span>
+                                <span data-i18n="dashboard.cmd_flash">Flash</span>
                             </button>
                             <button class="dash-command" type="button" onclick="BYD.dashboard.command(this, '/api/vehicle/find-car')">
                                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/><path d="M11 8v3l2 2"/></svg>
-                                <span>Find</span>
+                                <span data-i18n="dashboard.cmd_find">Find</span>
                             </button>
                             <a class="dash-command" href="live-view.html">
                                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m22 8-6 4 6 4V8Z"/><rect width="14" height="12" x="2" y="6" rx="2"/></svg>
-                                <span>Live</span>
+                                <span data-i18n="dashboard.cmd_live">Live</span>
                             </a>
                             <a class="dash-command" href="events.html">
                                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg>
-                                <span>Events</span>
+                                <span data-i18n="dashboard.cmd_events">Events</span>
                             </a>
                         </div>
                     </article>
@@ -109,17 +126,17 @@
                     <article class="dash-card dash-info-card">
                         <div class="dash-card-head">
                             <div>
-                                <span class="dash-card-kicker">Vehicle</span>
-                                <h2>Main info</h2>
+                                <span class="dash-card-kicker" data-i18n="dashboard.kicker_vehicle">Vehicle</span>
+                                <h2 data-i18n="dashboard.card_info">Main info</h2>
                             </div>
                         </div>
                         <div class="dash-metric-grid">
-                            <div class="dash-metric"><span>Battery</span><strong id="dashSoc">--</strong></div>
-                            <div class="dash-metric"><span>Range</span><strong id="dashRange">--</strong></div>
+                            <div class="dash-metric"><span data-i18n="dashboard.metric_battery">Battery</span><strong id="dashSoc">--</strong></div>
+                            <div class="dash-metric"><span data-i18n="dashboard.metric_range">Range</span><strong id="dashRange">--</strong></div>
                             <div class="dash-metric"><span>12V</span><strong id="dash12v">--</strong></div>
                             <div class="dash-metric"><span>ACC</span><strong id="dashAcc">--</strong></div>
-                            <div class="dash-metric"><span>Network</span><strong id="dashNetwork">--</strong></div>
-                            <div class="dash-metric"><span>Lock</span><strong id="dashLock">--</strong></div>
+                            <div class="dash-metric"><span data-i18n="dashboard.metric_network">Network</span><strong id="dashNetwork">--</strong></div>
+                            <div class="dash-metric"><span data-i18n="dashboard.metric_lock">Lock</span><strong id="dashLock">--</strong></div>
                         </div>
                     </article>
                 </section>
@@ -139,8 +156,16 @@
         }
 
         .dashboard-page-body {
-            width: min(1180px, 100%);
-            margin: 0 auto;
+            box-sizing: border-box;
+            width: 100%;
+            max-width: 1180px;
+            /* Centering needs explicit auto cross-axis margins AND
+               align-self because .main-content is display:flex column.
+               Auto-margins alone leave the body left-aligned on some
+               older WebViews. */
+            margin-left: auto;
+            margin-right: auto;
+            align-self: center;
             padding: 22px;
             padding-bottom: calc(28px + var(--safe-bottom));
         }
@@ -204,6 +229,53 @@
 
         .dash-chip.good { color: var(--brand-primary); border-color: rgba(0, 212, 170, 0.35); }
         .dash-chip.warn { color: #f59e0b; border-color: rgba(245, 158, 11, 0.35); }
+
+        .dash-vehicle-card {
+            margin-top: 16px;
+            background: var(--bg-surface);
+            border: 1px solid var(--border-subtle);
+            border-radius: 8px;
+            overflow: hidden;
+        }
+
+        .dash-vehicle-canvas-wrap {
+            position: relative;
+            width: 100%;
+            /* Fixed height (CSS aspect-ratio is Chrome 88+, our floor is
+               the BYD head-unit's Chrome 58 WebView). 380px on desktop
+               keeps the card prominent without leaving a wide empty
+               band above and below the side-profile car (which is
+               width-bound on the desktop aspect). Mobile trims to
+               200px via the media query below. */
+            height: 380px;
+            /* Soft brand-tinted gradient. Diagonal teal glow upper-left
+               fading to base elevated dark bottom-right gives the panel
+               depth without competing with the 3D model. Layered:
+                 1. broad teal radial highlight from upper-left,
+                 2. faint warm glow under the car (ground bounce),
+                 3. base elevated surface. */
+            background:
+                radial-gradient(80% 60% at 18% 12%,
+                    rgba(0, 212, 170, 0.16) 0%,
+                    rgba(0, 212, 170, 0.04) 40%,
+                    transparent 70%),
+                radial-gradient(60% 40% at 50% 100%,
+                    rgba(0, 212, 170, 0.08) 0%,
+                    transparent 65%),
+                linear-gradient(135deg,
+                    var(--bg-elevated) 0%,
+                    var(--bg-surface) 60%,
+                    var(--bg-base) 100%);
+        }
+
+        .dash-vehicle-canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            display: block;
+        }
 
         .dash-grid {
             display: grid;
@@ -408,6 +480,7 @@
                 padding: 18px;
             }
             .dash-hero h1 { font-size: 27px; }
+            .dash-vehicle-canvas-wrap { height: 200px; }
             .dash-grid,
             .dash-command-grid,
             .dash-metric-grid {
@@ -444,11 +517,14 @@
                     return r.json();
                 }).then(function(data) {
                     var ok = !!(data && data.success);
-                    var msg = (data && (data.message || data.error)) || (ok ? 'Command sent' : 'Command failed');
+                    var fallback = ok
+                        ? (BYD.i18n.t('dashboard.toast_command_sent') || 'Command sent')
+                        : (BYD.i18n.t('dashboard.toast_command_failed') || 'Command failed');
+                    var msg = (data && (data.message || data.error)) || fallback;
                     if (BYD.utils && BYD.utils.toast) BYD.utils.toast(msg, ok ? 'success' : 'error');
                     setTimeout(function() { BYD.dashboard.refreshVehicleState(); }, 700);
                 }).catch(function() {
-                    if (BYD.utils && BYD.utils.toast) BYD.utils.toast('Command failed', 'error');
+                    if (BYD.utils && BYD.utils.toast) BYD.utils.toast(BYD.i18n.t('dashboard.toast_command_failed') || 'Command failed', 'error');
                 }).finally(function() {
                     btn.classList.remove('pending');
                 });
@@ -465,8 +541,8 @@
                 var lockEl = document.getElementById('dashLock');
                 if (!lockEl || !data || !data.doors) return;
                 var overall = data.doors.overall;
-                if (overall === 1) lockEl.textContent = 'Locked';
-                else if (overall === 2) lockEl.textContent = 'Unlocked';
+                if (overall === 1) lockEl.textContent = BYD.i18n.t('dashboard.status_locked') || 'Locked';
+                else if (overall === 2) lockEl.textContent = BYD.i18n.t('dashboard.status_unlocked') || 'Unlocked';
                 else lockEl.textContent = '--';
             },
             updateFromStatus: function(status) {
@@ -485,24 +561,45 @@
                     if (cls) el.classList.add(cls);
                 }
                 function timeAgo(timestamp) {
+                    // Returns "Ns ago" / "Nm ago" / "Nh ago" using locale-
+                    // aware suffixes from the catalog. Catalog values
+                    // contain `{n}` placeholder; while the catalog is
+                    // still loading (i18n.t returns null) we fall back to
+                    // English unit letters.
                     var seconds = Math.floor((Date.now() - timestamp) / 1000);
-                    if (seconds < 60) return seconds + 's ago';
+                    if (seconds < 60) {
+                        var s = BYD.i18n.t('dashboard.time_seconds_ago', { n: seconds });
+                        return s || (seconds + 's ago');
+                    }
                     var minutes = Math.floor(seconds / 60);
-                    if (minutes < 60) return minutes + 'm ago';
+                    if (minutes < 60) {
+                        var m = BYD.i18n.t('dashboard.time_minutes_ago', { n: minutes });
+                        return m || (minutes + 'm ago');
+                    }
                     var hours = Math.floor(minutes / 60);
-                    return hours + 'h ago';
+                    var h = BYD.i18n.t('dashboard.time_hours_ago', { n: hours });
+                    return h || (hours + 'h ago');
+                }
+                function tOnOff(on) {
+                    return on
+                        ? (BYD.i18n.t('status.on') || 'ON')
+                        : (BYD.i18n.t('status.off') || 'OFF');
                 }
 
-                setChip('dashConnChip', 'Device ' + (status.deviceId || '--'), status.deviceId ? 'good' : '');
-                setChip('dashSurvChip', 'Surveillance ' + (status.gpuSurveillance ? 'ON' : 'OFF'), status.gpuSurveillance ? 'good' : '');
-                setText('dashAcc', status.acc ? 'ON' : 'OFF');
+                var deviceLabel = BYD.i18n.t('dashboard.chip_device_value', { id: status.deviceId || '--' })
+                                  || ('Device ' + (status.deviceId || '--'));
+                setChip('dashConnChip', deviceLabel, status.deviceId ? 'good' : '');
+                var survLabel = BYD.i18n.t('dashboard.chip_surveillance_value', { state: tOnOff(status.gpuSurveillance) })
+                                || ('Surveillance ' + tOnOff(status.gpuSurveillance));
+                setChip('dashSurvChip', survLabel, status.gpuSurveillance ? 'good' : '');
+                setText('dashAcc', tOnOff(status.acc));
 
                 if (status.battery && status.battery.voltage) setText('dash12v', status.battery.voltage.toFixed(1) + 'V');
                 if (status.soc && status.soc.percent !== undefined) setText('dashSoc', Math.round(status.soc.percent) + '%');
                 if (status.range && status.range.elecRangeKm !== undefined) setText('dashRange', BYD.units.dist(status.range.elecRangeKm));
 
                 if (status.network && status.network.type === 'wifi') setText('dashNetwork', status.network.ssid || 'WiFi');
-                else if (status.network && status.network.type === 'mobile') setText('dashNetwork', 'Mobile');
+                else if (status.network && status.network.type === 'mobile') setText('dashNetwork', BYD.i18n.t('dashboard.network_mobile') || 'Mobile');
                 else setText('dashNetwork', '--');
 
                 if (status.gps && status.gps.hasLocation) {
@@ -511,20 +608,30 @@
                     var meta = [];
                     setText('dashLocationValue', lat.toFixed(5) + ', ' + lng.toFixed(5));
                     if (status.gps.lastUpdate) meta.push(timeAgo(status.gps.lastUpdate));
+                    // km/h and deg are in the glossary (or terse enough to
+                    // read across locales) — leave the unit suffixes raw
+                    // and only translate the heading abbreviation.
                     if (status.gps.speed !== undefined) meta.push(Math.round(status.gps.speed) + ' km/h');
-                    if (status.gps.heading !== undefined) meta.push(Math.round(status.gps.heading) + ' deg');
-                    setText('dashLocationMeta', meta.length ? meta.join(' · ') : 'Position available');
-                    setChip('dashGpsChip', status.gps.isCached || status.gps.isStale ? 'GPS cached' : 'GPS live', status.gps.isCached || status.gps.isStale ? 'warn' : 'good');
+                    if (status.gps.heading !== undefined) {
+                        meta.push(Math.round(status.gps.heading) + ' ' + (BYD.i18n.t('dashboard.unit_deg') || 'deg'));
+                    }
+                    var positionAvailable = BYD.i18n.t('dashboard.position_available') || 'Position available';
+                    setText('dashLocationMeta', meta.length ? meta.join(' · ') : positionAvailable);
+                    var stale = status.gps.isCached || status.gps.isStale;
+                    var gpsChip = stale
+                        ? (BYD.i18n.t('dashboard.chip_gps_cached') || 'GPS cached')
+                        : (BYD.i18n.t('dashboard.chip_gps_live') || 'GPS live');
+                    setChip('dashGpsChip', gpsChip, stale ? 'warn' : 'good');
                 } else {
-                    setText('dashLocationValue', 'No GPS fix');
-                    setText('dashLocationMeta', 'Waiting for vehicle position');
-                    setChip('dashGpsChip', 'GPS --', '');
+                    setText('dashLocationValue', BYD.i18n.t('dashboard.no_gps_fix') || 'No GPS fix');
+                    setText('dashLocationMeta', BYD.i18n.t('dashboard.gps_waiting') || 'Waiting for vehicle position');
+                    setChip('dashGpsChip', BYD.i18n.t('dashboard.chip_gps_pending') || 'GPS --', '');
                 }
             },
             openDirections: function() {
                 var gps = this.lastStatus && this.lastStatus.gps;
                 if (!gps || !gps.hasLocation) {
-                    if (BYD.utils && BYD.utils.toast) BYD.utils.toast('Car location not available', 'error');
+                    if (BYD.utils && BYD.utils.toast) BYD.utils.toast(BYD.i18n.t('dashboard.toast_no_location') || 'Car location not available', 'error');
                     return;
                 }
                 window.open('https://www.google.com/maps/dir/?api=1&destination=' + gps.lat + ',' + gps.lng + '&travelmode=driving', '_blank');
@@ -546,6 +653,47 @@
             BYD.dashboard.refreshVehicleState();
             setInterval(function() { BYD.dashboard.refreshVehicleState(); }, 6000);
         });
+
+        // Hero 3D vehicle. Mounts via OverdriveAppShell.mountVehicleCanvas
+        // (same pipeline as the sidebar EV-card), passing only `view`
+        // — the dashboard hero gets the identical side-profile framing
+        // the sidebar uses. (model, colour) come from the daemon's
+        // /api/models/selected endpoint via the shell's standard
+        // applyVehicleSelection() flow.
+        //
+        // mountVehicleCanvas internally calls ensureEv3d() which looks
+        // for the sidebar's #evCardCanvas to decide whether to inject
+        // ev-card-3d.js — so we must wait for the sidebar to be mounted
+        // before calling. The shell dispatches `app-shell:ready` after
+        // mount; we listen for that (with a DOMContentLoaded fallback).
+        //
+        // Note: on the laptop static-server preview the daemon endpoint
+        // 404s, so neither sidebar EV-card nor this hero canvas paint
+        // a model. To preview the dashboard layout/CSS in a browser
+        // without the device, run the app on-device. We do not seed
+        // any synthetic default here — keeping the renderer pipeline
+        // strictly daemon-driven matches the sidebar's behaviour.
+        (function () {
+            var didMount = false;
+            function mountHero() {
+                if (didMount) return;
+                var canvas = document.getElementById('dashHero3d');
+                if (!canvas) return;
+                var shell = window.OverdriveAppShell;
+                if (!shell || typeof shell.mountVehicleCanvas !== 'function') return;
+                if (!document.getElementById('evCardCanvas')) return; // sidebar not mounted yet
+                didMount = true;
+                shell.mountVehicleCanvas(canvas, { view: 'side' });
+            }
+            document.addEventListener('app-shell:ready', mountHero);
+            if (document.readyState === 'loading') {
+                document.addEventListener('DOMContentLoaded', function () {
+                    setTimeout(mountHero, 0);
+                });
+            } else {
+                setTimeout(mountHero, 0);
+            }
+        })();
     </script>
 </body>
 </html>

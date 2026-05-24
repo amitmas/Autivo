@@ -46,8 +46,33 @@ public final class BydCloudDataProvider {
     }
 
     public void addLockStateListener(CloudLockStateListener listener) {
-        if (listener != null && !lockListeners.contains(listener)) {
-            lockListeners.add(listener);
+        if (listener == null || lockListeners.contains(listener)) return;
+        lockListeners.add(listener);
+
+        // Immediate replay of current valid snapshot. Edge tracking
+        // (lastKnownLocked/lastKnownValid) persists across ACC cycles within
+        // the daemon's process lifetime; without this replay, a listener that
+        // attaches AFTER the last edge fired gets nothing until the next
+        // transition — which means a fresh sentry cycle never arms when the
+        // car was already locked from the previous park.
+        //
+        // CRITICAL ordering: read snapshot AFTER `lockListeners.add` so we
+        // can't miss an edge that fires on a different thread between add
+        // and snapshot.get(). updateFromVehicleInfo iterates listeners via
+        // CopyOnWriteArrayList — its iterator is snapshotted at iterator()
+        // time, so a fire that started just before our add will skip us;
+        // re-reading our snapshot here delivers whatever edge they wrote.
+        // Worst case: same edge fires twice — applyLockEvent in CameraDaemon
+        // is idempotent so duplicate fires are safe.
+        VehicleCloudSnapshot s = snapshot.get();
+        if (s != null && s.isLockStateFresh() && s.hasValidLockState()) {
+            if (s.isAllLocked()) {
+                try { listener.onCloudLockStateChanged(true, s.receivedAt); }
+                catch (Exception e) { logger.warn("Lock listener replay error: " + e.getMessage()); }
+            } else if (s.isAnyUnlocked()) {
+                try { listener.onCloudLockStateChanged(false, s.receivedAt); }
+                catch (Exception e) { logger.warn("Lock listener replay error: " + e.getMessage()); }
+            }
         }
     }
 

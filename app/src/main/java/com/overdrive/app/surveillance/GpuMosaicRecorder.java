@@ -38,14 +38,15 @@ public class GpuMosaicRecorder {
     private EGLSurface encoderSurface;
     private Surface encoderInputSurface;
     
-    // SOTA: Dynamic Time-Base Corrector (TBC) state.
-    // Uses an Exponential Moving Average to learn the actual hardware frame rate
-    // in real-time, then feeds mathematically perfect, evenly spaced timestamps
-    // to the encoder. This eliminates both the fast-forward bug (from hardcoded FPS)
-    // and the rubber-banding jitter (from raw System.nanoTime()).
-    private long lastRealTimeNs = -1;
-    private long smoothedPtsNs = -1;
-    private long averageDeltaNs = 181_000_000L;  // Initial assumption: ~5.5 FPS
+    // PTS comes from the HAL-provided Image.getTimestamp() value, passed in
+    // through drawFrame(textureId, timestampNs). The previous EMA-based
+    // Time-Base Corrector clamped per-frame deltas to [30 ms, 500 ms] and
+    // smoothed at α = 0.1, which was incompatible with rates ≥ ~22 fps —
+    // the lower clamp pushed averageDeltaNs toward 33 fps regardless of the
+    // real arrival rate, and any 200 ms spike took ~22 frames to recover,
+    // producing the rubber-banding/snapback users saw at 15+ fps + high
+    // bitrate. Letting the hardware timestamp speak for itself means PTS
+    // values exactly mirror real camera cadence.
     
     // OpenGL program and locations
     private int programId;
@@ -93,20 +94,64 @@ public class GpuMosaicRecorder {
     private boolean overlayTextureReady = false;
     private boolean overlayTextureInitialized = false;
     
-    // Frame skip tracking - prevents eglSwapBuffers from blocking GL thread
-    // When encoder is backed up (SD card I/O), skip rendering to keep camera HAL flowing
+    // HAL-contention safety valve.
+    //
+    // The original code skipped a frame any time the *previous* draw exceeded
+    // 30 ms three times in a row. That tripped constantly at 25–30 fps + high
+    // bitrate (per-frame budget = 33–40 ms; eglSwap fence + AI readback
+    // routinely cross 30 ms by themselves), removing 1-in-N frames from the
+    // recorded MP4 even when nothing was actually wrong.
+    //
+    // Under normal operation we now do nothing — eglSwapBuffers is supposed to
+    // block when the encoder input queue is full, and acquireLatestImage will
+    // drop incoming HAL frames at zero GPU cost when we fall behind.
+    //
+    // The valve only opens when the BYD native parking-camera app is sharing
+    // the HAL with us (set via setHalContentionProbe). In that mode a stalled
+    // GL thread fills the gralloc pool and the native AVM loses its preview
+    // signal, so we sacrifice one frame to keep the BufferQueue draining.
+    // Threshold is derived from the encoder's frame budget × 2, refreshed on
+    // every init() so an FPS change scales it correctly.
     private long lastDrawDurationNs = 0;
-    private static final long MAX_DRAW_DURATION_NS = 30_000_000L;  // 30ms threshold
+
+    // Last PTS handed to the encoder surface. Belt-and-suspenders against
+    // the encoder-input-queue lag at HW->NANO domain transition: PTS values
+    // queued before the latch fires can have larger timestamps than NANO
+    // values that follow, breaking muxer monotonicity. The PTS-source helper
+    // in PanoramicCameraGpu already enforces monotonicity within its own
+    // sequence, but doesn't see what's still pending in MediaCodec's input
+    // queue. Clamping here against the previously-stamped value covers both
+    // the cross-domain transition and any future code path that bypasses
+    // nextFrameTimestampNs (audit P1).
+    private long lastSwappedPtsNs = 0;
+    private long maxDrawDurationNs = 100_000_000L;          // refreshed in init()
     private int consecutiveSlowFrames = 0;
-    private static final int SLOW_FRAME_SKIP_THRESHOLD = 3;  // Skip after 3 slow frames
+    private static final int SLOW_FRAME_SKIP_THRESHOLD = 20; // ~0.7 s at 30 fps
     private int skippedFrames = 0;
+    // Default probe — never trips. PanoramicCameraGpu installs the real one
+    // pointing at BydCameraCoordinator.isNativeAppActive(); if no one wires
+    // it, the safety valve stays inert and eglSwap handles backpressure
+    // natively.
+    private volatile java.util.function.BooleanSupplier halContentionProbe = () -> false;
     
     // EGL_BAD_SURFACE recovery: track consecutive surface errors to trigger reinit
     private int consecutiveSurfaceErrors = 0;
     private static final int SURFACE_ERROR_REINIT_THRESHOLD = 3;
     private volatile boolean needsReinit = false;
+
+    // Per-quadrant strip-X offsets resolved from the camera profile + user role
+    // mapping. Default mirrors the legacy Seal layout (TL=Front, TR=Right,
+    // BL=Rear, BR=Left). The fragment shader is rebuilt at construction time
+    // with these constants baked in — no per-frame uniform write needed.
     private final float[] quadrantStripOffsetX;
     private final String fragmentShader;
+    private final int viewportWidth;
+    private final int viewportHeight;
+    private static final float[] DEFAULT_QUADRANT_STRIP_OFFSET_X = {
+        0.75f, 0.50f, 0.00f, 0.25f
+    };
+    private static final int DEFAULT_VIEWPORT_WIDTH = 2560;
+    private static final int DEFAULT_VIEWPORT_HEIGHT = 1920;
     
     // Fullscreen quad vertices (NDC coordinates)
     private static final float[] VERTEX_COORDS = {
@@ -122,10 +167,6 @@ public class GpuMosaicRecorder {
         1.0f, 1.0f,  // Bottom-right (flipped to top-right)
         0.0f, 0.0f,  // Top-left (flipped to bottom-left)
         1.0f, 0.0f   // Top-right (flipped to bottom-right)
-    };
-
-    private static final float[] DEFAULT_QUADRANT_STRIP_OFFSET_X = {
-        0.75f, 0.50f, 0.00f, 0.25f
     };
     
     // Vertex shader - simple passthrough
@@ -144,43 +185,11 @@ public class GpuMosaicRecorder {
     //           2.0 = 3-camera mosaic (Atto 3 default: Rear=0-25%, Side=25-75%, Front=75-100%)
     // 4-cam strip: cam1(Rear)=0.00, cam2(Left)=0.25, cam3(Right)=0.50, cam4(Front)=0.75
     // 3-cam strip: Rear=0.00-0.25, Left+Right=0.25-0.75, Front=0.75-1.00
-    private static final String FRAGMENT_SHADER =
-        "#extension GL_OES_EGL_image_external : require\n" +
-        "precision mediump float;\n" +
-        "uniform samplerExternalOES uCameraTex;\n" +
-        "uniform float uApaMode;\n" +
-        "varying vec2 vTexCoord;\n" +
-        "void main() {\n" +
-        "    vec2 samplePos;\n" +
-        "    if (uApaMode > 1.5) {\n" +
-        "        // 3-camera mosaic: TL=Front, BL=Rear, Right=Side(Left+Right)\n" +
-        "        if (vTexCoord.x < 0.5) {\n" +
-        "            // Left column: top=Front(0.75-1.0), bottom=Rear(0.0-0.25)\n" +
-        "            float localX = vTexCoord.x * 0.5;\n" +  // 0-0.5 -> 0-0.25
-        "            float localY = mod(vTexCoord.y, 0.5) * 2.0;\n" +
-        "            if (vTexCoord.y < 0.5) {\n" +
-        "                samplePos = vec2(localX + 0.75, localY);\n" +  // Front
-        "            } else {\n" +
-        "                samplePos = vec2(localX, localY);\n" +  // Rear
-        "            }\n" +
-        "        } else {\n" +
-        "            // Right column: Side view (0.25-0.75, full height)\n" +
-        "            float localX = (vTexCoord.x - 0.5) * 1.0;\n" +  // 0.5-1.0 -> 0-0.5
-        "            samplePos = vec2(0.25 + localX * 0.5, vTexCoord.y);\n" +
-        "        }\n" +
-        "    } else if (uApaMode > 0.5) {\n" +
-        "        // APA passthrough\n" +
-        "        samplePos = vTexCoord;\n" +
-        "    } else {\n" +
-        "        // 4-camera mosaic (Seal default)\n" +
-        "        vec2 gridPos = step(0.5, vTexCoord);\n" +
-        "        float stripOffsetX = 0.75 - (gridPos.x * 0.25) - (gridPos.y * 0.75) + (gridPos.x * gridPos.y * 0.50);\n" +
-        "        float localX = mod(vTexCoord.x, 0.5) * 0.5;\n" +
-        "        float localY = mod(vTexCoord.y, 0.5) * 2.0;\n" +
-        "        samplePos = vec2(localX + stripOffsetX, localY);\n" +
-        "    }\n" +
-        "    gl_FragColor = texture2D(uCameraTex, samplePos);\n" +
-        "}\n";
+    /** 4-camera mosaic offsets are baked at construction via
+     *  {@link #buildFragmentShader(float[])} so the per-quadrant slice→corner
+     *  mapping can be resolved per camera profile (Seal vs Tang) and per
+     *  user role mapping. 3-cam and APA branches are layout-independent so
+     *  they stay as-is. */
     
     // Overlay vertex shader - simple 2D passthrough
     private static final String OVERLAY_VERTEX_SHADER =
@@ -202,17 +211,35 @@ public class GpuMosaicRecorder {
         "}\n";
 
     public GpuMosaicRecorder() {
-        this(null);
+        this(null, DEFAULT_VIEWPORT_WIDTH, DEFAULT_VIEWPORT_HEIGHT);
     }
 
     public GpuMosaicRecorder(float[] quadrantStripOffsetX) {
+        this(quadrantStripOffsetX, DEFAULT_VIEWPORT_WIDTH, DEFAULT_VIEWPORT_HEIGHT);
+    }
+
+    /**
+     * @param quadrantStripOffsetX Per-quadrant strip-X offsets in
+     *     {Front, Right, Rear, Left} order. Resolved from
+     *     {@code ResolvedCameraConfig.getQuadrantStripOffsetX()}. Pass null
+     *     for the legacy Seal default.
+     * @param viewportWidth Encoder/mosaic width. Should match the encoder's
+     *     configured width — typically {@code panoWidth/2} (2560 on Seal,
+     *     2560 on Tang).
+     * @param viewportHeight Encoder/mosaic height. Should match the encoder's
+     *     configured height — typically {@code panoHeight*2} (1920 on Seal,
+     *     1440 on Tang).
+     */
+    public GpuMosaicRecorder(float[] quadrantStripOffsetX, int viewportWidth, int viewportHeight) {
         this.quadrantStripOffsetX = normalizeOffsets(quadrantStripOffsetX);
         this.fragmentShader = buildFragmentShader(this.quadrantStripOffsetX);
+        this.viewportWidth = viewportWidth > 0 ? viewportWidth : DEFAULT_VIEWPORT_WIDTH;
+        this.viewportHeight = viewportHeight > 0 ? viewportHeight : DEFAULT_VIEWPORT_HEIGHT;
     }
-    
+
     /**
      * Initializes the GPU mosaic recorder.
-     * 
+     *
      * @param eglCore EGL context manager
      * @param encoder Hardware encoder that provides the input surface
      */
@@ -227,20 +254,18 @@ public class GpuMosaicRecorder {
         this.eglCore = eglCore;
         this.encoder = encoder;
 
-        // Seed TBC EMA from the encoder's configured fps so the first ~10
-        // frames have correct PTS pacing. Without this, averageDeltaNs starts
-        // at the static default (~5.5 fps) and the EMA needs ~22 frames to
-        // converge — at 30 fps that's 700ms of fast-forward at the start of
-        // each recording, plus a "snap to wall clock" jump from the 1s drift
-        // failsafe. Reset smoothedPtsNs too so on reinit (FPS change) the
-        // first frame uses real wall-clock time as the new origin.
-        int encoderFps = encoder != null ? encoder.getFps() : 15;
-        averageDeltaNs = 1_000_000_000L / Math.max(1, encoderFps);
-        smoothedPtsNs = -1;
-        lastRealTimeNs = -1;
-        logger.info("TBC seeded: averageDeltaNs=" + (averageDeltaNs / 1_000_000)
-            + "ms (from encoder fps=" + encoderFps + ")");
-        
+        // Scale the HAL-contention safety valve to the configured fps. Budget
+        // is 2 × the per-frame target so a normal eglSwap fence + AI readback
+        // never trips it; only sustained backpressure during BYD native AVM
+        // contention should cross it.
+        int encFps = encoder != null ? encoder.getFps() : 15;
+        maxDrawDurationNs = 2L * 1_000_000_000L / Math.max(1, encFps);
+
+        // Reset the swap-time monotonic clamp on every init so a recorder
+        // reinit (encoder swap, codec change) doesn't carry over a stale
+        // ceiling that would clamp every new frame to a far-future PTS.
+        lastSwappedPtsNs = 0;
+
         // Register callback to sync recording flag when encoder closes file
         encoder.setFileClosedCallback(() -> {
             if (recording) {
@@ -279,7 +304,7 @@ public class GpuMosaicRecorder {
         // Create EGL surface from encoder surface (with RECORDABLE flag)
         encoderSurface = eglCore.createWindowSurface(encoderInputSurface);
         
-        // Compile shaders and create program
+        // Compile shaders and create program (fragment shader is profile-baked)
         programId = GlUtil.createProgram(VERTEX_SHADER, fragmentShader);
         if (programId == 0) {
             throw new RuntimeException("Failed to create shader program");
@@ -365,25 +390,33 @@ public class GpuMosaicRecorder {
      * parking camera app from losing video signal during prolonged recording.
      * 
      * @param cameraTextureId OpenGL texture ID containing camera frame
+     * @param frameTimestampNs HAL-provided sensor timestamp in nanoseconds
+     *                         (from Image.getTimestamp()). Stamped onto the
+     *                         encoder surface via eglPresentationTimeANDROID
+     *                         so MediaCodec emits PTS values that match real
+     *                         camera cadence — no smoothing, no EMA, no clamps.
      */
-    public void drawFrame(int cameraTextureId) {
+    public void drawFrame(int cameraTextureId, long frameTimestampNs) {
         // Check if initialized
         if (eglCore == null || encoderSurface == null) {
             // Not initialized yet - skip silently
             return;
         }
 
-        // ENCODER BACKPRESSURE GUARD: If previous frames took too long (encoder backed up),
-        // skip this frame to prevent blocking the GL thread. The camera HAL's BufferQueue
-        // must keep flowing or the BYD native camera app loses video signal.
-        if (consecutiveSlowFrames >= SLOW_FRAME_SKIP_THRESHOLD) {
+        // HAL-CONTENTION SAFETY VALVE: only trips when the BYD native AVM app
+        // is actively sharing the camera. In normal operation we let
+        // eglSwapBuffers block (its native backpressure mechanism) and let
+        // acquireLatestImage() drop upstream frames at zero GPU cost.
+        if (consecutiveSlowFrames >= SLOW_FRAME_SKIP_THRESHOLD
+                && halContentionProbe.getAsBoolean()) {
             skippedFrames++;
-            // Reset after skipping one frame to retry
             consecutiveSlowFrames = 0;
             if (skippedFrames % 10 == 1) {
-                logger.warn("Encoder backpressure: skipped " + skippedFrames + 
-                    " frames to keep camera HAL flowing (last draw=" + 
-                    (lastDrawDurationNs / 1_000_000) + "ms)");
+                logger.warn("HAL contention: skipped " + skippedFrames +
+                    " frames to keep BYD native AVM signal alive (last draw=" +
+                    (lastDrawDurationNs / 1_000_000) + "ms, threshold=" +
+                    (maxDrawDurationNs / 1_000_000) + "ms × " +
+                    SLOW_FRAME_SKIP_THRESHOLD + ")");
             }
             return;
         }
@@ -396,8 +429,8 @@ public class GpuMosaicRecorder {
         // Make encoder surface current
         eglCore.makeCurrent(encoderSurface);
 
-        // Set viewport to encoder resolution (2560x1920)
-        GLES20.glViewport(0, 0, 2560, 1920);
+        // Set viewport to encoder resolution (profile-driven: Seal=2560x1920, Tang=2560x1440)
+        GLES20.glViewport(0, 0, viewportWidth, viewportHeight);
 
         // Clear
         GLES20.glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
@@ -491,40 +524,25 @@ public class GpuMosaicRecorder {
             }
         }
 
-        // --- SOTA: Dynamic Time-Base Corrector (TBC) ---
-        // Learns the actual hardware frame rate via EMA and produces perfectly
-        // paced timestamps that eliminate both fast-forward and rubber-banding.
-        long nowNs = System.nanoTime();
-        if (smoothedPtsNs < 0) {
-            // First frame initialization
-            smoothedPtsNs = nowNs;
-            lastRealTimeNs = nowNs;
-        } else {
-            // 1. Calculate the raw, jittery delta
-            long rawDeltaNs = nowNs - lastRealTimeNs;
-            lastRealTimeNs = nowNs;
-            
-            // 2. Clamp outliers (ignore massive CPU freezes or dropped frames)
-            //    Min 30ms (33 FPS cap), Max 500ms (2 FPS floor)
-            long clampedDeltaNs = Math.max(30_000_000L, Math.min(rawDeltaNs, 500_000_000L));
-            
-            // 3. Update the moving average (Alpha=0.1 for smooth adaptation)
-            //    This learns the car's actual framerate without jitter
-            averageDeltaNs = (long)(averageDeltaNs * 0.9 + clampedDeltaNs * 0.1);
-            
-            // 4. Advance the perfectly smooth timeline
-            smoothedPtsNs += averageDeltaNs;
-            
-            // 5. Failsafe: prevent smoothed clock from drifting >1s from real time
-            long driftNs = nowNs - smoothedPtsNs;
-            if (Math.abs(driftNs) > 1_000_000_000L) {
-                smoothedPtsNs = nowNs;
-            }
+        // Push the HAL sensor timestamp straight through. MediaCodec uses the
+        // value stamped on the encoder surface via eglPresentationTimeANDROID
+        // to compute PTS, so the recorded MP4 inherits true camera cadence
+        // without any software smoothing/EMA layer in between.
+        //
+        // Swap-time monotonic clamp: if the candidate is not strictly greater
+        // than the previously-stamped value, bump by 1 ms. This guards the
+        // muxer against any path that produces a non-monotonic PTS — most
+        // notably the HW→NANO clock-domain transition where queued frames
+        // already inside MediaCodec's input pool carry pre-transition
+        // timestamps that can sequence-wise leapfrog post-transition ones.
+        long stampedPtsNs = frameTimestampNs;
+        if (stampedPtsNs <= lastSwappedPtsNs) {
+            stampedPtsNs = lastSwappedPtsNs + 1_000_000L;  // +1 ms
         }
-        
-        // Push the mathematically perfect timestamp to the hardware encoder
+        lastSwappedPtsNs = stampedPtsNs;
+
         try {
-            eglCore.swapBuffersWithTimestamp(encoderSurface, smoothedPtsNs);
+            eglCore.swapBuffersWithTimestamp(encoderSurface, stampedPtsNs);
             consecutiveSurfaceErrors = 0;  // Reset on success
         } catch (RuntimeException e) {
             consecutiveSurfaceErrors++;
@@ -545,7 +563,7 @@ public class GpuMosaicRecorder {
         long elapsedNs = System.nanoTime() - startTime;
         lastDrawDurationNs = elapsedNs;
 
-        if (elapsedNs > MAX_DRAW_DURATION_NS) {
+        if (elapsedNs > maxDrawDurationNs) {
             consecutiveSlowFrames++;
         } else {
             consecutiveSlowFrames = 0;
@@ -777,6 +795,17 @@ public class GpuMosaicRecorder {
     public void setOverlayEnabled(boolean enabled) {
         this.overlayEnabled = enabled;
     }
+
+    /**
+     * Wires the HAL-contention probe used by the safety valve. The valve only
+     * skips frames when this returns true (i.e., the BYD native AVM app is
+     * actively sharing the camera and could lose its preview signal). When
+     * unset (or set to a probe that always returns false), the valve is inert
+     * and eglSwapBuffers handles backpressure natively.
+     */
+    public void setHalContentionProbe(java.util.function.BooleanSupplier probe) {
+        this.halContentionProbe = probe != null ? probe : () -> false;
+    }
     
     /**
      * Sets the camera layout mode for the mosaic shader.
@@ -794,61 +823,7 @@ public class GpuMosaicRecorder {
     public void setApaMode(boolean apa) {
         setCameraLayout(apa ? 1 : 0);
     }
-
-    private static float[] normalizeOffsets(float[] quadrantStripOffsetX) {
-        if (quadrantStripOffsetX == null || quadrantStripOffsetX.length != 4) {
-            return DEFAULT_QUADRANT_STRIP_OFFSET_X.clone();
-        }
-        return quadrantStripOffsetX.clone();
-    }
-
-    private static String buildFragmentShader(float[] offsets) {
-        return String.format(Locale.US,
-            "#extension GL_OES_EGL_image_external : require\n" +
-            "precision mediump float;\n" +
-            "uniform samplerExternalOES uCameraTex;\n" +
-            "uniform float uApaMode;\n" +
-            "varying vec2 vTexCoord;\n" +
-            "void main() {\n" +
-            "    vec2 samplePos;\n" +
-            "    if (uApaMode > 1.5) {\n" +
-            "        if (vTexCoord.x < 0.5) {\n" +
-            "            float localX = vTexCoord.x * 0.5;\n" +
-            "            float localY = mod(vTexCoord.y, 0.5) * 2.0;\n" +
-            "            if (vTexCoord.y < 0.5) {\n" +
-            "                samplePos = vec2(localX + 0.75, localY);\n" +
-            "            } else {\n" +
-            "                samplePos = vec2(localX, localY);\n" +
-            "            }\n" +
-            "        } else {\n" +
-            "            float localX = (vTexCoord.x - 0.5) * 1.0;\n" +
-            "            samplePos = vec2(0.25 + localX * 0.5, vTexCoord.y);\n" +
-            "        }\n" +
-            "    } else if (uApaMode > 0.5) {\n" +
-            "        samplePos = vTexCoord;\n" +
-            "    } else {\n" +
-            "        vec2 gridPos = step(0.5, vTexCoord);\n" +
-            "        float tlOffset = %.5ff;\n" +
-            "        float trOffset = %.5ff;\n" +
-            "        float blOffset = %.5ff;\n" +
-            "        float brOffset = %.5ff;\n" +
-            "        float stripOffsetX;\n" +
-            "        if (gridPos.x < 0.5) {\n" +
-            "            stripOffsetX = gridPos.y < 0.5 ? tlOffset : blOffset;\n" +
-            "        } else {\n" +
-            "            stripOffsetX = gridPos.y < 0.5 ? trOffset : brOffset;\n" +
-            "        }\n" +
-            "        float localX = mod(vTexCoord.x, 0.5) * 0.5;\n" +
-            "        float localY = mod(vTexCoord.y, 0.5) * 2.0;\n" +
-            "        samplePos = vec2(localX + stripOffsetX, localY);\n" +
-            "    }\n" +
-            "    gl_FragColor = texture2D(uCameraTex, samplePos);\n" +
-            "}\n",
-            offsets[0], offsets[1], offsets[2], offsets[3]);
-    }
     
-    // (TBC timestamp is computed inline in drawFrame)
-
     public boolean isOverlayEnabled() {
         return overlayEnabled;
     }
@@ -924,5 +899,60 @@ public class GpuMosaicRecorder {
         }
         
         logger.info( "GpuMosaicRecorder released");
+    }
+
+    private static float[] normalizeOffsets(float[] quadrantStripOffsetX) {
+        if (quadrantStripOffsetX == null || quadrantStripOffsetX.length != 4) {
+            return DEFAULT_QUADRANT_STRIP_OFFSET_X.clone();
+        }
+        return quadrantStripOffsetX.clone();
+    }
+
+    /**
+     * Build the mosaic fragment shader with the four per-quadrant strip-X
+     * offsets baked in as GLSL constants. Order: {Front, Right, Rear, Left}
+     * → {TL, TR, BL, BR}. 3-cam (uApaMode > 1.5) and APA (uApaMode > 0.5)
+     * branches are layout-independent and stay as-is.
+     */
+    private static String buildFragmentShader(float[] offsets) {
+        return String.format(Locale.US,
+            "#extension GL_OES_EGL_image_external : require\n" +
+            "precision mediump float;\n" +
+            "uniform samplerExternalOES uCameraTex;\n" +
+            "uniform float uApaMode;\n" +
+            "varying vec2 vTexCoord;\n" +
+            "void main() {\n" +
+            "    vec2 samplePos;\n" +
+            "    float frontOffset = %.5ff;\n" +
+            "    float rightOffset = %.5ff;\n" +
+            "    float rearOffset  = %.5ff;\n" +
+            "    float leftOffset  = %.5ff;\n" +
+            "    if (uApaMode > 1.5) {\n" +
+            "        if (vTexCoord.x < 0.5) {\n" +
+            "            float lx = vTexCoord.x * 0.5;\n" +
+            "            float ly = mod(vTexCoord.y, 0.5) * 2.0;\n" +
+            "            if (vTexCoord.y < 0.5) { samplePos = vec2(lx + 0.75, ly); }\n" +
+            "            else { samplePos = vec2(lx, ly); }\n" +
+            "        } else {\n" +
+            "            float lx = (vTexCoord.x - 0.5);\n" +
+            "            samplePos = vec2(0.25 + lx * 0.5, vTexCoord.y);\n" +
+            "        }\n" +
+            "    } else if (uApaMode > 0.5) {\n" +
+            "        samplePos = vTexCoord;\n" +
+            "    } else {\n" +
+            "        vec2 gridPos = step(0.5, vTexCoord);\n" +
+            "        float stripOffsetX;\n" +
+            "        if (gridPos.x < 0.5) {\n" +
+            "            stripOffsetX = gridPos.y < 0.5 ? frontOffset : rearOffset;\n" +
+            "        } else {\n" +
+            "            stripOffsetX = gridPos.y < 0.5 ? rightOffset : leftOffset;\n" +
+            "        }\n" +
+            "        float localX = mod(vTexCoord.x, 0.5) * 0.5;\n" +
+            "        float localY = mod(vTexCoord.y, 0.5) * 2.0;\n" +
+            "        samplePos = vec2(localX + stripOffsetX, localY);\n" +
+            "    }\n" +
+            "    gl_FragColor = texture2D(uCameraTex, samplePos);\n" +
+            "}\n",
+            offsets[0], offsets[1], offsets[2], offsets[3]);
     }
 }

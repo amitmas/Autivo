@@ -475,25 +475,26 @@ public class SurveillanceIpcServer implements Runnable {
             
             boolean configChanged = false;
             
-            // Handle surveillance storage type change (INTERNAL or SD_CARD)
+            // Handle surveillance storage type change (INTERNAL, SD_CARD, USB)
             if (config.has("surveillanceStorageType")) {
                 String typeStr = config.getString("surveillanceStorageType").toUpperCase();
                 com.overdrive.app.storage.StorageManager storageManager =
                     com.overdrive.app.storage.StorageManager.getInstance();
-                com.overdrive.app.storage.StorageManager.StorageType type =
-                    "SD_CARD".equals(typeStr) ?
-                        com.overdrive.app.storage.StorageManager.StorageType.SD_CARD :
-                        com.overdrive.app.storage.StorageManager.StorageType.INTERNAL;
+                com.overdrive.app.storage.StorageManager.StorageType type;
+                switch (typeStr) {
+                    case "SD_CARD": type = com.overdrive.app.storage.StorageManager.StorageType.SD_CARD; break;
+                    case "USB":     type = com.overdrive.app.storage.StorageManager.StorageType.USB;     break;
+                    default:        type = com.overdrive.app.storage.StorageManager.StorageType.INTERNAL;
+                }
                 boolean success = storageManager.setSurveillanceStorageType(type);
                 if (success) {
                     logger.info("Surveillance storage type set to " + type + " via IPC");
-                    // Update sentry's event output directory if running
                     if (sentry != null) {
                         sentry.setEventOutputDir(storageManager.getSurveillanceDir());
                         logger.info("Updated sentry output dir: " + storageManager.getSurveillanceDir().getAbsolutePath());
                     }
                 } else {
-                    logger.warn("Failed to set surveillance storage to SD_CARD - not available");
+                    logger.warn("Failed to set surveillance storage to " + type + " - not available");
                 }
             }
             
@@ -933,20 +934,25 @@ public class SurveillanceIpcServer implements Runnable {
                         config.optBoolean("telegramSendStartPing", false));
                 configChanged = true;
             }
+            // Per-tier filter is persisted on the telegram section now — see
+            // UnifiedTelegramConfig.K_TIER_*. Don't flip configChanged: the
+            // surveillance config is unaffected, and writing through
+            // setBoolean already triggers an updateSection write that the
+            // gate's forceReload() will pick up on the next event.
             if (config.has("telegramNotices")) {
-                sentryConfig.setTelegramNotices(
+                com.overdrive.app.telegram.config.UnifiedTelegramConfig.setBoolean(
+                        com.overdrive.app.telegram.config.UnifiedTelegramConfig.K_TIER_NOTICES,
                         config.optBoolean("telegramNotices", false));
-                configChanged = true;
             }
             if (config.has("telegramAlerts")) {
-                sentryConfig.setTelegramAlerts(
+                com.overdrive.app.telegram.config.UnifiedTelegramConfig.setBoolean(
+                        com.overdrive.app.telegram.config.UnifiedTelegramConfig.K_TIER_ALERTS,
                         config.optBoolean("telegramAlerts", true));
-                configChanged = true;
             }
             if (config.has("telegramCritical")) {
-                sentryConfig.setTelegramCritical(
+                com.overdrive.app.telegram.config.UnifiedTelegramConfig.setBoolean(
+                        com.overdrive.app.telegram.config.UnifiedTelegramConfig.K_TIER_CRITICAL,
                         config.optBoolean("telegramCritical", true));
-                configChanged = true;
             }
 
         } catch (Exception e) {
@@ -1628,10 +1634,24 @@ public class SurveillanceIpcServer implements Runnable {
                         writeInstallProgress(phase, -1, m, null);
                     }
                     @Override public void onDownloadProgress(int percent) {
+                        // Coalesce: AppUpdater can fire this every percent;
+                        // writeInstallProgress is a full-file JSON rewrite.
+                        // Throttle to ≥2% steps or 500ms cadence so disk
+                        // write latency doesn't cap download throughput.
+                        long now = System.currentTimeMillis();
+                        boolean atEdge = percent < 0 || percent >= 99
+                                || dlLastPct < 0;
+                        boolean stepEnough = (percent - dlLastPct) >= 2;
+                        boolean timeEnough = (now - dlLastAt) >= 500;
+                        if (!(atEdge || stepEnough || timeEnough)) return;
+                        dlLastPct = percent;
+                        dlLastAt = now;
                         writeInstallProgress("downloading", percent,
                                 percent < 0 ? "Downloading…" : "Downloading " + percent + "%",
                                 null);
                     }
+                    private int dlLastPct = -1;
+                    private long dlLastAt = 0;
                     @Override public void onSuccess() {
                         writeInstallProgress("installing", 100, "Update installed, restarting…", null);
                     }

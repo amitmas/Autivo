@@ -13,26 +13,31 @@ import java.io.File;
 public class GpuPipelineFactory {
     private static final String TAG = "GpuPipelineFactory";
     private static final DaemonLogger logger = DaemonLogger.getInstance(TAG);
-    private static final com.overdrive.app.camera.CameraProfile LEGACY_PROFILE =
-        com.overdrive.app.camera.CameraProfiles.getLegacyDefault();
     
     /**
-     * Creates a complete GPU surveillance pipeline with default settings.
-     * 
+     * Creates a complete GPU surveillance pipeline using the camera profile
+     * resolved from the vehicle model + UnifiedConfigManager.camera section.
+     *
      * Configuration:
-    * - Camera: legacy-profile panoramic resolution @ 30 FPS
-     * - Encoder: 2560x1920 @ 15 FPS, 6 Mbps
+     * - Camera: profile-driven (Seal=5120x960, Tang=5120x720) @ targetFps from config
+     * - Encoder: derived from strip aspect (Seal=2560x1920, Tang=2560x1440)
      * - AI: 320x240 @ 2 FPS (idle), 5 FPS (active)
      * - Thermal protection enabled
      * - Adaptive bitrate enabled
-     * 
+     *
      * @param eventOutputDir Directory for event recordings
      * @return Configured GpuSurveillancePipeline
      */
     public static GpuSurveillancePipeline createDefault(File eventOutputDir) {
+        com.overdrive.app.camera.ResolvedCameraConfig resolved =
+            com.overdrive.app.camera.CameraConfigResolver.resolve();
+        logger.info("createDefault: profile=" + resolved.getProfile().getDisplayName()
+            + " (panoSize=" + resolved.getPanoWidth() + "x" + resolved.getPanoHeight()
+            + ", encoderSize=" + resolved.getProfile().getEncoderWidth()
+            + "x" + resolved.getProfile().getEncoderHeight() + ")");
         return new GpuSurveillancePipeline(
-            LEGACY_PROFILE.getPanoWidth(),
-            LEGACY_PROFILE.getPanoHeight(),
+            resolved.getPanoWidth(),
+            resolved.getPanoHeight(),
             eventOutputDir);
     }
     
@@ -83,10 +88,17 @@ public class GpuPipelineFactory {
      * Builder for custom GPU pipeline configuration.
      */
     public static class PipelineBuilder {
-        private int cameraWidth = LEGACY_PROFILE.getPanoWidth();
-        private int cameraHeight = LEGACY_PROFILE.getPanoHeight();
-        private int encoderWidth = 2560;
-        private int encoderHeight = 1920;
+        // Defaults pulled from the legacy Seal profile so existing callers
+        // that don't override get the same behavior as before. Custom builds
+        // should call cameraResolution() / encoderResolution() explicitly.
+        private int cameraWidth = com.overdrive.app.camera.CameraProfiles
+            .getLegacyDefault().getPanoWidth();
+        private int cameraHeight = com.overdrive.app.camera.CameraProfiles
+            .getLegacyDefault().getPanoHeight();
+        private int encoderWidth = com.overdrive.app.camera.CameraProfiles
+            .getLegacyDefault().getEncoderWidth();
+        private int encoderHeight = com.overdrive.app.camera.CameraProfiles
+            .getLegacyDefault().getEncoderHeight();
         private int fps = 15;
         private int bitrate = 6_000_000;
         private boolean grayscaleAi = false;

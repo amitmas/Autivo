@@ -145,84 +145,7 @@ class MainActivity : AppCompatActivity() {
         // FIRST so any zombie daemons / watchdogs from the previous install are
         // dead before the new daemon launcher starts. See UpdateLifecycle for
         // the sentinel handshake details.
-        val isPostUpdate = com.overdrive.app.updater.UpdateLifecycle
-            .isPostUpdateLaunch(this, intent)
-        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-            // Sync device ID to file synchronously before daemon startup
-            Thread {
-                try {
-                    val synced = com.overdrive.app.util.DeviceIdGenerator.syncDeviceIdToFileSync(this)
-                    android.util.Log.i("MainActivity", "Device ID sync result: $synced")
-                } catch (e: Exception) {
-                    android.util.Log.e("MainActivity", "Device ID sync error: ${e.message}")
-                }
-
-                val startDaemons = Runnable {
-                    runOnUiThread {
-                        daemonStartupManager.initializeOnAppLaunch()
-                        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                            daemonStartupManager.checkAllDaemonStatuses()
-                        }, 3000)
-                    }
-                }
-
-                if (isPostUpdate) {
-                    logsViewModel.info("Update", "Post-update launch — hard-resetting daemons before startup")
-                    com.overdrive.app.updater.UpdateLifecycle.hardResetDaemons(this) {
-                        // Surface failed-install errors first. consumeJustUpdatedVersion
-                        // returns null when a failure marker is present, so the success
-                        // toast never fires on a failed install. consumeFailedUpdateError
-                        // also clears the marker so it's a one-shot.
-                        val installError = com.overdrive.app.updater.AppUpdater
-                            .consumeFailedUpdateError(this)
-                        if (installError != null) {
-                            runOnUiThread {
-                                Toast.makeText(this, getString(R.string.toast_update_install_failed, installError), Toast.LENGTH_LONG).show()
-                                logsViewModel.warn("Update", "Install failed: $installError")
-                            }
-                        }
-                        // Consume the just-updated marker only after the cleanup
-                        // completes. A crash mid-reset will leave the sentinel
-                        // in place so the next launch retries.
-                        val updatedVersion = com.overdrive.app.updater.AppUpdater
-                            .consumeJustUpdatedVersion(this)
-                        if (updatedVersion != null) {
-                            runOnUiThread {
-                                Toast.makeText(this, getString(R.string.toast_updated_to, updatedVersion), Toast.LENGTH_LONG).show()
-                                logsViewModel.info("Update", "App updated to $updatedVersion")
-                            }
-                            // Plant the Telegram post-update hint file so when
-                            // the cloudflared tunnel comes back with a NEW URL,
-                            // the user sees the post-update bot message instead
-                            // of the generic "URL changed" message.
-                            // The daemon deletes the hint after one read, so
-                            // subsequent (non-update) tunnel restarts go back
-                            // to the normal copy.
-                            try {
-                                val adb = com.overdrive.app.launcher.AdbDaemonLauncher(this)
-                                val hintFile = com.overdrive.app.updater
-                                    .UpdateLifecycle.TELEGRAM_POST_UPDATE_HINT_FILE
-                                adb.executeShellCommand(
-                                    "echo '$updatedVersion' > $hintFile",
-                                    object : com.overdrive.app.launcher
-                                        .AdbDaemonLauncher.LaunchCallback {
-                                        override fun onLog(message: String) {}
-                                        override fun onLaunched() {}
-                                        override fun onError(error: String) {}
-                                    }
-                                )
-                            } catch (e: Exception) {
-                                android.util.Log.w("MainActivity",
-                                    "Failed to plant Telegram post-update hint: ${e.message}")
-                            }
-                        }
-                        startDaemons.run()
-                    }
-                } else {
-                    startDaemons.run()
-                }
-            }.start()
-        }, 1000)
+        runDaemonStartup(intent, fromOnCreate = true)
         
         // Handle Location start intent (from SentryDaemon restart)
         handleLocationStartIntent(intent)
@@ -299,8 +222,219 @@ class MainActivity : AppCompatActivity() {
     
     override fun onNewIntent(intent: android.content.Intent?) {
         super.onNewIntent(intent)
-        intent?.let { handleLocationStartIntent(it) }
+        intent?.let {
+            handleLocationStartIntent(it)
+            // Critical: when MainActivity is already running and the install
+            // script's `am start --ez post_update true` re-delivers the
+            // intent (singleTop launchMode → onNewIntent, not onCreate), the
+            // post-update hard-reset would otherwise be skipped, leaving
+            // zombie daemons from the old install alive. Re-run the same
+            // flow onCreate uses; runDaemonStartup is idempotent (guarded
+            // by daemonStartupRequested + by the sentinel/intent-extra
+            // checks inside isPostUpdateLaunch — once the sentinels are
+            // consumed, subsequent calls become no-ops).
+            runDaemonStartup(it, fromOnCreate = false)
+        }
     }
+
+    /**
+     * Single source of truth for "MainActivity wants daemons running."
+     * Idempotent across onCreate / onNewIntent / ADB-auth-granted callbacks:
+     *   - daemonStartupCoordinator guards against duplicate concurrent runs
+     *   - the underlying UpdateLifecycle sentinels are one-shot so a second
+     *     call after the post-update reset becomes a normal startup
+     *
+     * The 1-second postDelayed gives ADB / device-id sync time to settle.
+     */
+    private fun runDaemonStartup(intent: android.content.Intent?, fromOnCreate: Boolean) {
+        val isPostUpdate = com.overdrive.app.updater.UpdateLifecycle
+            .isPostUpdateLaunch(this, intent)
+        // Skip the postDelayed boilerplate when called from onNewIntent for
+        // a non-post-update intent — daemons are already up from onCreate
+        // and re-running initializeOnAppLaunch() in that case just churns.
+        if (!fromOnCreate && !isPostUpdate) {
+            android.util.Log.d("MainActivity",
+                "runDaemonStartup: onNewIntent without post-update marker — no-op")
+            return
+        }
+        synchronized (daemonStartupCoordinator) {
+            if (daemonStartupCoordinator.inFlight) {
+                android.util.Log.i("MainActivity",
+                    "runDaemonStartup: another startup pass is in flight — skipping")
+                return
+            }
+            daemonStartupCoordinator.inFlight = true
+        }
+
+        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+            Thread {
+                try {
+                    try {
+                        val synced = com.overdrive.app.util.DeviceIdGenerator
+                            .syncDeviceIdToFileSync(this)
+                        android.util.Log.i("MainActivity", "Device ID sync result: $synced")
+                    } catch (e: Exception) {
+                        android.util.Log.e("MainActivity", "Device ID sync error: ${e.message}")
+                    }
+
+                    val startDaemons = Runnable {
+                        runOnUiThread {
+                            daemonStartupManager.initializeOnAppLaunch()
+                            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                                daemonStartupManager.checkAllDaemonStatuses()
+                            }, 3000)
+                        }
+                    }
+
+                    if (isPostUpdate) {
+                        logsViewModel.info("Update",
+                            "Post-update launch — hard-resetting daemons before startup")
+                        // Watchdog: if hardResetDaemons silently drops its
+                        // callback (synchronous throw inside the launcher,
+                        // unexpected shell exec failure mode), the inFlight
+                        // flag would otherwise stay true forever and block
+                        // every subsequent runDaemonStartup call from
+                        // onNewIntent. 30s is well past hardResetDaemons'
+                        // observed worst-case (~5-8s for the shell sweep
+                        // plus the 1s settle) so this only fires on a
+                        // real silent-drop bug, not on slow happy paths.
+                        //
+                        // The watchdog Runnable is captured into
+                        // daemonStartupCoordinator.pendingWatchdog so
+                        // onDestroy can cancel it — otherwise the lambda
+                        // captures `this@MainActivity` and leaks the
+                        // activity for up to 30s after a backout.
+                        val callbackFired = java.util.concurrent.atomic.AtomicBoolean(false)
+                        val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+                        val watchdog = Runnable {
+                            if (isFinishing || isDestroyed) {
+                                if (callbackFired.compareAndSet(false, true)) {
+                                    synchronized (daemonStartupCoordinator) {
+                                        daemonStartupCoordinator.inFlight = false
+                                        daemonStartupCoordinator.pendingWatchdog = null
+                                    }
+                                }
+                                return@Runnable
+                            }
+                            if (callbackFired.compareAndSet(false, true)) {
+                                android.util.Log.w("MainActivity",
+                                    "runDaemonStartup: hardResetDaemons callback never fired " +
+                                    "within 30s — proceeding with daemon startup anyway")
+                                try { showPostUpdateToasts() } catch (_: Exception) {}
+                                startDaemons.run()
+                                synchronized (daemonStartupCoordinator) {
+                                    daemonStartupCoordinator.inFlight = false
+                                    daemonStartupCoordinator.pendingWatchdog = null
+                                }
+                            }
+                        }
+                        synchronized (daemonStartupCoordinator) {
+                            daemonStartupCoordinator.pendingWatchdog = watchdog
+                            daemonStartupCoordinator.watchdogHandler = mainHandler
+                        }
+                        mainHandler.postDelayed(watchdog, 30_000)
+                        com.overdrive.app.updater.UpdateLifecycle.hardResetDaemons(this) {
+                            if (callbackFired.compareAndSet(false, true)) {
+                                synchronized (daemonStartupCoordinator) {
+                                    daemonStartupCoordinator.pendingWatchdog?.let {
+                                        daemonStartupCoordinator.watchdogHandler
+                                            ?.removeCallbacks(it)
+                                    }
+                                    daemonStartupCoordinator.pendingWatchdog = null
+                                }
+                                if (isFinishing || isDestroyed) {
+                                    synchronized (daemonStartupCoordinator) {
+                                        daemonStartupCoordinator.inFlight = false
+                                    }
+                                    return@hardResetDaemons
+                                }
+                                try {
+                                    showPostUpdateToasts()
+                                } finally {
+                                    startDaemons.run()
+                                    synchronized (daemonStartupCoordinator) {
+                                        daemonStartupCoordinator.inFlight = false
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        startDaemons.run()
+                        synchronized (daemonStartupCoordinator) {
+                            daemonStartupCoordinator.inFlight = false
+                        }
+                    }
+                } catch (e: Exception) {
+                    android.util.Log.e("MainActivity",
+                        "runDaemonStartup error: ${e.message}", e)
+                    synchronized (daemonStartupCoordinator) {
+                        daemonStartupCoordinator.inFlight = false
+                    }
+                }
+            }.start()
+        }, 1000)
+    }
+
+    /**
+     * Show "updated to vX" / "install failed" toasts after a post-update
+     * hard-reset. Plants the Telegram hint file when an update succeeded
+     * so the next tunnel-URL message includes the new version.
+     *
+     * Both consume* methods clear their backing markers, so calling this
+     * twice in one process lifetime fires toasts only once.
+     */
+    private fun showPostUpdateToasts() {
+        val installError = com.overdrive.app.updater.AppUpdater
+            .consumeFailedUpdateError(this)
+        if (installError != null) {
+            runOnUiThread {
+                Toast.makeText(this,
+                    getString(R.string.toast_update_install_failed, installError),
+                    Toast.LENGTH_LONG).show()
+                logsViewModel.warn("Update", "Install failed: $installError")
+            }
+        }
+        val updatedVersion = com.overdrive.app.updater.AppUpdater
+            .consumeJustUpdatedVersion(this)
+        if (updatedVersion != null) {
+            runOnUiThread {
+                Toast.makeText(this,
+                    getString(R.string.toast_updated_to, updatedVersion),
+                    Toast.LENGTH_LONG).show()
+                logsViewModel.info("Update", "App updated to $updatedVersion")
+            }
+            try {
+                val adb = com.overdrive.app.launcher.AdbDaemonLauncher(this)
+                val hintFile = com.overdrive.app.updater
+                    .UpdateLifecycle.TELEGRAM_POST_UPDATE_HINT_FILE
+                adb.executeShellCommand(
+                    "echo '$updatedVersion' > $hintFile",
+                    object : com.overdrive.app.launcher
+                        .AdbDaemonLauncher.LaunchCallback {
+                        override fun onLog(message: String) {}
+                        override fun onLaunched() {}
+                        override fun onError(error: String) {}
+                    }
+                )
+            } catch (e: Exception) {
+                android.util.Log.w("MainActivity",
+                    "Failed to plant Telegram post-update hint: ${e.message}")
+            }
+        }
+    }
+
+    /** Coordinator object shared by onCreate / onNewIntent so concurrent
+     *  startup attempts collapse into one. inFlight is reset in every
+     *  terminal branch (success, hard-reset done, error path).
+     *  pendingWatchdog/watchdogHandler are tracked so onDestroy can
+     *  cancel an in-flight 30s watchdog and avoid leaking the Activity. */
+    private val daemonStartupCoordinator = DaemonStartupCoordinator()
+    private class DaemonStartupCoordinator {
+        @Volatile var inFlight: Boolean = false
+        var pendingWatchdog: Runnable? = null
+        var watchdogHandler: android.os.Handler? = null
+    }
+
     
     override fun onResume() {
         super.onResume()
@@ -428,9 +562,9 @@ class MainActivity : AppCompatActivity() {
                 runOnUiThread {
                     when {
                         message.contains("Downloading") -> progress.setStep("\u2B07\uFE0F Downloading update...", 15)
-                        message.contains("Verifying") -> progress.setStep("\uD83D\uDD0D Verifying download...", 40)
-                        message.contains("Stopping") -> progress.setStep("\u23F9\uFE0F Stopping daemons...", 60)
-                        message.contains("Installing") -> progress.setStep("\uD83D\uDCE6 Installing update...", 85)
+                        message.contains("Verifying") -> progress.setStep("\uD83D\uDD0D Verifying download...", 75)
+                        message.contains("Stopping") -> progress.setStep("\u23F9\uFE0F Stopping daemons...", 80)
+                        message.contains("Installing") -> progress.setStep("\uD83D\uDCE6 Installing update...", 90)
                         message.contains("installed") -> progress.setStep("\u2705 Update installed!", 100)
                         else -> progress.setStatus(message)
                     }
@@ -438,8 +572,18 @@ class MainActivity : AppCompatActivity() {
             }
 
             override fun onDownloadProgress(percent: Int) {
-                // Download is via ADB shell — no granular progress
-                // Step-based progress handles this
+                // Map the download's 0..100 into the bar's [15, 75) range so
+                // the bar advances continuously while the APK streams in.
+                // The non-download steps (Verifying / Stopping / Installing)
+                // own the 75..100 range above. percent < 0 means indeterminate
+                // — leave the bar at 15 (the step set by onProgress).
+                // Without this mapping the bar held at 15 for the entire
+                // download phase, which is what produced the "stuck at 15%"
+                // user reports.
+                if (percent < 0) return
+                val clamped = percent.coerceIn(0, 100)
+                val mapped = 15 + ((clamped * 60) / 100)
+                runOnUiThread { progress.setProgress(mapped) }
             }
 
             override fun onSuccess() {
@@ -953,7 +1097,11 @@ class MainActivity : AppCompatActivity() {
      */
     private fun updateCameraProbeMenuItem() { /* intentionally empty */ }
 
+
+    // ==================== Camera Mapping data model ====================
+
     private data class CameraRoleOption(val key: String, val label: String)
+
     private data class CameraPreviewCandidate(
         val id: String,
         val kind: String,
@@ -979,17 +1127,27 @@ class MainActivity : AppCompatActivity() {
         val currentMappings: Map<String, String>
     )
 
-
     /**
-     * Handle "Reconfigure Camera" menu item click.
-    * Shows a role-mapping dialog with live preview candidates.
+     * Diagnostics → Camera mapping entry point. Pulls resolved camera state
+     * from the daemon and shows the mapping dialog. Falls back to a toast on
+     * fetch failure rather than opening an empty dialog.
      */
     private fun onReconfigureCameraClicked() {
         Thread {
             val state = fetchCameraMappingState()
             runOnUiThread {
+                // Bail if the activity tore down during the 4-7 s fetch
+                // window — without this guard the captured `this@MainActivity`
+                // reference would hold the destroyed activity in memory and
+                // showCameraMappingDialog could crash with
+                // "Activity has been destroyed" on layoutInflater.
+                if (isFinishing || isDestroyed) return@runOnUiThread
                 if (state == null) {
-                    Toast.makeText(this, getString(R.string.toast_failed_to_save_short), Toast.LENGTH_SHORT).show()
+                    Toast.makeText(
+                        this,
+                        getString(R.string.toast_failed_to_save_short),
+                        Toast.LENGTH_SHORT
+                    ).show()
                     return@runOnUiThread
                 }
                 showCameraMappingDialog(state)
@@ -997,12 +1155,17 @@ class MainActivity : AppCompatActivity() {
         }.start()
     }
 
+    /**
+     * Single GET against /api/surveillance/config — server merges the
+     * resolved camera summary into the response so the dialog can render
+     * roles, candidates, and current mappings without a second round-trip.
+     */
     private fun fetchCameraMappingState(): CameraMappingState? {
+        var conn: java.net.HttpURLConnection? = null
         return try {
-            val conn = com.overdrive.app.util.DaemonHttpClient.open(
+            conn = com.overdrive.app.util.DaemonHttpClient.open(
                 "/api/surveillance/config", "GET", 3000, 4000)
             val body = conn.inputStream.bufferedReader().use { it.readText() }
-            conn.disconnect()
             val config = org.json.JSONObject(body).optJSONObject("config") ?: return null
 
             val panoCameraId = config.optInt("panoCameraId", config.optInt("cameraId", -1))
@@ -1011,9 +1174,7 @@ class MainActivity : AppCompatActivity() {
             val summary = if (panoCameraId >= 0 && panoWidth > 0 && panoHeight > 0) {
                 getString(
                     R.string.camera_mapping_summary_format,
-                    panoCameraId,
-                    panoWidth,
-                    panoHeight
+                    panoCameraId, panoWidth, panoHeight
                 )
             } else {
                 getString(R.string.camera_mapping_summary_probing)
@@ -1064,6 +1225,8 @@ class MainActivity : AppCompatActivity() {
         } catch (e: Exception) {
             logsViewModel.error("Camera", "Failed to load camera mapping state: ${e.message}")
             null
+        } finally {
+            try { conn?.disconnect() } catch (_: Exception) {}
         }
     }
 
@@ -1094,10 +1257,22 @@ class MainActivity : AppCompatActivity() {
         val previewHandler = android.os.Handler(android.os.Looper.getMainLooper())
         var dialogClosed = false
         var activePreviewCandidateId: String? = null
+        // Single in-flight preview at a time. The daemon gates direct opens
+        // and panoramic-slice JPEG cache reads behind a single-flight
+        // cold-start (returns 503 Retry-After=2s while warming up). Keeping
+        // one outstanding request avoids stacking when the user holds Next.
+        var fetchInFlight = false
+        // The previously-displayed bitmap. ImageView keeps a reference via
+        // its Drawable but won't recycle the old one when setImageBitmap
+        // replaces it; without manual recycle a 2s polling cycle leaks
+        // ~30+ ARGB_8888 1280×960 bitmaps per minute (4 MB each = 120 MB/min)
+        // and OOMs the dialog on the BYD heap.
+        var previousPreviewBitmap: android.graphics.Bitmap? = null
 
         fun mappedCandidateIndexForRole(roleKey: String): Int {
             val mappedId = state.currentMappings[roleKey] ?: return 0
-            return state.candidates.indexOfFirst { it.id == mappedId }.let { if (it >= 0) it else 0 }
+            return state.candidates.indexOfFirst { it.id == mappedId }
+                .let { if (it >= 0) it else 0 }
         }
 
         fun updateCurrentMappingText() {
@@ -1113,69 +1288,154 @@ class MainActivity : AppCompatActivity() {
 
         fun refreshPreview(scheduleNext: Boolean) {
             if (dialogClosed || state.candidates.isEmpty()) return
+            if (fetchInFlight) {
+                // A previous fetch hasn't completed. Arm a single retry on the
+                // poll cadence so we don't permanently lose the loop when the
+                // user navigates Prev/Next mid-fetch (the in-flight result
+                // discards itself when activePreviewCandidateId differs and
+                // can't re-arm for the new candidate).
+                if (scheduleNext) {
+                    previewHandler.removeCallbacksAndMessages(null)
+                    previewHandler.postDelayed({ refreshPreview(true) }, 2000)
+                }
+                return
+            }
             val candidate = state.candidates[currentCandidateIndex]
             activePreviewCandidateId = candidate.id
             candidateLabelView.text = candidate.label
-            previewPlaceholderView.visibility = View.VISIBLE
-            previewPlaceholderView.text = getString(R.string.camera_preview_unavailable)
+            val previewPath = buildCameraPreviewPath(candidate)
+            if (previewPath == null) {
+                // Malformed candidate — show placeholder, skip the fetch,
+                // re-arm next poll.
+                previewImageView.setImageDrawable(null)
+                previewPlaceholderView.visibility = View.VISIBLE
+                if (scheduleNext) {
+                    previewHandler.removeCallbacksAndMessages(null)
+                    previewHandler.postDelayed({ refreshPreview(true) }, 2000)
+                }
+                return
+            }
+            fetchInFlight = true
             Thread {
-                val imageBytes = try {
+                // Network + JPEG decode both happen on this worker thread —
+                // never block the UI thread on Bitmap.decodeByteArray (5-15 ms
+                // per tick at 2 s cadence is enough to cause visible jank on
+                // the BYD head unit).
+                var bitmap: android.graphics.Bitmap? = null
+                try {
+                    // 4 s read budget — daemon does AVMCamera open + ≤800 ms
+                    // frame-wait + teardown for direct kind, ~50 ms volatile
+                    // read + JPEG decode/crop for slice/virtual kinds. Both
+                    // are well inside this window.
                     val conn = com.overdrive.app.util.DaemonHttpClient.open(
-                        buildCameraPreviewPath(candidate),
+                        previewPath,
                         "GET",
                         2500,
                         4000
                     )
-                    val bytes = if (conn.responseCode == 200) conn.inputStream.use { it.readBytes() } else null
+                    val bytes = if (conn.responseCode == 200) {
+                        conn.inputStream.use { it.readBytes() }
+                    } else null
                     conn.disconnect()
-                    bytes
+                    if (bytes != null && bytes.isNotEmpty()) {
+                        bitmap = android.graphics.BitmapFactory
+                            .decodeByteArray(bytes, 0, bytes.size)
+                    }
                 } catch (_: Exception) {
-                    null
+                    bitmap = null
                 }
 
+                val finalBitmap = bitmap
                 runOnUiThread {
-                    if (dialogClosed || activePreviewCandidateId != candidate.id) return@runOnUiThread
-                    if (imageBytes != null && imageBytes.isNotEmpty()) {
-                        val bitmap = android.graphics.BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
-                        if (bitmap != null) {
-                            previewImageView.setImageBitmap(bitmap)
-                            previewPlaceholderView.visibility = View.GONE
-                        } else {
-                            previewImageView.setImageDrawable(null)
-                            previewPlaceholderView.visibility = View.VISIBLE
+                    fetchInFlight = false
+                    if (dialogClosed || activePreviewCandidateId != candidate.id) {
+                        // Result for an old candidate or the dialog closed.
+                        // The bitmap is no longer needed; recycle.
+                        finalBitmap?.recycle()
+                        // The new candidate may have re-armed via
+                        // selectCandidate → refreshPreview but bailed at
+                        // fetchInFlight; now that the in-flight is done, kick
+                        // a fresh fetch immediately so the user doesn't see
+                        // a 2s blank period after Prev/Next.
+                        if (!dialogClosed && scheduleNext) {
+                            previewHandler.removeCallbacksAndMessages(null)
+                            refreshPreview(true)
                         }
+                        return@runOnUiThread
+                    }
+                    if (finalBitmap != null) {
+                        // Recycle the previous frame before swapping in the
+                        // new one — ImageView holds via Drawable and won't
+                        // recycle the replaced bitmap on its own.
+                        val oldBitmap = previousPreviewBitmap
+                        previewImageView.setImageBitmap(finalBitmap)
+                        previewPlaceholderView.visibility = View.GONE
+                        previousPreviewBitmap = finalBitmap
+                        oldBitmap?.recycle()
                     } else {
                         previewImageView.setImageDrawable(null)
                         previewPlaceholderView.visibility = View.VISIBLE
+                        previousPreviewBitmap?.recycle()
+                        previousPreviewBitmap = null
+                    }
+                    if (scheduleNext) {
+                        // Cancel any pending poll callback first so we don't
+                        // double-arm when the in-flight result coincides
+                        // with selectCandidate() arming its own poll.
+                        previewHandler.removeCallbacksAndMessages(null)
+                        previewHandler.postDelayed({ refreshPreview(true) }, 2000)
                     }
                 }
             }.start()
-
-            if (scheduleNext) {
-                previewHandler.removeCallbacksAndMessages(null)
-                previewHandler.postDelayed({ refreshPreview(true) }, 2000)
-            }
         }
 
-        fun updateCandidateSelection(schedulePreview: Boolean) {
+        fun selectCandidate(index: Int) {
             if (state.candidates.isEmpty()) {
                 candidateLabelView.text = getString(R.string.camera_preview_unavailable)
                 previewImageView.setImageDrawable(null)
                 previewPlaceholderView.visibility = View.VISIBLE
+                activePreviewCandidateId = null
                 return
             }
-            if (currentCandidateIndex < 0) currentCandidateIndex = 0
-            if (currentCandidateIndex >= state.candidates.size) currentCandidateIndex = state.candidates.lastIndex
-            candidateLabelView.text = state.candidates[currentCandidateIndex].label
-            if (schedulePreview) refreshPreview(true)
+            currentCandidateIndex = when {
+                index < 0 -> 0
+                index >= state.candidates.size -> state.candidates.lastIndex
+                else -> index
+            }
+            val newCandidate = state.candidates[currentCandidateIndex]
+            candidateLabelView.text = newCandidate.label
+            // Eagerly update the active id so an in-flight fetch result for
+            // a previous candidate can no longer slip through and render
+            // its image under the new candidate's label. The fetch path
+            // sees activePreviewCandidateId != candidate.id and discards.
+            activePreviewCandidateId = newCandidate.id
+            // Cancel any pending poll for the previous candidate, then
+            // re-arm with the new one.
+            previewHandler.removeCallbacksAndMessages(null)
+            refreshPreview(true)
         }
 
+        // Spinner.setOnItemSelectedListener fires synchronously on the next
+        // layout pass for position 0 even when the user hasn't interacted —
+        // an Android quirk. Suppress the first auto-fire so we don't kick a
+        // duplicate fetch that races dialog.show() and the explicit
+        // selectCandidate() call below.
+        var spinnerInitialFireSuppressed = false
         roleSpinner.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
-            override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: View?, position: Int, id: Long) {
+            override fun onItemSelected(
+                parent: android.widget.AdapterView<*>?,
+                view: View?,
+                position: Int,
+                id: Long
+            ) {
+                if (!spinnerInitialFireSuppressed) {
+                    spinnerInitialFireSuppressed = true
+                    return
+                }
                 currentRoleIndex = position
-                currentCandidateIndex = mappedCandidateIndexForRole(state.roles[position].key)
+                val newIdx = mappedCandidateIndexForRole(state.roles[position].key)
                 updateCurrentMappingText()
-                updateCandidateSelection(true)
+                selectCandidate(newIdx)
             }
 
             override fun onNothingSelected(parent: android.widget.AdapterView<*>?) = Unit
@@ -1183,17 +1443,21 @@ class MainActivity : AppCompatActivity() {
 
         prevButton.setOnClickListener {
             if (state.candidates.isEmpty()) return@setOnClickListener
-            currentCandidateIndex = if (currentCandidateIndex <= 0) state.candidates.lastIndex else currentCandidateIndex - 1
-            updateCandidateSelection(true)
+            val idx = if (currentCandidateIndex <= 0) state.candidates.lastIndex
+                      else currentCandidateIndex - 1
+            selectCandidate(idx)
         }
 
         nextButton.setOnClickListener {
             if (state.candidates.isEmpty()) return@setOnClickListener
-            currentCandidateIndex = if (currentCandidateIndex >= state.candidates.lastIndex) 0 else currentCandidateIndex + 1
-            updateCandidateSelection(true)
+            val idx = if (currentCandidateIndex >= state.candidates.lastIndex) 0
+                      else currentCandidateIndex + 1
+            selectCandidate(idx)
         }
 
-        val dialog = com.google.android.material.dialog.MaterialAlertDialogBuilder(this, R.style.Theme_Overdrive_M3_Dialog)
+        val dialog = com.google.android.material.dialog.MaterialAlertDialogBuilder(
+            this, R.style.Theme_Overdrive_M3_Dialog
+        )
             .setView(dialogView)
             .setNegativeButton(getString(R.string.dialog_close), null)
             .create()
@@ -1201,6 +1465,23 @@ class MainActivity : AppCompatActivity() {
         dialog.setOnDismissListener {
             dialogClosed = true
             previewHandler.removeCallbacksAndMessages(null)
+            // Drop the ImageView's drawable so the bitmap is no longer
+            // pinned, then recycle it — Android's GC won't reclaim the
+            // pixel buffer while the ImageView still references it.
+            previewImageView.setImageDrawable(null)
+            previousPreviewBitmap?.recycle()
+            previousPreviewBitmap = null
+        }
+
+        // Lock both Save and Clear after the first click on either. The
+        // success path dismisses the dialog and SIGKILLs the daemon for a
+        // 5-second relaunch; without this guard the user can spam-click,
+        // each click POSTing to a dying daemon and toasting "failed to
+        // save". The buttons are re-enabled only on a save *failure* (the
+        // dialog stays open so the user can retry).
+        fun setActionsEnabled(enabled: Boolean) {
+            saveMappingButton.isEnabled = enabled
+            clearMappingButton.isEnabled = enabled
         }
 
         saveMappingButton.setOnClickListener {
@@ -1212,12 +1493,23 @@ class MainActivity : AppCompatActivity() {
                     put("source", candidate.toJson())
                 })
             }.toString()
+            setActionsEnabled(false)
             postSurveillanceConfig(payload) { success, message ->
                 if (success) {
+                    Toast.makeText(
+                        this,
+                        getString(R.string.camera_mapping_saved),
+                        Toast.LENGTH_SHORT
+                    ).show()
                     restartCameraDaemonForCameraSettings()
                     dialog.dismiss()
                 } else {
-                    Toast.makeText(this, message ?: getString(R.string.toast_failed_to_save_short), Toast.LENGTH_SHORT).show()
+                    Toast.makeText(
+                        this,
+                        message ?: getString(R.string.toast_failed_to_save_short),
+                        Toast.LENGTH_SHORT
+                    ).show()
+                    setActionsEnabled(true)
                 }
             }
         }
@@ -1230,84 +1522,220 @@ class MainActivity : AppCompatActivity() {
                     put("clear", true)
                 })
             }.toString()
+            setActionsEnabled(false)
             postSurveillanceConfig(payload) { success, message ->
                 if (success) {
+                    Toast.makeText(
+                        this,
+                        getString(R.string.camera_mapping_cleared),
+                        Toast.LENGTH_SHORT
+                    ).show()
                     restartCameraDaemonForCameraSettings()
                     dialog.dismiss()
                 } else {
-                    Toast.makeText(this, message ?: getString(R.string.toast_failed_to_save_short), Toast.LENGTH_SHORT).show()
+                    Toast.makeText(
+                        this,
+                        message ?: getString(R.string.toast_failed_to_save_short),
+                        Toast.LENGTH_SHORT
+                    ).show()
+                    setActionsEnabled(true)
                 }
             }
         }
 
         updateCurrentMappingText()
-        updateCandidateSelection(true)
+        selectCandidate(mappedCandidateIndexForRole(
+            state.roles.getOrNull(currentRoleIndex)?.key ?: ""))
         dialog.show()
     }
 
     private fun postSurveillanceConfig(body: String, onComplete: (Boolean, String?) -> Unit) {
         Thread {
+            var success = false
+            var message: String? = null
+            var conn: java.net.HttpURLConnection? = null
+            try {
+                conn = com.overdrive.app.util.DaemonHttpClient.open(
+                    "/api/surveillance/config", "POST", 3000, 4000)
+                conn.setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                conn.doOutput = true
+                conn.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
+                val httpOk = conn.responseCode == 200
+                if (httpOk) {
+                    // Daemon's HttpResponse.sendJsonError returns HTTP 200 with
+                    // a {success:false, error: "..."} body, so we can't trust
+                    // the status code alone. Parse the body and check the
+                    // explicit success field.
+                    val bodyText = conn.inputStream.bufferedReader().use { it.readText() }
+                    try {
+                        val json = org.json.JSONObject(bodyText)
+                        success = json.optBoolean("success", true)
+                        if (!success) {
+                            message = json.optString("error",
+                                getString(R.string.toast_failed_to_save_short))
+                        }
+                    } catch (_: Exception) {
+                        // Non-JSON body — assume success (legacy endpoints).
+                        success = true
+                    }
+                } else {
+                    message = conn.errorStream?.bufferedReader()?.use { it.readText() }
+                }
+            } catch (e: Exception) {
+                success = false
+                message = e.message
+            } finally {
+                try { conn?.disconnect() } catch (_: Exception) {}
+            }
+            runOnUiThread { onComplete(success, message) }
+        }.start()
+    }
+
+    /**
+     * Save → restart pattern: camera mapping changes propagate through
+     * GpuSurveillancePipeline.init() (foveated cropper, mosaic recorder,
+     * downscaler, stream scaler all read the resolved layout at init time).
+     * A bare config write doesn't reapply offsets to the running pipeline,
+     * so we kill the daemon and let the watchdog relaunch.
+     *
+     * <p>Two-phase to avoid corrupting in-flight recordings:
+     * <ol>
+     *   <li>POST /api/surveillance/prepare-restart — daemon stops the pipeline
+     *       gracefully (writes MP4 moov atom, flushes circular buffer,
+     *       closes encoder + EGL surfaces). Bounded ~1-2 s.</li>
+     *   <li>SIGKILL the daemon and relaunch. The 5 s relaunch delay gives the
+     *       BYD camera HAL time to release the camera before the new daemon
+     *       opens it (without that, the HAL emits event 1002).</li>
+     * </ol>
+     */
+    private fun restartCameraDaemonForCameraSettings() {
+        // Guard every continuation against an Activity that's destroyed mid-
+        // restart. The chain is: Thread → runOnUiThread → AdbDaemonLauncher
+        // callback → runOnUiThread → 5s postDelayed → 5s postDelayed —
+        // total ~10s. If the user backgrounds or recreates the activity
+        // during that window, the captured `this` would otherwise be a
+        // dead reference to a torn-down Activity.
+        fun activityAlive(): Boolean = !isFinishing && !isDestroyed
+
+        Toast.makeText(
+            this,
+            getString(R.string.toast_camera_settings_saved_restarting),
+            Toast.LENGTH_LONG
+        ).show()
+        logsViewModel.info("Camera",
+            "Camera settings changed — restarting daemon to apply them immediately")
+
+        Thread {
+            // Phase 1: graceful flush. Best-effort — failures here are
+            // logged but don't block the restart, since the dialog already
+            // toasted "saved" and the user expects the restart to happen.
             try {
                 val conn = com.overdrive.app.util.DaemonHttpClient.open(
-                    "/api/surveillance/config", "POST", 3000, 4000)
-                conn.setRequestProperty("Content-Type", "application/json")
+                    "/api/surveillance/prepare-restart", "POST", 3000, 5000)
                 conn.doOutput = true
-                conn.outputStream.use { it.write(body.toByteArray()) }
-                val success = conn.responseCode == 200
-                val message = if (success) null else conn.errorStream?.bufferedReader()?.use { it.readText() }
+                conn.outputStream.use { it.write(byteArrayOf()) }
+                val code = conn.responseCode
                 conn.disconnect()
-                runOnUiThread { onComplete(success, message) }
+                logsViewModel.debug("Camera",
+                    "prepare-restart returned HTTP $code")
             } catch (e: Exception) {
-                runOnUiThread { onComplete(false, e.message) }
+                logsViewModel.warn("Camera",
+                    "prepare-restart failed (continuing with kill anyway): ${e.message}")
+            }
+
+            // Phase 2: kill + relaunch on the UI thread.
+            runOnUiThread {
+                if (!activityAlive()) return@runOnUiThread
+                val adb = com.overdrive.app.launcher.AdbDaemonLauncher(this)
+                adb.killDaemon(object : com.overdrive.app.launcher.AdbDaemonLauncher.LaunchCallback {
+                    override fun onLog(message: String) {
+                        logsViewModel.debug("Camera", message)
+                    }
+
+                    override fun onLaunched() {
+                        runOnUiThread {
+                            if (!activityAlive()) return@runOnUiThread
+                            logsViewModel.info("Camera",
+                                "Camera daemon stopped — relaunching with updated camera settings")
+                            // 5 s delay: BYD camera HAL needs ~3-5 s to release
+                            // the camera after process death; relaunching too
+                            // early triggers event 1002 on the new daemon's open.
+                            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                                if (!activityAlive()) return@postDelayed
+                                daemonStartupManager.initializeOnAppLaunch()
+                                android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                                    if (!activityAlive()) return@postDelayed
+                                    daemonStartupManager.checkAllDaemonStatuses()
+                                }, 5000)
+                            }, 5000)
+                        }
+                    }
+
+                    override fun onError(error: String) {
+                        // Kill failed. The daemon is still alive AND its
+                        // shutdownInProgress latch is set (prepare-restart
+                        // ran successfully). Without unsticking it, every
+                        // future preview returns "Preview unavailable".
+                        // Fire-and-forget POST to clear the latch.
+                        Thread {
+                            try {
+                                val conn = com.overdrive.app.util.DaemonHttpClient.open(
+                                    "/api/surveillance/abort-restart", "POST", 2000, 2000)
+                                conn.doOutput = true
+                                conn.outputStream.use { it.write(byteArrayOf()) }
+                                conn.responseCode  // force send
+                                conn.disconnect()
+                            } catch (_: Exception) {
+                                // Best-effort. Worst case the user must
+                                // manually restart the daemon.
+                            }
+                        }.start()
+                        runOnUiThread {
+                            if (!activityAlive()) return@runOnUiThread
+                            logsViewModel.error("Camera",
+                                "Failed to restart daemon after camera settings save: $error")
+                            Toast.makeText(
+                                this@MainActivity,
+                                getString(R.string.toast_camera_settings_restart_failed),
+                                Toast.LENGTH_LONG
+                            ).show()
+                        }
+                    }
+                })
             }
         }.start()
     }
 
-    private fun restartCameraDaemonForCameraSettings() {
-        Toast.makeText(this, getString(R.string.toast_camera_settings_saved_restarting), Toast.LENGTH_LONG).show()
-        logsViewModel.info("Camera", "Camera settings changed — restarting daemon to apply them immediately")
-
-        val adb = com.overdrive.app.launcher.AdbDaemonLauncher(this)
-        adb.killDaemon(object : com.overdrive.app.launcher.AdbDaemonLauncher.LaunchCallback {
-            override fun onLog(message: String) {
-                logsViewModel.debug("Camera", message)
+    private fun buildCameraPreviewPath(candidate: CameraPreviewCandidate): String? {
+        // Build the preview URL with strict shape matching. A malformed
+        // candidate (e.g. kind=direct without cameraId, kind=panoramicSlice
+        // without slice) used to silently fall through to "panoramic
+        // front", which would render the front camera under whatever role
+        // the user was actually mapping — misleading. Now we return null
+        // and the caller treats it as "Preview unavailable".
+        return when {
+            candidate.kind.equals("direct", ignoreCase = true) -> {
+                if (candidate.cameraId == null) null
+                else "/api/surveillance/camera-preview?kind=direct" +
+                    "&cameraId=${candidate.cameraId}" +
+                    "&width=${candidate.width}&height=${candidate.height}"
             }
-
-            override fun onLaunched() {
-                runOnUiThread {
-                    logsViewModel.info("Camera", "Camera daemon stopped — relaunching with updated camera settings")
-                    android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                        daemonStartupManager.initializeOnAppLaunch()
-                        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                            daemonStartupManager.checkAllDaemonStatuses()
-                        }, 5000)
-                    }, 3000)
-                }
+            candidate.kind.equals("panoramicSlice", ignoreCase = true) -> {
+                if (candidate.slice.isNullOrEmpty()) null
+                else "/api/surveillance/camera-preview?kind=panoramicSlice" +
+                    "&slice=${candidate.slice}" +
+                    "&width=${candidate.width}&height=${candidate.height}"
             }
-
-            override fun onError(error: String) {
-                runOnUiThread {
-                    logsViewModel.error("Camera", "Failed to restart daemon after camera settings save: $error")
-                    Toast.makeText(
-                        this@MainActivity,
-                        getString(R.string.toast_camera_settings_restart_failed),
-                        Toast.LENGTH_LONG
-                    ).show()
-                }
+            candidate.kind.equals("panoramic", ignoreCase = true)
+                    || candidate.kind.equals("panoramicVirtual", ignoreCase = true) -> {
+                if (candidate.view.isNullOrEmpty()) null
+                else "/api/surveillance/camera-preview?kind=panoramic" +
+                    "&view=${candidate.view}"
             }
-        })
-    }
-
-    private fun buildCameraPreviewPath(candidate: CameraPreviewCandidate): String {
-        return if (candidate.kind.equals("direct", ignoreCase = true) && candidate.cameraId != null) {
-            "/api/surveillance/camera-preview?kind=direct&cameraId=${candidate.cameraId}&width=${candidate.width}&height=${candidate.height}"
-        } else if (candidate.kind.equals("panoramicSlice", ignoreCase = true) && !candidate.slice.isNullOrEmpty()) {
-            "/api/surveillance/camera-preview?kind=panoramicSlice&slice=${candidate.slice}&width=${candidate.width}&height=${candidate.height}"
-        } else {
-            "/api/surveillance/camera-preview?kind=panoramic&view=${candidate.view ?: "front"}"
+            else -> null
         }
     }
-    
+
     /**
      * Clear saved camera config and restart the camera daemon.
      */
@@ -1940,6 +2368,18 @@ class MainActivity : AppCompatActivity() {
         // activity reference after recreate.
         updateCheckRunnable?.let { mainHandler.removeCallbacks(it) }
         updateCheckRunnable = null
+        // Cancel any in-flight post-update watchdog. Without this the
+        // Handler.postDelayed lambda holds a reference to this@MainActivity
+        // for up to 30 seconds, leaking the activity if the user backs out
+        // mid-update. The watchdog itself also short-circuits on
+        // isFinishing/isDestroyed but we cancel here for cleanliness.
+        synchronized (daemonStartupCoordinator) {
+            daemonStartupCoordinator.pendingWatchdog?.let {
+                daemonStartupCoordinator.watchdogHandler?.removeCallbacks(it)
+            }
+            daemonStartupCoordinator.pendingWatchdog = null
+            daemonStartupCoordinator.watchdogHandler = null
+        }
         // Note: We intentionally do NOT call cleanupAll() here
         // Daemons should persist after app closure
         super.onDestroy()

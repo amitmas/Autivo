@@ -1001,15 +1001,44 @@ BYD.core = {
     },
 
     /**
-     * Show toast notification
+     * Show toast notification.
+     *
+     * Defensive against catalog races: callers commonly do
+     *   toast(BYD.i18n.t('foo.bar'), 'success')
+     * and BYD.i18n.t() returns null when the catalog hasn't finished
+     * loading yet. textContent = null paints an empty toast pill (a
+     * black box with no visible message), which reads as "something
+     * happened but I have no idea what". Fall back to a generic label
+     * keyed off the toast type so the user always sees acknowledging
+     * text. Same idea covers undefined / empty string callers.
+     *
+     * The exit animation references @keyframes slideIn (not slideUp,
+     * which is what the entrance uses) — defined on pages that need it
+     * (e.g. notifications.html). On pages without that keyframe the
+     * animation is a no-op and the toast is removed by the setTimeout
+     * regardless, so this isn't a regression.
      */
     toast(message, type = 'info', duration = 3000) {
         const container = document.getElementById('toastContainer');
         if (!container) return;
 
+        let text = message;
+        if (text == null || text === '') {
+            // Try the i18n catalog first; if it hasn't loaded yet (the
+            // common race that produces empty toasts in the WebView), fall
+            // back to a typed English string so the user always sees text.
+            const tr = BYD.i18n && BYD.i18n.t ? BYD.i18n.t.bind(BYD.i18n) : null;
+            switch (type) {
+                case 'success': text = (tr && tr('toast.fallback_success')) || 'Saved'; break;
+                case 'error':   text = (tr && tr('toast.fallback_error'))   || 'Something went wrong'; break;
+                case 'warning': text = (tr && tr('toast.fallback_warning')) || 'Warning'; break;
+                default:        text = (tr && tr('toast.fallback_info'))    || 'Done';
+            }
+        }
+
         const toast = document.createElement('div');
         toast.className = 'toast ' + type;
-        toast.textContent = message;
+        toast.textContent = text;
         container.appendChild(toast);
 
         setTimeout(() => {
@@ -1022,6 +1051,164 @@ BYD.core = {
 // Expose toast globally for convenience
 BYD.utils = BYD.utils || {};
 BYD.utils.toast = (msg, type) => BYD.core.toast(msg, type);
+
+/**
+ * Themed alert/confirm replacements. Native window.alert / window.confirm
+ * paint the OS chrome (white panel + system font + "127.0.0.1 says…"
+ * header inside the head-unit WebView), which breaks the dark Material
+ * surface and leaks the loopback origin into the UI. These helpers reuse
+ * the existing .modal-backdrop + .modal-card styling (see
+ * shared/styles.css and the SOH capacity modal on performance.html) so
+ * popups match the rest of the page.
+ *
+ * Both helpers return a Promise:
+ *   - alertDialog resolves once the user dismisses.
+ *   - confirmDialog resolves true on confirm, false on cancel / backdrop click / Esc.
+ *
+ * Each call mounts a one-shot DOM node and tears it down on dismiss —
+ * the helpers don't keep persistent state, so calling them in quick
+ * succession is safe.
+ */
+BYD.utils._modalEscBound = false;
+BYD.utils._modalStack = [];
+BYD.utils._dismissTopModal = function (result) {
+    var top = BYD.utils._modalStack.pop();
+    if (top) top.dismiss(result);
+};
+BYD.utils._ensureModalEscHandler = function () {
+    if (BYD.utils._modalEscBound) return;
+    BYD.utils._modalEscBound = true;
+    document.addEventListener('keydown', function (ev) {
+        if (ev.key !== 'Escape' || BYD.utils._modalStack.length === 0) return;
+        ev.preventDefault();
+        BYD.utils._dismissTopModal(false);
+    });
+};
+
+BYD.utils._showModal = function (opts) {
+    return new Promise(function (resolve) {
+        BYD.utils._ensureModalEscHandler();
+
+        var backdrop = document.createElement('div');
+        backdrop.className = 'modal-backdrop';
+        backdrop.setAttribute('role', 'presentation');
+        // .modal-backdrop's stylesheet rule already sets display:flex; we
+        // just need to make sure the inline display:none guard the SOH
+        // template uses isn't inherited here.
+        backdrop.style.display = 'flex';
+
+        var card = document.createElement('div');
+        card.className = 'modal-card';
+        card.setAttribute('role', 'dialog');
+        card.setAttribute('aria-modal', 'true');
+
+        // Title + body — text content only, never raw HTML.
+        if (opts.title) {
+            var h = document.createElement('h3');
+            h.className = 'soh-modal-title';
+            h.textContent = opts.title;
+            card.appendChild(h);
+        }
+        if (opts.body) {
+            var p = document.createElement('p');
+            p.style.margin = '0 0 4px 0';
+            p.style.fontSize = '14px';
+            p.style.lineHeight = '1.5';
+            p.style.color = 'var(--text-secondary, var(--text-primary))';
+            p.style.whiteSpace = 'pre-wrap';
+            p.textContent = opts.body;
+            card.appendChild(p);
+        }
+
+        var actions = document.createElement('div');
+        actions.className = 'soh-modal-actions';
+
+        // Optional Cancel — confirm dialogs always have one; alerts skip it.
+        if (opts.cancelLabel) {
+            var cancelBtn = document.createElement('button');
+            cancelBtn.className = 'btn btn-secondary';
+            cancelBtn.type = 'button';
+            cancelBtn.textContent = opts.cancelLabel;
+            cancelBtn.addEventListener('click', function () { dismiss(false); });
+            actions.appendChild(cancelBtn);
+        }
+
+        var confirmBtn = document.createElement('button');
+        // btn-danger for destructive confirms, btn-primary for everything else.
+        var confirmClass = opts.danger ? 'btn btn-danger' : 'btn btn-primary';
+        confirmBtn.className = confirmClass;
+        confirmBtn.type = 'button';
+        confirmBtn.textContent = opts.confirmLabel || 'OK';
+        confirmBtn.addEventListener('click', function () { dismiss(true); });
+        actions.appendChild(confirmBtn);
+
+        card.appendChild(actions);
+        backdrop.appendChild(card);
+
+        // Backdrop click closes (acts as cancel for confirm, dismiss for alert).
+        backdrop.addEventListener('click', function (ev) {
+            if (ev.target === backdrop) dismiss(false);
+        });
+
+        var prevFocus = document.activeElement;
+        document.body.appendChild(backdrop);
+
+        // Focus the primary action so Enter confirms without an extra tap.
+        try { confirmBtn.focus(); } catch (e) {}
+
+        var entry = { dismiss: dismiss };
+        BYD.utils._modalStack.push(entry);
+
+        function dismiss(result) {
+            // Idempotent — backdrop click + button click + Esc could all race.
+            if (entry._done) return;
+            entry._done = true;
+            try { backdrop.remove(); } catch (e) {}
+            try { if (prevFocus && prevFocus.focus) prevFocus.focus(); } catch (e) {}
+            // Pop from stack if still there (e.g. button click path).
+            var idx = BYD.utils._modalStack.indexOf(entry);
+            if (idx !== -1) BYD.utils._modalStack.splice(idx, 1);
+            resolve(result);
+        }
+    });
+};
+
+/**
+ * Themed alert. Returns a Promise<void> that resolves on dismiss.
+ *   BYD.utils.alertDialog({ title: 'Upload failed', body: 'The file is too large.' })
+ */
+BYD.utils.alertDialog = function (opts) {
+    opts = opts || {};
+    var t = BYD.i18n && BYD.i18n.t ? BYD.i18n.t.bind(BYD.i18n) : null;
+    return BYD.utils._showModal({
+        title: opts.title || (t && t('common.notice')) || 'Notice',
+        body: opts.body || '',
+        confirmLabel: opts.confirmLabel || (t && t('common.ok')) || 'OK',
+        danger: false
+    });
+};
+
+/**
+ * Themed confirm. Returns a Promise<boolean>.
+ *   const ok = await BYD.utils.confirmDialog({
+ *       title: 'Remove image?',
+ *       body: 'This cannot be undone.',
+ *       confirmLabel: 'Remove',
+ *       danger: true
+ *   });
+ *   if (!ok) return;
+ */
+BYD.utils.confirmDialog = function (opts) {
+    opts = opts || {};
+    var t = BYD.i18n && BYD.i18n.t ? BYD.i18n.t.bind(BYD.i18n) : null;
+    return BYD.utils._showModal({
+        title: opts.title || (t && t('common.confirm')) || 'Confirm',
+        body: opts.body || '',
+        confirmLabel: opts.confirmLabel || (t && t('common.ok')) || 'OK',
+        cancelLabel: opts.cancelLabel || (t && t('common.cancel')) || 'Cancel',
+        danger: opts.danger === true
+    });
+};
 
 // Auto-load the language picker on every page that includes core.js so we
 // don't have to touch every HTML file. Picker mounts itself once the DOM is

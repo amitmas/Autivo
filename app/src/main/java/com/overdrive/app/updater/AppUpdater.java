@@ -52,7 +52,22 @@ public class AppUpdater {
 
     private final Context context;
     private volatile boolean cancelled = false;
-    private final ExecutorService executor = Executors.newSingleThreadExecutor();
+    /**
+     * Single-threaded executor SHARED across every {@link AppUpdater}
+     * instance. MainActivity instantiates a fresh AppUpdater for the
+     * periodic 6h check, manual checks, and the actual install — and the
+     * daemon-process API handler does the same. Per-instance executors
+     * leaked one non-daemon thread per check, accumulating across days.
+     * One static executor with a daemon thread keeps the process clean
+     * across instance churn AND serializes concurrent install attempts
+     * naturally (the second one waits behind the first).
+     */
+    private static final ExecutorService executor =
+            Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "AppUpdater");
+                t.setDaemon(true);
+                return t;
+            });
     // Null in the daemon process — Looper.getMainLooper() returns null when no
     // thread has been designated as the main looper (the daemon's main() only
     // does Looper.prepare(), not prepareMainLooper()). Callbacks fall back to
@@ -68,6 +83,40 @@ public class AppUpdater {
         if (mainHandler != null) mainHandler.post(r);
         else r.run();
     }
+
+    /**
+     * "Are we in a process that can write {@code /data/local/tmp}?"
+     * Used to decide between the direct OkHttp path and the
+     * AdbDaemonLauncher-tunnelled shell path.
+     *
+     * UID 2000 (shell) is the canonical answer — that's what the daemon
+     * runs as via app_process. But some vendor-modded BYD ROMs launch the
+     * daemon as system (UID 1000) or root (UID 0). A bare `myUid() == 2000`
+     * check would silently route those into the slow shell-tunnel path
+     * even though they have direct write access. Probe the actual
+     * permission once and cache.
+     */
+    private static volatile Boolean canWriteTmpCached = null;
+
+    private static boolean canWriteLocalTmp() {
+        Boolean cached = canWriteTmpCached;
+        if (cached != null) return cached;
+        File probe = new File("/data/local/tmp/.overdrive_updater_probe");
+        boolean ok;
+        try {
+            try (FileOutputStream fos = new FileOutputStream(probe)) {
+                fos.write((byte) 0);
+                fos.flush();
+            }
+            ok = true;
+        } catch (Exception e) {
+            ok = false;
+        } finally {
+            try { probe.delete(); } catch (Exception ignored) {}
+        }
+        canWriteTmpCached = ok;
+        return ok;
+    }
     private AdbShellExecutor adb; // Lazy — only created when install is triggered
     private com.overdrive.app.launcher.AdbDaemonLauncher adbLauncher; // For daemon management
 
@@ -77,7 +126,18 @@ public class AppUpdater {
     private String remoteUpdatedAt;
 
     /**
-     * Build an OkHttpClient that auto-detects sing-box proxy on port 8119.
+     * Build an OkHttpClient that routes through whichever proxy the rest of
+     * the app is using — sing-box on 8119 first, Tailscale on 8539 as a
+     * fallback. Delegates to {@link com.overdrive.app.mqtt.ProxyHelper} so
+     * we share a single 60s probe cache with MQTT, ABRP, BYD Cloud, and
+     * the Telegram daemon (no separate timing windows where one consumer
+     * thinks the proxy is up and another doesn't).
+     *
+     * Both timeouts are in seconds. Pass {@code 0} for {@code readTimeout}
+     * when streaming a large body — we still want a connect deadline but
+     * we don't want OkHttp to abort a healthy slow download as "read
+     * timed out". For tiny JSON fetches (release metadata) keep both
+     * non-zero.
      */
     private static OkHttpClient buildClient(long connectTimeout, long readTimeout) {
         OkHttpClient.Builder builder = new OkHttpClient.Builder()
@@ -85,21 +145,11 @@ public class AppUpdater {
                 .readTimeout(readTimeout, TimeUnit.SECONDS)
                 .followRedirects(true);
 
-        // Probe for sing-box proxy
-        boolean proxyAvailable = false;
-        try {
-            java.net.Socket probe = new java.net.Socket();
-            probe.connect(new java.net.InetSocketAddress("127.0.0.1", 8119), 200);
-            probe.close();
-            proxyAvailable = true;
-        } catch (Exception ignored) {}
-
-        if (proxyAvailable) {
-            builder.proxy(new java.net.Proxy(java.net.Proxy.Type.HTTP,
-                    new java.net.InetSocketAddress("127.0.0.1", 8119)));
-            Log.d(TAG, "Using sing-box proxy for update check");
+        java.net.Proxy proxy = com.overdrive.app.mqtt.ProxyHelper.getHttpProxy();
+        if (proxy != null && proxy.type() != java.net.Proxy.Type.DIRECT) {
+            builder.proxy(proxy);
+            Log.d(TAG, "AppUpdater HTTP via proxy " + proxy.address());
         }
-
         return builder.build();
     }
 
@@ -162,7 +212,10 @@ public class AppUpdater {
      */
     private void runShell(String command,
                           com.overdrive.app.launcher.AdbDaemonLauncher.LaunchCallback callback) {
-        if (android.os.Process.myUid() != 2000) {
+        // Tunnel through ADB if this process can't write /data/local/tmp
+        // directly (the canonical app-process state). See canWriteLocalTmp
+        // for why this beats a UID==2000 check.
+        if (!canWriteLocalTmp()) {
             getAdbLauncher().executeShellCommand(command, callback);
             return;
         }
@@ -201,10 +254,25 @@ public class AppUpdater {
     }
 
     /**
+     * Currently-active OkHttp call, held so {@link #cancel()} can tear
+     * down the socket immediately instead of waiting for the read loop
+     * to observe the cancelled flag on its next iteration. Volatile so
+     * the cancel thread sees the most recent reference set by the
+     * download thread.
+     */
+    private volatile okhttp3.Call activeCall = null;
+
+    /**
      * Cancel an in-progress download/install.
      */
     public void cancel() {
         cancelled = true;
+        // Tear the socket down NOW so a stalled-mid-read transfer can't
+        // hold for another 15 seconds before the read loop notices.
+        okhttp3.Call call = activeCall;
+        if (call != null) {
+            try { call.cancel(); } catch (Exception ignored) {}
+        }
     }
 
     private static final String APK_PATH = "/data/local/tmp/overdrive_update.apk";
@@ -385,34 +453,72 @@ public class AppUpdater {
                     return;
                 }
 
-                // Step 1: Download APK via ADB shell (shell user can write to /data/local/tmp/)
-                // Use app_process to run Java URL download as UID 2000
-                postProgress(callback, "Downloading update...");
-                runCallback(() -> callback.onDownloadProgress(-1)); // -1 = indeterminate
+                // Wipe any leftover APK from a previous attempt up front.
+                // The constructor already runs cleanupLeftoverApk, but a
+                // single AppUpdater instance can be reused across multiple
+                // download attempts (cancel + retry), and a static executor
+                // means the previous attempt's partial APK could still be
+                // on disk. Re-running cleanup here is the cheap safe call.
+                cleanupLeftoverApk();
 
-                String downloadCmd = buildDownloadCommand(latestDownloadUrl, APK_PATH);
-                
+                // Step 1: Download APK.
+                //
+                // Two paths:
+                //   - Daemon process (UID 2000): direct OkHttp download. Uses
+                //     ProxyHelper.getHttpProxy() so we go through sing-box on
+                //     8119 (or Tailscale 8539) the same way every other
+                //     network call in the project does. Streams the body to
+                //     /data/local/tmp/ and emits real progress percent.
+                //     Connect timeout caps wedged TCP at 15s; readTimeout is
+                //     also 15s (per-read, not whole-download) so a stalled
+                //     CDN throws SocketTimeoutException instead of hanging
+                //     indefinitely. Healthy slow downloads keep flowing
+                //     because each successful read resets the timer.
+                //   - App process (UID 10xxx): falls back to the shell tunnel
+                //     because the app UID can't write to /data/local/tmp/.
+                //     Shell command now carries explicit timeout flags so a
+                //     blocked CDN fails cleanly within ~30s instead of the
+                //     5-minute Java waiter.
+                //
+                // The 5-minute wait below is now an outer ceiling — both
+                // paths self-cap much earlier on failure.
+                postProgress(callback, "Downloading update...");
+                runCallback(() -> callback.onDownloadProgress(-1));
+
                 final boolean[] dlDone = {false};
                 final String[] dlResult = {null};
 
-                runShell(downloadCmd, new com.overdrive.app.launcher.AdbDaemonLauncher.LaunchCallback() {
-                    @Override public void onLog(String message) {
-                        dlResult[0] = message;
+                if (canWriteLocalTmp()) {
+                    // Direct OkHttp — runs synchronously on the executor thread.
+                    try {
+                        downloadApkOkHttp(latestDownloadUrl, APK_PATH, callback);
+                        dlResult[0] = "OK";
+                    } catch (Exception e) {
+                        dlResult[0] = "ERROR: " + (e.getMessage() == null ? "download failed" : e.getMessage());
                     }
-                    @Override public void onLaunched() {
-                        dlDone[0] = true;
-                        synchronized (dlDone) { dlDone.notify(); }
-                    }
-                    @Override public void onError(String error) {
-                        dlResult[0] = "ERROR: " + error;
-                        dlDone[0] = true;
-                        synchronized (dlDone) { dlDone.notify(); }
-                    }
-                });
+                    dlDone[0] = true;
+                } else {
+                    String downloadCmd = buildDownloadCommand(latestDownloadUrl, APK_PATH);
+                    runShell(downloadCmd, new com.overdrive.app.launcher.AdbDaemonLauncher.LaunchCallback() {
+                        @Override public void onLog(String message) {
+                            dlResult[0] = message;
+                        }
+                        @Override public void onLaunched() {
+                            dlDone[0] = true;
+                            synchronized (dlDone) { dlDone.notify(); }
+                        }
+                        @Override public void onError(String error) {
+                            dlResult[0] = "ERROR: " + error;
+                            dlDone[0] = true;
+                            synchronized (dlDone) { dlDone.notify(); }
+                        }
+                    });
 
-                // Wait for download (up to 5 minutes for large APKs)
-                synchronized (dlDone) {
-                    if (!dlDone[0]) dlDone.wait(300000);
+                    // Outer ceiling — only relevant for the shell path.
+                    // OkHttp path already returned synchronously above.
+                    synchronized (dlDone) {
+                        if (!dlDone[0]) dlDone.wait(300000);
+                    }
                 }
 
                 if (cancelled) {
@@ -492,7 +598,7 @@ public class AppUpdater {
                 //   /data/local/tmp/ and kick it off detached (subshell + closed
                 //   stdio so init reparents it), then return. The script runs
                 //   on its own; our death is fine.
-                if (android.os.Process.myUid() == 2000) {
+                if (canWriteLocalTmp()) {
                     postProgress(callback, "Stopping daemons & installing...");
                     runDetachedInstall(callback);
                     return;
@@ -565,19 +671,158 @@ public class AppUpdater {
      * Uses Java's URL class via a shell one-liner (no curl/wget dependency).
      */
     private String buildDownloadCommand(String url, String outputPath) {
-        // Use shell heredoc with Java to download — runs as UID 2000 which can write to /data/local/tmp/
+        // Shell-tunnel path (app process). Direct download in the daemon
+        // process goes through downloadApkOkHttp instead.
+        //
+        // Deadline enforcement: BYD ships toybox 0.7.x (Android 7.1) where
+        // toybox `wget` is the bare single-file applet — it ignores
+        // `--timeout` and rejects `--tries` outright. Wrap with toybox's
+        // own `timeout` applet so the deadline holds regardless of which
+        // wget flavor is installed (busybox-wget, toybox-wget, vendor
+        // bundle). 600s caps a 60 MB APK on a 100 kbps SIM. `timeout`
+        // sends SIGTERM at the deadline and SIGKILL 5s later, so wget
+        // dies cleanly and the `&& echo OK` short-circuits → "Download
+        // failed:" surfaces in the UI instead of the 5-minute Java
+        // waiter sweeping the symptom under the rug.
+        //
+        // curl gets the granular flags directly because curl on every
+        // toolbox/toybox version ships with full flag parsing.
         return "sh -c 'java_url=\"" + url + "\"; " +
                "output=\"" + outputPath + "\"; " +
                "rm -f \"$output\"; " +
-               // Use Android's built-in toybox wget if available, otherwise use content provider
                "if command -v wget >/dev/null 2>&1; then " +
-               "  wget -q -O \"$output\" \"$java_url\" && echo OK; " +
+               "  timeout 600 wget -q -O \"$output\" \"$java_url\" && echo OK; " +
                "elif command -v curl >/dev/null 2>&1; then " +
-               "  curl -sL -o \"$output\" \"$java_url\" && echo OK; " +
+               "  curl -sL --connect-timeout 15 --max-time 600 -o \"$output\" \"$java_url\" && echo OK; " +
                "else " +
-               // Fallback: use am broadcast to trigger download from app process
                "  echo \"ERROR: No download tool available\"; " +
                "fi'";
+    }
+
+    /**
+     * Stream an APK download to disk via OkHttp, emitting real percent
+     * progress to the install callback. Used by the daemon-process path
+     * (UID 2000) where we have direct write access to /data/local/tmp/
+     * and can route through ProxyHelper.getHttpProxy() — same proxy the
+     * rest of the app uses for outbound HTTP.
+     *
+     * Timeout policy:
+     *   - connectTimeout = 15s  (covers slow handshake / blocked egress)
+     *   - readTimeout    = 15s per read, NOT whole download
+     *
+     * OkHttp's readTimeout fires only when no bytes arrive for that many
+     * seconds. A healthy slow link that delivers a packet every few
+     * seconds keeps progressing. A wedged CDN socket where bytes stop
+     * flowing throws SocketTimeoutException within 15s, which we surface
+     * as a clean "Download failed" instead of the 5-minute hang the old
+     * shell-wget path produced.
+     *
+     * Throws on any failure; caller wraps in dlResult[]. Honors
+     * {@link #cancelled} between reads so the dialog's Cancel button
+     * stops the transfer within one buffer's worth.
+     */
+    private void downloadApkOkHttp(String url, String outputPath, InstallCallback callback)
+            throws Exception {
+        // Drop any stale APK from a previous attempt so a partial download
+        // can't be confused with a complete one if we fail mid-stream.
+        new File(outputPath).delete();
+
+        java.net.Proxy proxy = com.overdrive.app.mqtt.ProxyHelper.getHttpProxy();
+        boolean usedProxy = proxy != null && proxy.type() != java.net.Proxy.Type.DIRECT;
+        try {
+            doStreamingDownload(url, outputPath, proxy, callback);
+        } catch (Exception primary) {
+            // If we tried via sing-box/Tailscale and failed, the proxy may
+            // have died mid-flight (sing-box restart, Tailscale link drop).
+            // Invalidate the probe cache so MQTT and friends re-detect on
+            // their next call, then retry once direct. If the network
+            // truly requires the proxy (CN-firmware on the SIM, GitHub
+            // CDN blocked), the direct retry still fails and we surface
+            // the original error — better than silently swallowing a
+            // recoverable proxy blip.
+            if (cancelled) throw primary;
+            if (!usedProxy) throw primary;
+            Log.w(TAG, "Download via proxy failed (" + primary.getMessage() + "); retrying direct");
+            com.overdrive.app.mqtt.ProxyHelper.invalidateCache();
+            try {
+                doStreamingDownload(url, outputPath, java.net.Proxy.NO_PROXY, callback);
+            } catch (Exception retry) {
+                // Surface the proxy-attempt error since that's what the user
+                // is more likely to recognize (sing-box / tunnel issue), but
+                // append the direct-retry detail for diagnostics.
+                throw new java.io.IOException(
+                        primary.getMessage() + " (direct retry: " + retry.getMessage() + ")");
+            }
+        }
+    }
+
+    /**
+     * Single-shot streaming download. Caller decides whether to retry.
+     */
+    private void doStreamingDownload(String url, String outputPath,
+                                     java.net.Proxy proxy, InstallCallback callback)
+            throws Exception {
+        OkHttpClient.Builder builder = new OkHttpClient.Builder()
+                .connectTimeout(15, TimeUnit.SECONDS)
+                .readTimeout(15, TimeUnit.SECONDS)
+                .followRedirects(true);
+        if (proxy != null && proxy.type() != java.net.Proxy.Type.DIRECT) {
+            builder.proxy(proxy);
+        }
+        OkHttpClient client = builder.build();
+
+        Request req = new Request.Builder().url(url).build();
+        okhttp3.Call call = client.newCall(req);
+        activeCall = call;
+        Response resp;
+        try {
+            resp = call.execute();
+        } catch (Exception e) {
+            activeCall = null;
+            throw e;
+        }
+        try {
+            if (!resp.isSuccessful()) {
+                throw new java.io.IOException("HTTP " + resp.code() + " " + resp.message());
+            }
+            long total = resp.body() != null ? resp.body().contentLength() : -1;
+            int lastReportedPct = -1;
+            long bytesRead = 0;
+
+            // Drop any partial bytes from a failed prior proxy attempt before
+            // the retry rewrites the file from scratch.
+            new File(outputPath).delete();
+
+            try (InputStream in = resp.body().byteStream();
+                 FileOutputStream fos = new FileOutputStream(outputPath)) {
+                byte[] buf = new byte[64 * 1024];
+                int n;
+                while ((n = in.read(buf)) != -1) {
+                    if (cancelled) {
+                        throw new java.io.IOException("Cancelled");
+                    }
+                    fos.write(buf, 0, n);
+                    bytesRead += n;
+                    if (total > 0) {
+                        int pct = (int) Math.min(99, (bytesRead * 100L) / total);
+                        if (pct != lastReportedPct) {
+                            lastReportedPct = pct;
+                            final int report = pct;
+                            runCallback(() -> callback.onDownloadProgress(report));
+                        }
+                    }
+                }
+                fos.flush();
+            }
+            Log.i(TAG, "APK downloaded: " + bytesRead + " bytes → " + outputPath
+                    + " (proxy=" + (proxy != null ? proxy.type() : "DIRECT") + ")");
+        } finally {
+            try { resp.close(); } catch (Exception ignored) {}
+            // Release the cancel hook so a follow-up cancel() doesn't try
+            // to tear down a finished call. Set to null AFTER close so a
+            // racing cancel still hits Call.cancel on the live socket.
+            activeCall = null;
+        }
     }
 
     /**
@@ -725,12 +970,35 @@ public class AppUpdater {
         script.append("echo \"[install] done rc=$INSTALL_RC at $(date)\"\n");
 
         try {
-            // Write the script via a Runtime.exec heredoc — this is the
-            // daemon process, so we have direct write access to /data/local/tmp.
-            try (java.io.FileWriter w = new java.io.FileWriter(scriptPath)) {
-                w.write(script.toString());
+            // Atomic write: stream into a .tmp sibling, fsync, then rename
+            // onto the final path. If the daemon is killed mid-write (very
+            // small window between the write and the spawn below), the
+            // partial .tmp file is harmless on its own — only after the
+            // rename completes does the launcher see a valid script. The
+            // previous direct-write approach could leave a partially-formed
+            // script that fired pkill but never reached the pm install
+            // section, leaving the device with daemons dead and no
+            // recovery on the same boot.
+            String tmpPath = scriptPath + ".tmp";
+            java.io.File tmpFile = new java.io.File(tmpPath);
+            try (java.io.FileOutputStream fos = new java.io.FileOutputStream(tmpFile)) {
+                fos.write(script.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                fos.getFD().sync();
             }
-            new java.io.File(scriptPath).setExecutable(true, false);
+            tmpFile.setExecutable(true, false);
+            java.io.File finalFile = new java.io.File(scriptPath);
+            // Java's File.renameTo is best-effort across filesystems but
+            // /data/local/tmp/<a> → /data/local/tmp/<b> is intra-fs so
+            // it's atomic on every Android kernel.
+            if (!tmpFile.renameTo(finalFile)) {
+                // Fallback: explicit delete + rename. Some BYD ROMs reject
+                // renameTo if the target exists despite POSIX rename(2)
+                // semantics — defensive.
+                finalFile.delete();
+                if (!tmpFile.renameTo(finalFile)) {
+                    throw new java.io.IOException("Could not rename install script into place");
+                }
+            }
 
             // Detach: a subshell with `& exit 0` reparents the install script
             // to init (PID 1), so SIGTERM/SIGHUP from the daemon's death don't
@@ -745,10 +1013,17 @@ public class AppUpdater {
             pb.start();
 
             postProgress(callback, "Installing...");
-            // Don't onSuccess here — the daemon process itself is about to be
-            // killed by the script. Just return and let the script + webapp
-            // poller take it from here.
-            runCallback(callback::onSuccess);
+            // DO NOT call onSuccess here. The detached script hasn't run
+            // pm install yet — it's still in its 1-second sleep. Calling
+            // onSuccess clears installInFlight in the API handler, which
+            // lets a second concurrent install request slip through, and
+            // it tells the UI "✅ Update installed!" before the install
+            // has actually started. The script writes its own terminal
+            // progress (phase=error on pm-install failure, daemon process
+            // death on success), and the webapp's poller is the source of
+            // truth from this point. The original comment ("Just return
+            // and let the script + webapp poller take it from here") was
+            // correct; the runCallback below contradicted it. Removed.
         } catch (Exception e) {
             Log.e(TAG, "Detached install failed: " + e.getMessage());
             postInstallError(callback, "Detached install failed: " + e.getMessage());

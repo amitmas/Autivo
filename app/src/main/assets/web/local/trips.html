@@ -1514,8 +1514,9 @@
                                 </div>
                                 <div class="setting-control">
                                     <div class="btn-group">
-                                        <button class="btn-toggle active" id="storageInternal" onclick="TRIPS.setStorageType('INTERNAL')" data-i18n="trip.settings.storage_internal">📱 Internal</button>
-                                        <button class="btn-toggle" id="storageSdCard" onclick="TRIPS.setStorageType('SD_CARD')" data-i18n="trip.settings.storage_sd">💾 SD Card</button>
+                                        <button class="btn-toggle active" id="storageInternal" onclick="TRIPS.setStorageType('INTERNAL')" data-i18n="trip.settings.storage_internal">Internal</button>
+                                        <button class="btn-toggle" id="storageSdCard" onclick="TRIPS.setStorageType('SD_CARD')" data-i18n="trip.settings.storage_sd">SD card</button>
+                                        <button class="btn-toggle" id="storageUsb" onclick="TRIPS.setStorageType('USB')" data-i18n="trip.settings.storage_usb">USB</button>
                                     </div>
                                 </div>
                             </div>
@@ -1527,6 +1528,16 @@
                                 </div>
                                 <div class="sd-space-info" id="tripSdSpaceInfo" style="display:none;">
                                     <span id="tripSdFree">-- free</span> / <span id="tripSdTotal">-- total</span>
+                                </div>
+                            </div>
+                            <!-- USB Drive Status -->
+                            <div class="sd-card-status" id="tripUsbStatus" style="display:none;">
+                                <div class="sd-status-row">
+                                    <span class="sd-status-dot" id="tripUsbStatusDot"></span>
+                                    <span class="sd-status-text" id="tripUsbStatusText" data-i18n="trip.settings.usb_checking">USB: Checking...</span>
+                                </div>
+                                <div class="sd-space-info" id="tripUsbSpaceInfo" style="display:none;">
+                                    <span id="tripUsbFree">-- free</span> / <span id="tripUsbTotal">-- total</span>
                                 </div>
                             </div>
                             <div class="setting-row" style="border-bottom:none;padding-bottom:8px;">

@@ -28,6 +28,8 @@
     <string name="cd_play_pause">Spille/pause</string>
     <string name="cd_player_prev">Forrige opptak</string>
     <string name="cd_player_next">Opptak</string>
+    <string name="cd_player_maximize">Maksimalisere spilleren</string>
+    <string name="cd_player_minimize">Utgang fullskjerm</string>
     <string name="cd_delete">Slett</string>
     <string name="cd_expand">Utvide</string>
     <string name="cd_configure">Konfigurering</string>
@@ -63,6 +65,20 @@
     <string name="camera_option_4">Kamera 4</string>
     <string name="camera_option_5">Kamera 5</string>
     <string name="camera_selection_hint">Auto velger riktig kamera for din trim på hver boot. Kamera 1 = BYD Seal, Kamera 0 = Atto trimmer. Restart daemon etter å ha endret kamera-ID for innstillingen å komme i kraft.</string>
+    <string name="camera_mapping_title">Kamera kartlegging</string>
+    <string name="camera_role_label">Rollemapping</string>
+    <string name="camera_candidate_previous">Tidligere</string>
+    <string name="camera_candidate_next">Neste</string>
+    <string name="camera_preview_unavailable">Prøv en annen kandidat eller oppdater ved å åpne dialogen igjen etter at daemon har startet på nytt.</string>
+    <string name="camera_mapping_save">Lagre kartlegging</string>
+    <string name="camera_mapping_clear">Klar rolle</string>
+    <string name="camera_mapping_saved">Kamera kartlegging sparket.</string>
+    <string name="camera_mapping_cleared">Kamera roll kartlegging ryddet.</string>
+    <string name="camera_mapping_summary_format">Panorama strøm: Kamera %1$d · %2$dx%3$d</string>
+    <string name="camera_mapping_summary_probing">Panorama strøm: Legacy auto-detection / sondering</string>
+    <string name="camera_mapping_current_format">Strømkartlegging: %1$s</string>
+    <string name="camera_mapping_current_none">Aktuell kartlegging: Auto / standard</string>
+    <string name="camera_mapping_hint">OverDrive beholder den gamle oppstartsadfærd som standard, men lar deg nå kalibrere den sammenslåte panorama stripen riktig. Forutsetning hvert rå sammenslåte skive, kartlegge de logiske 360 rollene til skiven som faktisk viser foran / høyre / bak / venstre på kjøretøyet ditt, og daemonen vil gjenbruke det oppsettet for opptak, streaming og AI etter tilbakestilling.</string>
     <string name="dashboard_scan_to_connect">Scan for å koble</string>
     <string name="dashboard_qr_waiting">Ventet på tunnelen...</string>
     <string name="dashboard_daemons_running_default">0/5 Løper</string>
@@ -216,6 +232,8 @@
     <string name="toast_restarting_camera_daemon">Å starte kamera daemon...</string>
     <string name="toast_camera_daemon_restarting">Kamera daemon gjenstarte med full sonde</string>
     <string name="toast_camera_restart_failed">Konfigurering ryddet, men daemon tilbakestillingen mislyktes.</string>
+    <string name="toast_camera_settings_saved_restarting">Kamera innstillinger sparket  gjenstart kamera daemon...</string>
+    <string name="toast_camera_settings_restart_failed">Kamerainnstillingene ble lagret, men daemon-innstart mislyktes.</string>
     <string name="toast_failed_with_message_x">Mislyktes: %1$s</string>
     <string name="toast_soh_reset_success">SOH estimate reset  vil beregne fra neste data</string>
     <string name="toast_soh_reset_failed_no_daemon">Reset mislyktes  daemon ikke reagerer og fil ikke kan skrives</string>
@@ -273,6 +291,14 @@
     <string name="tunnel_label_cloudflared">Skyenblåst</string>
     <string name="tunnel_label_zrok">Zrok</string>
     <string name="tunnel_label_tailscale">Tailscale</string>
+    <string name="daemon_name_camera">Kamera Daemon</string>
+    <string name="daemon_name_surveillance">Overvåkning Daemon</string>
+    <string name="daemon_name_acc_surveillance">ACC Overvåkning</string>
+    <string name="daemon_name_singbox">Sing-box Proxy</string>
+    <string name="daemon_name_cloudflared">Cloudflared Tunnel</string>
+    <string name="daemon_name_zrok">Zrok Tunnel</string>
+    <string name="daemon_name_tailscale">Tailscale Tunnel</string>
+    <string name="daemon_name_telegram">Telegram Bot</string>
     <string name="clip_label_access_code">Tilgangskode</string>
     <string name="clip_label_url">URL</string>
     <string name="toast_no_config_needed">Ingen konfigurasjon nødvendig for %1$s</string>

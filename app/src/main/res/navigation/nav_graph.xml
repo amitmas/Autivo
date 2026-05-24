@@ -12,7 +12,9 @@
         tools:layout="@layout/fragment_dashboard" />
 
     <!-- Live view: canonical multi-cam page (WebView). Falls back from
-         WebCodecs to JMuxer on Chrome 58 / Android 7.1 head unit. -->
+         WebCodecs to JMuxer on Chrome 58 / Android 7.1 head unit.
+         page_path is /live-view (the camera UI moved out of index.html
+         when the new Dashboard landing page took over /). -->
     <fragment
         android:id="@+id/liveViewFragment"
         android:name="com.overdrive.app.ui.fragment.WebViewFragment"
@@ -21,7 +23,7 @@
         <argument
             android:name="page_path"
             app:argType="string"
-            android:defaultValue="/" />
+            android:defaultValue="/live-view" />
     </fragment>
 
     <!-- Recordings: native two-pane (library + player) with M3 segmented Dashcam/Surveillance -->

@@ -370,6 +370,23 @@ public class AccSentryDaemon {
             log("UnifiedConfigManager.init() failed: " + e.getMessage());
         }
 
+        // SIGKILL recovery: clear cross-process screen-deterrent flags. Both
+        // are normally cleared on the next ACC OFF (enterSentryMode lines
+        // ~900-907) so this is mostly defensive — but if the daemon was
+        // killed mid-exitSentryMode between the screenDeterrentForceStop=true
+        // write (line ~998) and the worker thread's clear (line ~1047), and
+        // the next event happens to be a manual deterrent fire while the car
+        // is parked-but-already-in-sentry, the stale flag would block it.
+        // Mirroring CameraDaemon.main()'s top-of-process clear keeps the
+        // pair symmetric. See feedback memory: daemon-shutdown-clears-state.
+        try {
+            java.util.Map<String, Object> reset = new java.util.HashMap<>();
+            reset.put("screenDeterrentForceStop", false);
+            reset.put("screenDeterrentActiveUntilMs", 0L);
+            com.overdrive.app.config.UnifiedConfigManager.updateValues(
+                    "surveillance", reset);
+        } catch (Throwable ignored) {}
+
         // Record start time for uptime tracking
         startTime = System.currentTimeMillis();
 
@@ -440,11 +457,29 @@ public class AccSentryDaemon {
                 log("WARNING: Running without context");
             }
 
-            // Register bodywork listener for ACC state changes
+            // Register bodywork listener for ACC state changes. On cold boot
+            // BYD's bodywork service may not be up yet — historically this
+            // failed silently and the daemon ran as a wakelock-holding zombie
+            // forever (no ACC events ever delivered). Retry with backoff so
+            // a slow service-startup window doesn't strand us.
             boolean registered = registerBodyworkListener(context);
-
+            if (!registered && context != null) {
+                final int maxRetries = 5;
+                final long retryDelayMs = 5000L;
+                for (int attempt = 1; attempt <= maxRetries && !registered; attempt++) {
+                    log("Bodywork listener registration failed — retry "
+                        + attempt + "/" + maxRetries + " in " + (retryDelayMs / 1000) + "s");
+                    try {
+                        Thread.sleep(retryDelayMs);
+                    } catch (InterruptedException ie) {
+                        log("Bodywork-listener retry interrupted — proceeding without listener");
+                        break;
+                    }
+                    registered = registerBodyworkListener(context);
+                }
+            }
             if (!registered) {
-                log("Bodywork listener failed - ACC monitoring unavailable");
+                log("Bodywork listener failed after retries - ACC monitoring unavailable");
             }
 
             log("Daemon running, entering persistence loop...");
@@ -892,6 +927,20 @@ public class AccSentryDaemon {
         inSentryMode = true;
         log("=== ENTERING SENTRY MODE ===");
 
+        // Clear any stale screen-deterrent stop flag from the previous sentry
+        // session. exitSentryMode sets it; the ScreenWake worker clears it on
+        // its way out, but if the daemon was killed mid-exit the flag may
+        // linger. Without this clear, the first motion in this session would
+        // see screenDeterrentForceStop=true and refuse to render.
+        try {
+            com.overdrive.app.config.UnifiedConfigManager.updateValues(
+                "surveillance",
+                java.util.Collections.singletonMap("screenDeterrentForceStop", false));
+            com.overdrive.app.config.UnifiedConfigManager.updateValues(
+                "surveillance",
+                java.util.Collections.singletonMap("screenDeterrentActiveUntilMs", 0L));
+        } catch (Throwable ignored) {}
+
         // CRITICAL: Always notify CameraDaemon that ACC is OFF immediately.
         // enableSurveillance() may skip the IPC if surveillanceEnabled is already true
         // or if the user has surveillance disabled in config, which would leave
@@ -971,6 +1020,21 @@ public class AccSentryDaemon {
         inSentryMode = false;
         surveillanceEnabled = false;
 
+        // Tear down any in-progress screen deterrent. ScreenDeterrent.fire()
+        // runs in byd_cam_daemon's process (different JVM), so we signal it
+        // via unified config: screenDeterrentForceStop=true. The render loop
+        // polls this every tick and exits its draw loop, which lets its
+        // finally block release the surface and turn the backlight off
+        // BEFORE our setBacklightState(true) below — otherwise our wake
+        // would land while the deterrent surface still occluded the panel.
+        try {
+            com.overdrive.app.config.UnifiedConfigManager.updateValues(
+                "surveillance",
+                java.util.Collections.singletonMap("screenDeterrentForceStop", true));
+        } catch (Throwable t) {
+            log("Failed to signal screen deterrent stop: " + t.getMessage());
+        }
+
         // CRITICAL: Always notify CameraDaemon that ACC is ON.
         // CameraDaemon handles all surveillance cleanup (door lock gate, unlock poll,
         // cloud listener, pipeline stop) in its ACC ON path.
@@ -997,12 +1061,29 @@ public class AccSentryDaemon {
         // Restore backlight — retry a few times with delay.
         // The keep-alive thread should be fully stopped by now (inSentryMode=false
         // ensures it exits on interrupt), but retry in case the BYD system overrides
-        // our first attempt during its own ACC ON boot sequence.
+        // our first attempt during its own ACC ON boot sequence. Brief delay at
+        // the start gives ScreenDeterrent (in byd_cam_daemon process) time to
+        // pick up the screenDeterrentForceStop flag, release its SurfaceControl
+        // layer, and turn the backlight off — otherwise our wake here lands
+        // while the deterrent surface still covers the screen.
         new Thread(() -> {
+            try { Thread.sleep(300); } catch (InterruptedException ignored) {}
             for (int attempt = 1; attempt <= 3; attempt++) {
                 setBacklightState(true);
                 try { Thread.sleep(1000); } catch (InterruptedException ignored) { break; }
             }
+            // Once we've finished the wake sequence, clear the cross-process
+            // force-stop flag so the next sentry session can run deterrents
+            // again. Done last so any belated ScreenDeterrent tick still sees
+            // the stop signal.
+            try {
+                com.overdrive.app.config.UnifiedConfigManager.updateValues(
+                    "surveillance",
+                    java.util.Collections.singletonMap("screenDeterrentForceStop", false));
+                com.overdrive.app.config.UnifiedConfigManager.updateValues(
+                    "surveillance",
+                    java.util.Collections.singletonMap("screenDeterrentActiveUntilMs", 0L));
+            } catch (Throwable ignored) {}
         }, "ScreenWake").start();
 
         log("Sentry mode DEACTIVATED");
@@ -1520,22 +1601,29 @@ public class AccSentryDaemon {
      */
     private static void enforceSmartSleep() {
         if (appContext == null) return;
-        
+
+        // Yield to an active screen deterrent — the deterrent in
+        // byd_cam_daemon's process is currently driving the panel ON and
+        // would be clobbered by goToSleep / setBacklightState(false).
+        if (isScreenDeterrentActive()) {
+            return;
+        }
+
         try {
             Context permissiveContext = new PermissionBypassContext(appContext);
             PowerManager pm = (PowerManager) permissiveContext.getSystemService(Context.POWER_SERVICE);
-            
+
             // Method signature: goToSleep(long time, int reason, int flags)
             Method method = PowerManager.class.getMethod("goToSleep", Long.TYPE, Integer.TYPE, Integer.TYPE);
-            
+
             // Dynamically retrieve the system-specific reason code (Compatibility Mode)
             // This ensures the command is accepted by the Body Control Module
             int reasonID = getSystemSleepReasonCode();
-            
+
             // Execute with Flag 1 (GO_TO_SLEEP_FLAG_NO_DOZE)
             // Flag 1 is the critical component: Screen OFF, but CPU/Radio remain ACTIVE.
             method.invoke(pm, android.os.SystemClock.uptimeMillis(), reasonID, 1);
-            
+
         } catch (Exception e) {
             log("Smart sleep state enforcement failed: " + e.getMessage());
             // Graceful fallback to basic backlight control if reflection fails
@@ -1568,7 +1656,15 @@ public class AccSentryDaemon {
                     // 1. Maintain Network Interface Stability
                     ensureWifiEnabled();
                     injectFakeUserActivity();
-                    setBacklightState(false);
+
+                    // ScreenDeterrent gate: if a screen deterrent is currently
+                    // displaying (set by ScreenDeterrent.fire()), skip the
+                    // backlight-off tick. Otherwise this loop would clobber
+                    // the wake within 10s and the user would never see the
+                    // deterrent through to its full duration.
+                    if (!isScreenDeterrentActive()) {
+                        setBacklightState(false);
+                    }
 
                     // 4. Maintenance Cycle Interval (10 seconds)
                     Thread.sleep(SYSTEM_KEEPALIVE_INTERVAL_MS);
@@ -1597,6 +1693,25 @@ public class AccSentryDaemon {
         // CRITICAL: Not a daemon thread! Survives if main thread has issues.
         systemKeepAliveThread.setDaemon(false);
         systemKeepAliveThread.start();
+    }
+
+    /**
+     * True if a screen deterrent is currently displaying (set by
+     * ScreenDeterrent.fire() in byd_cam_daemon's process). Reads via
+     * forceReload() because the value is written by a different UID/process.
+     * Returns false on any failure so a stuck flag can never disable the
+     * stealth keep-alive permanently.
+     */
+    private static boolean isScreenDeterrentActive() {
+        try {
+            org.json.JSONObject s = com.overdrive.app.config.UnifiedConfigManager.forceReload()
+                    .optJSONObject("surveillance");
+            if (s == null) return false;
+            long deadline = s.optLong("screenDeterrentActiveUntilMs", 0L);
+            return deadline > System.currentTimeMillis();
+        } catch (Throwable t) {
+            return false;
+        }
     }
 
     private static void stopSystemKeepAlive() {
@@ -1898,7 +2013,17 @@ public class AccSentryDaemon {
     // ==================== SURVEILLANCE ====================
 
     private static void enableSurveillance() {
-        if (surveillanceEnabled) return;
+        if (surveillanceEnabled) {
+            // Silent return historically — added log so future diagnosis of
+            // "why didn't surveillance arm this cycle?" doesn't cost a build
+            // cycle. AccSentry's surveillanceEnabled flag is reset to false
+            // by exitSentryMode and disableSurveillance, so reaching this
+            // line means AccSentry believes a prior IPC succeeded within
+            // the current sentry session — re-arming would just churn.
+            // See feedback memory: diagnostic-log-paths.
+            log("enableSurveillance: already enabled this sentry session — skipping");
+            return;
+        }
 
         // RACE CONDITION FIX: Check inSentryMode before attempting to enable.
         // If exitSentryMode() was called (ACC ON) while we were sleeping/retrying,

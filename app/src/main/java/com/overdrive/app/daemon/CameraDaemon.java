@@ -253,13 +253,25 @@ public class CameraDaemon {
 
     public static void main(String[] args) {
         initFileLogging();
-        
+
         // CRITICAL: Acquire singleton lock FIRST - exit if another instance is running
         if (!acquireSingletonLock()) {
             log("ERROR: Another CameraDaemon instance is already running. Exiting.");
             System.exit(1);
             return;
         }
+
+        // Clear any stale screen-deterrent flags left from a previous unclean
+        // exit (SIGKILL bypasses our shutdown hook). Without this, AccSentry
+        // could see a future screenDeterrentActiveUntilMs and skip backlight
+        // off forever, draining the 12V battery until the next ACC cycle.
+        try {
+            java.util.Map<String, Object> reset = new java.util.HashMap<>();
+            reset.put("screenDeterrentActiveUntilMs", 0L);
+            reset.put("screenDeterrentForceStop", false);
+            com.overdrive.app.config.UnifiedConfigManager.updateValues(
+                    "surveillance", reset);
+        } catch (Exception ignored) {}
         
         // Enable daemon logging for StorageManager (uses DaemonLogger instead of android.util.Log)
         com.overdrive.app.storage.StorageManager.enableDaemonLogging();
@@ -950,10 +962,18 @@ public class CameraDaemon {
             fileLock = channel.tryLock();
             
             if (fileLock == null) {
-                // Another process holds the lock — check if it's actually alive.
-                // We treat "holder PID is dead", "holder PID is missing/corrupt",
-                // and "holder PID is our own PID" all as stale-lock cases, because
-                // each one means no live daemon owns the lock.
+                // Another process holds the lock — check if it's actually alive
+                // AND that it's actually a CameraDaemon. We treat the following
+                // as stale-lock cases, because each one means no live daemon
+                // owns the lock:
+                //   - empty lock file
+                //   - corrupt/non-numeric PID
+                //   - holder PID is our own PID (previous crash)
+                //   - /proc/<pid> doesn't exist (dead PID)
+                //   - /proc/<pid>/cmdline doesn't look like a CameraDaemon
+                //     (PID was recycled to an unrelated process — the kernel
+                //     flock should have been released, but if we got here the
+                //     file content still points at a stale PID)
                 boolean stale = false;
                 String reason = null;
                 try {
@@ -972,17 +992,47 @@ public class CameraDaemon {
                             stale = true;
                             reason = "dead PID " + pid;
                         } else {
-                            // Live process holds the lock — real conflict.
-                            log("Singleton: live daemon PID " + pid + " holds the lock");
-                            lockFile.close();
-                            return false;
+                            // PID is alive — verify it's actually a CameraDaemon
+                            // before declaring a real conflict. Without this an
+                            // unrelated process that inherited the prior daemon's
+                            // recycled PID would lock us out of starting forever.
+                            //
+                            // Three outcomes from readProcCmdline:
+                            //   MATCH    → real conflict, refuse to start
+                            //   NO_MATCH → PID is alive but not a daemon → stale
+                            //   UNKNOWN  → cmdline unreadable (Android 10+
+                            //              hidepid=2 blocks cross-UID reads).
+                            //              We MUST NOT steal the lock in this
+                            //              case — a legitimately-running daemon
+                            //              under a different UID would be booted
+                            //              out. Refuse to start; the watchdog's
+                            //              backoff handles the retry.
+                            CmdlineMatch match = classifyCmdline(pid);
+                            if (match == CmdlineMatch.MATCH) {
+                                log("Singleton: live daemon PID " + pid + " holds the lock"
+                                    + " (cmdline=" + readProcCmdline(pid) + ")");
+                                try { lockFile.close(); } catch (Exception ignored) {}
+                                return false;
+                            }
+                            if (match == CmdlineMatch.UNKNOWN) {
+                                log("Singleton: PID " + pid + " holds the lock but its "
+                                    + "/proc/<pid>/cmdline is unreadable (different UID? "
+                                    + "hidepid?) — assuming live daemon, refusing to start");
+                                try { lockFile.close(); } catch (Exception ignored) {}
+                                return false;
+                            }
+                            // NO_MATCH
+                            stale = true;
+                            reason = "PID " + pid + " is alive but not a CameraDaemon"
+                                + " (cmdline=" + readProcCmdline(pid) + ")";
                         }
                     }
                 } catch (NumberFormatException nfe) {
                     stale = true;
                     reason = "corrupt PID in lock file";
                 } catch (Exception e) {
-                    lockFile.close();
+                    log("Singleton: lock-file inspection failed: " + e.getMessage());
+                    try { lockFile.close(); } catch (Exception ignored) {}
                     return false;
                 }
                 
@@ -1023,7 +1073,30 @@ public class CameraDaemon {
             // its codec instance limit, causing system-level freezes.
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
                 log("Shutdown hook: cleaning up all resources...");
-                
+
+                // 0. Tear down any in-progress ScreenDeterrent FIRST. The
+                //    deterrent owns SurfaceControl + UCM gate flags; if we
+                //    skip this, AccSentryDaemon (separate process) reads
+                //    a stuck screenDeterrentActiveUntilMs in the future and
+                //    permanently skips its setBacklightState(false) — the
+                //    panel stays lit until the next ACC transition.
+                //    cancel() is non-blocking; the executor's finally block
+                //    clears UCM and turns the backlight off.
+                try {
+                    com.overdrive.app.surveillance.ScreenDeterrent.getInstance().cancel();
+                    // Defensive: clear cross-process flags directly in case
+                    // the executor doesn't get a chance to finish (SIGKILL
+                    // or VM dying mid-cleanup).
+                    java.util.Map<String, Object> reset = new java.util.HashMap<>();
+                    reset.put("screenDeterrentActiveUntilMs", 0L);
+                    reset.put("screenDeterrentForceStop", false);
+                    com.overdrive.app.config.UnifiedConfigManager.updateValues(
+                            "surveillance", reset);
+                    log("Shutdown hook: screen deterrent flags cleared");
+                } catch (Exception e) {
+                    log("Shutdown hook: screen deterrent cleanup error: " + e.getMessage());
+                }
+
                 // 1. Stop PermissionGranter — prevent orphaned pm grant processes
                 //    from continuing to hammer PMS after we exit
                 try {
@@ -1113,6 +1186,92 @@ public class CameraDaemon {
         }
     }
     
+    /** Result of inspecting /proc/<pid>/cmdline for singleton-lock validation. */
+    private enum CmdlineMatch {
+        /** cmdline matches a CameraDaemon process — real conflict. */
+        MATCH,
+        /** cmdline is readable AND clearly NOT us — stale lock, recycled PID. */
+        NO_MATCH,
+        /** cmdline is unreadable (EACCES, hidepid=2, race against PID exit).
+         *  Caller must NOT steal the lock — a legitimately-running daemon
+         *  under a different UID could be booted out. */
+        UNKNOWN
+    }
+
+    /**
+     * Classify a PID's cmdline. Distinguishes "definitely not us" from
+     * "we can't tell" — the latter happens on Android 10+ when the holder
+     * runs under a different UID and procfs is mounted with hidepid=2.
+     */
+    private static CmdlineMatch classifyCmdline(int pid) {
+        java.io.File f = new java.io.File("/proc/" + pid + "/cmdline");
+        if (!f.exists()) return CmdlineMatch.NO_MATCH; // PID gone in our window
+        if (!f.canRead()) return CmdlineMatch.UNKNOWN; // EACCES / hidepid
+        String cmdline = readProcCmdline(pid);
+        if (cmdline.isEmpty()) {
+            // canRead() said yes but read produced nothing — could be a
+            // kernel thread (whose /proc/.../cmdline is empty by design)
+            // or a transient race. Either way it's not our daemon.
+            // Treat as NO_MATCH so the next-step retry handles it.
+            return CmdlineMatch.NO_MATCH;
+        }
+        return isCameraDaemonCmdline(cmdline) ? CmdlineMatch.MATCH : CmdlineMatch.NO_MATCH;
+    }
+
+    /**
+     * Read /proc/<pid>/cmdline and return it with NUL bytes turned into
+     * spaces. Returns "" if the file is unreadable (race against PID exit,
+     * permission denied, etc.). NOT a sufficient check on its own — callers
+     * doing security-critical decisions must use {@link #classifyCmdline}.
+     *
+     * /proc/<pid>/cmdline reports stat()-size=0 on most kernels even when
+     * it has content, so Files.readAllBytes (size-hinted) can short-read.
+     * Stream until EOF instead. Capped at 4096 because cmdlines longer
+     * than that are pathological and we only need a substring match.
+     */
+    private static String readProcCmdline(int pid) {
+        java.io.File f = new java.io.File("/proc/" + pid + "/cmdline");
+        if (!f.exists()) return "";
+        try (java.io.FileInputStream fis = new java.io.FileInputStream(f)) {
+            byte[] buf = new byte[4096];
+            int total = 0;
+            int n;
+            while (total < buf.length && (n = fis.read(buf, total, buf.length - total)) > 0) {
+                total += n;
+            }
+            if (total == 0) return "";
+            // /proc/.../cmdline is NUL-separated and trailing-NUL-terminated.
+            StringBuilder sb = new StringBuilder(total);
+            for (int i = 0; i < total; i++) {
+                byte b = buf[i];
+                sb.append(b == 0 ? ' ' : (char) (b & 0xff));
+            }
+            return sb.toString().trim();
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    /**
+     * Tighter cmdline match: the only legitimate ways our daemon shows up in
+     * /proc/<pid>/cmdline are:
+     *   - argv[0] (after kernel applies nice-name): "byd_cam_daemon"
+     *   - app_process invocation: "...--nice-name=byd_cam_daemon..."
+     *   - some launchers append "com.overdrive.app.daemon.CameraDaemon"
+     *     as the entry-point arg
+     *
+     * We anchor on the underscore-named token / FQCN to reduce collisions
+     * with unrelated processes (e.g. `logcat -s CameraDaemon`, `grep
+     * cam_daemon`, an ADB shell that has these strings in its argv). A
+     * bare `cam_daemon` substring is too broad; require either the
+     * "byd_" prefix or the FQCN.
+     */
+    private static boolean isCameraDaemonCmdline(String cmdline) {
+        if (cmdline == null || cmdline.isEmpty()) return false;
+        return cmdline.contains("byd_cam_daemon")
+            || cmdline.contains("com.overdrive.app.daemon.CameraDaemon");
+    }
+
     /**
      * Release the singleton lock on shutdown.
      */
@@ -1215,15 +1374,20 @@ public class CameraDaemon {
     private static void initSurveillance() {
         try {
             log("Initializing GPU Surveillance Pipeline...");
+
+            // Resolve camera profile (Seal vs Tang) so the pipeline gets
+            // correct strip dimensions per vehicle. Falls back to legacy Seal
+            // if ro.product.model is unrecognized — same behavior as before
+            // for existing Seal/Atto installs.
             com.overdrive.app.camera.ResolvedCameraConfig resolvedCamera =
                 com.overdrive.app.camera.CameraConfigResolver.resolve();
-            
+
             // SOTA: Use StorageManager for surveillance output directory
             com.overdrive.app.storage.StorageManager storageManager =
                 com.overdrive.app.storage.StorageManager.getInstance();
             File eventDir = storageManager.getSurveillanceDir();
-            
-            // Create GPU pipeline
+
+            // Create GPU pipeline with resolved profile dimensions
             gpuPipeline = new com.overdrive.app.surveillance.GpuSurveillancePipeline(
                 resolvedCamera.getPanoWidth(), resolvedCamera.getPanoHeight(), eventDir);
             
@@ -1316,7 +1480,8 @@ public class CameraDaemon {
             log("GPU Surveillance initialized: profile=" + resolvedCamera.getProfile().getDisplayName()
                 + ", panoCam=" + resolvedCamera.getPanoCameraId()
                 + ", size=" + resolvedCamera.getPanoWidth() + "x" + resolvedCamera.getPanoHeight()
-                + " -> 2560x1920 (mosaic)");
+                + " -> " + resolvedCamera.getProfile().getEncoderWidth()
+                + "x" + resolvedCamera.getProfile().getEncoderHeight() + " (mosaic)");
             
             // Clean up orphaned .tmp files from previous crashed recordings
             try {
@@ -1504,19 +1669,29 @@ public class CameraDaemon {
         // Force-arm timeout: if no source reports a lock within 60s, arm
         // anyway. Owner may have walked away without locking, or every event
         // source failed to deliver. This is the final safety net for arming.
+        // Gate ONLY on doorLockListenerArmed — `surveillanceEnabled` is a
+        // sticky static that's set to true by safe-zone / schedule
+        // suppression paths without an actual arm, and is never reset on
+        // ACC ON. Including it here silently disables the safety net for
+        // every cycle after the first suppression.
         new Thread(() -> {
             try {
                 Thread.sleep(DOOR_LOCK_ARM_TIMEOUT_MS);
-                if (com.overdrive.app.monitor.AccMonitor.isAccOn()) {
-                    log("LOCK GATE TIMEOUT: ACC is ON — not arming");
-                    return;
-                }
-                if (!doorLockListenerArmed && !surveillanceEnabled) {
-                    log("LOCK GATE TIMEOUT: No lock detected within "
-                        + (DOOR_LOCK_ARM_TIMEOUT_MS / 1000) + "s — force-arming surveillance");
-                    applyLockEvent(true, "timeout");
-                }
-            } catch (InterruptedException ignored) {}
+            } catch (InterruptedException ignored) {
+                log("LOCK GATE TIMEOUT: thread interrupted before deadline — not arming");
+                return;
+            }
+            if (com.overdrive.app.monitor.AccMonitor.isAccOn()) {
+                log("LOCK GATE TIMEOUT: ACC is ON — not arming");
+                return;
+            }
+            if (doorLockListenerArmed) {
+                log("LOCK GATE TIMEOUT: already armed via lock event — no-op");
+                return;
+            }
+            log("LOCK GATE TIMEOUT: No lock detected within "
+                + (DOOR_LOCK_ARM_TIMEOUT_MS / 1000) + "s — force-arming surveillance");
+            applyLockEvent(true, "timeout");
         }, "DoorLockTimeout").start();
 
         // Reverse fallback: ACC-ON disarm watchdog. Periodically queries
@@ -2044,6 +2219,19 @@ public class CameraDaemon {
             // Stop door lock gate: detach cloud + device-SDK listeners, stop
             // unlock poll, stop ACC-ON disarm watchdog.
             cleanupDoorLockGate();
+
+            // Reset surveillance intent flag. The safe-zone-suppressed and
+            // schedule-suppressed branches in the ACC OFF handler set
+            // surveillanceEnabled=true *without* actually arming, as an
+            // "intent" marker for later re-evaluation. Once ACC turns ON
+            // those branches no longer apply, and leaving the flag set
+            // misleads the next cycle's force-arm timeout (which gates on it)
+            // and the schedule checker. enableSurveillance() will set it
+            // again next time the lock gate or schedule fires.
+            if (surveillanceEnabled) {
+                log("ACC ON: clearing sticky surveillanceEnabled flag");
+                surveillanceEnabled = false;
+            }
 
             // Clear safe-zone suppression flag. It was set during the prior
             // ACC OFF in a safe zone to record "would have armed surveillance,

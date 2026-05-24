@@ -28,6 +28,8 @@
     <string name="cd_play_pause">플레이/파우즈</string>
     <string name="cd_player_prev">이전 녹화본</string>
     <string name="cd_player_next">다음 녹화</string>
+    <string name="cd_player_maximize">플레이어를 극대화</string>
+    <string name="cd_player_minimize">출구 풀스크린</string>
     <string name="cd_delete">삭제</string>
     <string name="cd_expand">확장</string>
     <string name="cd_configure">구성</string>
@@ -63,6 +65,20 @@
     <string name="camera_option_4">카메라 4</string>
     <string name="camera_option_5">카메라 5</string>
     <string name="camera_selection_hint">자동으로 각 부트에서 트리밍에 적합한 카메라를 선택합니다. 카메라 1 = BYD Seal, 카메라 0 = Atto 트리밍. 설정이 효력을 발휘하기 위해 카메라 ID를 변경한 후 다이몬을 다시 시작하십시오.</string>
+    <string name="camera_mapping_title">카메라 지도</string>
+    <string name="camera_role_label">역할 지도</string>
+    <string name="camera_candidate_previous">이전</string>
+    <string name="camera_candidate_next">다음</string>
+    <string name="camera_preview_unavailable">미리보기 아직 사용할 수 없습니다. 다른 후보를 시도하거나 디몬이 다시 시작되면 대화소를 다시 열어 업데이트하십시오.</string>
+    <string name="camera_mapping_save">매핑을 저장</string>
+    <string name="camera_mapping_clear">명확한 역할</string>
+    <string name="camera_mapping_saved">카메라 지도 저장</string>
+    <string name="camera_mapping_cleared">카메라 역할 매핑이 해제됐습니다.</string>
+    <string name="camera_mapping_summary_format">파노라마 스트림: 카메라 %1$d · %2$dx%3$d</string>
+    <string name="camera_mapping_summary_probing">파노라마 스트림: 레거시 자동 탐지 / 탐지</string>
+    <string name="camera_mapping_current_format">현재 지도: %1$s</string>
+    <string name="camera_mapping_current_none">현재 지도: 자동 / 기본</string>
+    <string name="camera_mapping_hint">OverDrive는 기본으로 기존의 시작 동작을 유지하지만, 이제 통합된 판로마 스트립을 올바르게 캘리브 할 수 있습니다. 각 원료 통합된 슬라이드를 미리 볼 수 있으며, 논리적 360 역할이 실제로 차량에 앞/오른/뒤/왼쪽을 표시하는 슬라이드에 지도를 매핑하고, 데몬은 다시 시작 후 녹화, 스트리밍 및 AI를 위해 그 레이아웃을 재사용합니다.</string>
     <string name="dashboard_scan_to_connect">연결하기 위해 스캔</string>
     <string name="dashboard_qr_waiting">터널을 기다렸어</string>
     <string name="dashboard_daemons_running_default">0/5 실행</string>
@@ -216,6 +232,8 @@
     <string name="toast_restarting_camera_daemon">카메라 데몬을 다시 시작...</string>
     <string name="toast_camera_daemon_restarting">카메라 다이몬이 전체 탐사선으로 다시 시작됩니다</string>
     <string name="toast_camera_restart_failed">설정이 삭제되었지만 데몬 재부팅이 실패했습니다. 수동으로 재부팅하시기 바랍니다.</string>
+    <string name="toast_camera_settings_saved_restarting">카메라 설정 저장  카메라 데몬 다시 시작...</string>
+    <string name="toast_camera_settings_restart_failed">카메라 설정이 저장됐지만 데몬 리스타트가 실패했어요.</string>
     <string name="toast_failed_with_message_x">실패: %1$s</string>
     <string name="toast_soh_reset_success">SOH 추정 재설정  다음 데이터에서 재 계산됩니다</string>
     <string name="toast_soh_reset_failed_no_daemon">재설정 실패  데몬 응답하지 않고 파일 작성되지 않습니다</string>
@@ -273,6 +291,14 @@
     <string name="tunnel_label_cloudflared">구름이 흐르는</string>
     <string name="tunnel_label_zrok">Zrok</string>
     <string name="tunnel_label_tailscale">Tailscale</string>
+    <string name="daemon_name_camera">카메라 Daemon</string>
+    <string name="daemon_name_surveillance">감시 Daemon</string>
+    <string name="daemon_name_acc_surveillance">ACC 감시</string>
+    <string name="daemon_name_singbox">Sing-box 프록시</string>
+    <string name="daemon_name_cloudflared">Cloudflared 터널</string>
+    <string name="daemon_name_zrok">Zrok 터널</string>
+    <string name="daemon_name_tailscale">Tailscale 터널</string>
+    <string name="daemon_name_telegram">Telegram 보트</string>
     <string name="clip_label_access_code">액세스 코드</string>
     <string name="clip_label_url">URL</string>
     <string name="toast_no_config_needed">%1$s에 대한 구성이 필요하지 않습니다.</string>

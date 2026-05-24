@@ -21,6 +21,11 @@ const TRIPS = {
     pendingStorageLimit: null,
     electricityRate: 0,
     currency: '$',
+    // Pack capacity from SohEstimator (user override or auto-detected).
+    // Used as the fallback nominal when a trip's kwhStart wasn't recorded.
+    // 0 means the daemon hasn't surfaced one yet; falls through to the
+    // legacy 82.56 default per estimateNominalKwh() below.
+    nominalKwh: 0,
 
     // Canvas paint palette. text / grid / textStrong / dotStroke /
     // arcTrack flip with [data-theme="light"] via _refreshPalette() —
@@ -175,6 +180,7 @@ const TRIPS = {
                 // Load electricity rate
                 this.electricityRate = data.config.electricityRate || 0;
                 this.currency = data.config.currency || '$';
+                this.nominalKwh = data.config.nominalKwh || 0;
                 const rateInput = document.getElementById('rateInput');
                 const currSelect = document.getElementById('currencySelect');
                 if (rateInput && this.electricityRate > 0) rateInput.value = this.electricityRate;
@@ -356,50 +362,93 @@ const TRIPS = {
             const data = await resp.json();
             if (data.success && data.storage) {
                 const s = data.storage;
+                this.storageMeta = s;  // cached for setStorageType / clamp logic
                 const intBtn = document.getElementById('storageInternal');
                 const sdBtn = document.getElementById('storageSdCard');
-                if (intBtn && sdBtn) {
-                    intBtn.classList.toggle('active', s.storageType === 'INTERNAL');
+                const usbBtn = document.getElementById('storageUsb');
+                if (intBtn) intBtn.classList.toggle('active', s.storageType === 'INTERNAL');
+                if (sdBtn) {
                     sdBtn.classList.toggle('active', s.storageType === 'SD_CARD');
+                    sdBtn.disabled = !s.sdCardAvailable;
+                    sdBtn.title = s.sdCardAvailable ? '' : BYD.i18n.t('recording.sd_card_unavailable');
+                }
+                if (usbBtn) {
+                    usbBtn.classList.toggle('active', s.storageType === 'USB');
+                    usbBtn.disabled = !s.usbAvailable;
+                    usbBtn.title = s.usbAvailable ? '' : BYD.i18n.t('recording.usb_unavailable');
                 }
                 const slider = document.getElementById('storageLimitSlider');
-                if (slider) slider.value = s.limitMb || 500;
+                const sliderMax = this.tripsMaxFor(s.storageType, s);
+                if (slider) {
+                    slider.max = sliderMax;
+                    slider.value = Math.min(s.limitMb || 500, sliderMax);
+                }
                 this.updateLimitLabel(s.limitMb || 500);
                 this.renderStorageUsage(s.usedMb || 0, s.limitMb || 500, s.tripsCount || 0, s.usedUnit || 'MB');
 
-                // Storage path
                 const pathEl = document.getElementById('tripStoragePath');
                 if (pathEl && s.storagePath) {
                     pathEl.textContent = s.storagePath;
                 } else if (pathEl) {
-                    pathEl.textContent = s.storageType === 'SD_CARD' ? BYD.i18n.t('trip.sd_path_default') : BYD.i18n.t('trip.internal_path_default');
+                    if (s.storageType === 'SD_CARD') pathEl.textContent = BYD.i18n.t('trip.sd_path_default');
+                    else if (s.storageType === 'USB') pathEl.textContent = BYD.i18n.t('trip.usb_path_default');
+                    else pathEl.textContent = BYD.i18n.t('trip.internal_path_default');
                 }
 
-                // SD card status
+                // SD card status row — always visible so the user sees the
+                // alternative volume's status (matches recording/surveillance
+                // pages). Online/offline dot reflects availability regardless
+                // of which type is currently selected.
                 const sdStatus = document.getElementById('tripSdCardStatus');
                 const sdDot = document.getElementById('tripSdStatusDot');
                 const sdText = document.getElementById('tripSdStatusText');
                 const sdSpaceInfo = document.getElementById('tripSdSpaceInfo');
                 const sdFree = document.getElementById('tripSdFree');
                 const sdTotal = document.getElementById('tripSdTotal');
-
-                if (s.storageType === 'SD_CARD' && sdStatus) {
+                if (sdStatus) {
                     sdStatus.style.display = 'block';
                     if (s.sdCardAvailable) {
                         if (sdDot) { sdDot.classList.add('online'); sdDot.classList.remove('offline'); }
                         if (sdText) sdText.textContent = BYD.i18n.t('trip.sd_card_available');
+                        if (sdSpaceInfo && s.sdCardTotalSpace) {
+                            sdSpaceInfo.style.display = 'block';
+                            if (sdFree) sdFree.textContent = this.formatBytes(s.sdCardFreeSpace) + ' free';
+                            if (sdTotal) sdTotal.textContent = this.formatBytes(s.sdCardTotalSpace) + ' total';
+                        }
                     } else {
                         if (sdDot) { sdDot.classList.add('offline'); sdDot.classList.remove('online'); }
                         if (sdText) sdText.textContent = BYD.i18n.t('trip.sd_card_not_detected');
+                        if (sdSpaceInfo) sdSpaceInfo.style.display = 'none';
                     }
-                } else if (sdStatus) {
-                    sdStatus.style.display = 'none';
                 }
 
-                // Show/hide dashcam cleanup card based on storage type
+                // USB status row — always visible (see comment above).
+                const usbStatus = document.getElementById('tripUsbStatus');
+                const usbDot = document.getElementById('tripUsbStatusDot');
+                const usbText = document.getElementById('tripUsbStatusText');
+                const usbSpaceInfo = document.getElementById('tripUsbSpaceInfo');
+                const usbFree = document.getElementById('tripUsbFree');
+                const usbTotal = document.getElementById('tripUsbTotal');
+                if (usbStatus) {
+                    usbStatus.style.display = 'block';
+                    if (s.usbAvailable) {
+                        if (usbDot) { usbDot.classList.add('online'); usbDot.classList.remove('offline'); }
+                        if (usbText) usbText.textContent = BYD.i18n.t('recording.usb_available');
+                        if (usbSpaceInfo && s.usbTotalSpace) {
+                            usbSpaceInfo.style.display = 'block';
+                            if (usbFree) usbFree.textContent = this.formatBytes(s.usbFreeSpace) + ' free';
+                            if (usbTotal) usbTotal.textContent = this.formatBytes(s.usbTotalSpace) + ' total';
+                        }
+                    } else {
+                        if (usbDot) { usbDot.classList.add('offline'); usbDot.classList.remove('online'); }
+                        if (usbText) usbText.textContent = BYD.i18n.t('recording.usb_not_detected');
+                        if (usbSpaceInfo) usbSpaceInfo.style.display = 'none';
+                    }
+                }
+
+                // CDR cleanup card is SD-only (BYD's built-in dashcam)
                 const cdrCard = document.getElementById('tripCdrCleanupCard');
                 if (cdrCard) cdrCard.style.display = s.storageType === 'SD_CARD' ? 'block' : 'none';
-                // Load CDR info if SD card
                 if (s.storageType === 'SD_CARD') this.loadCdrInfo();
 
                 this.pendingStorageType = null;
@@ -409,15 +458,61 @@ const TRIPS = {
         } catch (e) { console.warn('[Trips] Storage load failed:', e); }
     },
 
+    /**
+     * Resolve the slider max for a given storage type from the cached
+     * /api/trips/storage payload. Accepts both the trips-historical
+     * `maxLimitMbInternal` and the recording/surveillance-aligned
+     * `maxLimitMb` (server emits both). Falls back to 100GB if neither
+     * is reported (older server).
+     */
+    tripsMaxFor(type, meta) {
+        if (!meta) return 100000;
+        switch (type) {
+            case 'SD_CARD': return meta.maxLimitMbSdCard   || 100000;
+            case 'USB':     return meta.maxLimitMbUsb      || 100000;
+            default:        return meta.maxLimitMbInternal || meta.maxLimitMb || 100000;
+        }
+    },
+
+    formatBytes(bytes) {
+        if (!bytes) return '0 B';
+        if (bytes >= 1e9) return (bytes / 1e9).toFixed(1) + ' GB';
+        if (bytes >= 1e6) return (bytes / 1e6).toFixed(1) + ' MB';
+        if (bytes >= 1e3) return (bytes / 1e3).toFixed(1) + ' KB';
+        return bytes + ' B';
+    },
+
     setStorageType(type) {
+        const meta = this.storageMeta || {};
+        if (type === 'SD_CARD' && !meta.sdCardAvailable) {
+            if (BYD.utils && BYD.utils.toast) BYD.utils.toast(BYD.i18n.t('recording.sd_card_unavailable'), 'error');
+            return;
+        }
+        if (type === 'USB' && !meta.usbAvailable) {
+            if (BYD.utils && BYD.utils.toast) BYD.utils.toast(BYD.i18n.t('recording.usb_unavailable'), 'error');
+            return;
+        }
         this.pendingStorageType = type;
         const intBtn = document.getElementById('storageInternal');
         const sdBtn = document.getElementById('storageSdCard');
-        if (intBtn && sdBtn) {
-            intBtn.classList.toggle('active', type === 'INTERNAL');
-            sdBtn.classList.toggle('active', type === 'SD_CARD');
+        const usbBtn = document.getElementById('storageUsb');
+        if (intBtn) intBtn.classList.toggle('active', type === 'INTERNAL');
+        if (sdBtn) sdBtn.classList.toggle('active', type === 'SD_CARD');
+        if (usbBtn) usbBtn.classList.toggle('active', type === 'USB');
+
+        // Re-clamp slider to new volume's max
+        const slider = document.getElementById('storageLimitSlider');
+        const newMax = this.tripsMaxFor(type, meta);
+        if (slider) {
+            slider.max = newMax;
+            const cur = parseInt(slider.value, 10);
+            if (cur > newMax) {
+                slider.value = newMax;
+                this.pendingStorageLimit = newMax;
+                this.updateLimitLabel(newMax);
+            }
         }
-        // Show/hide dashcam cleanup card
+
         const cdrCard = document.getElementById('tripCdrCleanupCard');
         if (cdrCard) cdrCard.style.display = type === 'SD_CARD' ? 'block' : 'none';
         this.showApplyNeeded();
@@ -938,6 +1033,19 @@ const TRIPS = {
         this.updateCostHero();
     },
 
+    // Resolve the per-trip nominal pack kWh used for SoC→energy fallbacks.
+    // Order of precedence:
+    //   1. trip.kwhStart / (socStart/100) — exact recorded value when present
+    //   2. this.nominalKwh — surfaced from /api/trips/config (user/auto)
+    //   3. 82.56 — last-resort default (Atto 3, mid-pack baseline)
+    estimateNominalKwh(trip) {
+        const ss = (trip && (trip.socStart || trip.soc_start)) || 0;
+        const ks = (trip && (trip.kwhStart || trip.kwh_start)) || 0;
+        if (ks > 0 && ss > 5) return ks / (ss / 100);
+        if (this.nominalKwh > 0) return this.nominalKwh;
+        return 82.56;
+    },
+
     createTripCard(trip) {
         const card = document.createElement('div');
         card.className = 'trip-card';
@@ -971,9 +1079,8 @@ const TRIPS = {
             const socEnd = trip.socEnd || trip.soc_end || 0;
             if (socStart > socEnd && socStart > 0) {
                 const socDelta = socStart - socEnd;
-                // Derive nominal from kwhStart if available, else use 82.56 kWh default
-                const kwhStart = trip.kwhStart || trip.kwh_start || 0;
-                const nominal = (kwhStart > 0 && socStart > 5) ? kwhStart / (socStart / 100) : 82.56;
+                // Prefer per-trip kwhStart, then user/auto nominal, then 82.56 default
+                const nominal = this.estimateNominalKwh(trip);
                 const estEnergy = (socDelta / 100) * nominal;
                 costStr = '~' + cur + (estEnergy * this.electricityRate).toFixed(1);
             }
@@ -1058,8 +1165,7 @@ const TRIPS = {
                 const ss = t.socStart || t.soc_start || 0;
                 const se = t.socEnd || t.soc_end || 0;
                 if (ss > se && ss > 0) {
-                    const kws = t.kwhStart || t.kwh_start || 0;
-                    const nom = (kws > 0 && ss > 5) ? kws / (ss / 100) : 82.56;
+                    const nom = this.estimateNominalKwh(t);
                     energy = ((ss - se) / 100) * nom;
                 }
             }
@@ -1128,8 +1234,7 @@ const TRIPS = {
                     const ss = t.socStart || t.soc_start || 0;
                     const se = t.socEnd || t.soc_end || 0;
                     if (ss > se && ss > 0) {
-                        const kws = t.kwhStart || t.kwh_start || 0;
-                        const nom = (kws > 0 && ss > 5) ? kws / (ss / 100) : 82.56;
+                        const nom = this.estimateNominalKwh(t);
                         energy = ((ss - se) / 100) * nom;
                     }
                 }

@@ -74,6 +74,14 @@ public class TelegramBotDaemon {
     private static String botToken;
     private static long ownerChatId = -1;
     private static boolean videoUploadsEnabled = false;  // Default to OFF - user must enable
+    // Notification-category gates. Defaults match UnifiedTelegramConfig getters
+    // (criticalAlerts/motionText default ON, connectivity default OFF) so a
+    // fresh install behaves the way the UI's checked-by-default toggles imply.
+    // Refreshed once per long-poll cycle by refreshConfigFromUnified() so a
+    // toggle in the web UI takes effect within ~30s without a daemon restart.
+    private static boolean criticalAlertsEnabled = true;
+    private static boolean connectivityAlertsEnabled = false;
+    private static boolean motionTextEnabled = true;
     private static OkHttpClient httpClient;
     private static long lastUpdateId = 0;
     
@@ -254,10 +262,16 @@ public class TelegramBotDaemon {
 
             ownerChatId = com.overdrive.app.telegram.config.UnifiedTelegramConfig.getOwnerChatId();
             videoUploadsEnabled = com.overdrive.app.telegram.config.UnifiedTelegramConfig.isVideoUploads();
+            criticalAlertsEnabled = com.overdrive.app.telegram.config.UnifiedTelegramConfig.isCriticalAlerts();
+            connectivityAlertsEnabled = com.overdrive.app.telegram.config.UnifiedTelegramConfig.isConnectivity();
+            motionTextEnabled = com.overdrive.app.telegram.config.UnifiedTelegramConfig.isMotionText();
 
             log("Config loaded: token=***" + botToken.substring(Math.max(0, botToken.length() - 6)));
             log("Owner chat ID: " + (ownerChatId > 0 ? ownerChatId : "not set"));
-            log("Video uploads: " + (videoUploadsEnabled ? "enabled" : "disabled"));
+            log("Video uploads: " + (videoUploadsEnabled ? "enabled" : "disabled")
+                + ", critical: " + criticalAlertsEnabled
+                + ", connectivity: " + connectivityAlertsEnabled
+                + ", motionText: " + motionTextEnabled);
 
             return true;
         } catch (Exception e) {
@@ -284,6 +298,9 @@ public class TelegramBotDaemon {
             String newToken = com.overdrive.app.telegram.config.UnifiedTelegramConfig.getBotToken();
             long newOwner = com.overdrive.app.telegram.config.UnifiedTelegramConfig.getOwnerChatId();
             boolean newVideo = com.overdrive.app.telegram.config.UnifiedTelegramConfig.isVideoUploads();
+            boolean newCritical = com.overdrive.app.telegram.config.UnifiedTelegramConfig.isCriticalAlerts();
+            boolean newConnectivity = com.overdrive.app.telegram.config.UnifiedTelegramConfig.isConnectivity();
+            boolean newMotionText = com.overdrive.app.telegram.config.UnifiedTelegramConfig.isMotionText();
 
             if (newToken != null && !newToken.isEmpty() && !newToken.equals(botToken)) {
                 log("Bot token changed from unified config; updating");
@@ -296,6 +313,18 @@ public class TelegramBotDaemon {
             if (newVideo != videoUploadsEnabled) {
                 log("Video uploads changed: " + videoUploadsEnabled + " → " + newVideo);
                 videoUploadsEnabled = newVideo;
+            }
+            if (newCritical != criticalAlertsEnabled) {
+                log("Critical alerts changed: " + criticalAlertsEnabled + " → " + newCritical);
+                criticalAlertsEnabled = newCritical;
+            }
+            if (newConnectivity != connectivityAlertsEnabled) {
+                log("Connectivity alerts changed: " + connectivityAlertsEnabled + " → " + newConnectivity);
+                connectivityAlertsEnabled = newConnectivity;
+            }
+            if (newMotionText != motionTextEnabled) {
+                log("Motion text alerts changed: " + motionTextEnabled + " → " + newMotionText);
+                motionTextEnabled = newMotionText;
             }
         } catch (Exception e) {
             // Don't kill the poll loop on a config read blip.
@@ -546,6 +575,26 @@ public class TelegramBotDaemon {
         }
     }
     
+    /**
+     * Map a `category` string from a `sendMessage` IPC payload onto the
+     * matching pref toggle. Unknown categories are treated as CRITICAL —
+     * the safest default for ad-hoc engine messages whose author hasn't
+     * been categorised yet (proximity alerts, manual sends, etc.). The
+     * flags are refreshed once per long-poll cycle by
+     * {@link #refreshConfigFromUnified()}, so a UI toggle takes effect
+     * within ~30s without restarting the daemon.
+     */
+    private static boolean isCategoryEnabled(String category) {
+        if (category == null) return criticalAlertsEnabled;
+        switch (category) {
+            case "MOTION":       return motionTextEnabled;
+            case "CONNECTIVITY": return connectivityAlertsEnabled;
+            case "VIDEO":        return videoUploadsEnabled;
+            case "CRITICAL":
+            default:             return criticalAlertsEnabled;
+        }
+    }
+
     private static JSONObject processIpcCommand(JSONObject cmd) {
         JSONObject response = new JSONObject();
         try {
@@ -553,8 +602,21 @@ public class TelegramBotDaemon {
             
             switch (action) {
                 case "sendMessage":
+                    // Engine-issued ad-hoc messages (proximity alerts, manual
+                    // sends from app code). Default to the criticalAlerts
+                    // category — turning that toggle off should silence
+                    // everything except the typed command paths below, which
+                    // declare their own category. Callers who want a different
+                    // category can pass an explicit `category` field.
                     long chatId = cmd.optLong("chatId", ownerChatId);
                     String text = cmd.optString("text", "");
+                    String msgCategory = cmd.optString("category", "CRITICAL");
+                    if (!isCategoryEnabled(msgCategory)) {
+                        log("sendMessage skipped - " + msgCategory + " disabled");
+                        response.put("status", "skipped");
+                        response.put("message", msgCategory + " disabled");
+                        break;
+                    }
                     if (chatId > 0 && !text.isEmpty()) {
                         boolean ok = sendMessage(chatId, text);
                         response.put("status", ok ? "ok" : "error");
@@ -563,7 +625,7 @@ public class TelegramBotDaemon {
                         response.put("message", "Missing chatId or text");
                     }
                     break;
-                    
+
                 case "sendVideo":
                     // Check if video uploads are enabled
                     if (!videoUploadsEnabled) {
@@ -572,7 +634,7 @@ public class TelegramBotDaemon {
                         response.put("message", "Video uploads disabled");
                         break;
                     }
-                    
+
                     long videoChatId = cmd.optLong("chatId", ownerChatId);
                     String videoPath = cmd.optString("path", "");
                     String caption = cmd.optString("caption", "");
@@ -584,8 +646,14 @@ public class TelegramBotDaemon {
                         response.put("message", "Missing chatId or path");
                     }
                     break;
-                    
+
                 case "notifyTunnel":
+                    if (!connectivityAlertsEnabled) {
+                        log("notifyTunnel skipped - connectivity updates disabled");
+                        response.put("status", "skipped");
+                        response.put("message", "Connectivity updates disabled");
+                        break;
+                    }
                     String url = cmd.optString("url", "");
                     boolean isNew = cmd.optBoolean("isNew", true);
                     log("IPC notifyTunnel: url=" + url + ", isNew=" + isNew);
@@ -628,6 +696,12 @@ public class TelegramBotDaemon {
                     break;
                     
                 case "notifyMotion":
+                    if (!motionTextEnabled) {
+                        log("notifyMotion skipped - motion text alerts disabled");
+                        response.put("status", "skipped");
+                        response.put("message", "Motion text alerts disabled");
+                        break;
+                    }
                     if (ownerChatId > 0) {
                         String motionText = formatMotionMessage(cmd, /*finalized=*/false);
                         boolean ok = sendMessage(ownerChatId, motionText);
@@ -643,6 +717,12 @@ public class TelegramBotDaemon {
                     // PHOTO (with rich caption) when the path is available; fall
                     // back to text-only if the photo upload fails or there's no
                     // hero — never silently drop.
+                    if (!motionTextEnabled) {
+                        log("notifyMotionFinalized skipped - motion text alerts disabled");
+                        response.put("status", "skipped");
+                        response.put("message", "Motion text alerts disabled");
+                        break;
+                    }
                     if (ownerChatId > 0) {
                         String finalCaption = formatMotionMessage(cmd, /*finalized=*/true);
                         String heroPath = cmd.optString("heroPhotoPath", "");
@@ -665,6 +745,12 @@ public class TelegramBotDaemon {
                     break;
                     
                 case "notifyCritical":
+                    if (!criticalAlertsEnabled) {
+                        log("notifyCritical skipped - critical alerts disabled");
+                        response.put("status", "skipped");
+                        response.put("message", "Critical alerts disabled");
+                        break;
+                    }
                     String criticalType = cmd.optString("type", "");
                     String details = cmd.optString("details", "");
                     if (ownerChatId > 0) {

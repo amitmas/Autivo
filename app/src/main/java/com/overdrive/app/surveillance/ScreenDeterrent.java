@@ -1,0 +1,843 @@
+package com.overdrive.app.surveillance;
+
+import android.content.Context;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.graphics.Canvas;
+import android.graphics.Color;
+import android.graphics.Movie;
+import android.graphics.Paint;
+import android.graphics.Rect;
+import android.graphics.Typeface;
+import android.os.PowerManager;
+import android.os.SystemClock;
+import android.view.Surface;
+
+import com.overdrive.app.config.UnifiedConfigManager;
+import com.overdrive.app.daemon.DaemonBootstrap;
+import com.overdrive.app.logging.DaemonLogger;
+
+import org.json.JSONObject;
+
+import java.io.File;
+import java.io.FileInputStream;
+import java.lang.reflect.Method;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+
+/**
+ * Daemon-side coordinator for the Screen Deterrent feature.
+ *
+ * Hybrid architecture: SurfaceControl owns the visual; an Activity in the
+ * app process captures touches.
+ *
+ * Why hybrid? While ACC is off, BYD composites only its own AccAnimation
+ * layer (`z=2^30`) into HWC — every other Window from any process is
+ * excluded from composition by the vendor compositor. Only a SurfaceControl
+ * layer placed directly into SurfaceFlinger at `z=Integer.MAX_VALUE` (=
+ * 2^31-1) sits above AccAnimation and is composited. WindowManager-managed
+ * Activity windows top out at `z≈3000` and are invisible during ACC-off.
+ *
+ * However, a SurfaceControl color/buffer layer has no `InputChannel` of its
+ * own — taps pass through to whatever's beneath. So we also `am start` a
+ * fullscreen DeterrentActivity in the app process: it's visually hidden by
+ * AccAnimation but its InputChannel sits at the top of the input-dispatch
+ * stack, consuming taps and back-key presses.
+ *
+ * Process split:
+ *   ┌─ byd_cam_daemon (UID 2000) ──────────────────────────────────────┐
+ *   │  Atomic CAS deadline (GL frame thread, lock-free)                │
+ *   │  Executor:                                                       │
+ *   │    PowerManager.TurnBacklightOn   ← BYD vendor API, UID 2000     │
+ *   │    SurfaceControl@z=MAX render    ← visual                       │
+ *   │    am start DeterrentActivity     ← input capture                │
+ *   │    refresh UCM gate ≤1 Hz                                        │
+ *   │    release surface + TurnBacklightOff                            │
+ *   └──────────────────────────────────────────────────────────────────┘
+ *   ┌─ com.overdrive.app (UID 10067) ──────────────────────────────────┐
+ *   │  DeterrentActivity                                               │
+ *   │    setOnTouchListener → consume                                  │
+ *   │    polls UCM, finishes when deadline elapses                     │
+ *   └──────────────────────────────────────────────────────────────────┘
+ *
+ * Cross-process coordination is via UnifiedConfigManager:
+ *   - screenDeterrentActiveUntilMs: deadline; signals AccSentryDaemon's
+ *     keep-alive (in a third process) to skip its setBacklightState(false).
+ *   - screenDeterrentForceStop: set by AccSentryDaemon.exitSentryMode() to
+ *     ask the daemon-side render and the activity to bail before duration.
+ */
+public final class ScreenDeterrent {
+
+    private static final String TAG = "ScreenDeterrent";
+    private static final DaemonLogger logger = DaemonLogger.getInstance(TAG);
+
+    private static final int DEFAULT_DURATION_SEC = 8;
+    private static final int GIF_FRAME_INTERVAL_MS = 50;
+    private static final int STATIC_FRAME_TICK_MS = 200;
+    private static final int DISPLAY_W = 1920;
+    private static final int DISPLAY_H = 1080;
+
+    private static final long HOT_CACHE_TTL_MS = 1_000;
+    private static final long GATE_REFRESH_INTERVAL_MS = 1_000;
+
+    private static volatile ScreenDeterrent instance;
+
+    private final ExecutorService executor = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "ScreenDeterrent");
+        t.setDaemon(true);
+        t.setPriority(Thread.MIN_PRIORITY);
+        return t;
+    });
+
+    /**
+     * Background scheduler that refreshes the hot cache off the GL frame
+     * thread. The GL thread only ever reads volatiles. Without this, every
+     * cross-process write to the config file would force the next motion
+     * frame to re-read disk (audit #7).
+     */
+    private final java.util.concurrent.ScheduledExecutorService cacheScheduler =
+        java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "ScreenDeterrentCache");
+            t.setDaemon(true);
+            t.setPriority(Thread.MIN_PRIORITY);
+            return t;
+        });
+
+    private final AtomicLong extendDeadlineMs = new AtomicLong(0);
+    private final AtomicBoolean inFlight = new AtomicBoolean(false);
+    private final AtomicBoolean cancelled = new AtomicBoolean(false);
+    private volatile Thread renderThread;
+
+    /**
+     * Hot-path cache: read on the GL frame thread (volatile-only, no I/O).
+     * Refreshed by cacheScheduler at HOT_CACHE_TTL_MS intervals.
+     */
+    private volatile boolean hotCacheEnabled = false;
+    private volatile int hotCacheDurationSec = DEFAULT_DURATION_SEC;
+
+    private long lastPublishedGateMs = 0;
+
+    // Throttle for the "no daemon context" warning. Without this, sustained
+    // motion produced one log line per millisecond because cleanup()
+    // re-enqueues onMotionDetected() while the deadline is still in the
+    // future, fire() early-returns on null ctx, and the cycle repeats.
+    private long lastNoCtxWarnMs = 0;
+    private static final long NO_CTX_WARN_INTERVAL_MS = 5_000;
+
+    /**
+     * Resolve the app context for this process. Two sources:
+     *   1. CameraDaemon.getAppContext() — populated by CameraDaemon.main()
+     *      via createAppContext(). This is the *primary* source: the GL
+     *      thread that triggers ScreenDeterrent.onMotionDetected lives in
+     *      the CameraDaemon process, so this field is always set there.
+     *   2. DaemonBootstrap.getContext() — populated only if a daemon
+     *      explicitly called DaemonBootstrap.init(). Currently no daemon
+     *      does, so reading from here in isolation always returned null
+     *      and produced the spam pattern described above.
+     *
+     * Reflection on CameraDaemon avoids a hard compile-time dependency
+     * from `surveillance` → `daemon`; ScreenDeterrent is also reachable
+     * from non-daemon callers (the API handler invokes reset() during a
+     * config POST), so a direct import would create a coupling we'd then
+     * need to maintain across both call sites.
+     */
+    private static Context resolveContext() {
+        try {
+            Class<?> cd = Class.forName("com.overdrive.app.daemon.CameraDaemon");
+            Method m = cd.getMethod("getAppContext");
+            Object ctx = m.invoke(null);
+            if (ctx instanceof Context) return (Context) ctx;
+        } catch (Throwable ignored) {
+            // CameraDaemon class missing or method renamed — fall through
+            // to DaemonBootstrap.
+        }
+        return DaemonBootstrap.getContext();
+    }
+    private long lastGateWriteMs = 0;
+    private long lastWakeReassertMs = 0;
+    private boolean activityLaunched = false;
+
+    private ScreenDeterrent() {
+        // Refresh hot cache from disk every second on a dedicated background
+        // thread. Bootstraps with one immediate read so first-motion isn't
+        // forced to wait a full second.
+        cacheScheduler.scheduleWithFixedDelay(
+            this::refreshHotCacheFromDisk, 0, HOT_CACHE_TTL_MS,
+            java.util.concurrent.TimeUnit.MILLISECONDS);
+    }
+
+    private void refreshHotCacheFromDisk() {
+        try {
+            JSONObject s = UnifiedConfigManager.getSurveillance();
+            hotCacheEnabled = s.optBoolean("screenDeterrentEnabled", false);
+            int sec = s.optInt("screenDeterrentDurationSeconds", DEFAULT_DURATION_SEC);
+            hotCacheDurationSec = Math.max(3, Math.min(30, sec));
+        } catch (Throwable ignored) {
+            // Keep last known good values on read failure.
+        }
+    }
+
+    public static ScreenDeterrent getInstance() {
+        if (instance == null) {
+            synchronized (ScreenDeterrent.class) {
+                if (instance == null) {
+                    instance = new ScreenDeterrent();
+                }
+            }
+        }
+        return instance;
+    }
+
+    /**
+     * GL frame thread enters here on every confirmed motion. Must be cheap:
+     * volatile reads + atomic CAS only. NO I/O, NO locks, NO allocations.
+     * The hot cache is kept fresh by cacheScheduler on a separate thread.
+     */
+    public void onMotionDetected() {
+        if (!hotCacheEnabled) return;
+
+        long durationMs = hotCacheDurationSec * 1000L;
+        long newDeadline = System.currentTimeMillis() + durationMs;
+
+        while (true) {
+            long current = extendDeadlineMs.get();
+            if (newDeadline <= current) break;
+            if (extendDeadlineMs.compareAndSet(current, newDeadline)) break;
+        }
+
+        if (!inFlight.compareAndSet(false, true)) return;
+
+        cancelled.set(false);
+        executor.execute(() -> {
+            renderThread = Thread.currentThread();
+            try {
+                fire();
+            } catch (Throwable t) {
+                logger.warn("Screen deterrent failed: " + t.getMessage());
+            } finally {
+                cleanup();
+            }
+        });
+    }
+
+    private void cleanup() {
+        try {
+            UnifiedConfigManager.updateValues("surveillance",
+                java.util.Collections.singletonMap("screenDeterrentActiveUntilMs", 0L));
+        } catch (Throwable ignored) {}
+        lastPublishedGateMs = 0;
+        lastGateWriteMs = 0;
+        activityLaunched = false;
+
+        // Restore stealth backlight unless somebody else owns the wake (ACC-on).
+        Context ctx = resolveContext();
+        if (ctx != null && !cancelled.get() && !isForceStop()) {
+            turnBacklightOff(ctx);
+        }
+
+        // Race fix (audit #8): a GL-thread motion bump can land between any
+        // two of the next three lines. Clearing extendDeadlineMs first then
+        // inFlight is wrong (bump lost). Clearing inFlight first then
+        // re-reading the deadline AFTER catches the bump correctly. We also
+        // re-trigger by enqueueing a fresh executor task instead of recursing
+        // (audit #9) — recursion on the executor with sustained motion would
+        // keep the executor queue at depth 1 (single-thread) but generates
+        // unbounded stack frames inside cleanup→onMotionDetected→cleanup.
+        renderThread = null;
+        inFlight.set(false);
+        long pendingDeadline = extendDeadlineMs.get();
+        long now = System.currentTimeMillis();
+        if (pendingDeadline > now && !cancelled.get()) {
+            // Re-enter via the public API so we hit inFlight CAS again
+            // cleanly. The executor will queue our next fire() task.
+            // Note: at this point another GL-thread motion call could ALSO
+            // re-enter — that's fine, only one wins the CAS.
+            executor.execute(this::onMotionDetected);
+        } else {
+            extendDeadlineMs.set(0);
+        }
+    }
+
+    public void cancel() {
+        cancelled.set(true);
+        extendDeadlineMs.set(0);
+        Thread t = renderThread;
+        if (t != null) {
+            try { t.interrupt(); } catch (Throwable ignored) {}
+        }
+    }
+
+    public void reset() {
+        extendDeadlineMs.set(0);
+        cancelled.set(false);
+        // Force the cache scheduler to refresh on its next tick by writing
+        // through the same code path (idempotent).
+        refreshHotCacheFromDisk();
+    }
+
+    // ── fire() — the executor-thread render loop ───────────────────────────
+
+    private void fire() {
+        Context ctx = resolveContext();
+        if (ctx == null) {
+            // Throttle: cleanup() re-enqueues onMotionDetected on sustained
+            // motion, so without this throttle a single null-ctx state
+            // produces one warning per millisecond. Also cancel the deadline
+            // so cleanup doesn't keep re-enqueueing — there's nothing this
+            // process can do without a Context, and ACC monitoring will
+            // re-trigger us on the next genuine motion event after context
+            // becomes available.
+            long now = System.currentTimeMillis();
+            if (now - lastNoCtxWarnMs > NO_CTX_WARN_INTERVAL_MS) {
+                logger.warn("No daemon context — cannot wake panel (throttled)");
+                lastNoCtxWarnMs = now;
+            }
+            extendDeadlineMs.set(0);
+            return;
+        }
+
+        publishGate(extendDeadlineMs.get());
+        wakePanel(ctx);
+        launchActivity();  // touch-capture in app process
+        activityLaunched = true;
+
+        Object surface = null;
+        Bitmap staticFrame = null;
+        Movie movie = null;
+        try {
+            String imagePath = getImagePath();
+            boolean isGif = imagePath != null && !imagePath.isEmpty()
+                    && isGifFile(imagePath);
+
+            surface = createBufferLayer("ScreenDeterrent", DISPLAY_W, DISPLAY_H);
+            if (surface == null) {
+                logger.warn("Failed to create SurfaceControl buffer layer");
+                return;
+            }
+            applyTransaction(surface, Integer.MAX_VALUE, true);
+
+            if (isGif) movie = decodeGifSafe(imagePath);
+
+            if (movie != null && movie.duration() > 0) {
+                renderGifLoop(surface, movie);
+            } else {
+                staticFrame = buildStaticFrame(imagePath);
+                renderStaticLoop(surface, staticFrame);
+            }
+        } catch (Throwable t) {
+            logger.warn("Deterrent render failed: " + t.getMessage());
+        } finally {
+            if (staticFrame != null) {
+                try { staticFrame.recycle(); } catch (Throwable ignored) {}
+            }
+            if (surface != null) releaseSurface(surface);
+        }
+    }
+
+    private void renderStaticLoop(Object surface, Bitmap frame) {
+        drawBitmapToSurface(surface, frame);
+        while (!shouldStop()) {
+            maybeReassertWake();
+            try {
+                Thread.sleep(STATIC_FRAME_TICK_MS);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                if (cancelled.get()) return;
+                Thread.interrupted();
+            }
+        }
+    }
+
+    private void renderGifLoop(Object surface, Movie movie) {
+        Bitmap frame = null;
+        try {
+            frame = Bitmap.createBitmap(DISPLAY_W, DISPLAY_H, Bitmap.Config.ARGB_8888);
+            Canvas frameCanvas = new Canvas(frame);
+
+            float scale = Math.min((float) DISPLAY_W / movie.width(),
+                                   (float) DISPLAY_H / movie.height());
+            int dw = (int) (movie.width() * scale);
+            int dh = (int) (movie.height() * scale);
+            int dx = (DISPLAY_W - dw) / 2;
+            int dy = (DISPLAY_H - dh) / 2;
+
+            long start = SystemClock.uptimeMillis();
+            while (!shouldStop()) {
+                long elapsed = SystemClock.uptimeMillis() - start;
+                int progress = (int) (elapsed % movie.duration());
+                movie.setTime(progress);
+
+                frameCanvas.drawColor(Color.BLACK);
+                frameCanvas.save();
+                frameCanvas.translate(dx, dy);
+                frameCanvas.scale(scale, scale);
+                movie.draw(frameCanvas, 0, 0);
+                frameCanvas.restore();
+
+                drawBitmapToSurface(surface, frame);
+                maybeReassertWake();
+
+                try {
+                    Thread.sleep(GIF_FRAME_INTERVAL_MS);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    if (cancelled.get()) return;
+                    Thread.interrupted();
+                }
+            }
+        } catch (Throwable t) {
+            logger.debug("GIF loop failed: " + t.getMessage());
+        } finally {
+            if (frame != null) frame.recycle();
+        }
+    }
+
+    private void maybeReassertWake() {
+        long now = System.currentTimeMillis();
+        if (now - lastWakeReassertMs > 5_000) {
+            Context ctx = resolveContext();
+            if (ctx != null) wakePanel(ctx);
+            lastWakeReassertMs = now;
+        }
+    }
+
+    /**
+     * Stop predicate. Side-effect: throttled UCM gate refresh (≤1 Hz, only
+     * when local deadline moved).
+     */
+    private boolean shouldStop() {
+        if (cancelled.get()) return true;
+        long now = System.currentTimeMillis();
+        long localDeadline = extendDeadlineMs.get();
+        if (now >= localDeadline) return true;
+
+        if (localDeadline != lastPublishedGateMs
+                && (now - lastGateWriteMs) >= GATE_REFRESH_INTERVAL_MS) {
+            publishGate(localDeadline);
+        }
+
+        try {
+            JSONObject s = UnifiedConfigManager.forceReload().optJSONObject("surveillance");
+            if (s == null) return false;
+            if (s.optBoolean("screenDeterrentForceStop", false)) return true;
+            if (!s.optBoolean("screenDeterrentEnabled", false)) return true;
+        } catch (Throwable ignored) {}
+        return false;
+    }
+
+    private void publishGate(long deadlineMs) {
+        try {
+            UnifiedConfigManager.updateValues("surveillance",
+                java.util.Collections.singletonMap("screenDeterrentActiveUntilMs", deadlineMs));
+            lastPublishedGateMs = deadlineMs;
+            lastGateWriteMs = System.currentTimeMillis();
+        } catch (Throwable t) {
+            logger.debug("Failed to publish gate: " + t.getMessage());
+        }
+    }
+
+    private static boolean isForceStop() {
+        try {
+            JSONObject s = UnifiedConfigManager.forceReload().optJSONObject("surveillance");
+            return s != null && s.optBoolean("screenDeterrentForceStop", false);
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    // ── Bitmap building (downsample to avoid OOM) ──────────────────────────
+
+    /** Decode static image with inSampleSize keyed to display so even a
+     *  50 MP user upload doesn't allocate >100 MB. */
+    private Bitmap buildStaticFrame(String imagePath) {
+        Bitmap bg = null;
+        if (imagePath != null && !imagePath.isEmpty()) {
+            bg = decodeBitmapDownsampled(imagePath);
+        }
+
+        Bitmap canvas = Bitmap.createBitmap(DISPLAY_W, DISPLAY_H, Bitmap.Config.ARGB_8888);
+        Canvas c = new Canvas(canvas);
+
+        if (bg != null) {
+            c.drawColor(Color.BLACK);
+            float scale = Math.min((float) DISPLAY_W / bg.getWidth(),
+                                   (float) DISPLAY_H / bg.getHeight());
+            int dw = (int) (bg.getWidth() * scale);
+            int dh = (int) (bg.getHeight() * scale);
+            int dx = (DISPLAY_W - dw) / 2;
+            int dy = (DISPLAY_H - dh) / 2;
+            Paint p = new Paint(Paint.FILTER_BITMAP_FLAG | Paint.ANTI_ALIAS_FLAG);
+            c.drawBitmap(bg, null, new Rect(dx, dy, dx + dw, dy + dh), p);
+            bg.recycle();
+        } else {
+            c.drawColor(0xFFB00020);
+            drawDefaultText(c);
+        }
+        return canvas;
+    }
+
+    /**
+     * Decode the OverDrive glyph from the APK asset bundle once, cache it
+     * for subsequent fire() calls, and return null on any failure (caller
+     * falls back to the synthetic camera icon).
+     *
+     * Reads {@code web/shared/app-icon-glyph-dark.webp} — the bare brand
+     * glyph on a transparent background. Painted directly over the red
+     * deterrent screen with alpha blending; no container / squircle, the
+     * glyph floats free to match the rest of the deterrent's flat layout.
+     */
+    private volatile Bitmap cachedBrandLogo = null;
+    private Bitmap loadBrandLogo() {
+        Bitmap b = cachedBrandLogo;
+        if (b != null && !b.isRecycled()) return b;
+
+        Context ctx = resolveContext();
+        if (ctx == null) return null;
+        try {
+            android.content.res.AssetManager am = ctx.getAssets();
+            if (am == null) return null;
+            try (java.io.InputStream is = am.open("web/shared/app-icon-glyph-dark.webp")) {
+                BitmapFactory.Options opts = new BitmapFactory.Options();
+                opts.inPreferredConfig = Bitmap.Config.ARGB_8888;
+                Bitmap decoded = BitmapFactory.decodeStream(is, null, opts);
+                if (decoded != null) cachedBrandLogo = decoded;
+                return decoded;
+            }
+        } catch (Throwable t) {
+            logger.debug("loadBrandLogo failed: " + t.getMessage());
+            return null;
+        }
+    }
+
+    private static Bitmap decodeBitmapDownsampled(String path) {
+        try {
+            BitmapFactory.Options bounds = new BitmapFactory.Options();
+            bounds.inJustDecodeBounds = true;
+            BitmapFactory.decodeFile(path, bounds);
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null;
+
+            int sample = 1;
+            while ((bounds.outWidth / sample) > DISPLAY_W * 2
+                    || (bounds.outHeight / sample) > DISPLAY_H * 2) {
+                sample *= 2;
+            }
+            BitmapFactory.Options decode = new BitmapFactory.Options();
+            decode.inSampleSize = sample;
+            decode.inPreferredConfig = Bitmap.Config.ARGB_8888;
+            return BitmapFactory.decodeFile(path, decode);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /**
+     * Default content layout (no user image):
+     *   ┌──────────────────────────────────────────┐
+     *   │                                          │
+     *   │           ┌───────────────┐              │
+     *   │           │   [camera]    │   ← rounded-rect icon, light grey
+     *   │           └───────────────┘              │
+     *   │                                          │
+     *   │             OVERDRIVE                    │   ← wordmark, light grey
+     *   │                                          │
+     *   │       YOU ARE ON CAMERA                  │   ← 144pt BOLD headline
+     *   │                                          │
+     *   │   Surveillance recording in progress     │   ← 64pt subtitle
+     *   │                                          │
+     *   └──────────────────────────────────────────┘
+     * All text + icon use #E5E7EB (light grey) on the red background — pure
+     * white was too harsh; this reads cleaner per user feedback.
+     */
+    private void drawDefaultText(Canvas c) {
+        // Pure white for foreground text — sits on a saturated red background,
+        // so the slight harshness vs the previous E5E7EB grey is the right
+        // call for legibility from across the cabin. The brand glyph keeps
+        // its mint green; it gets painted inside a white rounded-rect card
+        // (below) so it reads cleanly without clashing with the red fill.
+        final int FG = 0xFFFFFFFF;
+
+        // 1. OverDrive glyph, centered upper-third. Painted INSIDE a white
+        //    rounded-rectangle "card" so the green glyph has its own surface
+        //    against the red deterrent background. The card uses iOS-style
+        //    squircle radius (~22%) to match the OverDrive launcher icon.
+        //    Glyph size is bumped up vs. the previous bare-floating layout
+        //    since the white card now anchors it visually.
+        //
+        //    Falls back to a hand-drawn camera icon if the APK asset can't
+        //    be loaded (asset path renamed, context lost, OOM on decode)
+        //    so the deterrent always paints something instead of going blank.
+        float iconCx = DISPLAY_W / 2f;
+        float iconCy = DISPLAY_H * 0.26f;
+        float cardSize = 280f;
+        Bitmap logo = loadBrandLogo();
+        if (logo != null) {
+            float cardHalf = cardSize / 2f;
+            android.graphics.RectF cardRect = new android.graphics.RectF(
+                iconCx - cardHalf, iconCy - cardHalf,
+                iconCx + cardHalf, iconCy + cardHalf);
+            float corner = cardSize * 0.2237f;
+
+            // White card.
+            Paint cardPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+            cardPaint.setColor(0xFFFFFFFF);
+            cardPaint.setStyle(Paint.Style.FILL);
+            c.drawRoundRect(cardRect, corner, corner, cardPaint);
+
+            // Glyph centered inside, with breathing room — the asset is
+            // already padded with whitespace, so we only need a small inset
+            // here. Fits the brand glyph at ~88% of card width which makes
+            // it noticeably larger than the previous 220px floating size.
+            float glyphSize = cardSize * 0.88f;
+            float glyphHalf = glyphSize / 2f;
+            Rect glyphDst = new Rect(
+                (int) (iconCx - glyphHalf), (int) (iconCy - glyphHalf),
+                (int) (iconCx + glyphHalf), (int) (iconCy + glyphHalf));
+            Paint imgPaint = new Paint(Paint.FILTER_BITMAP_FLAG | Paint.ANTI_ALIAS_FLAG);
+            c.drawBitmap(logo, null, glyphDst, imgPaint);
+        } else {
+            drawCameraIcon(c, iconCx, iconCy, 200, FG);
+        }
+
+        Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+        p.setColor(FG);
+        p.setTextAlign(Paint.Align.CENTER);
+
+        // 2. OVERDRIVE wordmark — white, sits below the card.
+        p.setTextSize(56);
+        p.setTypeface(Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD));
+        p.setLetterSpacing(0.20f);
+        c.drawText("OVERDRIVE", DISPLAY_W / 2f, DISPLAY_H * 0.50f, p);
+
+        // 3. Headline — BIG, BOLD. 144pt is ~2× the wordmark, scales with
+        //    1080p panel. Letter-spacing 0.04 keeps it readable at this size.
+        p.setTextSize(144);
+        p.setTypeface(Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD));
+        p.setLetterSpacing(0.04f);
+        String headline = readMessage("YOU ARE ON CAMERA");
+        c.drawText(headline, DISPLAY_W / 2f, DISPLAY_H * 0.70f, p);
+
+        // 4. Subtitle.
+        p.setTextSize(64);
+        p.setTypeface(Typeface.create(Typeface.SANS_SERIF, Typeface.NORMAL));
+        p.setLetterSpacing(0.04f);
+        p.setAlpha(220);
+        c.drawText("Surveillance recording in progress",
+            DISPLAY_W / 2f, DISPLAY_H * 0.82f, p);
+    }
+
+    /**
+     * Render a flat outline-style camera icon inside a rounded rectangle.
+     * cx, cy are the icon center; size is the rounded-rect side length in px.
+     * Designed minimal — single colour, ~12px stroke, no fills, so it reads
+     * cleanly against any background.
+     */
+    private static void drawCameraIcon(Canvas c, float cx, float cy, float size, int color) {
+        Paint stroke = new Paint(Paint.ANTI_ALIAS_FLAG);
+        stroke.setColor(color);
+        stroke.setStyle(Paint.Style.STROKE);
+        stroke.setStrokeWidth(size * 0.045f);
+        stroke.setStrokeCap(Paint.Cap.ROUND);
+        stroke.setStrokeJoin(Paint.Join.ROUND);
+
+        float half = size / 2f;
+        float radius = size * 0.18f;
+
+        // Outer rounded rectangle.
+        android.graphics.RectF rect = new android.graphics.RectF(
+            cx - half, cy - half, cx + half, cy + half);
+        c.drawRoundRect(rect, radius, radius, stroke);
+
+        // Inside: a simplified camera lens (circle) + viewfinder bump (small rect on top).
+        float lensRadius = size * 0.22f;
+        c.drawCircle(cx, cy + size * 0.04f, lensRadius, stroke);
+
+        // Inner lens dot (filled to break monotony).
+        Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
+        fill.setColor(color);
+        fill.setStyle(Paint.Style.FILL);
+        c.drawCircle(cx, cy + size * 0.04f, size * 0.07f, fill);
+
+        // Top viewfinder rectangle.
+        float vfW = size * 0.18f;
+        float vfH = size * 0.10f;
+        android.graphics.RectF vf = new android.graphics.RectF(
+            cx - vfW / 2f - size * 0.10f, cy - half + size * 0.06f,
+            cx - vfW / 2f - size * 0.10f + vfW, cy - half + size * 0.06f + vfH);
+        c.drawRoundRect(vf, radius * 0.3f, radius * 0.3f, stroke);
+    }
+
+    private static Movie decodeGifSafe(String path) {
+        try {
+            byte[] data = readAllBytes(path);
+            if (data != null) return Movie.decodeByteArray(data, 0, data.length);
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
+    // ── Wake / sleep panel (BYD PowerManager extension, UID 2000 only) ─────
+
+    private static void wakePanel(Context ctx) {
+        try {
+            PowerManager pm = (PowerManager) ctx.getSystemService(Context.POWER_SERVICE);
+            for (String name : new String[]{"TurnBacklightOn", "turnBacklightOn"}) {
+                try {
+                    Method m = pm.getClass().getMethod(name, long.class);
+                    m.invoke(pm, SystemClock.uptimeMillis());
+                    return;
+                } catch (NoSuchMethodException ignored) {}
+            }
+        } catch (Throwable t) {
+            logger.warn("TurnBacklightOn reflection failed: " + t.getMessage());
+        }
+    }
+
+    private static void turnBacklightOff(Context ctx) {
+        try {
+            PowerManager pm = (PowerManager) ctx.getSystemService(Context.POWER_SERVICE);
+            for (String name : new String[]{"TurnBacklightOff", "turnBacklightOff"}) {
+                try {
+                    Method m = pm.getClass().getMethod(name, long.class);
+                    m.invoke(pm, SystemClock.uptimeMillis());
+                    return;
+                } catch (NoSuchMethodException ignored) {}
+            }
+        } catch (Throwable t) {
+            logger.debug("TurnBacklightOff reflection failed: " + t.getMessage());
+        }
+    }
+
+    // ── Activity launch (touch capture only, no visual) ────────────────────
+
+    private static void launchActivity() {
+        try {
+            ProcessBuilder pb = new ProcessBuilder("sh", "-c",
+                "am start -n com.overdrive.app/.DeterrentActivity "
+                    + "-a android.intent.action.MAIN "
+                    + "--activity-no-history "
+                    + "--activity-clear-task "
+                    + "--activity-new-task "
+                    + ">/dev/null 2>&1 &");
+            pb.redirectErrorStream(true);
+            pb.start();
+            // Detach — am start can take 2-3s on cold app spawn; we don't wait.
+        } catch (Throwable t) {
+            logger.warn("am start DeterrentActivity failed: " + t.getMessage());
+        }
+    }
+
+    // ── SurfaceControl reflection (visual layer at z=Integer.MAX_VALUE) ────
+
+    private static Object createBufferLayer(String name, int w, int h) {
+        try {
+            Class<?> builderCls = Class.forName("android.view.SurfaceControl$Builder");
+            Object builder = builderCls.getDeclaredConstructor().newInstance();
+            builderCls.getMethod("setName", String.class).invoke(builder, name);
+            builderCls.getMethod("setBufferSize", int.class, int.class).invoke(builder, w, h);
+            try {
+                builderCls.getMethod("setOpaque", boolean.class).invoke(builder, true);
+            } catch (NoSuchMethodException ignored) {}
+            return builderCls.getMethod("build").invoke(builder);
+        } catch (Throwable t) {
+            logger.warn("SurfaceControl.Builder failed: " + t.getMessage());
+            return null;
+        }
+    }
+
+    private static void applyTransaction(Object surface, int z, boolean show) {
+        try {
+            Class<?> sc = Class.forName("android.view.SurfaceControl");
+            Class<?> txCls = Class.forName("android.view.SurfaceControl$Transaction");
+            Object tx = txCls.getDeclaredConstructor().newInstance();
+            try { txCls.getMethod("setLayer", sc, int.class).invoke(tx, surface, z); } catch (Throwable ignored) {}
+            try { txCls.getMethod("setAlpha", sc, float.class).invoke(tx, surface, 1.0f); } catch (Throwable ignored) {}
+            if (show) try { txCls.getMethod("show", sc).invoke(tx, surface); } catch (Throwable ignored) {}
+            txCls.getMethod("apply").invoke(tx);
+        } catch (Throwable t) {
+            logger.warn("SurfaceControl.Transaction failed: " + t.getMessage());
+        }
+    }
+
+    private static void releaseSurface(Object surface) {
+        try {
+            Class<?> sc = Class.forName("android.view.SurfaceControl");
+            Class<?> txCls = Class.forName("android.view.SurfaceControl$Transaction");
+            Object tx = txCls.getDeclaredConstructor().newInstance();
+            try { txCls.getMethod("hide", sc).invoke(tx, surface); } catch (Throwable ignored) {}
+            try { txCls.getMethod("reparent", sc, sc).invoke(tx, surface, null); } catch (Throwable ignored) {}
+            txCls.getMethod("apply").invoke(tx);
+            try { sc.getMethod("release").invoke(surface); } catch (Throwable ignored) {}
+        } catch (Throwable t) {
+            logger.debug("Surface release failed: " + t.getMessage());
+        }
+    }
+
+    private static void drawBitmapToSurface(Object surfaceControl, Bitmap bitmap) {
+        Surface surface = null;
+        try {
+            Class<?> scClass = Class.forName("android.view.SurfaceControl");
+            java.lang.reflect.Constructor<Surface> ctor = Surface.class.getConstructor(scClass);
+            surface = ctor.newInstance(surfaceControl);
+            Canvas canvas = surface.lockCanvas(null);
+            try {
+                canvas.drawBitmap(bitmap, 0, 0, null);
+            } finally {
+                surface.unlockCanvasAndPost(canvas);
+            }
+        } catch (Throwable t) {
+            logger.warn("drawBitmapToSurface failed: " + t.getMessage());
+        } finally {
+            if (surface != null) {
+                try { surface.release(); } catch (Throwable ignored) {}
+            }
+        }
+    }
+
+    // ── Config readers ─────────────────────────────────────────────────────
+
+    private static String getImagePath() {
+        try {
+            JSONObject s = UnifiedConfigManager.getSurveillance();
+            String p = s.optString("screenDeterrentImagePath", "");
+            if (p.isEmpty()) return "";
+            File f = new File(p);
+            return (f.exists() && f.length() > 0) ? p : "";
+        } catch (Throwable t) {
+            return "";
+        }
+    }
+
+    private static String readMessage(String fallback) {
+        try {
+            JSONObject s = UnifiedConfigManager.getSurveillance();
+            String m = s.optString("screenDeterrentMessage", "").trim();
+            return m.isEmpty() ? fallback : m;
+        } catch (Throwable t) {
+            return fallback;
+        }
+    }
+
+    private static boolean isGifFile(String path) {
+        try (FileInputStream fis = new FileInputStream(path)) {
+            byte[] hdr = new byte[6];
+            int n = fis.read(hdr);
+            return n >= 6 && hdr[0] == 'G' && hdr[1] == 'I' && hdr[2] == 'F'
+                && hdr[3] == '8' && (hdr[4] == '7' || hdr[4] == '9') && hdr[5] == 'a';
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private static byte[] readAllBytes(String path) {
+        try (FileInputStream fis = new FileInputStream(path)) {
+            java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+            byte[] buf = new byte[16 * 1024];
+            int n;
+            while ((n = fis.read(buf)) > 0) bos.write(buf, 0, n);
+            return bos.toByteArray();
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+}

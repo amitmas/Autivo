@@ -360,6 +360,7 @@
                                 <div class="btn-group" id="recStorageTypeBtns">
                                     <button class="btn-toggle active" data-value="INTERNAL" onclick="RecSettings.setStorageType('INTERNAL')" data-i18n="trip.settings.storage_internal">Internal</button>
                                     <button class="btn-toggle" data-value="SD_CARD" onclick="RecSettings.setStorageType('SD_CARD')" id="btnRecSdCard" data-i18n="trip.settings.storage_sd">SD card</button>
+                                    <button class="btn-toggle" data-value="USB" onclick="RecSettings.setStorageType('USB')" id="btnRecUsb" data-i18n="trip.settings.storage_usb">USB</button>
                                 </div>
                             </div>
                         </div>
@@ -371,6 +372,16 @@
                             </div>
                             <div class="sd-space-info" id="recSdSpaceInfo" style="display:none;">
                                 <span id="recSdFree">-- free</span> / <span id="recSdTotal">-- total</span>
+                            </div>
+                        </div>
+                        <!-- USB Drive Status -->
+                        <div class="sd-card-status" id="recUsbStatus" style="display:none;">
+                            <div class="sd-status-row">
+                                <span class="sd-status-dot" id="recUsbStatusDot"></span>
+                                <span class="sd-status-text" id="recUsbStatusText" data-i18n="recording.usb_checking">USB: Checking...</span>
+                            </div>
+                            <div class="sd-space-info" id="recUsbSpaceInfo" style="display:none;">
+                                <span id="recUsbFree">-- free</span> / <span id="recUsbTotal">-- total</span>
                             </div>
                         </div>
                         <div class="setting-row" style="border-bottom:none;padding-bottom:8px;">

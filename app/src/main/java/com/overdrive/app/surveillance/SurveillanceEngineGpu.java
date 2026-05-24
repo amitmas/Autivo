@@ -180,6 +180,21 @@ public class SurveillanceEngineGpu {
     });
     // 3. Atomic Flag for thread safety
     private final AtomicBoolean isAiRunning = new AtomicBoolean(false);
+
+    // 4. Scheduler for staggered inference dispatch. Used by the baseline
+    //    seeder to space the four per-quadrant YOLO calls ~500 ms apart.
+    //    Firing them back-to-back saturates the Adreno 610's unified compute
+    //    units and holds the GL thread hostage for ~1.6 s during seeding,
+    //    producing a visible playback freeze. We schedule the dispatch but
+    //    still run the actual detect() on aiExecutor so the TFLite GPU
+    //    delegate keeps its thread affinity.
+    private final java.util.concurrent.ScheduledExecutorService aiScheduler =
+        java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "SentryAiScheduler");
+            t.setDaemon(true);
+            t.setPriority(Thread.MIN_PRIORITY);
+            return t;
+        });
     // --- END SOTA FIX ---
     
     // State
@@ -250,11 +265,77 @@ public class SurveillanceEngineGpu {
     // changes; the cropOnGlThread budget tracks it. 0 until wired — the
     // crop path falls back to a safe minimum so we never time out on cold start.
     private volatile int cameraTargetFps = 0;
-    // Throttle for foveated GL-hop timeout warnings — log at most once per 5s
-    // and aggregate the count so a busy GL thread doesn't spam.
-    private long lastFoveatedTimeoutLogMs = 0;
-    private long foveatedTimeoutCount = 0;
-    
+
+    // ==================== FOVEATED MAILBOX (Option B, full async) ====================
+    //
+    // Old design: AI worker called cropOnGlThread() which posted a Runnable to
+    // glHandler and blocked waiting. That post competed with the render loop's
+    // self-post for handler slots, AND FoveatedCropper.crop() internally called
+    // glFinish() which blocks on any GPU work in flight (including unrelated
+    // YOLO OpenCL jobs). Result: 100-300ms gaps in eglSwapBuffers cadence,
+    // baked into the encoded MP4 as PTS jumps that play back as freeze+skip
+    // at consistent timestamps regardless of player.
+    //
+    // New design: completely decoupled producer/consumer.
+    //   - AI worker (any thread): calls requestFoveatedCrop(q, cx, cy) — sets
+    //     a per-quadrant request flag with the latest centroid; non-blocking.
+    //     Then calls pollFoveatedSlot(q) to read the most recent result; null
+    //     if no result yet (caller falls back to mosaic for THIS tick).
+    //   - GL thread: at the END of each renderLoop iteration, calls
+    //     serviceFoveatedRequestsOnGlThread(). This walks the request flags,
+    //     performs the crop synchronously on the GL thread (no hop, no post),
+    //     deep-copies the result into the slot, clears the request flag.
+    //
+    // Cost: foveated results lag the requesting AI tick by ~1 motion cycle
+    // (~100ms at V2's 10Hz). At 30 fps that's 3 frames behind — well below
+    // human perception during playback overlay. Net benefit: zero GL handler
+    // queue contention, zero glFinish cross-contention, encoder cadence
+    // remains tight.
+    private static final int FOVEATED_NUM_QUADRANTS = MotionPipelineV2.NUM_QUADRANTS;
+    private final boolean[] foveatedRequested = new boolean[FOVEATED_NUM_QUADRANTS];
+    private final float[] foveatedReqCentroidX = new float[FOVEATED_NUM_QUADRANTS];
+    private final float[] foveatedReqCentroidY = new float[FOVEATED_NUM_QUADRANTS];
+    private final Object foveatedRequestLock = new Object();
+    /** Most-recent foveated crop result per quadrant. Slot value is immutable;
+     *  publication replaces the AtomicReference. AI worker reads without lock. */
+    @SuppressWarnings("unchecked")
+    private final java.util.concurrent.atomic.AtomicReference<FoveatedSlot>[] foveatedSlots =
+        (java.util.concurrent.atomic.AtomicReference<FoveatedSlot>[])
+            new java.util.concurrent.atomic.AtomicReference[FOVEATED_NUM_QUADRANTS];
+    {
+        for (int i = 0; i < FOVEATED_NUM_QUADRANTS; i++) {
+            foveatedSlots[i] = new java.util.concurrent.atomic.AtomicReference<>(null);
+        }
+    }
+    /** Slot result is the deep-copied crop bytes plus the timestamp it was
+     *  produced at (System.nanoTime() at publish). Consumers can compare the
+     *  timestamp against frame time to decide whether the result is fresh
+     *  enough to use; older than ~500ms = treat as stale. */
+    private static final class FoveatedSlot {
+        final byte[] rgb;
+        final long publishedNanos;
+        final int width;
+        final int height;
+        FoveatedSlot(byte[] rgb, long publishedNanos, int w, int h) {
+            this.rgb = rgb;
+            this.publishedNanos = publishedNanos;
+            this.width = w;
+            this.height = h;
+        }
+    }
+    /** Stale threshold for slot results. ~500ms = ~15 frames at 30fps. */
+    private static final long FOVEATED_SLOT_STALE_NANOS = 500_000_000L;
+
+    // GL-thread service throttle. The cropper is double-buffered (async readback
+    // is non-blocking) but we still pay the 640×640 RGBA→RGB Y-flip on every
+    // call. Capping to one service call per ~150 ms keeps the encoder GL thread
+    // well under its 33 ms (30 fps) / 66 ms (15 fps) per-frame budget even on
+    // worst-case event frames. V2 motion runs at 10 Hz internally, so 150 ms
+    // is exactly one motion tick — zero AI cadence loss.
+    private long lastFoveatedServiceNs = 0L;
+    private static final long FOVEATED_SERVICE_INTERVAL_NS = 150_000_000L;
+
+
     // Cross-quadrant object tracker
     private final CrossQuadrantTracker crossQuadrantTracker = new CrossQuadrantTracker();
 
@@ -357,6 +438,37 @@ public class SurveillanceEngineGpu {
     
     // Cached latest mosaic frame for snapshot API (640×480 RGB)
     private volatile byte[] latestMosaicFrame = null;
+    // JPEG-encoded snapshot of the cached mosaic. Refresh is OFF the
+    // AiLaneWorker thread — every MOSAIC_JPEG_FRAME_MODULO frames we hand a
+    // snapshot of the RGB mosaic to {@link #mosaicJpegExecutor} and let it
+    // do the int[] alloc + Bitmap.compress. This keeps Bitmap.compress
+    // (30–80 ms on the BYD SoC) off the motion-pipeline thread. Readers see
+    // a plain volatile read.
+    private volatile byte[] latestMosaicJpeg = null;
+    // ~1 Hz at 15 fps. Fast enough that a dialog tile feels live, slow enough
+    // that the JPEG encode doesn't impact other lanes.
+    private static final int MOSAIC_JPEG_FRAME_MODULO = 15;
+    // Single-thread bounded executor — drops new requests if the previous
+    // encode hasn't completed (rather than queuing forever and producing
+    // backlog). A bounded queue size of 1 with discardOldestPolicy keeps
+    // the freshest pending request and skips intermediate ones. Daemon
+    // thread so it doesn't block JVM shutdown.
+    private final java.util.concurrent.ThreadPoolExecutor mosaicJpegExecutor =
+        new java.util.concurrent.ThreadPoolExecutor(
+            1, 1, 0L, java.util.concurrent.TimeUnit.MILLISECONDS,
+            new java.util.concurrent.ArrayBlockingQueue<>(1),
+            r -> {
+                Thread t = new Thread(r, "MosaicJpegEncoder");
+                t.setDaemon(true);
+                t.setPriority(Thread.NORM_PRIORITY - 1);
+                return t;
+            },
+            new java.util.concurrent.ThreadPoolExecutor.DiscardOldestPolicy());
+    // Reusable scratch buffers — avoid the per-encode int[] + Bitmap alloc
+    // churn (~5 MB/sec at 30 fps cadence). Guarded by mosaicJpegExecutor's
+    // single-thread invariant (no need for explicit lock).
+    private int[] mosaicJpegPixelsScratch = null;
+    private android.graphics.Bitmap mosaicJpegBitmapScratch = null;
     
     /**
      * Initializes the surveillance engine.
@@ -508,6 +620,111 @@ public class SurveillanceEngineGpu {
         }
     }
 
+    /**
+     * Mark a quadrant as wanting a foveated crop on the next render loop pass.
+     * Non-blocking. Latest centroid wins (overwrite semantics). Safe from any
+     * thread.
+     */
+    public void requestFoveatedCrop(int quadrant, float centroidX, float centroidY) {
+        if (quadrant < 0 || quadrant >= FOVEATED_NUM_QUADRANTS) return;
+        synchronized (foveatedRequestLock) {
+            foveatedRequested[quadrant] = true;
+            foveatedReqCentroidX[quadrant] = centroidX;
+            foveatedReqCentroidY[quadrant] = centroidY;
+        }
+    }
+
+    /**
+     * Read the latest foveated crop for a quadrant, if fresh.
+     * Returns null if no result is available or the result is older than
+     * FOVEATED_SLOT_STALE_NANOS (the AI worker will fall back to mosaic).
+     * Non-blocking. Safe from any thread.
+     */
+    public byte[] pollFoveatedSlot(int quadrant) {
+        if (quadrant < 0 || quadrant >= FOVEATED_NUM_QUADRANTS) return null;
+        FoveatedSlot slot = foveatedSlots[quadrant].get();
+        if (slot == null) return null;
+        long age = System.nanoTime() - slot.publishedNanos;
+        if (age > FOVEATED_SLOT_STALE_NANOS) return null;
+        return slot.rgb;
+    }
+
+    /**
+     * GL-thread hook. Called from PanoramicCameraGpu.renderLoop once per
+     * frame. Walks the per-quadrant request flags, performs each requested
+     * crop synchronously on the GL thread (since this method is itself called
+     * on the GL thread), publishes the result to the matching slot, and
+     * clears the request flag. Deep-copies the cropper's internal buffer
+     * because FoveatedCropper.crop() returns a pointer to a shared array.
+     *
+     * MUST be called on the GL thread that owns cameraTextureId.
+     *
+     * Performance: each crop is ~3-8ms (FBO blit + glReadPixels of 640×640
+     * RGBA + Y-flip RGBA→RGB). Capped to one crop per render frame to keep
+     * the per-frame budget predictable. If multiple quadrants request
+     * simultaneously, they're serviced round-robin across consecutive
+     * render frames.
+     */
+    public void serviceFoveatedRequestsOnGlThread() {
+        FoveatedCropper cropper = this.foveatedCropper;
+        int texId = this.cameraTextureId;
+        if (cropper == null || texId < 0 || !cropper.isInitialized()) return;
+
+        // SOTA throttle: even with double-buffered async readback, the row pack
+        // + Y-flip costs ~3 ms per call on Adreno 610. Capping to one service
+        // per 150 ms keeps total per-frame GL cost predictable across the
+        // entire event window.
+        long nowNs = System.nanoTime();
+        if (nowNs - lastFoveatedServiceNs < FOVEATED_SERVICE_INTERVAL_NS) return;
+
+        // Snapshot the requests under the lock, then service at most one per
+        // call. Round-robin via a per-instance cursor so no quadrant starves.
+        int qToServe = -1;
+        float cx = 0f, cy = 0f;
+        synchronized (foveatedRequestLock) {
+            for (int i = 0; i < FOVEATED_NUM_QUADRANTS; i++) {
+                int q = (foveatedRoundRobin + i) % FOVEATED_NUM_QUADRANTS;
+                if (foveatedRequested[q]) {
+                    qToServe = q;
+                    cx = foveatedReqCentroidX[q];
+                    cy = foveatedReqCentroidY[q];
+                    foveatedRequested[q] = false;
+                    foveatedRoundRobin = (q + 1) % FOVEATED_NUM_QUADRANTS;
+                    break;
+                }
+            }
+        }
+        if (qToServe < 0) return;
+
+        lastFoveatedServiceNs = nowNs;
+
+        FoveatedCropper.Result result;
+        try {
+            // Async readback: this submits the CURRENT quadrant's render and
+            // returns the PREVIOUS quadrant's bytes (which the GPU has already
+            // finished). The result's quadrant field tells us which slot to
+            // publish to. The very first call returns null — by design.
+            result = cropper.crop(texId, qToServe, cx, cy);
+        } catch (Throwable t) {
+            logger.warn("Foveated crop (GL inline) failed: " + t.getMessage());
+            return;
+        }
+        if (result == null || result.rgb == null || result.quadrant < 0
+                || result.quadrant >= FOVEATED_NUM_QUADRANTS) {
+            return;
+        }
+        // Deep-copy: cropper.rgb is a pointer to its shared internal buffer;
+        // the next service call will overwrite it. The copy is 1.2 MB —
+        // negligible vs. the 200 ms YOLO inference downstream.
+        byte[] copy = new byte[result.rgb.length];
+        System.arraycopy(result.rgb, 0, copy, 0, result.rgb.length);
+        foveatedSlots[result.quadrant].set(new FoveatedSlot(
+                copy, System.nanoTime(),
+                result.width, result.height));
+    }
+
+    private int foveatedRoundRobin = 0;
+
     /** GL handler for posting foveated crops back to the GL thread.
      *  Required when processFrame runs on AiLaneWorker. */
     public void setGlHandler(android.os.Handler glHandler) {
@@ -520,73 +737,11 @@ public class SurveillanceEngineGpu {
         if (fps > 0) this.cameraTargetFps = fps;
     }
 
-    /**
-     * Run foveatedCropper.crop on the GL thread and wait for result. Caller
-     * may be on AiLaneWorker — this method bridges back to GL where
-     * FBO/glReadPixels calls are valid.
-     *
-     * Returns null if the crop fails, the GL handler isn't set, or the call
-     * times out. Timeout is sized to one full camera frame (1000/targetFps + 50ms
-     * slack) so we tolerate the GL thread being mid-render without flooding logs.
-     * Caller falls back to the mosaic crop on null.
-     */
-    private byte[] cropOnGlThread(int quadrant, float centroidX, float centroidY) {
-        FoveatedCropper cropper = this.foveatedCropper;
-        int texId = this.cameraTextureId;
-        android.os.Handler h = this.glHandler;
-        if (cropper == null || texId < 0) return null;
-        // Fast path: if we're already on GL thread (handler == null OR handler's
-        // looper == current looper), just call directly.
-        if (h == null || h.getLooper().getThread() == Thread.currentThread()) {
-            try {
-                return cropper.crop(texId, quadrant, centroidX, centroidY);
-            } catch (Throwable t) {
-                logger.warn("Foveated crop (inline) failed: " + t.getMessage());
-                return null;
-            }
-        }
-        // Slow path: post to GL handler and wait. Budget = one camera frame at
-        // the configured target FPS, plus a small slack for the readback itself.
-        // At 15 fps that's ~115ms; at 30 fps ~85ms. The previous 50ms cap was
-        // smaller than a single frame's render budget which guaranteed timeouts.
-        // Floor at 80ms so we don't go shorter than a normal readback even if
-        // FPS hasn't been wired yet (cold start before setCameraTargetFps).
-        int fps = this.cameraTargetFps;
-        long timeoutMs = fps > 0 ? Math.max(80, (1000L / fps) + 50) : 150;
-        final byte[][] result = new byte[1][];
-        final java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
-        boolean posted = h.post(() -> {
-            try {
-                result[0] = cropper.crop(texId, quadrant, centroidX, centroidY);
-            } catch (Throwable t) {
-                logger.warn("Foveated crop (GL hop) failed: " + t.getMessage());
-            } finally {
-                latch.countDown();
-            }
-        });
-        if (!posted) {
-            // GL thread shutting down or handler invalid — fall back to mosaic.
-            return null;
-        }
-        try {
-            if (!latch.await(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)) {
-                // Throttle the warn so a busy GL thread doesn't spam logs.
-                long now = System.currentTimeMillis();
-                if (now - lastFoveatedTimeoutLogMs > 5_000) {
-                    lastFoveatedTimeoutLogMs = now;
-                    foveatedTimeoutCount++;
-                    logger.info("Foveated crop GL hop timed out (mosaic fallback active; "
-                            + foveatedTimeoutCount + " timeouts since start)");
-                }
-                return null;
-            }
-        } catch (InterruptedException ie) {
-            Thread.currentThread().interrupt();
-            return null;
-        }
-        return result[0];
-    }
-    
+    // cropOnGlThread() removed — foveated crops now run synchronously on the
+    // GL thread inside serviceFoveatedRequestsOnGlThread() (called from
+    // PanoramicCameraGpu.renderLoop). The AI worker uses the mailbox
+    // (requestFoveatedCrop / pollFoveatedSlot) and never blocks on GL.
+
     /**
      * Get the current foveated cropper (for lazy-init check).
      */
@@ -666,6 +821,34 @@ public class SurveillanceEngineGpu {
                     latestMosaicFrame = new byte[smallRgbFrame.length];
                 }
                 System.arraycopy(smallRgbFrame, 0, latestMosaicFrame, 0, smallRgbFrame.length);
+            }
+
+            // Hand a snapshot of the cached mosaic to a dedicated single-
+            // thread encoder executor. Bitmap.compress (30–80 ms) does NOT
+            // run on AiLaneWorker — the motion pipeline keeps its frame
+            // budget. The executor's queue is depth-1 with DiscardOldest so
+            // a stalled encoder doesn't grow a backlog: the next tick just
+            // replaces the pending request with the freshest mosaic.
+            //
+            // We CLONE here rather than capturing the latestMosaicFrame
+            // reference — the cache buffer is rewritten in-place every 10
+            // frames via System.arraycopy, which would tear the encoder's
+            // pixel reads if it shared the buffer. The clone is bounded
+            // (640×480×3 = 920 KB once per ~15 frames at 15 fps ≈ 1 Hz).
+            if (frameCount % MOSAIC_JPEG_FRAME_MODULO == 0 && latestMosaicFrame != null) {
+                final byte[] snapshot = latestMosaicFrame.clone();
+                try {
+                    mosaicJpegExecutor.execute(() -> {
+                        try {
+                            byte[] encoded = encodeMosaicJpeg(snapshot);
+                            if (encoded != null) latestMosaicJpeg = encoded;
+                        } catch (Throwable t) {
+                            logger.warn("mosaic jpeg encode failed: " + t.getMessage());
+                        }
+                    });
+                } catch (java.util.concurrent.RejectedExecutionException ignored) {
+                    // Executor was shut down (engine releasing). Skip.
+                }
             }
             
             // Log frame count every 100 frames to confirm frames are arriving
@@ -825,32 +1008,56 @@ public class SurveillanceEngineGpu {
             baselineSeeded = true;  // Set immediately to prevent re-entry
             final byte[] seedFrame = new byte[smallRgbFrame.length];
             System.arraycopy(smallRgbFrame, 0, seedFrame, 0, smallRgbFrame.length);
-            aiExecutor.execute(() -> {
-                // FIX (A8/B3): snapshot detector at lambda entry — see runAiOnQuadrant
-                // for rationale. Toggling AI off via setObjectFilters between
-                // submission and execution would otherwise NPE or crash native TFLite.
-                final YoloDetector detectorSnap = yoloDetector;
-                if (detectorSnap == null || !aiEnabled) {
-                    logger.info("Baseline seed skipped (detector closed)");
-                    return;
-                }
-                logger.info("Seeding detection baseline (frame 30)...");
-                int qW = THUMBNAIL_WIDTH / 2;
-                int qH = THUMBNAIL_HEIGHT / 2;
-                for (int q = 0; q < MotionPipelineV2.NUM_QUADRANTS; q++) {
-                    try {
-                        byte[] quadCrop = cropFromMosaic(seedFrame, q, qW, qH);
-                        if (quadCrop != null) {
-                            java.util.List<com.overdrive.app.ai.Detection> dets =
-                                    detectorSnap.detect(quadCrop, qW, qH, aiConfidence, true, true, false, true, minObjectSize);
-                            detectionBaseline.seedFromDetections(q, dets, qW, qH);
+            // Stagger the four per-quadrant inferences instead of running them
+            // back-to-back. The Adreno 610 is a unified architecture; firing
+            // four ~400 ms GPU-delegate detect() calls in a tight loop holds
+            // the GL thread hostage for ~1.6 s and produces a visible freeze
+            // during the seeding window. Spacing them 500 ms apart turns one
+            // long stall into four short, individually unnoticeable hiccups
+            // — the Adreno gets time to drain GL+swap work between calls.
+            //
+            // Scheduling is on aiScheduler; each tick re-dispatches to
+            // aiExecutor so the TFLite GPU-delegate interpreter keeps its
+            // thread affinity (it was created on aiExecutor and must run
+            // there).
+            final int qW = THUMBNAIL_WIDTH / 2;
+            final int qH = THUMBNAIL_HEIGHT / 2;
+            final long staggerMs = 500L;
+            logger.info("Scheduling staggered detection baseline seed (4 quadrants × " +
+                    staggerMs + "ms apart) starting at frame 30");
+            for (int qi = 0; qi < MotionPipelineV2.NUM_QUADRANTS; qi++) {
+                final int q = qi;
+                aiScheduler.schedule(() -> {
+                    aiExecutor.execute(() -> {
+                        // FIX (A8/B3): snapshot detector at lambda entry — see
+                        // runAiOnQuadrant for rationale. Toggling AI off via
+                        // setObjectFilters between schedule and execution
+                        // would otherwise NPE or crash native TFLite.
+                        final YoloDetector detectorSnap = yoloDetector;
+                        if (detectorSnap == null || !aiEnabled) {
+                            if (q == 0) {
+                                logger.info("Baseline seed skipped (detector closed)");
+                            }
+                            return;
                         }
-                    } catch (Exception e) {
-                        logger.warn("Baseline seed failed for Q" + q + ": " + e.getMessage());
-                    }
-                }
-                logger.info("Detection baseline seeded for all quadrants");
-            });
+                        try {
+                            byte[] quadCrop = cropFromMosaic(seedFrame, q, qW, qH);
+                            if (quadCrop != null) {
+                                java.util.List<com.overdrive.app.ai.Detection> dets =
+                                        detectorSnap.detect(quadCrop, qW, qH,
+                                                aiConfidence, true, true, false,
+                                                true, minObjectSize);
+                                detectionBaseline.seedFromDetections(q, dets, qW, qH);
+                            }
+                        } catch (Exception e) {
+                            logger.warn("Baseline seed failed for Q" + q + ": " + e.getMessage());
+                        }
+                        if (q == MotionPipelineV2.NUM_QUADRANTS - 1) {
+                            logger.info("Detection baseline seeded for all quadrants");
+                        }
+                    });
+                }, q * staggerMs, java.util.concurrent.TimeUnit.MILLISECONDS);
+            }
         }
         
         // Per-quadrant override post-filter. The native pipeline ran with the
@@ -1210,10 +1417,12 @@ public class SurveillanceEngineGpu {
                             logger.warn("Failed to send motion notification: " + e.getMessage());
                         }
 
-                        // SOTA: Fire BYD cloud deterrent (flash lights / find car)
-                        // Runs on background thread, never blocks surveillance pipeline
+                        // SOTA: Fire deterrents (cloud + screen). Both run on
+                        // background threads and never block the surveillance pipeline.
+                        // Each one independently honors its own enabled flag and cooldown.
                         try {
                             com.overdrive.app.byd.cloud.BydCloudDeterrent.getInstance().onMotionDetected();
+                            ScreenDeterrent.getInstance().onMotionDetected();
                             deterrentFiredTime = now;  // Track when deterrent was dispatched
                         } catch (Exception e) {
                             logger.debug("Deterrent dispatch failed: " + e.getMessage());
@@ -1226,11 +1435,12 @@ public class SurveillanceEngineGpu {
                     if (newStopTime > recordingStopTime) {
                         recordingStopTime = newStopTime;
                     }
-                    
+
                     // SOTA: Recurring deterrent — re-trigger while motion continues.
-                    // The cooldown inside BydCloudDeterrent prevents spamming (default 15s).
+                    // Per-deterrent cooldowns prevent spamming.
                     try {
                         com.overdrive.app.byd.cloud.BydCloudDeterrent.getInstance().onMotionDetected();
+                        ScreenDeterrent.getInstance().onMotionDetected();
                         deterrentFiredTime = now;  // Track latest deterrent dispatch
                     } catch (Exception e) {
                         // Fail silently — never block surveillance
@@ -1351,6 +1561,7 @@ public class SurveillanceEngineGpu {
                         }
                         try {
                             com.overdrive.app.byd.cloud.BydCloudDeterrent.getInstance().onMotionDetected();
+                            ScreenDeterrent.getInstance().onMotionDetected();
                             deterrentFiredTime = now;
                         } catch (Exception e) {
                             logger.debug("Deterrent dispatch failed: " + e.getMessage());
@@ -1689,33 +1900,57 @@ public class SurveillanceEngineGpu {
             }
         } catch (Exception ignored) {}
         
-        if (foveatedCropper != null && foveatedCropper.isInitialized() && cameraTextureId >= 0
+        // Detect heartbeat runs early so we can skip the foveated GL hop
+        // entirely on this code path. Heartbeats fire when the NCC tracker
+        // wants to refresh its template — which only happens once the
+        // tracked person has been stationary long enough for the score to
+        // drift, so by definition the subject is NOT moving and a 320×240
+        // mosaic crop carries enough detail. Doing the foveated 640×640
+        // dance for it is pure cost: it forces a GL-thread hop while the
+        // Adreno 610 is already saturated by the YOLO inference itself,
+        // which produces the 296ms `acq` stall (and the 1500ms "Foveated
+        // crop GL hop timed out" warning) we see in field logs during
+        // active recording.
+        boolean heartbeatRunEarly = false;
+        try {
+            heartbeatRunEarly = NativeMotion.trackerNeedsYoloHeartbeat(quadrant)
+                    && NativeMotion.trackerHasActiveTrack(quadrant);
+        } catch (Exception ignored) {}
+
+        if (!heartbeatRunEarly
+                && foveatedCropper != null && foveatedCropper.isInitialized() && cameraTextureId >= 0
                 && ((motionResult != null && motionResult.componentSize > 0) || heartbeatHasTrackerPos)) {
-            // Foveated path: 640×640 from raw strip. crop() touches GL state
-            // (FBO bind, glReadPixels) and must run on the GL thread. Since
-            // processFrame runs on AiLaneWorker, we hop to GL and wait
-            // synchronously. Round-trip is ~1-5ms so this doesn't meaningfully
-            // affect the AI lane budget.
+            // Foveated path (Option B mailbox).
+            //
+            // We never block the GL thread or post a Runnable to its handler
+            // queue. Instead:
+            //   1. Mark this quadrant as wanting a foveated crop on the next
+            //      render frame (requestFoveatedCrop, non-blocking).
+            //   2. Read the most recent crop from the slot. If present and
+            //      fresh (< 500ms old), use it. If absent or stale, fall
+            //      back to mosaic for THIS tick — the next tick's slot will
+            //      have been filled by the render loop in the interim.
+            //
+            // First-tick latency: the very first foveated tick after motion
+            // starts will see an empty slot and fall back to mosaic. By the
+            // second tick (~100ms later via V2's MOTION_PROCESS_INTERVAL_MS)
+            // the slot is populated. Steady-state behavior is foveated;
+            // start-of-event behavior is mosaic-then-foveated. Acceptable.
             float centroidX = (motionResult != null && motionResult.componentSize > 0)
                     ? motionResult.centroidX : trackerCentroidX;
             float centroidY = (motionResult != null && motionResult.componentSize > 0)
                     ? motionResult.centroidY : trackerCentroidY;
-            byte[] foveatedRgb = cropOnGlThread(quadrant, centroidX, centroidY);
+            requestFoveatedCrop(quadrant, centroidX, centroidY);
+
+            byte[] foveatedRgb = pollFoveatedSlot(quadrant);
             if (foveatedRgb != null) {
                 qW = FoveatedCropper.CROP_SIZE;
                 qH = FoveatedCropper.CROP_SIZE;
-                // Must copy — foveatedCropper reuses its internal buffer
-                cropData = new byte[foveatedRgb.length];
-                System.arraycopy(foveatedRgb, 0, cropData, 0, foveatedRgb.length);
+                // Slot deep-copies on publish; the bytes we got here are
+                // ours alone (no further copy needed for thread safety).
+                cropData = foveatedRgb;
             } else {
-                // Foveated crop failed — fall back to mosaic crop. Copy because
-                // cropFromMosaic returns a pointer to the shared aiBuffer which
-                // gets overwritten by subsequent main-thread tracker updates and
-                // mosaicQuadCrop captures (line ~1591) before the aiExecutor
-                // lambda runs. Without this copy, the lambda's YOLO inference +
-                // ThumbnailBuffer.observe see a stale or wrong-quadrant frame —
-                // the visible symptom being the bbox drawn on the hero image
-                // landing on the wrong part of the thumbnail.
+                // Slot empty or stale — fall back to mosaic for this tick.
                 qW = THUMBNAIL_WIDTH / 2;
                 qH = THUMBNAIL_HEIGHT / 2;
                 byte[] mosaicShared = cropFromMosaic(mosaicRgb, quadrant, qW, qH);
@@ -1755,17 +1990,11 @@ public class SurveillanceEngineGpu {
         final boolean usedFoveated = (qW == FoveatedCropper.CROP_SIZE);
         
         // Capture whether this YOLO run is a heartbeat verification BEFORE the lambda.
-        // The C++ tracker's needsYoloVerification flag is mutated by trackerUpdate() on
-        // every frame. By the time the aiExecutor lambda runs (100-200ms later), the flag
-        // state may have changed, causing the lambda to confirm the wrong quadrant.
-        boolean heartbeatCheck = false;
-        try {
-            heartbeatCheck = NativeMotion.trackerNeedsYoloHeartbeat(quadrant)
-                    && NativeMotion.trackerHasActiveTrack(quadrant);
-        } catch (Exception e) {
-            // Tracker not available
-        }
-        final boolean isHeartbeatRun = heartbeatCheck;
+        // Reuses the early decision computed above the foveated branch — the C++
+        // tracker's needsYoloVerification flag is mutated by trackerUpdate() on
+        // every frame, so reading it again here would race with the live state
+        // and could disagree with the foveated-skip decision.
+        final boolean isHeartbeatRun = heartbeatRunEarly;
 
         // FIX (B1/H-a): capture the recording generation NOW. The lambda below
         // will check it on completion and skip cross-recording writes if the
@@ -3271,12 +3500,19 @@ public class SurveillanceEngineGpu {
         com.overdrive.app.storage.StorageManager storageManager;
         try {
             storageManager = com.overdrive.app.storage.StorageManager.getInstance();
-            if (storageManager.getSurveillanceStorageType() ==
-                    com.overdrive.app.storage.StorageManager.StorageType.SD_CARD &&
+            com.overdrive.app.storage.StorageManager.StorageType type =
+                    storageManager.getSurveillanceStorageType();
+            if (type == com.overdrive.app.storage.StorageManager.StorageType.SD_CARD &&
                     !storageManager.isSdCardMounted()) {
                 logger.warn("SD card unmounted before recording - attempting remount");
                 if (!storageManager.ensureSdCardMounted(true)) {
                     logger.error("SD card remount failed - event may write to stale path");
+                }
+            } else if (type == com.overdrive.app.storage.StorageManager.StorageType.USB &&
+                    !storageManager.isUsbMounted()) {
+                logger.warn("USB unmounted before recording - attempting remount");
+                if (!storageManager.ensureUsbMounted(true)) {
+                    logger.error("USB remount failed - event may write to stale path");
                 }
             }
         } catch (Exception e) {
@@ -3686,6 +3922,13 @@ public class SurveillanceEngineGpu {
         active = false;
         inActiveMode = false;
 
+        // Tear down any in-progress screen deterrent. cancel() is non-blocking;
+        // the render thread (in this same process) sees the flag, releases its
+        // surface, and turns the backlight off in its finally block.
+        try {
+            ScreenDeterrent.getInstance().cancel();
+        } catch (Throwable ignored) {}
+
         // P1 #15: cancel pending YOLO work and clear shared state BEFORE
         // resetting the baseline. Without this, an aiExecutor lambda already
         // mid-flight can still write lastActors / lastYoloDetections after
@@ -3728,7 +3971,22 @@ public class SurveillanceEngineGpu {
     public boolean isActive() {
         return active;
     }
-    
+
+    /**
+     * Returns true while the underlying YOLO detector has a GPU OpenCL
+     * job in flight (between interp.run() and the implicit sync that
+     * reads the result tensor). The GL render loop checks this before
+     * issuing glReadPixels for the AI lane — if the Adreno is mid-job,
+     * the readback would block until the OpenCL queue drained, producing
+     * the ~250 ms aiReadback stalls observed during active recording.
+     *
+     * Safe to call from any thread (volatile read inside YoloDetector).
+     */
+    public boolean isAiGpuJobInFlight() {
+        YoloDetector d = yoloDetector;
+        return d != null && d.isGpuJobInFlight();
+    }
+
     /**
      * Checks if currently recording.
      * 
@@ -4009,7 +4267,67 @@ public class SurveillanceEngineGpu {
     public byte[] getLatestMosaicFrame() {
         return latestMosaicFrame;
     }
-    
+
+    /**
+     * Latest JPEG-encoded mosaic snapshot (Option C side-output). Refreshed
+     * every {@link #MOSAIC_JPEG_FRAME_MODULO} frames on the surveillance
+     * worker thread; readers pay one volatile read. Null until the first
+     * encode lands or when surveillance hasn't started yet.
+     */
+    public byte[] getLatestMosaicJpeg() {
+        return latestMosaicJpeg;
+    }
+
+    /**
+     * Encodes the 640×480 RGB mosaic into a JPEG byte[]. Always invoked from
+     * {@link #mosaicJpegExecutor}'s single thread so the scratch buffers
+     * ({@link #mosaicJpegPixelsScratch}, {@link #mosaicJpegBitmapScratch})
+     * are accessed without a lock. Reusing them avoids ~5 MB/s of int[] +
+     * Bitmap allocation that would otherwise hit the young-gen.
+     *
+     * Returns null on bad input or encode failure.
+     */
+    private byte[] encodeMosaicJpeg(byte[] mosaicRgb) {
+        final int W = 640, H = 480;
+        if (mosaicRgb == null || mosaicRgb.length < W * H * 3) return null;
+        if (mosaicJpegPixelsScratch == null || mosaicJpegPixelsScratch.length < W * H) {
+            mosaicJpegPixelsScratch = new int[W * H];
+        }
+        int[] pixels = mosaicJpegPixelsScratch;
+        for (int y = 0; y < H; y++) {
+            int rowBase = y * W * 3;
+            int dstBase = y * W;
+            for (int x = 0; x < W; x++) {
+                int srcIdx = rowBase + x * 3;
+                int r = mosaicRgb[srcIdx] & 0xFF;
+                int g = mosaicRgb[srcIdx + 1] & 0xFF;
+                int b = mosaicRgb[srcIdx + 2] & 0xFF;
+                pixels[dstBase + x] = 0xFF000000 | (r << 16) | (g << 8) | b;
+            }
+        }
+        // Reuse a mutable Bitmap and re-feed pixels via setPixels rather
+        // than allocating a new immutable Bitmap each call.
+        android.graphics.Bitmap bitmap = mosaicJpegBitmapScratch;
+        if (bitmap == null || bitmap.isRecycled()
+                || bitmap.getWidth() != W || bitmap.getHeight() != H) {
+            if (bitmap != null && !bitmap.isRecycled()) {
+                try { bitmap.recycle(); } catch (Exception ignored) {}
+            }
+            bitmap = android.graphics.Bitmap.createBitmap(
+                    W, H, android.graphics.Bitmap.Config.ARGB_8888);
+            mosaicJpegBitmapScratch = bitmap;
+        }
+        bitmap.setPixels(pixels, 0, W, 0, 0, W, H);
+        try {
+            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream(64 * 1024);
+            bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 82, out);
+            return out.toByteArray();
+        } catch (Exception e) {
+            return null;
+        }
+        // Bitmap NOT recycled — it's reused for the next encode.
+    }
+
     /**
      * Releases all resources.
      */
@@ -4159,22 +4477,64 @@ public class SurveillanceEngineGpu {
     
     public void release() {
         disable();
-        
+
         // SOTA FIX: Shutdown the executor
         aiExecutor.shutdownNow();
-        
+        // Cancel any pending staggered seed dispatches and stop the scheduler
+        // thread so it doesn't outlive the engine.
+        aiScheduler.shutdownNow();
+
+        // Shut down the mosaic JPEG encoder thread + recycle its scratch
+        // Bitmap. shutdownNow() interrupts any in-flight encode; we await
+        // termination with a bounded budget so we don't recycle the scratch
+        // Bitmap mid-Bitmap.compress — recycling under a live JNI compress
+        // crashes native code.
+        boolean encoderTerminated = false;
+        try {
+            mosaicJpegExecutor.shutdownNow();
+            // Bounded wait: 200ms × up to 10 attempts = 2s total. Bitmap
+            // compress at 640×480 q=82 typically completes in <80ms so a
+            // single 200ms wait is almost always sufficient; the loop
+            // covers a worst-case GC stall on the BYD SoC.
+            int attempts = 0;
+            while (attempts++ < 10) {
+                if (mosaicJpegExecutor.awaitTermination(200,
+                        java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                    encoderTerminated = true;
+                    break;
+                }
+            }
+            if (!encoderTerminated) {
+                logger.warn("mosaicJpegExecutor did not terminate within 2s — "
+                        + "skipping bitmap recycle to avoid native crash");
+            }
+        } catch (InterruptedException ignored) {
+            Thread.currentThread().interrupt();
+        } catch (Exception ignored) {}
+        if (encoderTerminated && mosaicJpegBitmapScratch != null) {
+            try {
+                if (!mosaicJpegBitmapScratch.isRecycled()) mosaicJpegBitmapScratch.recycle();
+            } catch (Exception ignored) {}
+        }
+        // Drop refs unconditionally — if we couldn't recycle (encoder still
+        // running), the GC will reclaim once the lingering encode finishes
+        // and releases its strong reference.
+        mosaicJpegBitmapScratch = null;
+        mosaicJpegPixelsScratch = null;
+        latestMosaicJpeg = null;
+
         // Clean up YOLO detector
         if (yoloDetector != null) {
             yoloDetector.close();
             yoloDetector = null;
         }
-        
+
         currentFrame = null;
         // ThreadLocal: clear this thread's scratch. Other threads' entries
         // (aiExecutor, drainer) will be reclaimed when those threads exit
         // or the next allocation replaces them.
         aiBufferTL.remove();
-        
+
         logger.info("Released");
     }
     

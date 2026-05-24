@@ -450,13 +450,31 @@ public class TripApiHandler {
         JSONObject response = new JSONObject();
         try {
             response.put("success", true);
+            JSONObject configJson;
             if (config != null) {
-                response.put("config", config.toJson());
+                configJson = config.toJson();
             } else {
-                JSONObject defaultConfig = new JSONObject();
-                defaultConfig.put("enabled", false);
-                response.put("config", defaultConfig);
+                configJson = new JSONObject();
+                configJson.put("enabled", false);
             }
+            // Surface the SOH-estimator's current nominal capacity so the
+            // web summary/cost paths fall back to the user's pack rather
+            // than the hard-coded 82.56 kWh default. Read defensively —
+            // any failure leaves the field absent and JS falls through.
+            try {
+                com.overdrive.app.abrp.SohEstimator soh =
+                    com.overdrive.app.monitor.SocHistoryDatabase.getInstance().getSohEstimator();
+                if (soh != null) {
+                    double nominal = soh.getNominalCapacityKwh();
+                    if (nominal > 0) {
+                        configJson.put("nominalKwh", nominal);
+                        configJson.put("nominalSource", soh.getNominalSource());
+                    }
+                }
+            } catch (Throwable t) {
+                logger.debug("nominalKwh enrichment skipped: " + t.getMessage());
+            }
+            response.put("config", configJson);
         } catch (Exception e) {
             logger.error("Error building config response", e);
         }
@@ -522,6 +540,16 @@ public class TripApiHandler {
         try {
             storage.put("storageType", sm.getTripsStorageType().name());
             storage.put("limitMb", sm.getTripsLimitMb());
+            // Per-volume effective max so the slider stays accurate when the
+            // user swaps cards or moves between SD/USB/internal.
+            // Both names emitted: `maxLimitMb` matches the recording/surveillance
+            // response (internal volume's ceiling); `maxLimitMbInternal` is kept
+            // for older clients that consumed the trips-only naming.
+            long maxInternal = sm.getEffectiveMaxLimitMb(StorageManager.StorageType.INTERNAL);
+            storage.put("maxLimitMb",         maxInternal);
+            storage.put("maxLimitMbInternal", maxInternal);
+            storage.put("maxLimitMbSdCard",   sm.getEffectiveMaxLimitMb(StorageManager.StorageType.SD_CARD));
+            storage.put("maxLimitMbUsb",      sm.getEffectiveMaxLimitMb(StorageManager.StorageType.USB));
             double usedBytes = sm.getTripsSize();
             double usedMb = usedBytes / (1024.0 * 1024.0);
             if (usedMb < 0.1 && usedBytes > 0) {
@@ -533,6 +561,15 @@ public class TripApiHandler {
                 storage.put("usedUnit", "MB");
             }
             storage.put("sdCardAvailable", sm.isSdCardAvailable());
+            storage.put("usbAvailable", sm.isUsbAvailable());
+            if (sm.isSdCardAvailable()) {
+                storage.put("sdCardTotalSpace", sm.getSdCardTotalSpace());
+                storage.put("sdCardFreeSpace", sm.getSdCardFreeSpace());
+            }
+            if (sm.isUsbAvailable()) {
+                storage.put("usbTotalSpace", sm.getUsbTotalSpace());
+                storage.put("usbFreeSpace", sm.getUsbFreeSpace());
+            }
             storage.put("tripsCount", db != null ? db.getTripCount() : 0);
             storage.put("storagePath", sm.getTripsPath());
         } catch (Exception e) {
@@ -560,9 +597,10 @@ public class TripApiHandler {
 
             if (bodyJson.has("storageType")) {
                 String typeStr = bodyJson.getString("storageType");
-                StorageManager.StorageType type = "SD_CARD".equalsIgnoreCase(typeStr)
-                        ? StorageManager.StorageType.SD_CARD
-                        : StorageManager.StorageType.INTERNAL;
+                StorageManager.StorageType type;
+                if ("SD_CARD".equalsIgnoreCase(typeStr))      type = StorageManager.StorageType.SD_CARD;
+                else if ("USB".equalsIgnoreCase(typeStr))     type = StorageManager.StorageType.USB;
+                else                                           type = StorageManager.StorageType.INTERNAL;
                 sm.setTripsStorageType(type);
             }
 

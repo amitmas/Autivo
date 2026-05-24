@@ -3671,9 +3671,23 @@ select.md-input ~ .md-label {
 /* === Modal (SOH battery-capacity picker) === */
 .modal-backdrop {
     position: fixed;
-    inset: 0;
+    /* Explicit edges instead of `inset: 0` — the shorthand was added in
+       Chrome 87 and the BYD head-unit WebView (Chrome 58) silently ignores
+       it, leaving the backdrop with no top/right/bottom/left and collapsing
+       it to content size. The result was a transparent 0×0 fixed element
+       with the modal-card floating at the upper-left of the viewport
+       instead of a full-screen overlay. */
+    top: 0;
+    right: 0;
+    bottom: 0;
+    left: 0;
     background: var(--modal-backdrop);
-    z-index: 1000;
+    /* z-index has to clear the WebView shell's footer-bar at 10000 (set in
+       WebViewFragment.kt's INJECT_JS) AND the toast container at 20000.
+       Without this, the bottom of the modal-card — where the action
+       buttons live — is overlaid by the Apply bar in the in-app WebView,
+       making "Remove image" / "Save" / "Cancel" untappable. */
+    z-index: 30000;
     display: flex;
     align-items: center;
     justify-content: center;

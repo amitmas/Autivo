@@ -28,6 +28,8 @@
     <string name="cd_play_pause">Speel/Pause</string>
     <string name="cd_player_prev">Vorige opname</string>
     <string name="cd_player_next">Volgende opname</string>
+    <string name="cd_player_maximize">Maximale speler</string>
+    <string name="cd_player_minimize">Uitgang fullscreen</string>
     <string name="cd_delete">Verwijderen</string>
     <string name="cd_expand">Uitbreiden</string>
     <string name="cd_configure">Configuratie</string>
@@ -63,6 +65,20 @@
     <string name="camera_option_4">Camera 4</string>
     <string name="camera_option_5">Camera 5</string>
     <string name="camera_selection_hint">De camera 1 = BYD Seal, camera 0 = Atto trimmen. Restart de daemon na het wijzigen van de camera-ID voor de instelling om in werking te treden.</string>
+    <string name="camera_mapping_title">Kamerkaarten maken</string>
+    <string name="camera_role_label">Role mapping</string>
+    <string name="camera_candidate_previous">Eerder</string>
+    <string name="camera_candidate_next">Volgende</string>
+    <string name="camera_preview_unavailable">Probeer een andere kandidaat of vernieuwen door de dialoog opnieuw te openen nadat de daemon opnieuw is gestart.</string>
+    <string name="camera_mapping_save">Bewaar mapping</string>
+    <string name="camera_mapping_clear">Een duidelijke rol</string>
+    <string name="camera_mapping_saved">Camera mapping opgeslagen.</string>
+    <string name="camera_mapping_cleared">Camera rol mapping vrij.</string>
+    <string name="camera_mapping_summary_format">Panorama-stroom: camera %1$d · %2$dx%3$d</string>
+    <string name="camera_mapping_summary_probing">Panorama-stroom: auto-detectie / sonde van erfenis</string>
+    <string name="camera_mapping_current_format">Mapping van de stroom: %1$s</string>
+    <string name="camera_mapping_current_none">Stroomopslag: automatisch / standaard</string>
+    <string name="camera_mapping_hint">OverDrive behoudt standaard het oude startgedrag, maar nu kunt u de samengestelde panoramische strip correct kalibreren. Bekijk elke rauwe samengestelde slice, kaart de logische 360-rollen naar de slice die eigenlijk voor/rechts/achter/links op uw voertuig toont, en de daemon zal die lay-out opnieuw gebruiken voor opname, streaming en AI na het opnieuw starten.</string>
     <string name="dashboard_scan_to_connect">Scan om te verbinden</string>
     <string name="dashboard_qr_waiting">Wachtend op de tunnel...</string>
     <string name="dashboard_daemons_running_default">0/5 Rennen</string>
@@ -216,6 +232,8 @@
     <string name="toast_restarting_camera_daemon">De camera daemon opnieuw starten...</string>
     <string name="toast_camera_daemon_restarting">Camera daemon herstarten met volledige sonde</string>
     <string name="toast_camera_restart_failed">Configure is verwijderd, maar de daemon herstart is gefaald.</string>
+    <string name="toast_camera_settings_saved_restarting">Camera-instellingen gespaard  herstarten camera daemon...</string>
+    <string name="toast_camera_settings_restart_failed">De camera-instellingen zijn opgeslagen, maar de daemon herstart is gefaald.</string>
     <string name="toast_failed_with_message_x">Niet gelukt: %1$s</string>
     <string name="toast_soh_reset_success">SOH schatting reset  zal opnieuw berekenen uit de volgende gegevens</string>
     <string name="toast_soh_reset_failed_no_daemon">Reset mislukte  daemon niet reageren en bestand niet schrijfbaar</string>
@@ -273,6 +291,14 @@
     <string name="tunnel_label_cloudflared">Wolkenbladen</string>
     <string name="tunnel_label_zrok">Zrok</string>
     <string name="tunnel_label_tailscale">Tailscale</string>
+    <string name="daemon_name_camera">Camera Daemon</string>
+    <string name="daemon_name_surveillance">Bewaking Daemon</string>
+    <string name="daemon_name_acc_surveillance">ACC Bewaking</string>
+    <string name="daemon_name_singbox">Sing-box Proxy</string>
+    <string name="daemon_name_cloudflared">Cloudflared Tunnel</string>
+    <string name="daemon_name_zrok">Zrok Tunnel</string>
+    <string name="daemon_name_tailscale">Tailscale Tunnel</string>
+    <string name="daemon_name_telegram">Telegram Bot</string>
     <string name="clip_label_access_code">Toegangscode</string>
     <string name="clip_label_url">URL</string>
     <string name="toast_no_config_needed">Geen configuratie nodig voor %1$s</string>

@@ -28,6 +28,8 @@
     <string name="cd_play_pause">播放/休息</string>
     <string name="cd_player_prev">上一次錄制</string>
     <string name="cd_player_next">下一次錄制</string>
+    <string name="cd_player_maximize">最大化玩家</string>
+    <string name="cd_player_minimize">排出全屏幕</string>
     <string name="cd_delete">刪除</string>
     <string name="cd_expand">擴展</string>
     <string name="cd_configure">設定方式</string>
@@ -63,6 +65,20 @@
     <string name="camera_option_4">攝影機 4</string>
     <string name="camera_option_5">攝影機 5</string>
     <string name="camera_selection_hint">自動選取對照相機的裝置.相機 1 = BYD Seal,相機 0 = Atto 裝置.</string>
+    <string name="camera_mapping_title">攝影機映射</string>
+    <string name="camera_role_label">角色映射</string>
+    <string name="camera_candidate_previous">上一篇:</string>
+    <string name="camera_candidate_next">下一步</string>
+    <string name="camera_preview_unavailable">試試另一個候選人或刷新, 重新啟動對話區域,</string>
+    <string name="camera_mapping_save">保存地圖</string>
+    <string name="camera_mapping_clear">明確的角色</string>
+    <string name="camera_mapping_saved">攝影機的映射保存.</string>
+    <string name="camera_mapping_cleared">攝影機角色映射已清除.</string>
+    <string name="camera_mapping_summary_format">全景流:攝影機 %1$d · %2$dx%3$d</string>
+    <string name="camera_mapping_summary_probing">全景流:傳承自動檢測/探測</string>
+    <string name="camera_mapping_current_format">目前的映射:%1$s</string>
+    <string name="camera_mapping_current_none">目前映射:自动 /默认</string>
+    <string name="camera_mapping_hint">OverDrive默認保留舊的啟動行為, 但現在讓你正確校對合并的全景帶. 預覽每個原始合并的片段, 將 logical 360 角色映射到實際上顯示你的車輛前/右/後/左的片段,</string>
     <string name="dashboard_scan_to_connect">掃描至連接</string>
     <string name="dashboard_qr_waiting">在等待道...</string>
     <string name="dashboard_daemons_running_default">0/5 運行</string>
@@ -216,6 +232,8 @@
     <string name="toast_restarting_camera_daemon">還是要重新啟動相機妖怪.</string>
     <string name="toast_camera_daemon_restarting">攝影機大師重新啟動,</string>
     <string name="toast_camera_restart_failed">設定已清除,但 Daemon 重啟未成功.</string>
+    <string name="toast_camera_settings_saved_restarting">預覽 預覽 預覽 預覽 預覽</string>
+    <string name="toast_camera_settings_restart_failed">請手動重新啟動.</string>
     <string name="toast_failed_with_message_x">失敗:%1$s</string>
     <string name="toast_soh_reset_success">SOH估算重置 將從下一步數據中重新計算</string>
     <string name="toast_soh_reset_failed_no_daemon">重置失敗 惡魔無法回應,檔案無法寫</string>
@@ -273,6 +291,14 @@
     <string name="tunnel_label_cloudflared">雲的狀況</string>
     <string name="tunnel_label_zrok">Zrok</string>
     <string name="tunnel_label_tailscale">Tailscale</string>
+    <string name="daemon_name_camera">攝影機 Daemon</string>
+    <string name="daemon_name_surveillance">監控 Daemon</string>
+    <string name="daemon_name_acc_surveillance">ACC 監控</string>
+    <string name="daemon_name_singbox">Sing-box 代理</string>
+    <string name="daemon_name_cloudflared">Cloudflared 隧道</string>
+    <string name="daemon_name_zrok">Zrok 隧道</string>
+    <string name="daemon_name_tailscale">Tailscale 隧道</string>
+    <string name="daemon_name_telegram">Telegram 機械人</string>
     <string name="clip_label_access_code">接入代碼</string>
     <string name="clip_label_url">URL</string>
     <string name="toast_no_config_needed">%1$s 沒有必要的配置</string>

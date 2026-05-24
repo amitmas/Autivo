@@ -28,6 +28,8 @@
     <string name="cd_play_pause">Игра / Пауза</string>
     <string name="cd_player_prev">Предыдущая запись</string>
     <string name="cd_player_next">Следующая запись</string>
+    <string name="cd_player_maximize">Максимизировать игрок</string>
+    <string name="cd_player_minimize">Выход на полный экран</string>
     <string name="cd_delete">Удалить</string>
     <string name="cd_expand">Расширение</string>
     <string name="cd_configure">Конфигурация</string>
@@ -63,6 +65,20 @@
     <string name="camera_option_4">Камера 4</string>
     <string name="camera_option_5">Камера 5</string>
     <string name="camera_selection_hint">Камера 1 = BYD Seal, Камера 0 = Atto. Возобновить загрузку после изменения идентификатора камеры, чтобы настройка вступила в силу.</string>
+    <string name="camera_mapping_title">Картировка с помощью камеры</string>
+    <string name="camera_role_label">Картировка роли</string>
+    <string name="camera_candidate_previous">Предыдущие</string>
+    <string name="camera_candidate_next">Далее</string>
+    <string name="camera_preview_unavailable">Пока не доступно предварительное просмотр. Попробуйте другого кандидата или обновьте, открыв диалог после запуска демона.</string>
+    <string name="camera_mapping_save">Сохранить картографию</string>
+    <string name="camera_mapping_clear">Ясная роль</string>
+    <string name="camera_mapping_saved">Камера сохранила картинку.</string>
+    <string name="camera_mapping_cleared">Карта роли камеры очищена.</string>
+    <string name="camera_mapping_summary_format">Панорамный поток: Камера %1$d · %2$dx%3$d</string>
+    <string name="camera_mapping_summary_probing">Панорамный поток: автоматическое обнаружение / исследование наследия</string>
+    <string name="camera_mapping_current_format">Нынешнее отображение: %1$s</string>
+    <string name="camera_mapping_current_none">Нынешнее отображение: автоматическое / по умолчанию</string>
+    <string name="camera_mapping_hint">OverDrive поддерживает традиционное поведение запуска по умолчанию, но теперь позволяет правильно калибровывать сливную панорамную ленту. Предусмотреть каждый сырый слитый слайд, отобразить логические 360-роли на слайд, который на самом деле показывает передний / правый / задний / левый на вашем автомобиле, и демон будет повторно использовать этот макет для записи, потоковой передачи и ИИ после перезапуска.</string>
     <string name="dashboard_scan_to_connect">Сканировать для подключения</string>
     <string name="dashboard_qr_waiting">Ждём туннеля...</string>
     <string name="dashboard_daemons_running_default">0/5 Бег</string>
@@ -216,6 +232,8 @@
     <string name="toast_restarting_camera_daemon">Возобновляем работу демона камеры...</string>
     <string name="toast_camera_daemon_restarting">Димон камеры запускается с полным зондом</string>
     <string name="toast_camera_restart_failed">Конфигурация очищена, но перезагрузка демона не удалась. Пожалуйста, перезагрузите ее вручную.</string>
+    <string name="toast_camera_settings_saved_restarting">Настройки камеры сохранились  перезагрузка демона камеры...</string>
+    <string name="toast_camera_settings_restart_failed">Настройки камеры были сохранены, но восстановление демона не удалось.</string>
     <string name="toast_failed_with_message_x">Не удалось: %1$s</string>
     <string name="toast_soh_reset_success">Перезагрузка оценки SOH  будет пересчитываться из следующих данных</string>
     <string name="toast_soh_reset_failed_no_daemon">Перезагрузка не удалась  демона не отвечает и файл не может быть написан</string>
@@ -273,6 +291,14 @@
     <string name="tunnel_label_cloudflared">Облакообразные</string>
     <string name="tunnel_label_zrok">Zrok</string>
     <string name="tunnel_label_tailscale">Tailscale</string>
+    <string name="daemon_name_camera">Камера Daemon</string>
+    <string name="daemon_name_surveillance">Daemon наблюдения</string>
+    <string name="daemon_name_acc_surveillance">ACC Наблюдение</string>
+    <string name="daemon_name_singbox">Sing-box Прокси</string>
+    <string name="daemon_name_cloudflared">Тоннель Cloudflared</string>
+    <string name="daemon_name_zrok">Тоннель Zrok</string>
+    <string name="daemon_name_tailscale">Тоннель Tailscale</string>
+    <string name="daemon_name_telegram">Telegram Бот</string>
     <string name="clip_label_access_code">Код доступа</string>
     <string name="clip_label_url">URL</string>
     <string name="toast_no_config_needed">Не требуется конфигурации для %1$s</string>

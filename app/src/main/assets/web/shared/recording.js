@@ -37,8 +37,14 @@ BYD.recording = {
         sdCardPath: null,
         sdCardFreeSpace: 0,
         sdCardTotalSpace: 0,
+        usbAvailable: false,
+        usbPath: null,
+        usbFreeSpace: 0,
+        usbTotalSpace: 0,
+        // Dynamic per-volume ceilings; server pulls these from live StatFs.
         maxLimitMb: 100000,
-        maxLimitMbSdCard: 100000
+        maxLimitMbSdCard: 100000,
+        maxLimitMbUsb: 100000
     },
     cdrInfo: null,
     savedConfig: null,
@@ -233,16 +239,25 @@ BYD.recording = {
             if (data.success) {
                 this.config.recordingsLimitMb = data.recordingsLimitMb || 500;
                 this.config.recordingsStorageType = data.recordingsStorageType || 'INTERNAL';
-                
-                // Update storage info
+
+                // SD card info
                 this.storageInfo.sdCardAvailable = data.sdCardAvailable || false;
                 this.storageInfo.sdCardPath = data.sdCardPath || null;
                 this.storageInfo.sdCardFreeSpace = data.sdCardFreeSpace || 0;
                 this.storageInfo.sdCardTotalSpace = data.sdCardTotalSpace || 0;
-                this.storageInfo.maxLimitMb = data.maxLimitMb || 100000;
+
+                // USB info
+                this.storageInfo.usbAvailable = data.usbAvailable || false;
+                this.storageInfo.usbPath = data.usbPath || null;
+                this.storageInfo.usbFreeSpace = data.usbFreeSpace || 0;
+                this.storageInfo.usbTotalSpace = data.usbTotalSpace || 0;
+
+                // Dynamic per-volume ceilings (live StatFs from server)
+                this.storageInfo.maxLimitMb       = data.maxLimitMb       || 100000;
                 this.storageInfo.maxLimitMbSdCard = data.maxLimitMbSdCard || 100000;
+                this.storageInfo.maxLimitMbUsb    = data.maxLimitMbUsb    || 100000;
                 this.storageInfo.recordingsPath = data.recordingsPath || '';
-                
+
                 this.updateStorageLimitUI();
                 this.updateStorageTypeUI();
             }
@@ -284,15 +299,25 @@ BYD.recording = {
         }
     },
     
+    /**
+     * Resolve the slider's effective max based on the selected storage
+     * type. Pulls the live per-volume ceiling from storageInfo so card
+     * swaps update the slider after the next loadStorageSettings.
+     */
+    effectiveMaxLimitMb() {
+        switch (this.config.recordingsStorageType) {
+            case 'SD_CARD': return this.storageInfo.maxLimitMbSdCard;
+            case 'USB':     return this.storageInfo.maxLimitMbUsb;
+            default:        return this.storageInfo.maxLimitMb;
+        }
+    },
+
     updateStorageLimitUI() {
         const slider = document.getElementById('recLimitSlider');
         const value = document.getElementById('recLimitValue');
-        
-        // Update slider max based on storage type
-        const maxLimit = this.config.recordingsStorageType === 'SD_CARD' 
-            ? this.storageInfo.maxLimitMbSdCard 
-            : this.storageInfo.maxLimitMb;
-        
+
+        const maxLimit = this.effectiveMaxLimitMb();
+
         if (slider) {
             slider.max = maxLimit;
             slider.value = Math.min(this.config.recordingsLimitMb, maxLimit);
@@ -302,7 +327,6 @@ BYD.recording = {
             value.textContent = mb >= 1000 ? BYD.i18n.t('recording.unit_gb', {n: (mb / 1000)}) : BYD.i18n.t('recording.unit_mb', {n: mb});
         }
 
-        // Update range labels
         const minLabel = document.getElementById('recLimitMin');
         const maxLabel = document.getElementById('recLimitMax');
         if (minLabel) minLabel.textContent = BYD.i18n.t('recording.unit_mb', {n: 100});
@@ -311,29 +335,30 @@ BYD.recording = {
     
     updateStorageTypeUI() {
         // Update storage type buttons
-        document.querySelectorAll('#recStorageTypeBtns .btn-toggle').forEach(btn => 
+        document.querySelectorAll('#recStorageTypeBtns .btn-toggle').forEach(btn =>
             btn.classList.toggle('active', btn.dataset.value === this.config.recordingsStorageType));
-        
-        // Update SD card button state
+
+        // SD card button state
         const sdCardBtn = document.getElementById('btnRecSdCard');
         if (sdCardBtn) {
             sdCardBtn.disabled = !this.storageInfo.sdCardAvailable;
-            if (!this.storageInfo.sdCardAvailable) {
-                sdCardBtn.title = BYD.i18n.t('recording.sd_card_unavailable');
-            } else {
-                sdCardBtn.title = '';
-            }
+            sdCardBtn.title = this.storageInfo.sdCardAvailable ? '' : BYD.i18n.t('recording.sd_card_unavailable');
         }
-        
-        // Show/hide SD card status
-        const statusEl = document.getElementById('recSdCardStatus');
-        if (statusEl) {
-            statusEl.style.display = 'block';
-            
+
+        // USB button state
+        const usbBtn = document.getElementById('btnRecUsb');
+        if (usbBtn) {
+            usbBtn.disabled = !this.storageInfo.usbAvailable;
+            usbBtn.title = this.storageInfo.usbAvailable ? '' : BYD.i18n.t('recording.usb_unavailable');
+        }
+
+        // SD card status block
+        const sdStatusEl = document.getElementById('recSdCardStatus');
+        if (sdStatusEl) {
+            sdStatusEl.style.display = 'block';
             const dotEl = document.getElementById('recSdStatusDot');
             const textEl = document.getElementById('recSdStatusText');
             const spaceEl = document.getElementById('recSdSpaceInfo');
-            
             if (this.storageInfo.sdCardAvailable) {
                 if (dotEl) dotEl.className = 'sd-status-dot online';
                 if (textEl) textEl.textContent = BYD.i18n.t('recording.sd_card_available');
@@ -348,8 +373,30 @@ BYD.recording = {
                 if (spaceEl) spaceEl.style.display = 'none';
             }
         }
-        
-        // Update storage path display
+
+        // USB status block
+        const usbStatusEl = document.getElementById('recUsbStatus');
+        if (usbStatusEl) {
+            usbStatusEl.style.display = 'block';
+            const dotEl = document.getElementById('recUsbStatusDot');
+            const textEl = document.getElementById('recUsbStatusText');
+            const spaceEl = document.getElementById('recUsbSpaceInfo');
+            if (this.storageInfo.usbAvailable) {
+                if (dotEl) dotEl.className = 'sd-status-dot online';
+                if (textEl) textEl.textContent = BYD.i18n.t('recording.usb_available');
+                if (spaceEl) {
+                    spaceEl.style.display = 'block';
+                    document.getElementById('recUsbFree').textContent = BYD.i18n.t('recording.size_free', {size: this.formatSize(this.storageInfo.usbFreeSpace)});
+                    document.getElementById('recUsbTotal').textContent = BYD.i18n.t('recording.size_total', {size: this.formatSize(this.storageInfo.usbTotalSpace)});
+                }
+            } else {
+                if (dotEl) dotEl.className = 'sd-status-dot offline';
+                if (textEl) textEl.textContent = BYD.i18n.t('recording.usb_not_detected');
+                if (spaceEl) spaceEl.style.display = 'none';
+            }
+        }
+
+        // Storage path display
         const pathEl = document.getElementById('recStoragePath');
         if (pathEl && this.storageInfo.recordingsPath) {
             const shortPath = this.storageInfo.recordingsPath.replace('/storage/emulated/0/', '');
@@ -369,17 +416,24 @@ BYD.recording = {
             if (BYD.utils && BYD.utils.toast) BYD.utils.toast(BYD.i18n.t('recording.sd_card_unavailable'), 'error');
             return;
         }
-        
+        if (type === 'USB' && !this.storageInfo.usbAvailable) {
+            if (BYD.utils && BYD.utils.toast) BYD.utils.toast(BYD.i18n.t('recording.usb_unavailable'), 'error');
+            return;
+        }
+
         this.config.recordingsStorageType = type;
-        document.querySelectorAll('#recStorageTypeBtns .btn-toggle').forEach(btn => 
+        document.querySelectorAll('#recStorageTypeBtns .btn-toggle').forEach(btn =>
             btn.classList.toggle('active', btn.dataset.value === type));
-        
-        // Update slider max when storage type changes
+
+        // Re-clamp slider value to the new volume's effective max so we don't
+        // ship a 80GB value to the server when the user just switched to a
+        // 32GB USB stick.
+        const newMax = this.effectiveMaxLimitMb();
+        if (this.config.recordingsLimitMb > newMax) {
+            this.config.recordingsLimitMb = newMax;
+        }
         this.updateStorageLimitUI();
-        
-        // Show/hide CDR cleanup card
         this.updateCdrCleanupVisibility();
-        
         this.markChanged();
     },
     

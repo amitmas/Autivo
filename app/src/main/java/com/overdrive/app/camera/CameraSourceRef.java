@@ -77,7 +77,14 @@ public final class CameraSourceRef {
         if (obj == null) return null;
         CameraSourceKind kind = CameraSourceKind.fromId(obj.optString("kind", null));
         if (kind == CameraSourceKind.DIRECT && obj.has("cameraId")) {
-            return direct(obj.optInt("cameraId", -1));
+            int id = obj.optInt("cameraId", -1);
+            // Range-validate at construction time — a malformed payload
+            // sending cameraId=-1 / 99 / etc. used to slip through and
+            // persist garbage in unified config that no preview path
+            // could ever satisfy. BYD panoramic platform enumerates
+            // physical cameras 0..5.
+            if (id < 0 || id > 5) return null;
+            return direct(id);
         }
         if (kind == CameraSourceKind.PANORAMIC_SLICE) {
             PanoramicSlice slice = PanoramicSlice.fromId(obj.optString("slice", null));

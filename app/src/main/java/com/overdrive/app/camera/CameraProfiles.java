@@ -11,6 +11,10 @@ import java.util.Map;
 
 /**
  * Registry of known camera profiles.
+ *
+ * Add new vehicle variants here. {@link #infer(String)} matches lowercase
+ * substrings of {@code ro.product.model}; that property's content varies
+ * across BYD firmwares so verify on real hardware before relying on auto.
  */
 public final class CameraProfiles {
     public static final String PROFILE_AUTO = "auto";

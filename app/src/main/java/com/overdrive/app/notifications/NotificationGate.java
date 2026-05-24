@@ -42,20 +42,35 @@ public final class NotificationGate {
     }
 
     /**
-     * Telegram-tier gate. Mirrors {@link #shouldPush(Actor.Severity, SurveillanceConfig)}
-     * but reads the telegramNotices/Alerts/Critical toggles so a
-     * Telegram-only user can mute low-severity events independently of push.
-     * Same null-config-allows-through and unknown-severity-allows-through
-     * guarantees as shouldPush.
+     * Telegram-tier gate. Reads the per-severity tier toggles
+     * (tierNotices/tierAlerts/tierCritical) from
+     * {@link com.overdrive.app.telegram.config.UnifiedTelegramConfig} so
+     * the daemon process and the app process see the same value the
+     * moment the user flips the toggle — no daemon restart needed.
+     *
+     * The {@code SurveillanceConfig} parameter is ignored and kept only
+     * so existing call sites don't have to change argument shape.
+     * forceReload() bypasses the per-process mtime cache so a write from
+     * the OTHER UID is picked up immediately.
+     *
+     * Unknown-severity-allows-through is preserved — never silently drop
+     * a notification of an unrecognised severity.
      */
     public static boolean shouldTelegram(Actor.Severity sev, SurveillanceConfig cfg) {
-        if (cfg == null) return true;
         if (sev == null) return true;
-        switch (sev) {
-            case CRITICAL: return cfg.isTelegramCritical();
-            case ALERT:    return cfg.isTelegramAlerts();
-            case NOTICE:   return cfg.isTelegramNotices();
-            default:       return false;
+        try {
+            com.overdrive.app.config.UnifiedConfigManager.forceReload();
+            switch (sev) {
+                case CRITICAL: return com.overdrive.app.telegram.config.UnifiedTelegramConfig.isTierCritical();
+                case ALERT:    return com.overdrive.app.telegram.config.UnifiedTelegramConfig.isTierAlerts();
+                case NOTICE:   return com.overdrive.app.telegram.config.UnifiedTelegramConfig.isTierNotices();
+                default:       return false;
+            }
+        } catch (Exception e) {
+            // Read failure shouldn't suppress an alert — the user-visible
+            // failure mode for "nothing arrives" is much worse than
+            // "something arrives that the user didn't want".
+            return true;
         }
     }
 

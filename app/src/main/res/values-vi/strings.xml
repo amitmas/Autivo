@@ -28,6 +28,8 @@
     <string name="cd_play_pause">Play/Pause</string>
     <string name="cd_player_prev">Bản ghi trước đó</string>
     <string name="cd_player_next">Bản ghi kế tiếp</string>
+    <string name="cd_player_maximize">Tăng tối đa người chơi</string>
+    <string name="cd_player_minimize">Chiếc màn hình đầy đủ xuất hiện</string>
     <string name="cd_delete">Xoá</string>
     <string name="cd_expand">Tăng cường</string>
     <string name="cd_configure">Thiết lập</string>
@@ -63,6 +65,20 @@
     <string name="camera_option_4">Camera 4</string>
     <string name="camera_option_5">Camera 5</string>
     <string name="camera_selection_hint">Auto chọn máy ảnh phù hợp cho trang bị của bạn trên mỗi boot. Camera 1 = BYD Seal, Camera 0 = Atto trang bị. khởi động lại daemon sau khi thay đổi ID máy ảnh để thiết lập có hiệu lực.</string>
+    <string name="camera_mapping_title">Chụp bản đồ bằng máy ảnh</string>
+    <string name="camera_role_label">Phân tích vai trò</string>
+    <string name="camera_candidate_previous">Trước đây</string>
+    <string name="camera_candidate_next">Tiếp</string>
+    <string name="camera_preview_unavailable">Xem trước chưa sẵn sàng. Hãy thử ứng cử viên khác hoặc làm mới bằng cách mở lại hộp thoại sau khi daemon khởi động lại.</string>
+    <string name="camera_mapping_save">Tiết kiệm bản đồ</string>
+    <string name="camera_mapping_clear">Vai trò rõ ràng</string>
+    <string name="camera_mapping_saved">Hình ảnh máy ảnh được lưu lại.</string>
+    <string name="camera_mapping_cleared">Khóa bản đồ vai trò của máy ảnh.</string>
+    <string name="camera_mapping_summary_format">Xu hướng toàn cảnh: Camera %1$d · %2$dx%3$d</string>
+    <string name="camera_mapping_summary_probing">Panoramic stream: Legacy auto-detect / thăm dò</string>
+    <string name="camera_mapping_current_format">Phân tích hiện tại: %1$s</string>
+    <string name="camera_mapping_current_none">Bản đồ hiện tại: tự động / mặc định</string>
+    <string name="camera_mapping_hint">OverDrive giữ lại hành vi khởi động cũ theo mặc định, nhưng bây giờ cho phép bạn chuẩn bị dải toàn cảnh hợp nhất đúng cách. Xem trước mỗi mảnh hợp nhất nguyên liệu, lập bản đồ các vai trò 360 hợp lý đến mảnh thực sự hiển thị phía trước / phải / phía sau / bên trái trên xe của bạn, và con quỷ sẽ sử dụng lại bố cục đó để ghi lại, phát trực tuyến và AI sau khi khởi động lại.</string>
     <string name="dashboard_scan_to_connect">Scan để kết nối</string>
     <string name="dashboard_qr_waiting">Chờ đường hầm...</string>
     <string name="dashboard_daemons_running_default">0/5 chạy</string>
@@ -216,6 +232,8 @@
     <string name="toast_restarting_camera_daemon">Khởi động lại camera daemon...</string>
     <string name="toast_camera_daemon_restarting">Camera daemon khởi động lại với toàn bộ thăm dò</string>
     <string name="toast_camera_restart_failed">Cài đặt đã xóa nhưng khởi động lại daemon đã thất bại. Xin vui lòng khởi động lại bằng tay.</string>
+    <string name="toast_camera_settings_saved_restarting">Cài đặt máy ảnh được lưu lại  khởi động lại camera daemon...</string>
+    <string name="toast_camera_settings_restart_failed">Cài đặt máy ảnh đã được lưu, nhưng khởi động lại daemon đã thất bại.</string>
     <string name="toast_failed_with_message_x">Không thành công: %1$s</string>
     <string name="toast_soh_reset_success">Đặt lại ước tính SOH  sẽ tính lại từ dữ liệu tiếp theo</string>
     <string name="toast_soh_reset_failed_no_daemon">Reset thất bại  daemon không trả lời và file không thể viết</string>
@@ -273,6 +291,14 @@
     <string name="tunnel_label_cloudflared">Tự nhiên</string>
     <string name="tunnel_label_zrok">Zrok</string>
     <string name="tunnel_label_tailscale">Tailscale</string>
+    <string name="daemon_name_camera">Camera Daemon</string>
+    <string name="daemon_name_surveillance">Daemon giám sát</string>
+    <string name="daemon_name_acc_surveillance">ACC Giám sát</string>
+    <string name="daemon_name_singbox">Sing-box Proxy</string>
+    <string name="daemon_name_cloudflared">Đường hầm Cloudflared</string>
+    <string name="daemon_name_zrok">Đường hầm Zrok</string>
+    <string name="daemon_name_tailscale">Đường hầm Tailscale</string>
+    <string name="daemon_name_telegram">Telegram Bot</string>
     <string name="clip_label_access_code">Mã truy cập</string>
     <string name="clip_label_url">URL</string>
     <string name="toast_no_config_needed">Không cần thiết cấu hình cho %1$s</string>

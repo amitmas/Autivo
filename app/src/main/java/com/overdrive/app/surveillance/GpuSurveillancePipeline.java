@@ -60,6 +60,11 @@ public class GpuSurveillancePipeline {
     // State
     private boolean initialized = false;
     private boolean running = false;
+    // True while {@link #stop()} is mid-teardown (encoders releasing, EGL
+    // tearing down). Concurrent start() must wait until stop completes —
+    // otherwise we race the encoder release with init() allocating a new
+    // one. Guarded by the same monitor as {@code running}.
+    private volatile boolean stopping = false;
     private boolean recordingMode = false;  // true = recording, false = viewing only
 
     // Serializes runtime reconfig methods (applyFpsChange, applyBitrateChange,
@@ -87,8 +92,13 @@ public class GpuSurveillancePipeline {
     public GpuSurveillancePipeline(int cameraWidth, int cameraHeight, File eventOutputDir) {
         this.cameraWidth = cameraWidth;
         this.cameraHeight = cameraHeight;
-        this.encoderWidth = 2560;
-        this.encoderHeight = 1920;
+        // Encoder/mosaic dims are derived from the strip aspect: each tile is
+        // (cameraWidth/4) wide x cameraHeight tall, mosaic is 2x2 of tiles, so
+        // encoder = (cameraWidth/2) x (cameraHeight*2). Seal 5120x960 → 2560x1920
+        // (4:3 quadrants). Tang 5120x720 → 2560x1440 (16:9 quadrants). Without
+        // this, Tang content gets stretched 33% vertically into 4:3 mosaic tiles.
+        this.encoderWidth = Math.max(1, cameraWidth / 2);
+        this.encoderHeight = Math.max(1, cameraHeight * 2);
         this.eventOutputDir = eventOutputDir;
         this.config = new GpuPipelineConfig();
     }
@@ -499,6 +509,23 @@ public class GpuSurveillancePipeline {
         }
         encoder.init();
 
+        // Wire the StorageManager cleanup gate against the new encoder so
+        // post-save / periodic / sidecar cleanup paths defer their delete
+        // bursts while we're mid-write. Field-deref lambda (audit P1) so a
+        // future reinit that swaps `encoder` is reflected without rebinding —
+        // the older `enc::isWritingToFile` form captured the *instance* and
+        // would return false on a released encoder, leaving cleanup un-gated
+        // during the reinit window.
+        try {
+            com.overdrive.app.storage.StorageManager.getInstance()
+                .setEncoderWritingProbe(() -> {
+                    HardwareEventRecorderGpu e = this.encoder;
+                    return e != null && e.isWritingToFile();
+                });
+        } catch (Exception e) {
+            logger.warn("Failed to wire encoder writing probe: " + e.getMessage());
+        }
+
         // Reinitialize recorder with new encoder on GL thread
         if (camera != null && camera.getEglCore() != null) {
             final Object initLock = new Object();
@@ -637,12 +664,29 @@ public class GpuSurveillancePipeline {
 
         encoder.init();
 
+        // Wire the StorageManager cleanup gate (RC9). Field-deref lambda so
+        // reinit-driven encoder swaps don't leave a stale instance ref.
+        try {
+            com.overdrive.app.storage.StorageManager.getInstance()
+                .setEncoderWritingProbe(() -> {
+                    HardwareEventRecorderGpu e = this.encoder;
+                    return e != null && e.isWritingToFile();
+                });
+        } catch (Exception e) {
+            logger.warn("Failed to wire encoder writing probe: " + e.getMessage());
+        }
+
+        // Resolve the camera profile NOW so the recorder, downscaler, foveated
+        // cropper, and PanoramicCameraGpu all share consistent per-quadrant
+        // strip-X offsets. Profile inference uses the vehicle model + any
+        // user-saved override in UnifiedConfigManager.camera.cameraProfile.
         com.overdrive.app.camera.ResolvedCameraConfig resolvedCamera =
             com.overdrive.app.camera.CameraConfigResolver.resolve(getVehicleModel());
         float[] quadrantStripOffsetX = resolvedCamera.getQuadrantStripOffsetX();
 
-        // 2. Create GPU mosaic recorder (shared)
-        recorder = new GpuMosaicRecorder(quadrantStripOffsetX);
+        // 2. Create GPU mosaic recorder (shared) with profile-driven viewport
+        // and per-quadrant offsets. Tang gets 2560x1440 instead of 2560x1920.
+        recorder = new GpuMosaicRecorder(quadrantStripOffsetX, encoderWidth, encoderHeight);
         // Note: recorder.init() will be called after EGL context is created by camera
 
         // Wire up telemetry collector to new recorder if available
@@ -652,7 +696,7 @@ public class GpuSurveillancePipeline {
         // Apply persisted overlay enabled state to new recorder
         recorder.setOverlayEnabled(overlayEnabledConfig);
 
-        // 3. Create GPU downscaler
+        // 3. Create GPU downscaler with profile-driven offsets
         downscaler = new GpuDownscaler(quadrantStripOffsetX);
         // Note: downscaler.init() will be called after EGL context is created by camera
 
@@ -677,18 +721,20 @@ public class GpuSurveillancePipeline {
         } catch (Exception e) {
             logger.warn("Failed to load saved config, using defaults: " + e.getMessage());
         }
-
-        if (cameraWidth != resolvedCamera.getPanoWidth() || cameraHeight != resolvedCamera.getPanoHeight()) {
+        
+        // 5. Create camera (this creates EGL context). Pass the profile's
+        // per-quadrant offsets so the foveated cropper + camera-side mosaic
+        // math agree with the recorder/downscaler/scaler.
+        if (cameraWidth != resolvedCamera.getPanoWidth()
+                || cameraHeight != resolvedCamera.getPanoHeight()) {
             logger.warn("Pipeline geometry " + cameraWidth + "x" + cameraHeight
                 + " differs from resolved camera profile "
                 + resolvedCamera.getPanoWidth() + "x" + resolvedCamera.getPanoHeight()
                 + " — restart the daemon to apply the new profile dimensions");
         }
-        
-        // 5. Create camera (this creates EGL context)
         camera = new PanoramicCameraGpu(cameraWidth, cameraHeight, quadrantStripOffsetX);
         camera.setConsumers(recorder, downscaler, sentry);
-        
+
         // Camera FPS config — must match the encoder FPS used above (loadTargetFps())
         // so that camera frame delivery rate matches the encoder's KEY_FRAME_RATE.
         camera.setTargetFps(fps);
@@ -698,6 +744,10 @@ public class GpuSurveillancePipeline {
             + ", size=" + resolvedCamera.getPanoWidth() + "x" + resolvedCamera.getPanoHeight()
             + ", surfaceMode=" + resolvedCamera.getPanoSurfaceMode() + ")");
 
+        // Camera selection priority:
+        //   1. Validated/manual override saved in UnifiedConfigManager → use as-is.
+        //   2. BmmCameraInfo system hint → preferred over profile default if available.
+        //   3. Profile default (Seal=1, Tang=2).
         if (resolvedCamera.isValidated() || resolvedCamera.isManualPanoOverride()) {
             logger.info("Using saved panoramic config: id=" + resolvedCamera.getPanoCameraId()
                 + ", surfaceMode=" + resolvedCamera.getPanoSurfaceMode()
@@ -705,6 +755,8 @@ public class GpuSurveillancePipeline {
             camera.setCameraId(resolvedCamera.getPanoCameraId());
             camera.setCameraSurfaceMode(resolvedCamera.getPanoSurfaceMode());
             camera.setAutoProbeCameras(false);
+            // Skip frame validation for saved configs. Luma heuristic produces
+            // false negatives in low-light/uniform scenes.
             camera.setSkipFrameValidation(true);
         } else {
             int discoveredId = com.overdrive.app.camera.AvmCameraHelper.discoverPanoCameraId();
@@ -712,14 +764,15 @@ public class GpuSurveillancePipeline {
                 logger.info("Using BmmCameraInfo panoramic hint: camera ID " + discoveredId);
                 camera.setCameraId(discoveredId);
             } else {
-                logger.info("Using profile default panoramic camera ID " + resolvedCamera.getPanoCameraId());
+                logger.info("Using profile default panoramic camera ID "
+                    + resolvedCamera.getPanoCameraId());
                 camera.setCameraId(resolvedCamera.getPanoCameraId());
             }
             camera.setCameraSurfaceMode(resolvedCamera.getPanoSurfaceMode());
             camera.setAutoProbeCameras(false);
             camera.setSkipFrameValidation(false);
         }
-        
+
         // Register probe callback — only used when manual probe is triggered via API
         camera.setCameraProbeCallback((cameraId, surfaceMode) -> {
             logger.info("Probe found working camera: id=" + cameraId + ", surfaceMode=" + surfaceMode);
@@ -776,6 +829,13 @@ public class GpuSurveillancePipeline {
                 logger.warn( "Already running");
                 return;
             }
+            if (stopping) {
+                // stop() is mid-teardown (encoders releasing, EGL tearing
+                // down). Refuse — caller (cold-start executor) can retry on
+                // its next 2-second tick when the lane has settled.
+                logger.warn("Refusing start() — pipeline is mid-stop");
+                return;
+            }
             running = true;  // Set immediately to block concurrent starts
         }
         
@@ -787,8 +847,10 @@ public class GpuSurveillancePipeline {
             
             logger.info( "Starting GPU pipeline (autoRecord=" + autoStartRecording + ")...");
             
-            // Re-read camera config before starting — user may have changed camera ID
-            // via the app UI menu since the pipeline was initialized.
+            // Re-resolve camera config before starting — user may have changed
+            // camera ID, profile, or role mappings via the app UI since init.
+            // Resolver picks profile-default if no probed/manual config exists,
+            // so this also covers "user cleared manual override → revert".
             try {
                 com.overdrive.app.camera.ResolvedCameraConfig refreshedCamera =
                     com.overdrive.app.camera.CameraConfigResolver.resolve(getVehicleModel());
@@ -800,7 +862,8 @@ public class GpuSurveillancePipeline {
                     camera.setCameraId(targetCameraId);
                     camera.setCameraSurfaceMode(targetSurfaceMode);
                     camera.setAutoProbeCameras(false);
-                    camera.setSkipFrameValidation(refreshedCamera.isValidated() || refreshedCamera.isManualPanoOverride());
+                    camera.setSkipFrameValidation(
+                        refreshedCamera.isValidated() || refreshedCamera.isManualPanoOverride());
                 }
             } catch (Exception e) {
                 logger.debug("Camera config re-read failed: " + e.getMessage());
@@ -913,18 +976,29 @@ public class GpuSurveillancePipeline {
     
     /**
      * Stops the GPU pipeline.
+     *
+     * <p>Synchronized on the same monitor as {@link #start(boolean)} so a
+     * concurrent cold-start request (from {@code SurveillanceApiHandler}'s
+     * {@code requestColdStartAsync}) can't race in mid-teardown. Without this,
+     * stop() can set {@code running=false} early, and a sibling start() can
+     * re-enter init() while stop() is still draining encoders / releasing
+     * EGL — corrupting both lanes.
      */
     public void stop() {
-        if (!running) {
-            return;
+        synchronized (this) {
+            if (!running) {
+                return;
+            }
+            running = false;
+            stopping = true;
         }
-        
-        logger.info( "Stopping GPU pipeline...");
-        running = false;
-        
-        // Clear any pending deferred recording
-        pendingRecordingDir = null;
-        pendingRecordingPrefix = null;
+
+        try {
+            logger.info( "Stopping GPU pipeline...");
+
+            // Clear any pending deferred recording
+            pendingRecordingDir = null;
+            pendingRecordingPrefix = null;
         
         // Reset mode so status API reflects that we're not in any active mode
         currentMode = Mode.IDLE;
@@ -962,12 +1036,18 @@ public class GpuSurveillancePipeline {
             encoder = null;
         }
         
-        // Mark as not initialized so init() can be called again
-        initialized = false;
-        
-        logger.info( "GPU pipeline stopped");
+            // Mark as not initialized so init() can be called again
+            initialized = false;
+
+            logger.info( "GPU pipeline stopped");
+        } finally {
+            // Clear stopping flag so concurrent start() can proceed.
+            synchronized (this) {
+                stopping = false;
+            }
+        }
     }
-    
+
     /**
      * Releases all resources.
      */
@@ -1276,14 +1356,13 @@ public class GpuSurveillancePipeline {
         
         // Create stream scaler
         logger.info("Creating stream scaler...");
-        float[] quadrantStripOffsetX = com.overdrive.app.camera.CameraConfigResolver
+        // Stream scaler picks the same per-quadrant offsets so user-mapped
+        // role-to-slice mappings affect single-direction streaming too.
+        float[] streamQuadrantStripOffsetX = com.overdrive.app.camera.CameraConfigResolver
             .resolve(getVehicleModel())
             .getQuadrantStripOffsetX();
         streamScaler = new com.overdrive.app.streaming.GpuStreamScaler(
-            streamWidth,
-            streamHeight,
-            quadrantStripOffsetX
-        );
+            streamWidth, streamHeight, streamQuadrantStripOffsetX);
         
         // Always 4-camera mosaic for streaming
         streamScaler.setCameraLayout(0);

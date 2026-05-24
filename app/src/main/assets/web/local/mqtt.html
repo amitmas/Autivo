@@ -118,10 +118,19 @@
         .telemetry-table td:last-child { text-align: right; font-family: 'JetBrains Mono', monospace; color: var(--text-primary); }
         .badge-count { background: var(--brand-primary); color: var(--bg-base); font-size: 11px; font-weight: 600;
             padding: 2px 8px; border-radius: 10px; margin-left: 8px; }
-        .icon-btn { background: none; border: 1px solid var(--border-color); border-radius: 6px; padding: 6px 8px;
-            color: var(--text-secondary); cursor: pointer; font-size: 12px; }
+        .icon-btn {
+            background: none; border: 1px solid var(--border-color); border-radius: 6px; padding: 6px;
+            color: var(--text-secondary); cursor: pointer; font-size: 12px;
+            display: inline-flex; align-items: center; justify-content: center;
+            width: 32px; height: 32px; flex-shrink: 0;
+        }
+        /* Chrome 58 fallback: inline <svg> with only viewBox renders at the
+           300x150 default and blows the row apart, hiding the trash/edit
+           buttons. Pin the icon size explicitly. */
+        .icon-btn svg { width: 16px; height: 16px; display: block; }
         .icon-btn:hover { background: var(--bg-elevated); color: var(--text-primary); }
-        .icon-btn.danger:hover { border-color: var(--danger); color: var(--danger); }
+        .icon-btn.danger { color: var(--danger); }
+        .icon-btn.danger:hover { border-color: var(--danger); background: rgba(239,68,68,0.08); color: var(--danger); }
     </style>
 </head>
 <body>

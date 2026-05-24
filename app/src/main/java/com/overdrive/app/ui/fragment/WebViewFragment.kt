@@ -304,16 +304,32 @@ class WebViewFragment : Fragment() {
     private var pendingFileCallback: ValueCallback<Array<Uri>>? = null
 
     // Picker launcher — registered in onCreate so it survives config changes.
-    // We use OpenMultipleDocuments so the same handler works whether the
-    // <input> allows a single file or has the `multiple` attribute.
-    private lateinit var fileChooserLauncher: ActivityResultLauncher<Array<String>>
+    //
+    // We use ACTION_GET_CONTENT (via ActivityResultContracts.GetContent) instead
+    // of OpenMultipleDocuments. Reasons specific to the BYD head unit (Android
+    // 7.1):
+    //   - OpenMultipleDocuments fires ACTION_OPEN_DOCUMENT, which routes to the
+    //     Storage Access Framework picker (the "Documents" tree). On the head
+    //     unit that UI is either missing or shows an empty Recents tree — the
+    //     user reported it as a "weird gallery I can't pick anything in".
+    //   - GetContent fires ACTION_GET_CONTENT, which Android 7.1 routes to the
+    //     system gallery / Files / any installed image picker. That's what
+    //     normal "Upload photo" buttons in apps use, and it's the picker
+    //     users on this device already know.
+    //   - PickVisualMedia (the modern Photo Picker) requires Android 13+ and
+    //     isn't an option on this device.
+    //
+    // Single-file only — the deterrent flow only ever wants one image, and
+    // GetContent is single-select. The web <input> doesn't carry `multiple`
+    // either, so there's no UX regression.
+    private lateinit var fileChooserLauncher: ActivityResultLauncher<String>
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         fileChooserLauncher = registerForActivityResult(
-            ActivityResultContracts.OpenMultipleDocuments()
-        ) { uris: List<Uri> ->
-            val result = if (uris.isNullOrEmpty()) null else uris.toTypedArray()
+            ActivityResultContracts.GetContent()
+        ) { uri: Uri? ->
+            val result = if (uri == null) null else arrayOf(uri)
             pendingFileCallback?.onReceiveValue(result)
             pendingFileCallback = null
         }
@@ -552,9 +568,23 @@ class WebViewFragment : Fragment() {
                         // 3. Fallback to application/octet-stream (not video/mp4!) for unknown types
                         val rawContentType = connection.contentType ?: "application/octet-stream"
                         var mime = rawContentType.split(";").first().trim()
-                        val encoding = if (rawContentType.contains("charset=")) {
-                            rawContentType.substringAfter("charset=").trim()
-                        } else "utf-8"
+                        // Encoding ONLY for text MIME types. WebResourceResponse
+                        // treats this as a charset hint; passing "utf-8" for a
+                        // binary image/video stream makes some Android 7.x
+                        // WebViews try to decode the bytes as UTF-8 text and
+                        // corrupt the data (the deterrent preview <img> not
+                        // rendering on this firmware was caused by this).
+                        val isTextMime = mime.startsWith("text/")
+                            || mime == "application/json"
+                            || mime == "application/javascript"
+                            || mime == "application/xml"
+                            || mime == "image/svg+xml"
+                        val encoding = when {
+                            rawContentType.contains("charset=") ->
+                                rawContentType.substringAfter("charset=").trim()
+                            isTextMime -> "utf-8"
+                            else -> null
+                        }
                         if (url.endsWith(".mp4")) mime = "video/mp4"
 
                         val response = WebResourceResponse(mime, encoding, stream)
@@ -763,12 +793,23 @@ class WebViewFragment : Fragment() {
                     pendingFileCallback?.onReceiveValue(null)
                     pendingFileCallback = filePathCallback
 
-                    // Honor the <input accept="..."> MIME hints; default to images.
+                    // GetContent takes a single MIME type. Collapse the <input
+                    // accept="image/png,image/jpeg,..."> list to "image/*" since
+                    // a wildcard is the safest pick on Android 7.1 head-unit
+                    // gallery apps that don't recognise specific image subtypes.
+                    // If the page asks for something other than images entirely,
+                    // honor that prefix; otherwise default to images.
                     val accept = fileChooserParams?.acceptTypes
-                        ?.filter { it.isNotBlank() }
-                        ?.toTypedArray()
-                        ?.takeIf { it.isNotEmpty() }
-                        ?: arrayOf("image/*")
+                        ?.firstOrNull { it.isNotBlank() }
+                        ?.let { type ->
+                            when {
+                                type.startsWith("image/") -> "image/*"
+                                type.startsWith("video/") -> "video/*"
+                                type.startsWith("audio/") -> "audio/*"
+                                type == "*/*" -> "*/*"
+                                else -> type
+                            }
+                        } ?: "image/*"
 
                     return try {
                         fileChooserLauncher.launch(accept)

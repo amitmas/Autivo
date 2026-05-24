@@ -182,8 +182,8 @@ object UnifiedConfigManager {
         val camera = config.optJSONObject("camera") ?: JSONObject().also {
             config.put("camera", it)
         }
-        val proximityGuard = config.optJSONObject("proximityGuard") ?: JSONObject().also { 
-            config.put("proximityGuard", it) 
+        val proximityGuard = config.optJSONObject("proximityGuard") ?: JSONObject().also {
+            config.put("proximityGuard", it)
         }
         
         // Surveillance defaults
@@ -201,6 +201,10 @@ object UnifiedConfigManager {
         if (!surveillance.has("surveillanceEnabled")) surveillance.put("surveillanceEnabled", false)
         if (!surveillance.has("deterrentAction")) surveillance.put("deterrentAction", "silent")
         if (!surveillance.has("deterrentCooldownSeconds")) surveillance.put("deterrentCooldownSeconds", 15)
+        if (!surveillance.has("screenDeterrentEnabled")) surveillance.put("screenDeterrentEnabled", false)
+        if (!surveillance.has("screenDeterrentDurationSeconds")) surveillance.put("screenDeterrentDurationSeconds", 8)
+        if (!surveillance.has("screenDeterrentImagePath")) surveillance.put("screenDeterrentImagePath", "")
+        if (!surveillance.has("screenDeterrentMessage")) surveillance.put("screenDeterrentMessage", "")
         
         // Recording defaults. The canonical key is `recordingQuality` (ECONOMY..MAX).
         // `quality` is the legacy mirror; `bitrate` (LOW/MEDIUM/HIGH) is no longer
@@ -214,15 +218,18 @@ object UnifiedConfigManager {
         // Streaming defaults
         if (!streaming.has("quality")) streaming.put("quality", "MEDIUM")
 
-        // Camera defaults. `cameraProfile=auto` lets the runtime resolver infer
-        // Tang vs legacy panoramic defaults from the vehicle model, while still
-        // preserving old installs that only know about `probedCameraId`.
-        if (!camera.has("cameraProfile")) camera.put("cameraProfile", com.overdrive.app.camera.CameraProfiles.PROFILE_AUTO)
-        if (!camera.has("targetFps")) camera.put("targetFps", 15)
-        if (!camera.has("probedCameraId")) camera.put("probedCameraId", -1)
+        // Camera defaults. cameraProfile=auto lets the runtime resolver infer
+        // Tang vs legacy panoramic dims from ro.product.model. Existing
+        // installs that only have probedCameraId continue to work unchanged.
+        if (!camera.has("cameraProfile")) {
+            camera.put("cameraProfile",
+                com.overdrive.app.camera.CameraProfiles.PROFILE_AUTO)
+        }
+        if (!camera.has("targetFps"))         camera.put("targetFps", 15)
+        if (!camera.has("probedCameraId"))    camera.put("probedCameraId", -1)
         if (!camera.has("probedSurfaceMode")) camera.put("probedSurfaceMode", -1)
-        if (!camera.has("roleMappings")) camera.put("roleMappings", JSONObject())
-        
+        if (!camera.has("roleMappings"))      camera.put("roleMappings", JSONObject())
+
         // Proximity Guard defaults
         if (!proximityGuard.has("enabled")) proximityGuard.put("enabled", false)
         if (!proximityGuard.has("triggerLevel")) proximityGuard.put("triggerLevel", "RED")
@@ -603,7 +610,31 @@ object UnifiedConfigManager {
     fun setAppearance(appearance: JSONObject): Boolean {
         return updateSection("appearance", appearance)
     }
-    
+
+    /**
+     * Native-shell preferences. Today this carries `locale` for the Android
+     * UI's language picker — kept separate from `appearance.locale` (which
+     * is the WebView-only locale) so a tunnel-side picker doesn't change
+     * the in-car native shell's language and vice versa.
+     *
+     * Schema: { "locale": "<bcp47>" | "auto" }
+     *
+     * The legacy file at /data/local/tmp/.overdrive/locale was unreliable
+     * because the app UID can't `mkdir` under /data/local/tmp/, so writes
+     * from the picker silently failed and the language reverted on next
+     * cold start.
+     */
+    @JvmStatic
+    fun getNativeShell(): JSONObject {
+        return loadConfig().optJSONObject("nativeShell") ?: JSONObject()
+    }
+
+    @JvmStatic
+    fun setNativeShell(nativeShell: JSONObject): Boolean {
+        return updateSection("nativeShell", nativeShell)
+    }
+
+
     /**
      * Update a specific section of the config.
      */

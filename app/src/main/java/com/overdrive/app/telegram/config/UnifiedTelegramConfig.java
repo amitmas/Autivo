@@ -68,10 +68,26 @@ public final class UnifiedTelegramConfig {
     public static final String K_CRITICAL_ALERTS  = "criticalAlerts";
     public static final String K_CONNECTIVITY     = "connectivity";
     public static final String K_MOTION_TEXT      = "motionText";
+    // Per-severity tier toggles. Sit alongside the category toggles above so
+    // the gate that decides whether a Telegram message goes out for a motion
+    // recording can read both "category enabled?" and "tier loud enough?"
+    // from one section. Previously these lived on SurveillanceConfig and
+    // were only refreshed when the camera daemon restarted, which made
+    // toggle changes feel sticky.
+    public static final String K_TIER_NOTICES     = "tierNotices";
+    public static final String K_TIER_ALERTS      = "tierAlerts";
+    public static final String K_TIER_CRITICAL    = "tierCritical";
     public static final String K_OUTPUT_DIR       = "outputDir";
     public static final String K_APK_PATH         = "apkPath";
 
     private static final String K_MIGRATED = "_migrated";
+    /**
+     * Separate marker for the surveillance.telegram* → telegram.tier* move.
+     * Independent of {@link #K_MIGRATED} (which guards the legacy .properties
+     * import) so a device that was already migrated off properties still
+     * gets the tier-key copy on first run after this upgrade.
+     */
+    private static final String K_TIER_MIGRATED = "_tierMigrated";
     private static final String LEGACY_PROPS_PATH =
             "/data/local/tmp/telegram_config.properties";
 
@@ -87,6 +103,13 @@ public final class UnifiedTelegramConfig {
      */
     private static volatile boolean migrationCheckedThisProcess = false;
 
+    /**
+     * Per-process latch for the tier-key migration. Same rationale as
+     * {@link #migrationCheckedThisProcess} but for the
+     * surveillance.telegramNotices/Alerts/Critical → telegram.tier* copy.
+     */
+    private static volatile boolean tierMigrationCheckedThisProcess = false;
+
     private UnifiedTelegramConfig() {}
 
     // ──────────────────────────── Read ────────────────────────────
@@ -97,6 +120,7 @@ public final class UnifiedTelegramConfig {
      */
     public static JSONObject load() {
         migrateLegacyIfNeeded();
+        migrateTierKeysIfNeeded();
         return UnifiedConfigManager.getTelegram();
     }
 
@@ -169,6 +193,17 @@ public final class UnifiedTelegramConfig {
     public static boolean isMotionText() {
         return load().optBoolean(K_MOTION_TEXT, true);
     }
+
+    /**
+     * Per-severity tier filters. Mirror the push tier toggles and decide
+     * whether a Telegram motion message of a given severity is suppressed.
+     * Defaults match the legacy SurveillanceConfig defaults (notices=off,
+     * alerts=on, critical=on) so an upgrade with no migration data still
+     * behaves the same way.
+     */
+    public static boolean isTierNotices()  { return load().optBoolean(K_TIER_NOTICES, false); }
+    public static boolean isTierAlerts()   { return load().optBoolean(K_TIER_ALERTS, true);  }
+    public static boolean isTierCritical() { return load().optBoolean(K_TIER_CRITICAL, true); }
 
     public static String getOutputDir() {
         return load().optString(K_OUTPUT_DIR, "");
@@ -458,6 +493,55 @@ public final class UnifiedTelegramConfig {
         // suppresses re-import. The next privileged-UID startup will clean
         // up via the cleanup branch below.
         try { legacy.delete(); } catch (Exception ignored) {}
+    }
+
+    /**
+     * One-shot copy of {@code surveillance.telegramNotices/Alerts/Critical}
+     * into {@code telegram.tierNotices/tierAlerts/tierCritical}. Lets users
+     * who already configured the per-tier filter on the Sentry settings
+     * page keep their choices after the gate moves to the Telegram section.
+     *
+     * Runs at most once per device (persistent {@code _tierMigrated} marker)
+     * and at most once per process (in-memory latch). Idempotent; if the
+     * surveillance keys are absent the migration writes an empty delta with
+     * just the marker so subsequent reads short-circuit.
+     */
+    private static synchronized void migrateTierKeysIfNeeded() {
+        if (tierMigrationCheckedThisProcess) return;
+
+        JSONObject section = UnifiedConfigManager.getTelegram();
+        if (section.optBoolean(K_TIER_MIGRATED, false)) {
+            tierMigrationCheckedThisProcess = true;
+            return;
+        }
+
+        JSONObject delta = new JSONObject();
+        try {
+            // Only copy keys that already had been written in the surveillance
+            // section. A field that was never written there must keep its
+            // documented default (false/true/true) — copying optBoolean's
+            // implicit false would silently disable critical/alert tiers for
+            // users who never touched the toggle.
+            JSONObject surveillance = UnifiedConfigManager.getSurveillance();
+            if (surveillance.has("telegramNotices")) {
+                delta.put(K_TIER_NOTICES, surveillance.optBoolean("telegramNotices", false));
+            }
+            if (surveillance.has("telegramAlerts")) {
+                delta.put(K_TIER_ALERTS, surveillance.optBoolean("telegramAlerts", true));
+            }
+            if (surveillance.has("telegramCritical")) {
+                delta.put(K_TIER_CRITICAL, surveillance.optBoolean("telegramCritical", true));
+            }
+            delta.put(K_TIER_MIGRATED, true);
+        } catch (Exception e) {
+            // Latch so we don't hammer the FS on every getter; skip the
+            // persistent marker so a future read with healthy state retries.
+            tierMigrationCheckedThisProcess = true;
+            return;
+        }
+
+        UnifiedConfigManager.updateSection(SECTION, delta);
+        tierMigrationCheckedThisProcess = true;
     }
 
     private static void stampMigrated() {

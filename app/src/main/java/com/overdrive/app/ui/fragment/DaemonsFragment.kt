@@ -21,6 +21,7 @@ import com.google.android.material.switchmaterial.SwitchMaterial
 import com.overdrive.app.ui.adapter.DaemonAdapter
 import com.overdrive.app.ui.viewmodel.DaemonsViewModel
 import com.overdrive.app.ui.model.DaemonType
+import com.overdrive.app.ui.model.localizedName
 import com.overdrive.app.R
 import com.overdrive.app.ui.model.DaemonStatus
 import com.overdrive.app.ui.util.QrCodeGenerator
@@ -120,7 +121,8 @@ class DaemonsFragment : Fragment() {
             DaemonType.TAILSCALE_TUNNEL -> showTailscaleSettingsDialog()
             else -> {
                 // Other daemons don't need configuration yet
-                Toast.makeText(context, getString(R.string.toast_no_config_needed, type.displayName), Toast.LENGTH_SHORT).show()
+                val ctx = context ?: return
+                Toast.makeText(ctx, getString(R.string.toast_no_config_needed, type.localizedName(ctx)), Toast.LENGTH_SHORT).show()
             }
         }
     }
@@ -428,8 +430,9 @@ class DaemonsFragment : Fragment() {
         val logPath = DaemonAdapter.getLogFilePath(type) ?: return
         val ctx = context ?: return
         val daemonName = type.displayName.replace(" ", "_").lowercase()
-        
-        Toast.makeText(ctx, getString(R.string.toast_fetching_log, type.displayName), Toast.LENGTH_SHORT).show()
+        val localizedName = type.localizedName(ctx)
+
+        Toast.makeText(ctx, getString(R.string.toast_fetching_log, localizedName), Toast.LENGTH_SHORT).show()
         
         // Use tail to limit output — 10000 lines is ~1-2MB which is safe for ADB + String
         val adb = com.overdrive.app.launcher.AdbDaemonLauncher(ctx)
@@ -463,7 +466,7 @@ class DaemonsFragment : Fragment() {
 
                             // Add header with metadata
                             val header = buildString {
-                                appendLine(getString(R.string.log_header_title, type.displayName))
+                                appendLine(getString(R.string.log_header_title, localizedName))
                                 appendLine(getString(R.string.log_header_source, logPath))
                                 appendLine(getString(R.string.log_header_exported, java.util.Date().toString()))
                                 if (totalLines > 10000) {
@@ -484,10 +487,10 @@ class DaemonsFragment : Fragment() {
                             val shareIntent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
                                 this.type = "text/plain"
                                 putExtra(android.content.Intent.EXTRA_STREAM, uri)
-                                putExtra(android.content.Intent.EXTRA_SUBJECT, getString(R.string.log_share_title, type.displayName, timestamp))
+                                putExtra(android.content.Intent.EXTRA_SUBJECT, getString(R.string.log_share_title, localizedName, timestamp))
                                 addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
                             }
-                            startActivity(android.content.Intent.createChooser(shareIntent, getString(R.string.log_share_chooser, type.displayName)))
+                            startActivity(android.content.Intent.createChooser(shareIntent, getString(R.string.log_share_chooser, localizedName)))
                         } catch (e: Exception) {
                             Toast.makeText(ctx, getString(R.string.toast_log_save_failed, e.message ?: ""), Toast.LENGTH_LONG).show()
                         }

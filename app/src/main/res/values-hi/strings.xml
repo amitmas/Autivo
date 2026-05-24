@@ -28,6 +28,8 @@
     <string name="cd_play_pause">खेल/विराम</string>
     <string name="cd_player_prev">पिछली रिकॉर्डिंग</string>
     <string name="cd_player_next">अगली रिकॉर्डिंग</string>
+    <string name="cd_player_maximize">प्लेयर को अधिकतम करें</string>
+    <string name="cd_player_minimize">पूर्ण स्क्रीन से बाहर निकलना</string>
     <string name="cd_delete">हटाएँ</string>
     <string name="cd_expand">विस्तार</string>
     <string name="cd_configure">विन्यास</string>
@@ -63,6 +65,20 @@
     <string name="camera_option_4">कैमरा 4</string>
     <string name="camera_option_5">कैमरा 5</string>
     <string name="camera_selection_hint">ऑटो प्रत्येक बूट पर आपके ट्रिम के लिए सही कैमरा चुनता है। कैमरा 1 = BYD Seal, कैमरा 0 = Atto ट्रिम। सेटिंग को प्रभावी होने के लिए कैमरा आईडी बदलने के बाद डेमोन को पुनरारंभ करें।</string>
+    <string name="camera_mapping_title">कैमरा मैपिंग</string>
+    <string name="camera_role_label">भूमिका मानचित्रण</string>
+    <string name="camera_candidate_previous">पूर्व</string>
+    <string name="camera_candidate_next">अगला</string>
+    <string name="camera_preview_unavailable">पूर्वावलोकन अभी तक उपलब्ध नहीं है. डेमोन फिर से शुरू होने के बाद संवाद को फिर से खोलने से एक और उम्मीदवार या ताज़ा करने की कोशिश करें.</string>
+    <string name="camera_mapping_save">मानचित्रण सहेजें</string>
+    <string name="camera_mapping_clear">स्पष्ट भूमिका</string>
+    <string name="camera_mapping_saved">कैमरा मैपिंग सहेजा गया।</string>
+    <string name="camera_mapping_cleared">कैमरा भूमिका मानचित्रण साफ.</string>
+    <string name="camera_mapping_summary_format">पैनोरमा प्रवाहः कैमरा %1$d · %2$dx%3$d</string>
+    <string name="camera_mapping_summary_probing">पैनोरमिक स्ट्रीम: विरासत ऑटो-डिटेक्शन / जांच</string>
+    <string name="camera_mapping_current_format">वर्तमान मानचित्रणः %1$s</string>
+    <string name="camera_mapping_current_none">वर्तमान मानचित्रणः ऑटो / डिफ़ॉल्ट</string>
+    <string name="camera_mapping_hint">OverDrive डिफ़ॉल्ट रूप से पुराने स्टार्टअप व्यवहार को बनाए रखता है, लेकिन अब आपको विलय किए गए पैनोरमिक स्ट्रिप को ठीक से कैलिब्रेट करने देता है। प्रत्येक कच्चे विलय किए गए स्लाइस का पूर्वावलोकन करें, लॉजिकल 360 रोल को उस स्लाइस पर मैप करें जो वास्तव में आपके वाहन पर सामने / दाएं / पीछे / बाएं दिखाता है, और डेमोन रिकॉर्डिंग, स्ट्रीमिंग और एआई के लिए उस लेआउट का पुनः उपयोग करेगा।</string>
     <string name="dashboard_scan_to_connect">कनेक्ट करने के लिए स्कैन करें</string>
     <string name="dashboard_qr_waiting">सुरंग के लिए इंतजार...</string>
     <string name="dashboard_daemons_running_default">0/5 चल रहा है</string>
@@ -216,6 +232,8 @@
     <string name="toast_restarting_camera_daemon">कैमरा डेमोन को पुनरारंभ करना...</string>
     <string name="toast_camera_daemon_restarting">पूर्ण जांच के साथ कैमरा डेमोन पुनः आरंभ</string>
     <string name="toast_camera_restart_failed">कॉन्फ़िगरेशन साफ किया गया है, लेकिन डेमन पुनरारंभ विफल रहा है. कृपया मैन्युअल रूप से पुनरारंभ करें.</string>
+    <string name="toast_camera_settings_saved_restarting">कैमरा सेटिंग्स सहेजे गए  कैमरा डेमोन पुनरारंभ ...</string>
+    <string name="toast_camera_settings_restart_failed">कैमरा सेटिंग्स सहेजी गई हैं, लेकिन डेमोन पुनरारंभ विफल रहा है. कृपया इसे मैन्युअल रूप से पुनरारंभ करें.</string>
     <string name="toast_failed_with_message_x">असफलः %1$s</string>
     <string name="toast_soh_reset_success">SOH अनुमान रीसेट  अगले आंकड़ों से पुनः गणना करेगा</string>
     <string name="toast_soh_reset_failed_no_daemon">रीसेट विफल  डेमन प्रतिक्रिया नहीं है और फ़ाइल नहीं लिख सकते हैं</string>
@@ -273,6 +291,14 @@
     <string name="tunnel_label_cloudflared">बादल से उगने वाला</string>
     <string name="tunnel_label_zrok">Zrok</string>
     <string name="tunnel_label_tailscale">Tailscale</string>
+    <string name="daemon_name_camera">कैमरा Daemon</string>
+    <string name="daemon_name_surveillance">निगरानी Daemon</string>
+    <string name="daemon_name_acc_surveillance">ACC निगरानी</string>
+    <string name="daemon_name_singbox">Sing-box प्रॉक्सी</string>
+    <string name="daemon_name_cloudflared">Cloudflared सुरंग</string>
+    <string name="daemon_name_zrok">Zrok सुरंग</string>
+    <string name="daemon_name_tailscale">Tailscale सुरंग</string>
+    <string name="daemon_name_telegram">Telegram बॉट</string>
     <string name="clip_label_access_code">एक्सेस कोड</string>
     <string name="clip_label_url">URL</string>
     <string name="toast_no_config_needed">%1$s के लिए कोई कॉन्फ़िगरेशन आवश्यक नहीं है</string>

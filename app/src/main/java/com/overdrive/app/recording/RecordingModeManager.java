@@ -325,8 +325,25 @@ public class RecordingModeManager {
             } else {
                 logger.info("Gear is P - PROXIMITY_GUARD will activate when gear changes");
             }
+        } else if (mode == Mode.NONE) {
+            // NONE while ACC is OFF: do NOT call activateMode(NONE) — that
+            // would tear down a pipeline that may be servicing an active
+            // surveillance recording. CameraDaemon owns the pipeline
+            // lifecycle during ACC OFF; let the next ACC ON tear it down
+            // via the normal NONE-mode path (pipeline only kept alive by
+            // CONTINUOUS/DRIVE_MODE/PROXIMITY_GUARD recording, and any of
+            // those would have called deactivateMode first via setMode).
+            //
+            // NONE while ACC is ON: tear it down now — the user changed
+            // mode mid-drive and expects "stop recording" to take effect.
+            if (accIsOn) {
+                activateMode(mode);
+            } else {
+                logger.info("ACC is OFF and mode set to NONE — pipeline stays under "
+                    + "CameraDaemon control (surveillance) until next ACC ON");
+            }
         } else if (accIsOn) {
-            // CONTINUOUS and NONE activate when ACC is ON
+            // CONTINUOUS activates when ACC is ON
             activateMode(mode);
         } else {
             logger.info("ACC is OFF - mode will activate when ACC turns ON");
@@ -384,8 +401,17 @@ public class RecordingModeManager {
             // If surveillance was active, CameraDaemon.onAccStateChanged handles
             // disabling it separately.
             
-            // Start AVC keep-alive and activate mode after warmup
+            // Start AVC keep-alive and activate mode after warmup.
+            // Skip the entire spawn when no recording mode is configured —
+            // otherwise the warmup `am start com.byd.avc/.MainActivity` runs
+            // for nothing, and per existing notes the AVC poke perturbs the
+            // camera HAL / drags panoramic FPS down. Symmetric with the
+            // Mode.NONE early-return in activateModeWithWarmup().
             final Mode modeToActivate = currentMode;
+            if (modeToActivate == Mode.NONE) {
+                logger.debug("ACC ON with mode=NONE — no AVC warmup or mode activation");
+                return;
+            }
             new Thread(() -> {
                 // Only warmup if pipeline isn't already running
                 // (if it's running, camera is already open — no need to poke com.byd.avc)
@@ -395,34 +421,36 @@ public class RecordingModeManager {
                         return;
                     }
                 }
-                
+
                 synchronized (RecordingModeManager.this) {
                     if (!accIsOn) {
                         logger.info("ACC turned OFF during reacquire delay — skipping mode activation");
                         return;
                     }
-                    
+
                     // Use CURRENT gear, not the gear at ACC ON time — gear may have changed
                     // during the delay (e.g., P→D or D→P)
                     int gearNow = currentGear;
-                    
+
                     if (modeToActivate == Mode.DRIVE_MODE && !isDrivingGear(gearNow)) {
                         logger.info("DRIVE_MODE waiting for driving gear (current=" + gearToString(gearNow) + ")");
-                    } else if (modeToActivate == Mode.PROXIMITY_GUARD && gearNow == GEAR_P) {
-                        logger.info("PROXIMITY_GUARD waiting for gear != P");
-                    } else if (modeToActivate != Mode.NONE) {
-                        // Skip only if the desired mode's recording is genuinely
-                        // already running. Previously this checked
-                        // pipeline.isRecording() alone, which returns true for
-                        // SURVEILLANCE recordings still finalizing at the moment
-                        // of ACC ON — causing CONTINUOUS/DRIVE_MODE to be skipped
-                        // and never started until the next state transition.
-                        if (modeActive && pipeline.isRunning() && pipeline.isNormalRecordingMode()) {
-                            logger.info("Mode " + modeToActivate + " already active — skipping re-activation");
-                        } else {
-                            activateMode(modeToActivate);
-                        }
+                        return;
                     }
+                    if (modeToActivate == Mode.PROXIMITY_GUARD && gearNow == GEAR_P) {
+                        logger.info("PROXIMITY_GUARD waiting for gear != P");
+                        return;
+                    }
+                    // Skip only if the desired mode's recording is genuinely
+                    // already running. Previously this checked
+                    // pipeline.isRecording() alone, which returns true for
+                    // SURVEILLANCE recordings still finalizing at the moment
+                    // of ACC ON — causing CONTINUOUS/DRIVE_MODE to be skipped
+                    // and never started until the next state transition.
+                    if (modeActive && pipeline.isRunning() && pipeline.isNormalRecordingMode()) {
+                        logger.info("Mode " + modeToActivate + " already active — skipping re-activation");
+                        return;
+                    }
+                    activateMode(modeToActivate);
                 }
             }, "AccOnReacquire").start();
             
@@ -605,8 +633,18 @@ public class RecordingModeManager {
                         logger.info("Starting pipeline for CONTINUOUS mode");
                         pipeline.start(false);
                     }
+                    // Re-check isRunning AFTER start(): pipeline.start() can
+                    // silently return without starting if it observes stopping=true
+                    // (mid-teardown from surveillance disable) or already-running
+                    // — we must not call startRecording on a non-running pipeline.
+                    if (!pipeline.isRunning()) {
+                        logger.warn("CONTINUOUS: pipeline.start() returned but pipeline isn't running"
+                            + " — likely mid-teardown; will retry on next mode trigger");
+                        modeActive = false;
+                        break;
+                    }
                     // Pipeline.start() blocks ~2s for GL init. Recorder should be ready.
-                    if (pipeline.isRunning() && !pipeline.isRecording()) {
+                    if (!pipeline.isRecording()) {
                         pipeline.startRecording();
                     }
                     // Start AVC keep-alive (pipeline is now running with ACC ON)
@@ -617,7 +655,7 @@ public class RecordingModeManager {
                     modeActive = false;
                 }
                 break;
-                
+
             case DRIVE_MODE:
                 // Start recording when driving (gear is D/R/S/M)
                 try {
@@ -625,8 +663,14 @@ public class RecordingModeManager {
                         logger.info("Starting pipeline for DRIVE_MODE");
                         pipeline.start(false);
                     }
+                    if (!pipeline.isRunning()) {
+                        logger.warn("DRIVE_MODE: pipeline.start() returned but pipeline isn't running"
+                            + " — likely mid-teardown; will retry on next gear change");
+                        modeActive = false;
+                        break;
+                    }
                     // Pipeline.start() blocks ~2s for GL init. Recorder should be ready.
-                    if (pipeline.isRunning() && !pipeline.isRecording()) {
+                    if (!pipeline.isRecording()) {
                         logger.info("Starting DRIVE_MODE recording");
                         pipeline.startRecording();
                     }
@@ -645,6 +689,17 @@ public class RecordingModeManager {
                     if (!pipeline.isRunning()) {
                         logger.info("Starting pipeline for PROXIMITY_GUARD mode");
                         pipeline.start(false);  // Don't auto-start recording
+                    }
+                    if (!pipeline.isRunning()) {
+                        // Don't start the proximity controller against a
+                        // pipeline that's mid-teardown — the controller would
+                        // wire its ADAS listener thinking the camera is up,
+                        // but the pipeline tears down moments later and the
+                        // proximity-trigger recordings would silently fail.
+                        logger.warn("PROXIMITY_GUARD: pipeline.start() returned but pipeline isn't running"
+                            + " — refusing to start proximity controller; will retry on next gear change");
+                        modeActive = false;
+                        break;
                     }
                     proximityController.start();
                     // Start AVC keep-alive (pipeline is now running with ACC ON)
