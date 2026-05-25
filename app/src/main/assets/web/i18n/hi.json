@@ -24,6 +24,7 @@
     "dashboard_title": "डैशबोर्ड - OverDrive"
   },
   "nav": {
+    "dashboard": "डैशबोर्ड",
     "live_view": "लाइव दृश्य",
     "events": "घटनाएँ",
     "surveillance": "निगरानी",
@@ -44,9 +45,8 @@
     "overview_group": "अवलोकन",
     "vehicle_group": "वाहन",
     "about_group": "के बारे में",
-    "telegram": "Telegram",
-    "dashboard": "डैशबोर्ड",
-    "brand_home": "OverDrive — डैशबोर्ड खोलें"
+    "brand_home": "OverDrive — डैशबोर्ड खोलें",
+    "telegram": "Telegram"
   },
   "status": {
     "device": "डिवाइस",
@@ -1640,28 +1640,23 @@
     "delivery_pointer": "डिलीवरी वरीयताओं (जो घटनाएं चैट तक पहुंचती हैं) सूचनाओं → Telegram टैब पर रहते हैं।"
   },
   "dashboard": {
+    "heading": "डैशबोर्ड",
+    "subtitle": "वाहन स्थिति, स्थान और मुख्य नियंत्रण।",
     "chip_device_pending": "डिवाइस -",
     "chip_surveillance_pending": "निगरानी -",
     "chip_gps_pending": "GPS --",
     "chip_device_value": "उपकरण {id}",
     "chip_surveillance_value": "निगरानी {state}",
+    "chip_gps_live": "GPS लाइव",
+    "chip_gps_cached": "GPS कैश",
     "kicker_position": "स्थिति",
     "kicker_commands": "आदेश",
     "kicker_vehicle": "वाहन",
-    "directions": "दिशाएँ",
-    "cmd_events": "घटनाएँ",
-    "metric_battery": "बैटरी",
-    "metric_range": "रेंज",
-    "metric_network": "नेटवर्क",
-    "unit_deg": "डेग",
-    "heading": "डैशबोर्ड",
-    "subtitle": "वाहन स्थिति, स्थान और मुख्य नियंत्रण।",
-    "chip_gps_live": "GPS लाइव",
-    "chip_gps_cached": "GPS कैश",
     "card_location": "वाहन स्थान",
     "card_commands": "त्वरित नियंत्रण",
     "card_info": "मुख्य जानकारी",
     "open_live_view": "लाइव व्यू खोलें",
+    "directions": "दिशाएँ",
     "no_gps_fix": "GPS सिग्नल नहीं",
     "gps_waiting": "वाहन स्थिति की प्रतीक्षा",
     "position_available": "स्थान उपलब्ध",
@@ -1670,15 +1665,23 @@
     "cmd_flash": "फ्लैश",
     "cmd_find": "ढूंढें",
     "cmd_live": "लाइव",
+    "cmd_trunk_open": "खुला ट्रंक",
+    "cmd_trunk_close": "बंद ट्रंक",
+    "cmd_trips": "यात्राएँ",
+    "metric_battery": "बैटरी",
+    "metric_range": "रेंज",
+    "metric_network": "नेटवर्क",
     "metric_lock": "लॉक",
     "status_locked": "लॉक किया गया",
     "status_unlocked": "अनलॉक",
     "network_mobile": "मोबाइल",
+    "unit_deg": "डेग",
     "time_seconds_ago": "{n} सेकंड पहले",
     "time_minutes_ago": "{n} मिनट पहले",
     "time_hours_ago": "{n} घंटे पहले",
     "toast_command_sent": "कमांड भेजी गई",
     "toast_command_failed": "कमांड विफल",
-    "toast_no_location": "वाहन स्थान उपलब्ध नहीं"
+    "toast_no_location": "वाहन स्थान उपलब्ध नहीं",
+    "cmd_recordings": "रिकॉर्डिंग"
   }
 }

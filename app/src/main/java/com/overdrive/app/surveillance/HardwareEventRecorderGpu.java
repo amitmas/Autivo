@@ -182,32 +182,49 @@ public class HardwareEventRecorderGpu {
         }
     }
 
-    // Lock-free pool. Per-packet ceiling for the live encoder output mirrors
-    // the H264CircularBuffer's per-bitrate sizing — 1 MB hard cap covers
-    // worst-case 10 Mbps H.265 IDRs at 2560×1920. Pool grows on miss but
-    // never shrinks, bounding peak native heap to MUXER_WRITE_QUEUE_CAPACITY
-    // packets × 1 MB = 600 MB worst case (paid only under sustained
-    // backpressure; steady state is far smaller).
+    // Pooled packets for the muxer write path. Per-packet buffer ceiling
+    // mirrors the H264CircularBuffer's per-bitrate sizing — 1 MB hard cap
+    // covers worst-case 10 Mbps H.265 IDRs at 2560×1920.
+    //
+    // Pool size is bounded. The previous version had no upper bound, so a
+    // single sustained SD-card backpressure burst could push 600 packets
+    // through the queue, each producing a 1 MB direct ByteBuffer that then
+    // sat in the pool forever (DirectByteBuffer's Cleaner doesn't fire
+    // until GC sees the wrapper unreachable, which never happens for a
+    // pool reference). On a 4 GB DiLink head unit this was a slow OOM-kill
+    // time bomb for a long-uptime daemon.
+    //
+    // Cap = MUXER_WRITE_QUEUE_CAPACITY + small headroom for "in flight
+    // between dequeue and recycle" packets. Steady-state need is tiny
+    // (~10 packets); the cap exists as a defensive ceiling, not a working
+    // set target. On overflow we drop the released packet and let GC
+    // reclaim the direct buffer.
     private static final int MUXER_PACKET_CEILING = 1024 * 1024;
+    private static final int MUXER_PACKET_POOL_CAP = MUXER_WRITE_QUEUE_CAPACITY + 16;
     private final java.util.concurrent.ConcurrentLinkedDeque<MuxerPacket> muxerPacketPool =
         new java.util.concurrent.ConcurrentLinkedDeque<>();
+    // Cheap size tracker — ConcurrentLinkedDeque.size() is O(n). We don't
+    // need exact accuracy under contention; an approximate counter is fine
+    // for the cap check.
+    private final java.util.concurrent.atomic.AtomicInteger muxerPacketPoolSize =
+        new java.util.concurrent.atomic.AtomicInteger(0);
 
     private MuxerPacket acquireMuxerPacket(int requiredSize) {
         // Walk pool looking for a packet whose buffer is large enough.
         // ConcurrentLinkedDeque iteration is weakly consistent which is fine
-        // here — worst case we miss a fitting slot and allocate. The pool
-        // grows monotonically so misses become rare.
+        // here — worst case we miss a fitting slot and allocate.
         java.util.Iterator<MuxerPacket> it = muxerPacketPool.iterator();
         while (it.hasNext()) {
             MuxerPacket p = it.next();
             if (p.data != null && p.data.capacity() >= requiredSize) {
                 if (muxerPacketPool.remove(p)) {
+                    muxerPacketPoolSize.decrementAndGet();
                     return p;
                 }
             }
         }
-        // None fit — allocate a fresh packet sized to ceiling so future
-        // packets reuse it without re-allocating.
+        // None fit — allocate a fresh packet. Sized to ceiling so future
+        // acquires can reuse it without re-allocating.
         MuxerPacket fresh = new MuxerPacket();
         int cap = Math.max(requiredSize, Math.min(MUXER_PACKET_CEILING, requiredSize * 2));
         fresh.data = ByteBuffer.allocateDirect(cap);
@@ -219,7 +236,15 @@ public class HardwareEventRecorderGpu {
         p.data.clear();
         p.payloadSize = 0;
         p.info.set(0, 0, 0, 0);
+        // Cap the pool. If we're over, drop this packet — the JVM Cleaner
+        // will reclaim its direct buffer at the next GC. This is the line
+        // that prevents the pool from monotonically growing into the
+        // hundreds of megabytes under sustained SD backpressure.
+        if (muxerPacketPoolSize.get() >= MUXER_PACKET_POOL_CAP) {
+            return;
+        }
         muxerPacketPool.offer(p);
+        muxerPacketPoolSize.incrementAndGet();
     }
 
     private void fillMuxerPacket(MuxerPacket dst, ByteBuffer src, MediaCodec.BufferInfo srcInfo) {
@@ -1316,7 +1341,17 @@ public class HardwareEventRecorderGpu {
     
     /**
      * Changes the encoder bitrate dynamically.
-     * 
+     *
+     * <p>Symmetric with {@link #setPreRecordDuration}: also resizes the
+     * shared pre-record circular buffer so its per-packet capacity covers
+     * the new bitrate's IDR worst-case. The previous version only reset
+     * KEY_VIDEO_BITRATE on the encoder; if the user moved from STANDARD
+     * (2 Mbps) to MAX (10 Mbps) the buffer was still sized for 2 Mbps and
+     * 800+ KB IDRs at the new bitrate would silently overflow the buffer's
+     * per-slot ceiling, dropping pre-record keyframes and leaving the
+     * pre-roll empty. The buffer recreate matches setPreRecordDuration's
+     * "duration / fps / bitrate triplet" reuse rule exactly.
+     *
      * @param newBitrate New bitrate in bps
      */
     public void setBitrate(int newBitrate) {
@@ -1325,11 +1360,30 @@ public class HardwareEventRecorderGpu {
                 Bundle params = new Bundle();
                 params.putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, newBitrate);
                 encoder.setParameters(params);
-                
+
                 this.bitrate = newBitrate;
-                logger.info( "Bitrate changed to: " + (newBitrate / 1_000_000) + " Mbps");
+                logger.info("Bitrate changed to: " + (newBitrate / 1_000_000) + " Mbps");
+
+                // Resize the pre-record buffer to match the new bitrate.
+                // Same triplet (duration/fps/bitrate) reuse rule as
+                // setPreRecordDuration's symmetric path.
+                synchronized (bufferLock) {
+                    if (sharedPreRecordBuffer != null) {
+                        int safeFps = Math.max(10, Math.min(30, fps));
+                        int safeBitrate = Math.max(500_000, newBitrate);
+                        if (sharedPreRecordBuffer.getSizedForBitrate() != safeBitrate) {
+                            int durationSec = (int) (sharedPreRecordBuffer.getMaxDurationUs() / 1_000_000L);
+                            logger.info("Pre-record buffer recreate (bitrate change): "
+                                + durationSec + " sec @ " + safeFps + "fps @ "
+                                + (safeBitrate / 1_000_000) + "Mbps (was "
+                                + (sharedPreRecordBuffer.getSizedForBitrate() / 1_000_000) + "Mbps)");
+                            sharedPreRecordBuffer = new H264CircularBuffer(durationSec, safeFps, safeBitrate);
+                            preRecordBuffer = sharedPreRecordBuffer;
+                        }
+                    }
+                }
             } catch (Exception e) {
-                logger.error( "Failed to change bitrate", e);
+                logger.error("Failed to change bitrate", e);
             }
         }
     }
@@ -1471,12 +1525,28 @@ public class HardwareEventRecorderGpu {
                 logger.warn("Drainer thread priority bump failed: " + t.getMessage());
             }
             logger.info("Encoder drainer thread started");
+            // SOTA Tier-A: replace poll+sleep with the encoder's native
+            // blocking dequeue. Previously we did dequeueOutputBuffer(timeout=0)
+            // + Thread.sleep(DRAIN_INTERVAL_MS=16) which added up to 16 ms of
+            // post-encode latency between every drain tick. At 15 fps the
+            // per-frame budget is 66 ms, so 16 ms idle was ~24% of budget; on
+            // bursty pre-record flushes the encoder's output queue saturated
+            // before the next drain woke up, back-pressuring the input
+            // surface and producing the 207ms "mosaic+swap" outliers
+            // observed in field logs. The blocking dequeue inside
+            // drainEncoderInternal() now wakes us the instant a packet is
+            // ready — no idle time, no polling. The 4ms safety sleep below
+            // only fires when the encoder produces nothing for the full
+            // dequeue timeout window (rare during active recording).
             while (drainerRunning) {
                 try {
-                    // Drain the encoder (SD card I/O happens here, not on GL thread)
                     drainEncoderInternal();
-                    // Don't burn CPU - wait a tiny bit for new frames
-                    Thread.sleep(DRAIN_INTERVAL_MS);
+                    // Tiny yield only — the inner dequeue already blocks.
+                    // Without ANY sleep here, a stuck encoder (zero output)
+                    // would burn 100% CPU calling dequeueOutputBuffer in a
+                    // tight loop forever. 4 ms is below one frame's
+                    // perceptual threshold and prevents that pathology.
+                    Thread.sleep(4);
                 } catch (InterruptedException e) {
                     break;
                 } catch (Exception e) {
@@ -1777,15 +1847,25 @@ public class HardwareEventRecorderGpu {
         
         MediaCodec.BufferInfo bufferInfo = reusableBufferInfo;
 
+        // SOTA Tier-A: first dequeue uses a short blocking timeout so the
+        // drainer wakes the moment the encoder produces a packet (no 16 ms
+        // poll-sleep gap between encoder-finish and drain). Subsequent
+        // dequeues in the same tick stay non-blocking (timeout=0) so we
+        // drain every available packet before yielding to the outer
+        // sleep — this is what handles pre-record flush bursts and HEVC
+        // I-frame catch-up without back-pressuring the input surface.
+        boolean firstDequeue = true;
         while (true) {
             int outputBufferIndex;
             try {
-                outputBufferIndex = encoder.dequeueOutputBuffer(bufferInfo, 0);
+                long dequeueTimeoutUs = firstDequeue ? 10_000L : 0L;
+                outputBufferIndex = encoder.dequeueOutputBuffer(bufferInfo, dequeueTimeoutUs);
+                firstDequeue = false;
             } catch (Exception e) {
                 // Encoder may have been released
                 break;
             }
-            
+
             if (outputBufferIndex == MediaCodec.INFO_TRY_AGAIN_LATER) {
                 break;  // No more output available
             } else if (outputBufferIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {

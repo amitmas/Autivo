@@ -116,6 +116,14 @@
         .telemetry-table tr:last-child td { border-bottom: none; }
         .telemetry-table td:first-child { color: var(--text-secondary); font-weight: 500; }
         .telemetry-table td:last-child { text-align: right; font-family: 'JetBrains Mono', monospace; color: var(--text-primary); }
+        /* Internal scroller — payload now carries ~100 keys when the SDK is fully populated.
+           Cap at 60vh so the card fits inside both 1080x1920 portrait and 1920x1080 landscape
+           BYD layouts without pushing the page-tabs offscreen. */
+        .telemetry-scroll { max-height: 60vh; overflow-y: auto; }
+        .telemetry-scroll::-webkit-scrollbar { width: 6px; }
+        .telemetry-scroll::-webkit-scrollbar-track { background: transparent; }
+        .telemetry-scroll::-webkit-scrollbar-thumb { background: var(--border-subtle); border-radius: 4px; }
+        .telemetry-scroll::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
         .badge-count { background: var(--brand-primary); color: var(--bg-base); font-size: 11px; font-weight: 600;
             padding: 2px 8px; border-radius: 10px; margin-left: 8px; }
         .icon-btn {
@@ -270,22 +278,11 @@
                             Live Telemetry Preview
                         </div>
                     </div>
-                    <div class="card-body" style="padding:0;">
+                    <div class="card-body telemetry-scroll" style="padding:0;">
                         <table class="telemetry-table">
-                            <tr><td>utc</td><td id="tlm_utc">--</td></tr>
-                            <tr><td>soc</td><td id="tlm_soc">--%</td></tr>
-                            <tr><td>power</td><td id="tlm_power">-- kW</td></tr>
-                            <tr><td>speed</td><td id="tlm_speed">-- km/h</td></tr>
-                            <tr><td>lat</td><td id="tlm_lat">--</td></tr>
-                            <tr><td>lon</td><td id="tlm_lon">--</td></tr>
-                            <tr><td>is_charging</td><td id="tlm_is_charging">--</td></tr>
-                            <tr><td>is_parked</td><td id="tlm_is_parked">--</td></tr>
-                            <tr><td>elevation</td><td id="tlm_elevation">-- m</td></tr>
-                            <tr><td>gear</td><td id="tlm_gear">--</td></tr>
-                            <tr><td>ext_temp</td><td id="tlm_ext_temp">-- °C</td></tr>
-                            <tr><td>batt_temp</td><td id="tlm_batt_temp">-- °C</td></tr>
-                            <tr><td>odometer</td><td id="tlm_odometer">-- km</td></tr>
-                            <tr><td>soh</td><td id="tlm_soh">--%</td></tr>
+                            <tbody id="telemetryBody">
+                                <tr><td colspan="2" style="text-align:center;color:var(--text-muted);padding:24px;">--</td></tr>
+                            </tbody>
                         </table>
                     </div>
                 </div>

@@ -647,12 +647,12 @@ BYD.performance = {
             this.updateBar('gpuBar', data.gpu.usage || 0);
             this.updateMetric('gpuFreq', (data.gpu.freqMhz ? data.gpu.freqMhz.toFixed(0) : '--'), ' MHz');
             this.updateMetric('gpuTemp', data.gpu.tempC || '--', '°C');
-            
+
             // SOTA: Frequency-aware GPU health highlighting
             // High usage at low freq = efficient (governor doing its job)
             // High usage at high freq = needs optimization
             this.updateGpuHealth(data.gpu.usage || 0, data.gpu.freqMhz || 0);
-            
+
             // Update history
             this.pushHistory('gpu', data.gpu.usage || 0);
         }
@@ -733,7 +733,7 @@ BYD.performance = {
     // Track recent GPU values for oscillation detection
     gpuRecentValues: [],
     GPU_OSCILLATION_WINDOW: 10, // Check last 10 samples
-    
+
     updateGpuHealth(usage, freqMhz) {
         const card = document.getElementById('gpuCard');
         const badge = document.getElementById('gpuStatusBadge');
@@ -991,13 +991,13 @@ BYD.performance = {
             if (s.data && s.data[dataIndex] !== undefined) {
                 const value = s.data[dataIndex];
                 const y = padding.top + chartHeight - (value / 100 * chartHeight);
-                
+
                 // Draw highlighted point
                 ctx.beginPath();
                 ctx.arc(x, y, 6, 0, Math.PI * 2);
                 ctx.fillStyle = s.color;
                 ctx.fill();
-                
+
                 // White ring
                 ctx.beginPath();
                 ctx.arc(x, y, 8, 0, Math.PI * 2);
@@ -1083,18 +1083,18 @@ BYD.performance = {
     
     drawLine(ctx, data, color, padding, chartWidth, chartHeight) {
         if (!data || data.length === 0) return;
-        
+
         const points = data.length;
         const stepX = chartWidth / (points - 1);
-        
+
         // Draw filled area
         ctx.beginPath();
         ctx.moveTo(padding.left, padding.top + chartHeight);
-        
+
         for (let i = 0; i < points; i++) {
             const x = padding.left + i * stepX;
             const y = padding.top + chartHeight - (data[i] / 100 * chartHeight);
-            
+
             if (i === 0) {
                 ctx.lineTo(x, y);
             } else {
@@ -1108,23 +1108,23 @@ BYD.performance = {
                 }
             }
         }
-        
+
         ctx.lineTo(padding.left + chartWidth, padding.top + chartHeight);
         ctx.closePath();
-        
+
         // Gradient fill
         const gradient = ctx.createLinearGradient(0, padding.top, 0, padding.top + chartHeight);
         gradient.addColorStop(0, color + '40');
         gradient.addColorStop(1, color + '05');
         ctx.fillStyle = gradient;
         ctx.fill();
-        
+
         // Draw line
         ctx.beginPath();
         for (let i = 0; i < points; i++) {
             const x = padding.left + i * stepX;
             const y = padding.top + chartHeight - (data[i] / 100 * chartHeight);
-            
+
             if (i === 0) {
                 ctx.moveTo(x, y);
             } else {
@@ -1137,22 +1137,22 @@ BYD.performance = {
                 }
             }
         }
-        
+
         ctx.strokeStyle = color;
         ctx.lineWidth = 2;
         ctx.lineCap = 'round';
         ctx.lineJoin = 'round';
         ctx.stroke();
-        
+
         // Draw current value dot
         const lastX = padding.left + chartWidth;
         const lastY = padding.top + chartHeight - (data[data.length - 1] / 100 * chartHeight);
-        
+
         ctx.beginPath();
         ctx.arc(lastX, lastY, 4, 0, Math.PI * 2);
         ctx.fillStyle = color;
         ctx.fill();
-        
+
         // Glow effect
         ctx.beginPath();
         ctx.arc(lastX, lastY, 6, 0, Math.PI * 2);

@@ -24,6 +24,7 @@
     "dashboard_title": "Dispositivo di controllo - OverDrive"
   },
   "nav": {
+    "dashboard": "Dashboard",
     "live_view": "Live View",
     "events": "Eventi",
     "surveillance": "Sorveglianza",
@@ -44,9 +45,8 @@
     "overview_group": "Panoramica",
     "vehicle_group": "Veicolo",
     "about_group": "Info",
-    "telegram": "Telegram",
-    "dashboard": "Dashboard",
-    "brand_home": "OverDrive — apri Dashboard"
+    "brand_home": "OverDrive — apri Dashboard",
+    "telegram": "Telegram"
   },
   "status": {
     "device": "Dispositivo",
@@ -1640,28 +1640,23 @@
     "delivery_pointer": "Le preferenze di consegna (che eventi raggiungono la chat) sono in diretta nella scheda Notifiche → Telegram."
   },
   "dashboard": {
+    "heading": "Cruscotto",
+    "subtitle": "Stato del veicolo, posizione e controlli principali.",
     "chip_device_pending": "Dispositivo...",
     "chip_surveillance_pending": "Sorveglianza...",
     "chip_gps_pending": "GPS --",
     "chip_device_value": "Dispositivo {id}",
     "chip_surveillance_value": "Servizio di sorveglianza {state}",
+    "chip_gps_live": "GPS live",
+    "chip_gps_cached": "GPS in cache",
     "kicker_position": "Posizione",
     "kicker_commands": "Comandi",
     "kicker_vehicle": "Veicolo",
-    "directions": "Direzioni",
-    "cmd_events": "Eventi",
-    "metric_battery": "Batteria",
-    "metric_range": "Distanza",
-    "metric_network": "Rete",
-    "unit_deg": "deg",
-    "heading": "Cruscotto",
-    "subtitle": "Stato del veicolo, posizione e controlli principali.",
-    "chip_gps_live": "GPS live",
-    "chip_gps_cached": "GPS in cache",
     "card_location": "Posizione veicolo",
     "card_commands": "Controlli rapidi",
     "card_info": "Informazioni principali",
     "open_live_view": "Apri Live View",
+    "directions": "Direzioni",
     "no_gps_fix": "Nessun fix GPS",
     "gps_waiting": "In attesa della posizione del veicolo",
     "position_available": "Posizione disponibile",
@@ -1670,15 +1665,23 @@
     "cmd_flash": "Lampeggia",
     "cmd_find": "Trova",
     "cmd_live": "Live",
+    "cmd_trunk_open": "Cisterna aperta",
+    "cmd_trunk_close": "Portata chiusa",
+    "cmd_trips": "Viaggi",
+    "metric_battery": "Batteria",
+    "metric_range": "Distanza",
+    "metric_network": "Rete",
     "metric_lock": "Blocca",
     "status_locked": "Bloccato",
     "status_unlocked": "Sbloccato",
     "network_mobile": "Cellulare",
+    "unit_deg": "deg",
     "time_seconds_ago": "{n} s fa",
     "time_minutes_ago": "{n} min fa",
     "time_hours_ago": "{n} h fa",
     "toast_command_sent": "Comando inviato",
     "toast_command_failed": "Comando non riuscito",
-    "toast_no_location": "Posizione del veicolo non disponibile"
+    "toast_no_location": "Posizione del veicolo non disponibile",
+    "cmd_recordings": "Registrazioni"
   }
 }

@@ -72,12 +72,16 @@ public final class CameraProfiles {
     }
 
     public static CameraProfile infer(String vehicleModel) {
-        if (vehicleModel != null) {
-            String normalized = vehicleModel.toLowerCase(Locale.US);
-            if (normalized.contains("tang")) {
-                return get(PROFILE_TANG_2022);
-            }
-        }
+        // Tang profile split disabled — every vehicle gets legacy Seal/Atto
+        // 5120x960 / cameraId=1 / surfaceMode=0. Tang's actual panoramic
+        // strip turned out to behave the same on this firmware, and the
+        // separate profile was causing daemon hangs.
+        // if (vehicleModel != null) {
+        //     String normalized = vehicleModel.toLowerCase(Locale.US);
+        //     if (normalized.contains("tang")) {
+        //         return get(PROFILE_TANG_2022);
+        //     }
+        // }
         return getLegacyDefault();
     }
 

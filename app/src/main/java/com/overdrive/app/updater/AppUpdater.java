@@ -857,40 +857,15 @@ public class AppUpdater {
         // Step 1: plant sentinels so the new MainActivity recovers correctly.
         script.append("echo 'update at '$(date) > ").append(UPDATE_IN_PROGRESS_FILE).append("\n");
         script.append("echo 'update at '$(date) > ").append(POST_UPDATE_FILE).append("\n");
-        // Step 2: kill watchdogs FIRST so they can't respawn the daemons we're
-        // about to kill in step 3. Mirrors DaemonLauncher.killDaemonViaAdb's
-        // ordering — if the daemon is killed before its watchdog, the watchdog
-        // observes the death and immediately relaunches it. Disable sentinel
-        // is also planted so any watchdog we miss exits on its next iteration.
+        // Step 2: plant the camera disable sentinel so any watchdog we miss
+        // exits on its next iteration, then kill everything in one syscall
+        // per family. Single broad pkill on 'cam_daemon' / 'acc_sentry' takes
+        // out watchdog + daemon together — no kill-order race, no sleep
+        // window for one to respawn the other. Each `2>/dev/null` so a
+        // "no such process" exit doesn't abort the script.
         script.append("echo 'disabled for update at '$(date) > /data/local/tmp/camera_daemon.disabled\n");
-        script.append("pkill -9 -f 'start_cam_daemon' 2>/dev/null\n");
-        script.append("pkill -9 -f 'start_acc_sentry' 2>/dev/null\n");
-        script.append("rm -f /data/local/tmp/start_cam_daemon.sh /data/local/tmp/cam_watchdog.pid 2>/dev/null\n");
-        script.append("rm -f /data/local/tmp/start_acc_sentry.sh /data/local/tmp/acc_sentry_daemon.lock 2>/dev/null\n");
-        script.append("sleep 1\n");
-
-        // Step 3: kill the daemons themselves. Mirrors DaemonLauncher per-daemon
-        // UID-2000 recipes (see killDaemonViaAdb at DaemonLauncher.kt:1457):
-        //
-        //   - acc_sentry_daemon  → pkill -f 'acc_sentry' (broader pattern so
-        //                          stragglers from start_acc_sentry also die)
-        //   - byd_cam_daemon     → pkill -f start_cam_daemon (already done in
-        //                          step 2) THEN pkill -f byd_cam_daemon. We're
-        //                          one of the matches; the script survives
-        //                          because the (...&) wrapper put it in a
-        //                          separate process group reparented to init.
-        //   - sentry_daemon, telegram_bot_daemon, sentry_proxy
-        //                        → simple pkill -f + killall by exe name
-        //   - cloudflared, zrok, tailscaled, sing-box (native binaries)
-        //                        → killall -9 by exe name (matches argv[0]
-        //                          basename more reliably than pkill -f does
-        //                          across BYD toybox vintages)
-        //
-        // Each kill is `2>/dev/null` so a "no such process" exit code doesn't
-        // abort the script (we have set +e but a stale errexit from a sourced
-        // env would still be a risk).
+        script.append("pkill -9 -f 'cam_daemon' 2>/dev/null\n");
         script.append("pkill -9 -f 'acc_sentry' 2>/dev/null\n");
-        script.append("pkill -9 -f 'byd_cam_daemon' 2>/dev/null\n");
         script.append("killall -9 byd_cam_daemon 2>/dev/null\n");
         script.append("pkill -9 -f 'sentry_daemon' 2>/dev/null\n");
         script.append("pkill -9 -f 'telegram_bot_daemon' 2>/dev/null\n");
@@ -903,6 +878,8 @@ public class AppUpdater {
         script.append("killall -9 sing-box 2>/dev/null\n");
         script.append("pkill -9 -f 'tailscaled' 2>/dev/null\n");
         script.append("killall -9 tailscaled 2>/dev/null\n");
+        script.append("rm -f /data/local/tmp/start_cam_daemon.sh /data/local/tmp/cam_watchdog.pid 2>/dev/null\n");
+        script.append("rm -f /data/local/tmp/start_acc_sentry.sh /data/local/tmp/acc_sentry_daemon.lock 2>/dev/null\n");
 
         // Per-daemon lock files (mirrors DaemonLauncher's killDaemonViaAdb
         // cleanup) so the relaunched MainActivity's daemon supervisor doesn't
@@ -1072,18 +1049,17 @@ public class AppUpdater {
             }
         } catch (InterruptedException ignored) {}
 
-        // Step 1: Kill ALL watchdog scripts and write sentinels FIRST.
-        // This prevents watchdogs from respawning daemons between kills.
-        // Must happen before any daemon kill — otherwise the watchdog sees the
-        // daemon die and immediately relaunches it.
-        Log.i(TAG, "Killing watchdog scripts and writing sentinels...");
+        // Step 1: Hard-kill the cam_daemon and acc_sentry families in one
+        // syscall each — broad pkill -f matches both watchdog and daemon
+        // simultaneously so neither survives to respawn the other. Plant the
+        // camera disable sentinel first so any straggler watchdog exits on
+        // its next iteration.
+        Log.i(TAG, "Killing daemons and watchdogs...");
         String killWatchdogsCmd =
-                // Camera daemon: sentinel + watchdog + lock
                 "echo 'disabled for update at $(date)' > /data/local/tmp/camera_daemon.disabled; " +
-                "pkill -9 -f 'start_cam_daemon' 2>/dev/null; " +
-                "rm -f /data/local/tmp/start_cam_daemon.sh /data/local/tmp/cam_watchdog.pid 2>/dev/null; " +
-                // ACC sentry daemon: watchdog + lock
-                "pkill -9 -f 'start_acc_sentry' 2>/dev/null; " +
+                "pkill -9 -f 'cam_daemon' 2>/dev/null; " +
+                "pkill -9 -f 'acc_sentry' 2>/dev/null; " +
+                "rm -f /data/local/tmp/start_cam_daemon.sh /data/local/tmp/cam_watchdog.pid /data/local/tmp/camera_daemon.lock 2>/dev/null; " +
                 "rm -f /data/local/tmp/start_acc_sentry.sh /data/local/tmp/acc_sentry_daemon.lock 2>/dev/null; " +
                 "echo done";
         
@@ -1107,12 +1083,11 @@ public class AppUpdater {
             }
         } catch (InterruptedException ignored) {}
         
-        // Brief pause to let watchdog processes fully exit before killing daemons
-        try { Thread.sleep(1000); } catch (InterruptedException ignored) {}
-        
-        // Step 2: Kill all daemon processes.
-        // Watchdogs are already dead so nothing will respawn these.
-        String[] daemons = {"acc_sentry_daemon", "byd_cam_daemon", "sentry_daemon",
+        // Step 2: Kill the rest of the daemon families. cam_daemon and
+        // acc_sentry are already gone from step 1 — this loop covers the
+        // standalone daemons (telegram, proxy) and native binaries
+        // (cloudflared, zrok, sing-box, tailscaled).
+        String[] daemons = {"sentry_daemon",
                 "telegram_bot_daemon", "sentry_proxy", "cloudflared", "zrok", "sing-box",
                 "tailscaled"};
         
@@ -1139,18 +1114,16 @@ public class AppUpdater {
             } catch (InterruptedException ignored) {}
         }
         
-        // Step 3: Final sweep — catch any stragglers that slipped through.
-        // This handles edge cases where a watchdog respawned a daemon in the
-        // brief window between step 1 and step 2, or orphaned shell processes.
+        // Step 3: Final sweep — broad pkill on every family pattern catches
+        // any stragglers (orphaned shells, late-respawn races). One syscall
+        // per family is enough; no need to re-list watchdog vs daemon
+        // separately because the broad pattern covers both.
         // NOTE: we keep UPDATE_IN_PROGRESS_FILE / POST_UPDATE_FILE in place;
         // the new process clears them after its own hard-reset pass.
         Log.i(TAG, "Final sweep for remaining processes...");
         String finalSweepCmd =
-                "pkill -9 -f 'start_cam_daemon' 2>/dev/null; " +
-                "pkill -9 -f 'start_acc_sentry' 2>/dev/null; " +
-                "pkill -9 -f 'byd_cam_daemon' 2>/dev/null; " +
                 "pkill -9 -f 'cam_daemon' 2>/dev/null; " +
-                "pkill -9 -f 'acc_sentry_daemon' 2>/dev/null; " +
+                "pkill -9 -f 'acc_sentry' 2>/dev/null; " +
                 "pkill -9 -f 'sentry_daemon' 2>/dev/null; " +
                 "pkill -9 -f 'telegram_bot_daemon' 2>/dev/null; " +
                 "pkill -9 -f 'sentry_proxy' 2>/dev/null; " +

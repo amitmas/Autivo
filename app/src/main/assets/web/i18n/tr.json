@@ -24,6 +24,7 @@
     "dashboard_title": "Kontrol tablosu - OverDrive"
   },
   "nav": {
+    "dashboard": "Kontrol paneli",
     "live_view": "Canlı Görünüm",
     "events": "Olaylar",
     "surveillance": "Gözetim",
@@ -44,9 +45,8 @@
     "overview_group": "Özet",
     "vehicle_group": "Araç",
     "about_group": "Hakkında",
-    "telegram": "Telegram",
-    "dashboard": "Kontrol paneli",
-    "brand_home": "OverDrive — Kontrol panelini aç"
+    "brand_home": "OverDrive — Kontrol panelini aç",
+    "telegram": "Telegram"
   },
   "status": {
     "device": "Cihaz",
@@ -1640,28 +1640,23 @@
     "delivery_pointer": "Teslimat tercihleri (çat'a ulaşan olaylar) İletiler → Telegram sekmesinde canlıdır."
   },
   "dashboard": {
+    "heading": "Kontrol paneli",
+    "subtitle": "Araç durumu, konum ve ana kontroller.",
     "chip_device_pending": "Cihaz...",
     "chip_surveillance_pending": "Gözlem...",
     "chip_gps_pending": "GPS --",
     "chip_device_value": "Cihaz {id}",
     "chip_surveillance_value": "Gözetim {state}",
+    "chip_gps_live": "GPS canlı",
+    "chip_gps_cached": "GPS önbellekte",
     "kicker_position": "Konum",
     "kicker_commands": "Komutlar",
     "kicker_vehicle": "Araç",
-    "directions": "Yönlendirmeler",
-    "cmd_events": "Olaylar",
-    "metric_battery": "Batarya",
-    "metric_range": "Aralık",
-    "metric_network": "Ağ",
-    "unit_deg": "deg",
-    "heading": "Kontrol paneli",
-    "subtitle": "Araç durumu, konum ve ana kontroller.",
-    "chip_gps_live": "GPS canlı",
-    "chip_gps_cached": "GPS önbellekte",
     "card_location": "Araç konumu",
     "card_commands": "Hızlı kontroller",
     "card_info": "Ana bilgiler",
     "open_live_view": "Canlı görünümü aç",
+    "directions": "Yönlendirmeler",
     "no_gps_fix": "GPS sinyali yok",
     "gps_waiting": "Araç konumu bekleniyor",
     "position_available": "Konum mevcut",
@@ -1670,15 +1665,23 @@
     "cmd_flash": "Far yak",
     "cmd_find": "Bul",
     "cmd_live": "Canlı",
+    "cmd_trunk_open": "Açık bagaj",
+    "cmd_trunk_close": "Kapalı bagaj",
+    "cmd_trips": "Seyahatler",
+    "metric_battery": "Batarya",
+    "metric_range": "Aralık",
+    "metric_network": "Ağ",
     "metric_lock": "Kilitle",
     "status_locked": "Kilitli",
     "status_unlocked": "Kilidi açık",
     "network_mobile": "Mobil",
+    "unit_deg": "deg",
     "time_seconds_ago": "{n} sn önce",
     "time_minutes_ago": "{n} dk önce",
     "time_hours_ago": "{n} sa önce",
     "toast_command_sent": "Komut gönderildi",
     "toast_command_failed": "Komut başarısız",
-    "toast_no_location": "Araç konumu mevcut değil"
+    "toast_no_location": "Araç konumu mevcut değil",
+    "cmd_recordings": "Kayıtlar"
   }
 }

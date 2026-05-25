@@ -1124,7 +1124,11 @@ class MainActivity : AppCompatActivity() {
         val summary: String,
         val roles: List<CameraRoleOption>,
         val candidates: List<CameraPreviewCandidate>,
-        val currentMappings: Map<String, String>
+        val currentMappings: Map<String, String>,
+        // Currently-saved manual camera ID, or null when auto / unset.
+        // Drives the manual-camera-ID radio group's initial selection.
+        val manualCameraId: Int?,
+        val isManualOverride: Boolean
     )
 
     /**
@@ -1216,11 +1220,20 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
+            // Manual override state — daemon merges these into the same
+            // /api/surveillance/config response (see SurveillanceApiHandler:546).
+            // cameraId == -1 + manualOverride==false is the "auto" state.
+            val rawManualId = config.optInt("cameraId", -1)
+            val manualOverride = config.optBoolean("cameraManualOverride", false)
+            val manualCameraId = if (manualOverride && rawManualId in 0..5) rawManualId else null
+
             CameraMappingState(
                 summary = summary,
                 roles = roles,
                 candidates = candidates,
-                currentMappings = mappings
+                currentMappings = mappings,
+                manualCameraId = manualCameraId,
+                isManualOverride = manualOverride
             )
         } catch (e: Exception) {
             logsViewModel.error("Camera", "Failed to load camera mapping state: ${e.message}")
@@ -1242,6 +1255,9 @@ class MainActivity : AppCompatActivity() {
         val nextButton = dialogView.findViewById<View>(R.id.btnNextCandidate)
         val saveMappingButton = dialogView.findViewById<View>(R.id.btnSaveCameraRoleMapping)
         val clearMappingButton = dialogView.findViewById<View>(R.id.btnClearCameraRoleMapping)
+        val manualCameraGroup = dialogView.findViewById<android.widget.RadioGroup>(R.id.rgManualCameraId)
+        val currentManualCameraView = dialogView.findViewById<TextView>(R.id.tvCurrentManualCamera)
+        val saveManualCameraButton = dialogView.findViewById<View>(R.id.btnSaveManualCameraId)
 
         summaryView.text = state.summary
 
@@ -1539,6 +1555,67 @@ class MainActivity : AppCompatActivity() {
                         Toast.LENGTH_SHORT
                     ).show()
                     setActionsEnabled(true)
+                }
+            }
+        }
+
+        // Manual camera ID picker. Independent from the role-mapping flow:
+        // saves a single integer (or clears it) and skips prepare-restart so
+        // it works even when the live preview pipeline is wedged. The
+        // manualCameraId field is read on next pipeline init (typically the
+        // next ACC OFF/ON cycle) — operators can also restart the daemon
+        // manually from the Daemons screen if they want it to take effect now.
+        val initialManualRadioId = when (state.manualCameraId) {
+            0 -> R.id.rbManualCamera0
+            1 -> R.id.rbManualCamera1
+            2 -> R.id.rbManualCamera2
+            3 -> R.id.rbManualCamera3
+            4 -> R.id.rbManualCamera4
+            5 -> R.id.rbManualCamera5
+            else -> R.id.rbManualCameraAuto
+        }
+        manualCameraGroup.check(initialManualRadioId)
+        currentManualCameraView.text = state.manualCameraId?.let {
+            getString(R.string.camera_mapping_current_format, "Camera $it")
+        } ?: getString(R.string.camera_current_auto)
+
+        saveManualCameraButton.setOnClickListener {
+            val selectedId = when (manualCameraGroup.checkedRadioButtonId) {
+                R.id.rbManualCamera0 -> 0
+                R.id.rbManualCamera1 -> 1
+                R.id.rbManualCamera2 -> 2
+                R.id.rbManualCamera3 -> 3
+                R.id.rbManualCamera4 -> 4
+                R.id.rbManualCamera5 -> 5
+                else -> -1
+            }
+            val payload = org.json.JSONObject().apply {
+                if (selectedId >= 0) {
+                    put("manualCameraId", selectedId)
+                } else {
+                    put("clearManualCameraId", true)
+                }
+            }.toString()
+            saveManualCameraButton.isEnabled = false
+            postSurveillanceConfig(payload) { success, message ->
+                saveManualCameraButton.isEnabled = true
+                if (success) {
+                    currentManualCameraView.text = if (selectedId >= 0) {
+                        getString(R.string.camera_mapping_current_format, "Camera $selectedId")
+                    } else {
+                        getString(R.string.camera_current_auto)
+                    }
+                    Toast.makeText(
+                        this,
+                        getString(R.string.camera_mapping_saved),
+                        Toast.LENGTH_SHORT
+                    ).show()
+                } else {
+                    Toast.makeText(
+                        this,
+                        message ?: getString(R.string.toast_failed_to_save_short),
+                        Toast.LENGTH_SHORT
+                    ).show()
                 }
             }
         }

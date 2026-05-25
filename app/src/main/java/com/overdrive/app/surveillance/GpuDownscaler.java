@@ -10,6 +10,7 @@ import android.opengl.EGLDisplay;
 import android.opengl.EGLSurface;
 import android.opengl.GLES11Ext;
 import android.opengl.GLES20;
+import android.opengl.GLES30;
 import android.os.Handler;
 import android.os.HandlerThread;
 
@@ -419,18 +420,34 @@ public class GpuDownscaler {
     private int directAPosition = -1;
     private int directATexCoord = -1;
     private int directUCameraTex = -1;
-    private ByteBuffer directReadBuffer = null;
     private byte[] directRgbBuffer = null;
     private byte[] directScratchRgba = null;  // bulk-copy RGBA scratch for Y-flip pack
     private boolean directInitialized = false;
 
+    // Tier 2 SOTA: PBO ring + fence-sync replaces the double-FBO ping-pong.
+    // glReadPixels into a bound GL_PIXEL_PACK_BUFFER queues a DMA and returns
+    // immediately; glClientWaitSync(timeout=0) is what tells us when the DMA
+    // has landed without blocking. RING_SIZE=3 lets two readbacks be in
+    // flight while a third PBO is being mapped on the CPU.
+    private static final int DIRECT_PBO_RING_SIZE = 3;
+    private static final int DIRECT_PBO_BYTES = WIDTH * HEIGHT * 4;
+    private final int[] directPboIds = new int[DIRECT_PBO_RING_SIZE];
+    private final long[] directFenceSyncs = new long[DIRECT_PBO_RING_SIZE];
+    private int directRingHead = 0;
+    private int directRingTail = 0;
+    // True iff the current GL context exposes GLES 3.x — see FoveatedCropper
+    // for rationale + fallback semantics.
+    private boolean directGles3Available = false;
+    private ByteBuffer directFallbackReadBuffer = null;
+
     // Single-buffered SYNCHRONOUS readback path. Used by the camera-mapping
-    // dialog snapshot endpoint where surveillance may be off and the
-    // double-buffered async path would hand back null on the first call
-    // (no previous frame to read). This path renders to a dedicated FBO and
-    // reads back in the SAME call — glReadPixels is implicitly a sync point,
-    // so the bytes are guaranteed valid on return. Independent FBO/texture
-    // from the async path so the AI lane's ping-pong state isn't disturbed.
+    // dialog snapshot endpoint where surveillance may be off and the async
+    // PBO-ring path would hand back null until enough frames had been
+    // queued for a fence to signal. This path renders to a dedicated FBO
+    // and reads back in the SAME call — glReadPixels is implicitly a sync
+    // point, so the bytes are guaranteed valid on return. Independent
+    // FBO/texture from the async path so the AI lane's PBO ring state
+    // isn't disturbed.
     private int syncFbo = -1;
     private int syncTexture = -1;
     private ByteBuffer syncReadBuffer = null;
@@ -438,82 +455,60 @@ public class GpuDownscaler {
     private byte[] syncScratchRgba = null;
     private boolean syncInitialized = false;
     
-    // Double-buffered async readback: eliminates glFinish() stall.
-    // We maintain two FBOs. On frame N, we render to FBO[current] and read back
-    // from FBO[previous] (which the GPU finished rendering on frame N-1).
-    // This pipelines the readback one frame behind, eliminating the 10-15ms
-    // synchronous CPU-GPU block that glFinish() + glReadPixels causes.
-    private int directFbo2 = -1;
-    private int directTexture2 = -1;
-    private int directCurrentFbo = 0;  // 0 or 1 — which FBO to render to this frame
-    private boolean directHasPreviousFrame = false;  // First frame has nothing to read back
-    
     /**
-     * SOTA: Double-buffered async readback on the current GL thread.
+     * SOTA Tier 2: PBO ring + fence-sync.
      *
-     * Previous implementation used glFinish() + glReadPixels which stalls the CPU
-     * for 10-15ms waiting for the GPU to complete rendering. This double-buffered
-     * approach renders to FBO[N] while reading back from FBO[N-1], pipelining the
-     * readback one frame behind. The GPU has already finished FBO[N-1] by the time
-     * we read it, so glReadPixels returns immediately without a stall.
+     * <p>Issue {@code glReadPixels} with a {@code GL_PIXEL_PACK_BUFFER} bound;
+     * driver queues a DMA into the PBO and returns immediately. Drop a
+     * {@code glFenceSync} right after. On a future call, drain the OLDEST
+     * fence with a zero-timeout {@code glClientWaitSync}; if signaled, map
+     * the PBO read-only and bulk-copy out. If not signaled, return null —
+     * the AI lane falls back to mosaic for THIS tick. We never block this
+     * GL thread on a glReadPixels stall; the readback latency lands as a
+     * one-tick AI staleness, which is invisible at V2's 10 Hz.
      *
-     * Trade-off: the AI lane sees data that is one frame old (~100ms at 10 FPS).
-     * This is negligible for motion detection — a person moves ~3 pixels in 100ms.
+     * <p>This is the path the previous double-FBO ping-pong was trying to
+     * be. Ping-pong reduced GPU-side stall but the host-side
+     * {@code glReadPixels(buffer)} into a Java direct ByteBuffer is still
+     * a synchronization point on Adreno when an OpenCL job is in the same
+     * hardware queue. PBO + fence-sync gives the driver complete freedom
+     * to pipeline the readback against unrelated GPU work.
      */
     public byte[] readPixelsDirect(int cameraTextureId) {
         if (!directInitialized) initDirectFbo();
         if (!directInitialized) return null;
-        
+
         int[] savedViewport = new int[4];
         GLES20.glGetIntegerv(GLES20.GL_VIEWPORT, savedViewport, 0);
-        
-        // Determine which FBO to render to (current) and which to read from (previous)
-        int renderFbo = (directCurrentFbo == 0) ? directFbo : directFbo2;
-        int readFbo = (directCurrentFbo == 0) ? directFbo2 : directFbo;
-        
-        // Step 1: Render current frame to renderFbo
-        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, renderFbo);
+
+        // ---- 1. Render the current camera frame into the FBO ----
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, directFbo);
         GLES20.glViewport(0, 0, WIDTH, HEIGHT);
         GLES20.glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT);
-        
+
         GLES20.glUseProgram(directProgram);
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, cameraTextureId);
         GLES20.glUniform1i(directUCameraTex, 0);
-        
+
         GLES20.glEnableVertexAttribArray(directAPosition);
         GLES20.glVertexAttribPointer(directAPosition, 2, GLES20.GL_FLOAT, false, 0, vertexBuffer);
         GLES20.glEnableVertexAttribArray(directATexCoord);
         GLES20.glVertexAttribPointer(directATexCoord, 2, GLES20.GL_FLOAT, false, 0, texCoordBuffer);
-        
+
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
-        
+
         GLES20.glDisableVertexAttribArray(directAPosition);
         GLES20.glDisableVertexAttribArray(directATexCoord);
-        
-        // Step 2: Read back from readFbo (previous frame — GPU already finished it)
-        // No glFinish() needed! The previous frame was submitted at least one full
-        // render loop iteration ago (~33ms at 30 FPS camera), which is far more than
-        // the GPU needs to complete a simple FBO blit.
-        byte[] result = null;
-        if (directHasPreviousFrame) {
-            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, readFbo);
-            directReadBuffer.clear();
-            GLES20.glReadPixels(0, 0, WIDTH, HEIGHT, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, directReadBuffer);
 
-            // RGBA → RGB with Y-flip. The previous version did a 921 K-iter Java
-            // loop with per-byte ByteBuffer.get(int) calls — each one a JNI hop.
-            // That loop alone was ~80 ms and the dominant cost in this stage.
-            //
-            // Bulk-copy the whole RGBA into a scratch byte[] in one JNI call,
-            // then walk it as a Java array. Y-flip happens during the row pack.
-            if (directScratchRgba == null || directScratchRgba.length != WIDTH * HEIGHT * 4) {
-                directScratchRgba = new byte[WIDTH * HEIGHT * 4];
-            }
-            directReadBuffer.rewind();
-            directReadBuffer.get(directScratchRgba, 0, WIDTH * HEIGHT * 4);
-
+        // GLES2 fallback: synchronous read into a direct buffer.
+        if (!directGles3Available) {
+            directFallbackReadBuffer.clear();
+            GLES20.glReadPixels(0, 0, WIDTH, HEIGHT, GLES20.GL_RGBA,
+                    GLES20.GL_UNSIGNED_BYTE, directFallbackReadBuffer);
+            directFallbackReadBuffer.rewind();
+            directFallbackReadBuffer.get(directScratchRgba, 0, DIRECT_PBO_BYTES);
             byte[] src = directScratchRgba;
             byte[] dst = directRgbBuffer;
             final int rowRgbaBytes = WIDTH * 4;
@@ -527,19 +522,76 @@ public class GpuDownscaler {
                     dst[dstIdx++] = src[s + 2];
                 }
             }
-            result = dst;
-        } else {
-            // First frame — nothing to read back yet. Render submitted, will be
-            // available next call. Return null this one time.
-            directHasPreviousFrame = true;
+            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0);
+            GLES20.glViewport(savedViewport[0], savedViewport[1], savedViewport[2], savedViewport[3]);
+            return dst;
         }
-        
-        // Step 3: Swap FBOs for next frame
-        directCurrentFbo = 1 - directCurrentFbo;
-        
+
+        // ---- 2. Queue an async DMA into the head PBO ----
+        int nextHead = (directRingHead + 1) % DIRECT_PBO_RING_SIZE;
+        boolean ringFull = (nextHead == directRingTail) && directFenceSyncs[directRingTail] != 0L;
+        if (!ringFull) {
+            GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, directPboIds[directRingHead]);
+            GLES30.glReadPixels(0, 0, WIDTH, HEIGHT,
+                    GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, 0);
+            GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, 0);
+            directFenceSyncs[directRingHead] = GLES30.glFenceSync(
+                    GLES30.GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+            directRingHead = nextHead;
+        }
+
+        // ---- 3. Drain: harvest the oldest signaled slot, if any ----
+        byte[] result = null;
+        if (directRingTail != directRingHead && directFenceSyncs[directRingTail] != 0L) {
+            int sig = GLES30.glClientWaitSync(directFenceSyncs[directRingTail], 0, 0);
+            boolean signaled = (sig == GLES30.GL_ALREADY_SIGNALED
+                             || sig == GLES30.GL_CONDITION_SATISFIED);
+            if (signaled) {
+                if (directScratchRgba == null || directScratchRgba.length != DIRECT_PBO_BYTES) {
+                    directScratchRgba = new byte[DIRECT_PBO_BYTES];
+                }
+                GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, directPboIds[directRingTail]);
+                java.nio.Buffer mapped = GLES30.glMapBufferRange(
+                        GLES30.GL_PIXEL_PACK_BUFFER, 0, DIRECT_PBO_BYTES,
+                        GLES30.GL_MAP_READ_BIT);
+                if (mapped instanceof ByteBuffer) {
+                    ByteBuffer bb = (ByteBuffer) mapped;
+                    bb.order(java.nio.ByteOrder.nativeOrder());
+                    bb.rewind();
+                    bb.get(directScratchRgba, 0, DIRECT_PBO_BYTES);
+                    GLES30.glUnmapBuffer(GLES30.GL_PIXEL_PACK_BUFFER);
+                    GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, 0);
+
+                    byte[] src = directScratchRgba;
+                    byte[] dst = directRgbBuffer;
+                    final int rowRgbaBytes = WIDTH * 4;
+                    int dstIdx = 0;
+                    for (int y = HEIGHT - 1; y >= 0; y--) {
+                        int srcRow = y * rowRgbaBytes;
+                        for (int x = 0; x < WIDTH; x++) {
+                            int s = srcRow + (x << 2);
+                            dst[dstIdx++] = src[s];
+                            dst[dstIdx++] = src[s + 1];
+                            dst[dstIdx++] = src[s + 2];
+                        }
+                    }
+                    result = dst;
+                } else {
+                    GLES30.glUnmapBuffer(GLES30.GL_PIXEL_PACK_BUFFER);
+                    GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, 0);
+                    logger.warn("readPixelsDirect: glMapBufferRange returned non-ByteBuffer");
+                }
+
+                GLES30.glDeleteSync(directFenceSyncs[directRingTail]);
+                directFenceSyncs[directRingTail] = 0L;
+                directRingTail = (directRingTail + 1) % DIRECT_PBO_RING_SIZE;
+            }
+            // Not signaled — leave fence in place; next call will poll it.
+        }
+
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0);
         GLES20.glViewport(savedViewport[0], savedViewport[1], savedViewport[2], savedViewport[3]);
-        
+
         return result;
     }
     
@@ -555,8 +607,8 @@ public class GpuDownscaler {
                 directATexCoord = GLES20.glGetAttribLocation(directProgram, "aTexCoord");
                 directUCameraTex = GLES20.glGetUniformLocation(directProgram, "uCameraTex");
             }
-            
-            // Create FBO #1
+
+            // Single render FBO.
             int[] texIds = new int[1];
             GLES20.glGenTextures(1, texIds, 0);
             directTexture = texIds[0];
@@ -565,57 +617,54 @@ public class GpuDownscaler {
                     GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, null);
             GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR);
             GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR);
-            
+
             int[] fboIds = new int[1];
             GLES20.glGenFramebuffers(1, fboIds, 0);
             directFbo = fboIds[0];
             GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, directFbo);
             GLES20.glFramebufferTexture2D(GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0,
                     GLES20.GL_TEXTURE_2D, directTexture, 0);
-            
             int status = GLES20.glCheckFramebufferStatus(GLES20.GL_FRAMEBUFFER);
-            if (status != GLES20.GL_FRAMEBUFFER_COMPLETE) {
-                logger.error("FBO #1 incomplete: " + status);
-                GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0);
-                return;
-            }
-            
-            // Create FBO #2 (for double-buffered async readback)
-            int[] texIds2 = new int[1];
-            GLES20.glGenTextures(1, texIds2, 0);
-            directTexture2 = texIds2[0];
-            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, directTexture2);
-            GLES20.glTexImage2D(GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA, WIDTH, HEIGHT, 0,
-                    GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, null);
-            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR);
-            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR);
-            
-            int[] fboIds2 = new int[1];
-            GLES20.glGenFramebuffers(1, fboIds2, 0);
-            directFbo2 = fboIds2[0];
-            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, directFbo2);
-            GLES20.glFramebufferTexture2D(GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0,
-                    GLES20.GL_TEXTURE_2D, directTexture2, 0);
-            
-            int status2 = GLES20.glCheckFramebufferStatus(GLES20.GL_FRAMEBUFFER);
             GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0);
-            if (status2 != GLES20.GL_FRAMEBUFFER_COMPLETE) {
-                logger.error("FBO #2 incomplete: " + status2);
+            if (status != GLES20.GL_FRAMEBUFFER_COMPLETE) {
+                logger.error("Direct FBO incomplete: " + status);
                 return;
             }
-            
-            directReadBuffer = ByteBuffer.allocateDirect(WIDTH * HEIGHT * 4);
-            directReadBuffer.order(java.nio.ByteOrder.nativeOrder());
+
+            // GL version probe (one-shot). PBO + fence-sync require GLES 3.
+            String glVer = GLES20.glGetString(GLES20.GL_VERSION);
+            directGles3Available = (glVer != null && glVer.contains("OpenGL ES 3"));
+            logger.info("Downscaler GL version: '" + glVer + "' (gles3=" + directGles3Available + ")");
+
+            if (directGles3Available) {
+                // PBO ring. STREAM_READ tells the driver these are
+                // CPU-readback buffers and to place them in the right memory
+                // pool (host-coherent on Adreno).
+                GLES30.glGenBuffers(DIRECT_PBO_RING_SIZE, directPboIds, 0);
+                for (int i = 0; i < DIRECT_PBO_RING_SIZE; i++) {
+                    GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, directPboIds[i]);
+                    GLES30.glBufferData(GLES30.GL_PIXEL_PACK_BUFFER, DIRECT_PBO_BYTES, null,
+                            GLES30.GL_STREAM_READ);
+                    directFenceSyncs[i] = 0L;
+                }
+                GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, 0);
+            } else {
+                directFallbackReadBuffer = ByteBuffer.allocateDirect(DIRECT_PBO_BYTES);
+                directFallbackReadBuffer.order(java.nio.ByteOrder.nativeOrder());
+            }
+
             directRgbBuffer = new byte[WIDTH * HEIGHT * 3];
-            
+            directScratchRgba = new byte[DIRECT_PBO_BYTES];
+
             if (vertexBuffer == null) vertexBuffer = GlUtil.createFloatBuffer(VERTEX_COORDS);
             if (texCoordBuffer == null) texCoordBuffer = GlUtil.createFloatBuffer(TEX_COORDS);
-            
-            directCurrentFbo = 0;
-            directHasPreviousFrame = false;
-            
+
+            directRingHead = 0;
+            directRingTail = 0;
+
             directInitialized = true;
-            logger.info("Double-buffered FBO readback initialized (640x480, async)");
+            logger.info("Downscaler direct path initialized (GLES3 PBO ring x"
+                    + DIRECT_PBO_RING_SIZE + ", " + WIDTH + "×" + HEIGHT + " RGBA)");
         } catch (Exception e) {
             logger.error("Failed to init direct FBO: " + e.getMessage());
         }
@@ -630,7 +679,7 @@ public class GpuDownscaler {
      * <p>Used by the camera-mapping dialog snapshot endpoint where surveillance
      * may be off and the async {@link #readPixelsDirect(int)} would return
      * null on its first call. Independent of the async path's FBO state, so
-     * calling this here doesn't disturb the AI lane's ping-pong cadence.
+     * calling this here doesn't disturb the AI lane's PBO ring cadence.
      *
      * <p>Cost: ~10-15 ms (glReadPixels stalls until the GPU finishes the
      * render). Acceptable for one-shot dialog use; do NOT call per-frame.
@@ -787,45 +836,78 @@ public class GpuDownscaler {
     private byte[] reusableRgbBuffer = null;
     
     /**
-     * Release all resources.
+     * Release the direct-path GL resources (PBO ring, FBO, texture, shader
+     * program shared with the sync path). MUST be called on whichever GL
+     * thread/context originally allocated these — under Tier 1 wiring,
+     * that is the AiLaneGl thread (because readPixelsDirect is invoked
+     * from AiLaneGl.processOnce). The pipeline shutdown path calls this
+     * via {@code AiLaneGl.runOnGlThreadBlocking(...)} BEFORE tearing down
+     * the AI-lane EGL context.
+     *
+     * <p>Previously this cleanup was posted to {@code renderHandler} (the
+     * legacy ImageReader-backed thread), which made the {@code glDelete*}
+     * calls execute against the wrong context — they silently no-op
+     * because the GL object names aren't visible to that context. Each
+     * pipeline stop/start cycle then leaked one full set: 3 PBOs (3.6 MB
+     * direct buffer storage backing them, plus driver handles), 3 sync
+     * objects, 2 FBOs, 2 textures, 1 program. After many cycles the
+     * driver's handle table saturated and inits started failing.
+     *
+     * <p>Idempotent: every guard checks for the sentinel value, so a
+     * double-free is safe.
+     */
+    public void releaseDirectResources() {
+        // Drop in-flight fences first; deleting their PBOs without
+        // releasing the syncs leaks driver-side sync objects.
+        for (int i = 0; i < DIRECT_PBO_RING_SIZE; i++) {
+            if (directFenceSyncs[i] != 0L) {
+                try { GLES30.glDeleteSync(directFenceSyncs[i]); } catch (Throwable ignored) {}
+                directFenceSyncs[i] = 0L;
+            }
+        }
+        if (directPboIds[0] != 0) {
+            try { GLES30.glDeleteBuffers(DIRECT_PBO_RING_SIZE, directPboIds, 0); } catch (Throwable ignored) {}
+            for (int i = 0; i < DIRECT_PBO_RING_SIZE; i++) directPboIds[i] = 0;
+        }
+        if (directFbo >= 0) {
+            try { GLES20.glDeleteFramebuffers(1, new int[]{directFbo}, 0); } catch (Throwable ignored) {}
+            directFbo = -1;
+        }
+        if (directTexture >= 0) {
+            try { GLES20.glDeleteTextures(1, new int[]{directTexture}, 0); } catch (Throwable ignored) {}
+            directTexture = -1;
+        }
+        if (syncFbo >= 0) {
+            try { GLES20.glDeleteFramebuffers(1, new int[]{syncFbo}, 0); } catch (Throwable ignored) {}
+            syncFbo = -1;
+        }
+        if (syncTexture >= 0) {
+            try { GLES20.glDeleteTextures(1, new int[]{syncTexture}, 0); } catch (Throwable ignored) {}
+            syncTexture = -1;
+        }
+        if (directProgram > 0) {
+            try { GLES20.glDeleteProgram(directProgram); } catch (Throwable ignored) {}
+            directProgram = -1;
+        }
+        directInitialized = false;
+        syncInitialized = false;
+    }
+
+    /**
+     * Release the legacy ImageReader-backed path resources owned by the
+     * downscaler's own internal {@link #renderThread}/{@link #renderHandler}.
+     * These belong to the downscaler's private EGL context, NOT the AI-lane
+     * context, so they must be deleted from {@link #renderHandler}.
+     *
+     * <p>This is what stays on {@link #release}'s posted runnable; the
+     * direct-path cleanup migrated out via
+     * {@link #releaseDirectResources()}.
      */
     public void release() {
         initialized = false;
-        directInitialized = false;
-        syncInitialized = false;
 
         if (renderHandler != null) {
             renderHandler.post(() -> {
-                // Clean up double-buffered FBOs
-                if (directFbo >= 0) {
-                    GLES20.glDeleteFramebuffers(1, new int[]{directFbo}, 0);
-                    directFbo = -1;
-                }
-                if (directFbo2 >= 0) {
-                    GLES20.glDeleteFramebuffers(1, new int[]{directFbo2}, 0);
-                    directFbo2 = -1;
-                }
-                if (directTexture >= 0) {
-                    GLES20.glDeleteTextures(1, new int[]{directTexture}, 0);
-                    directTexture = -1;
-                }
-                if (directTexture2 >= 0) {
-                    GLES20.glDeleteTextures(1, new int[]{directTexture2}, 0);
-                    directTexture2 = -1;
-                }
-                if (syncFbo >= 0) {
-                    GLES20.glDeleteFramebuffers(1, new int[]{syncFbo}, 0);
-                    syncFbo = -1;
-                }
-                if (syncTexture >= 0) {
-                    GLES20.glDeleteTextures(1, new int[]{syncTexture}, 0);
-                    syncTexture = -1;
-                }
-                if (directProgram > 0) {
-                    GLES20.glDeleteProgram(directProgram);
-                    directProgram = -1;
-                }
-                
                 if (eglSurface != null && eglSurface != EGL14.EGL_NO_SURFACE) {
                     EGL14.eglDestroySurface(eglDisplay, eglSurface);
                 }

@@ -12,9 +12,9 @@
     <meta name="theme-color" content="#00876C">
     <script src="../shared/theme.js?v=3"></script>
     <script src="../shared/app-shell.js"></script>
-    <link rel="stylesheet" href="../shared/styles.css">
-    <link rel="stylesheet" href="../shared/leaflet.css" />
+    <link rel="stylesheet" href="../shared/leaflet.css">
     <script src="../shared/leaflet.js"></script>
+    <link rel="stylesheet" href="../shared/styles.css">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
 </head>
@@ -75,8 +75,8 @@
                                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18l6-6-6-6"/></svg>
                             </a>
                         </div>
-                        <div class="dash-location-map" style="height: 180px; border-radius: 8px; overflow: hidden; margin-bottom: 14px; position: relative; z-index: 1; border: 1px solid var(--border-subtle);">
-                            <div id="mapContainer" style="width: 100%; height: 100%; background: var(--bg-elevated);"></div>
+                        <div class="dash-location-map">
+                            <div id="mapContainer"></div>
                         </div>
                         <div class="dash-action-row">
                             <a class="dash-secondary-btn" href="live-view.html" data-i18n="dashboard.open_live_view">Open Live View</a>
@@ -108,13 +108,27 @@
                                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/><path d="M11 8v3l2 2"/></svg>
                                 <span data-i18n="dashboard.cmd_find">Find</span>
                             </button>
+                            <button class="dash-command" type="button" onclick="BYD.dashboard.command(this, '/api/vehicle/trunk', {action:'open'})">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2z"/><polyline points="12 11 12 6"/><polyline points="9 8 12 5 15 8"/></svg>
+                                <span data-i18n="dashboard.cmd_trunk_open">Open trunk</span>
+                            </button>
+                            <button class="dash-command" type="button" onclick="BYD.dashboard.command(this, '/api/vehicle/trunk', {action:'close'})">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2z"/><polyline points="12 9 12 14"/><polyline points="9 12 12 15 15 12"/></svg>
+                                <span data-i18n="dashboard.cmd_trunk_close">Close trunk</span>
+                            </button>
+                        </div>
+                        <div class="dash-command-grid dash-command-grid-media">
                             <a class="dash-command" href="live-view.html">
-                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m22 8-6 4 6 4V8Z"/><rect width="14" height="12" x="2" y="6" rx="2"/></svg>
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 8V6a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-6"/><path d="M2 12a9 9 0 0 0 8 8"/><circle cx="2" cy="12" r="2"/></svg>
                                 <span data-i18n="dashboard.cmd_live">Live</span>
                             </a>
                             <a class="dash-command" href="events.html">
-                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg>
-                                <span data-i18n="dashboard.cmd_events">Events</span>
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m22 8-6 4 6 4V8Z"/><rect width="14" height="12" x="2" y="6" rx="2"/></svg>
+                                <span data-i18n="dashboard.cmd_recordings">Recordings</span>
+                            </a>
+                            <a class="dash-command" href="trips.html">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 17h2v-7l4 4 4-4 4 4 4-4v7h2"/><path d="M4 5h16"/></svg>
+                                <span data-i18n="dashboard.cmd_trips">Trips</span>
                             </a>
                         </div>
                     </article>
@@ -355,54 +369,30 @@
             pointer-events: none;
         }
 
-        .dash-location-body {
-            min-height: 122px;
-            display: flex;
-            align-items: center;
-            gap: 16px;
-            padding: 18px;
+        .dash-location-map {
             border-radius: 8px;
-            background: var(--bg-elevated);
             border: 1px solid var(--border-subtle);
+            background: var(--bg-elevated);
+            overflow: hidden;
             margin-bottom: 14px;
         }
 
-        .dash-location-pin {
-            width: 52px;
-            height: 52px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            color: var(--brand-primary);
-            background: rgba(0, 212, 170, 0.10);
-            border-radius: 8px;
-            flex: 0 0 auto;
-        }
-
-        .dash-location-pin svg { width: 28px; height: 28px; }
-
-        .dash-location-body strong,
-        .dash-location-body span {
-            display: block;
-        }
-
-        .dash-location-body strong {
-            font-size: 17px;
-            color: var(--text-primary);
-            line-height: 1.25;
-            overflow-wrap: anywhere;
-        }
-
-        .dash-location-body span {
-            color: var(--text-muted);
-            font-size: 13px;
-            margin-top: 4px;
+        .dash-location-map #mapContainer {
+            width: 100%;
+            height: 180px;
         }
 
         .dash-command-grid {
             display: grid;
             grid-template-columns: repeat(3, minmax(0, 1fr));
             gap: 10px;
+        }
+
+        /* Recordings/Trips/Live live in their own grid below the vehicle controls.
+           Always 3 columns regardless of viewport — only 3 items, never wraps. */
+        .dash-command-grid-media {
+            margin-top: 10px;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
         }
 
         .dash-command {
@@ -481,6 +471,16 @@
             .dash-command-grid,
             .dash-metric-grid {
                 grid-template-columns: 1fr 1fr;
+            }
+            /* Media tiles (Live / Recordings / Trips) stay 3 across so the
+               row never widows a single tile on a second line. */
+            .dash-command-grid-media {
+                grid-template-columns: repeat(3, minmax(0, 1fr));
+                gap: 8px;
+            }
+            .dash-command-grid-media .dash-command {
+                min-height: 64px;
+                font-size: 12px;
             }
             .dash-location-card,
             .dash-actions-card,
@@ -600,28 +600,12 @@
                 else setText('dashNetwork', '--');
 
                 if (status.gps && status.gps.hasLocation) {
-                    var lat = Number(status.gps.lat);
-                    var lng = Number(status.gps.lng);
-                    var meta = [];
-                    setText('dashLocationValue', lat.toFixed(5) + ', ' + lng.toFixed(5));
-                    if (status.gps.lastUpdate) meta.push(timeAgo(status.gps.lastUpdate));
-                    // km/h and deg are in the glossary (or terse enough to
-                    // read across locales) — leave the unit suffixes raw
-                    // and only translate the heading abbreviation.
-                    if (status.gps.speed !== undefined) meta.push(Math.round(status.gps.speed) + ' km/h');
-                    if (status.gps.heading !== undefined) {
-                        meta.push(Math.round(status.gps.heading) + ' ' + (BYD.i18n.t('dashboard.unit_deg') || 'deg'));
-                    }
-                    var positionAvailable = BYD.i18n.t('dashboard.position_available') || 'Position available';
-                    setText('dashLocationMeta', meta.length ? meta.join(' · ') : positionAvailable);
                     var stale = status.gps.isCached || status.gps.isStale;
                     var gpsChip = stale
                         ? (BYD.i18n.t('dashboard.chip_gps_cached') || 'GPS cached')
                         : (BYD.i18n.t('dashboard.chip_gps_live') || 'GPS live');
                     setChip('dashGpsChip', gpsChip, stale ? 'warn' : 'good');
                 } else {
-                    setText('dashLocationValue', BYD.i18n.t('dashboard.no_gps_fix') || 'No GPS fix');
-                    setText('dashLocationMeta', BYD.i18n.t('dashboard.gps_waiting') || 'Waiting for vehicle position');
                     setChip('dashGpsChip', BYD.i18n.t('dashboard.chip_gps_pending') || 'GPS --', '');
                 }
             },

@@ -783,22 +783,60 @@ public class SohEstimator {
             VehicleDataMonitor vdm = VehicleDataMonitor.getInstance();
             BatterySocData socData = vdm.getBatterySoc();
             BydVehicleData vd = vdm.getVd();
-            // Read RAW vd.remainKwh, never getBatteryRemainPowerKwh() — the
-            // helper synthesizes from currentSoh on PHEV/bad-BMS paths and
-            // would seed SOH from itself (defaulting to 100% baseline).
-            if (vd == null || Double.isNaN(vd.remainKwh) || vd.remainKwh <= 0) return;
-            if (socData == null || socData.socPercent < 10 || socData.socPercent > 100) return;
-            double rawRemainKwh = vd.remainKwh;
-            double impliedCap = rawRemainKwh / (socData.socPercent / 100.0);
-            double ratio = impliedCap / nominalCapacityKwh;
-            // Junk BMS reading — refuse to seed rather than baking in nonsense.
-            if (ratio < 0.5 || ratio > 1.5) return;
-            double highCellV = Double.isNaN(vd.highCellVoltage) ? Double.NaN : vd.highCellVoltage;
-            double soh = computeLiveSoh(rawRemainKwh, socData.socPercent, highCellV);
-            if (soh > 0) {
-                currentSoh = soh;
+            // Try the energy-based seed first. Read RAW vd.remainKwh, never
+            // getBatteryRemainPowerKwh() — the helper synthesizes from
+            // currentSoh on PHEV / bad-BMS paths and would loop SOH back
+            // into itself, locking the estimate at the seed value forever.
+            boolean energySeedFired = false;
+            if (vd != null && !Double.isNaN(vd.remainKwh) && vd.remainKwh > 0
+                    && socData != null
+                    && socData.socPercent >= 10 && socData.socPercent <= 100) {
+                double rawRemainKwh = vd.remainKwh;
+                double impliedCap = rawRemainKwh / (socData.socPercent / 100.0);
+                double ratio = impliedCap / nominalCapacityKwh;
+                // Refuse junk BMS readings (ratio outside 50-150% of nominal).
+                // On PHEVs hit by the SOC-as-kWh firmware bug this is the
+                // common reject path even AFTER BydDataCollector's mimic
+                // guard, because we may have seeded mid-cycle before the
+                // PHEV-native getBatteryPowerHEV path filled vd.remainKwh.
+                if (ratio >= 0.5 && ratio <= 1.5) {
+                    double highCellV = Double.isNaN(vd.highCellVoltage) ? Double.NaN : vd.highCellVoltage;
+                    double soh = computeLiveSoh(rawRemainKwh, socData.socPercent, highCellV);
+                    if (soh > 0) {
+                        currentSoh = soh;
+                        persistEstimate();
+                        energySeedFired = true;
+                        logger.info("Initial SOH seeded: " + String.format("%.1f", soh) + "%");
+                    }
+                }
+            }
+
+            // Always-persist tail. v15.6 had this and v17 lost it during the
+            // SohEstimator rewrite — without it, vehicles whose first poll
+            // can't satisfy the energy seed (PHEV firmware bug, SOC out of
+            // range, junk BMS readings) never write a SOH line to disk and
+            // /api/performance/soh stays empty forever. Falling back to a
+            // 100% baseline is safe: the calibration anchor refines it as
+            // soon as the user does a real charging session, and live SOH
+            // updateFromEnergy() takes over once vd.remainKwh becomes
+            // trustworthy (e.g. when getBatteryPowerHEV starts reporting).
+            if (!hasEstimate()) {
+                String why;
+                if (socData == null) {
+                    why = "no SOC data";
+                } else if (socData.socPercent < 10) {
+                    why = "SOC " + String.format("%.0f", socData.socPercent) + "% below seed threshold";
+                } else if (socData.socPercent > 100) {
+                    why = "SOC out of range";
+                } else if (vd == null || Double.isNaN(vd.remainKwh) || vd.remainKwh <= 0) {
+                    why = "no remainKwh from BMS";
+                } else {
+                    why = "energy reading rejected by ratio gate";
+                }
+                logger.info("Seeding SOH at 100% baseline (" + why + ") — nominal="
+                    + String.format("%.2f", nominalCapacityKwh) + " kWh");
+                currentSoh = 100.0;
                 persistEstimate();
-                logger.info("Initial SOH seeded: " + String.format("%.1f", soh) + "%");
             }
         } catch (Exception e) {
             logger.debug("Initial SOH seed failed: " + e.getMessage());

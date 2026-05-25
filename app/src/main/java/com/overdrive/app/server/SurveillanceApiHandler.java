@@ -609,16 +609,22 @@ public class SurveillanceApiHandler {
             JSONObject configJson = new JSONObject(body);
 
             // ---- Camera profile selection (vehicle class) ----
+            // Surfaces save failures back to the caller — saveCameraProfile
+            // returns false when the unified-config write fails (filesystem
+            // permission on app-UID writes is the common case on this device).
             if (configJson.has("cameraProfile")
                     || configJson.optBoolean("clearCameraProfile", false)) {
                 String requestedProfile = configJson.optBoolean("clearCameraProfile", false)
                     ? com.overdrive.app.camera.CameraProfiles.PROFILE_AUTO
                     : configJson.optString("cameraProfile",
                         com.overdrive.app.camera.CameraProfiles.PROFILE_AUTO);
-                if (com.overdrive.app.camera.CameraConfigResolver
+                if (!com.overdrive.app.camera.CameraConfigResolver
                         .saveCameraProfile(requestedProfile)) {
-                    CameraDaemon.log("Camera profile saved: " + requestedProfile);
+                    HttpResponse.sendJsonError(out,
+                        "Failed to save camera profile: " + requestedProfile);
+                    return;
                 }
+                CameraDaemon.log("Camera profile saved: " + requestedProfile);
             }
 
             // ---- Camera role → source mapping (diagnostics camera-mapping dialog) ----
@@ -1213,47 +1219,83 @@ public class SurveillanceApiHandler {
                 }
             }
             
-            // Manual camera ID override. Saved width/height come from the
-            // resolved profile so the persisted record stays self-consistent
-            // (Tang manual-override keeps Tang's 720 height, not Seal's 960).
+            // Manual camera ID override. Persists into the same `camera`
+            // section keys the new resolver reads (probedCameraId,
+            // probedSurfaceMode, probedWidth, probedHeight, probedAndValidated,
+            // manualOverride), with width/height pulled from the resolved
+            // profile so a Tang override keeps Tang's 720 height, not Seal's 960.
+            //
+            // Surfaces save failures back to the caller — UnifiedConfigManager
+            // can return false on this device when the app UID can't write
+            // /data/local/tmp/overdrive_config.json (EACCES). Previously we
+            // swallowed the failure and still answered success, leaving the
+            // dialog reporting "saved" while the disk record was unchanged.
+            // Also writes the manualOverride keys + camera section atomically
+            // via UnifiedConfigManager.updateSection so a partial write can't
+            // leave the resolver reading inconsistent state.
             if (configJson.has("manualCameraId")) {
                 int camId = configJson.optInt("manualCameraId", -1);
                 if (camId >= 0 && camId <= 5) {
+                    com.overdrive.app.camera.ResolvedCameraConfig resolvedCamera =
+                        com.overdrive.app.camera.CameraConfigResolver.resolve();
+                    org.json.JSONObject camCfg = new org.json.JSONObject();
                     try {
-                        com.overdrive.app.camera.ResolvedCameraConfig resolvedCamera =
-                            com.overdrive.app.camera.CameraConfigResolver.resolve();
-                        org.json.JSONObject camCfg = new org.json.JSONObject();
                         camCfg.put("probedCameraId", camId);
                         camCfg.put("probedSurfaceMode", resolvedCamera.getPanoSurfaceMode());
                         camCfg.put("probedWidth", resolvedCamera.getPanoWidth());
                         camCfg.put("probedHeight", resolvedCamera.getPanoHeight());
                         camCfg.put("probedAndValidated", true);
+                        camCfg.put("fallbackFromProbe", false);
                         camCfg.put("manualOverride", true);
-                        com.overdrive.app.config.UnifiedConfigManager.updateSection("camera", camCfg);
-                        CameraDaemon.log("Manual camera ID set: " + camId + " (will take effect on next restart)");
-                    } catch (Exception e) {
-                        CameraDaemon.log("Failed to save manual camera ID: " + e.getMessage());
+                    } catch (org.json.JSONException je) {
+                        HttpResponse.sendJsonError(out, "Failed to build camera config: " + je.getMessage());
+                        return;
                     }
+                    boolean saved = com.overdrive.app.config.UnifiedConfigManager
+                        .updateSection("camera", camCfg);
+                    if (!saved) {
+                        CameraDaemon.log("Failed to persist manual camera ID " + camId
+                            + " — UnifiedConfigManager.updateSection returned false");
+                        HttpResponse.sendJsonError(out,
+                            "Could not persist camera config (filesystem permission?)");
+                        return;
+                    }
+                    CameraDaemon.log("Manual camera ID set: " + camId
+                        + " (will take effect on next pipeline init)");
                     configChanged = true;
+                } else {
+                    HttpResponse.sendJsonError(out,
+                        "manualCameraId must be in range 0..5, got " + camId);
+                    return;
                 }
             }
             if (configJson.has("clearManualCameraId")
                     && configJson.optBoolean("clearManualCameraId", false)) {
+                com.overdrive.app.camera.ResolvedCameraConfig resolvedCamera =
+                    com.overdrive.app.camera.CameraConfigResolver.resolve();
+                org.json.JSONObject camCfg = new org.json.JSONObject();
                 try {
-                    com.overdrive.app.camera.ResolvedCameraConfig resolvedCamera =
-                        com.overdrive.app.camera.CameraConfigResolver.resolve();
-                    org.json.JSONObject camCfg = new org.json.JSONObject();
                     camCfg.put("probedCameraId", -1);
                     camCfg.put("probedSurfaceMode", -1);
                     camCfg.put("probedWidth", resolvedCamera.getPanoWidth());
                     camCfg.put("probedHeight", resolvedCamera.getPanoHeight());
                     camCfg.put("probedAndValidated", false);
+                    camCfg.put("fallbackFromProbe", false);
                     camCfg.put("manualOverride", false);
-                    com.overdrive.app.config.UnifiedConfigManager.updateSection("camera", camCfg);
-                    CameraDaemon.log("Manual camera ID cleared — will auto-detect on next restart");
-                } catch (Exception e) {
-                    CameraDaemon.log("Failed to clear manual camera ID: " + e.getMessage());
+                } catch (org.json.JSONException je) {
+                    HttpResponse.sendJsonError(out, "Failed to build camera config: " + je.getMessage());
+                    return;
                 }
+                boolean saved = com.overdrive.app.config.UnifiedConfigManager
+                    .updateSection("camera", camCfg);
+                if (!saved) {
+                    CameraDaemon.log("Failed to clear manual camera ID — "
+                        + "UnifiedConfigManager.updateSection returned false");
+                    HttpResponse.sendJsonError(out,
+                        "Could not persist camera config (filesystem permission?)");
+                    return;
+                }
+                CameraDaemon.log("Manual camera ID cleared — will auto-detect on next pipeline init");
                 configChanged = true;
             }
 

@@ -24,6 +24,7 @@
     "dashboard_title": "แดชบอร์ด - OverDrive"
   },
   "nav": {
+    "dashboard": "แดชบอร์ด",
     "live_view": "ภาพสด",
     "events": "เหตุการณ์",
     "surveillance": "เฝ้าระวัง",
@@ -44,9 +45,8 @@
     "overview_group": "วิวรวม",
     "vehicle_group": "รถยนต์",
     "about_group": "เกี่ยวกับ",
-    "telegram": "Telegram",
-    "dashboard": "แดชบอร์ด",
-    "brand_home": "OverDrive — เปิดแดชบอร์ด"
+    "brand_home": "OverDrive — เปิดแดชบอร์ด",
+    "telegram": "Telegram"
   },
   "status": {
     "device": "อุปกรณ์",
@@ -1665,7 +1665,9 @@
     "cmd_flash": "กระพริบไฟ",
     "cmd_find": "ค้นหารถ",
     "cmd_live": "ภาพสด",
-    "cmd_events": "เหตุการณ์",
+    "cmd_trunk_open": "เปิดกระเป๋าเดินทาง",
+    "cmd_trunk_close": "กระเป๋าเดินทางปิด",
+    "cmd_trips": "การเดินทาง",
     "metric_battery": "แบตเตอรี่",
     "metric_range": "ระยะทาง",
     "metric_network": "เครือข่าย",
@@ -1679,6 +1681,7 @@
     "time_hours_ago": "{n} ชม.ที่แล้ว",
     "toast_command_sent": "ส่งคำสั่งแล้ว",
     "toast_command_failed": "ส่งคำสั่งไม่สำเร็จ",
-    "toast_no_location": "ไม่มีข้อมูลตำแหน่งรถ"
+    "toast_no_location": "ไม่มีข้อมูลตำแหน่งรถ",
+    "cmd_recordings": "การบันทึก"
   }
 }

@@ -143,21 +143,16 @@ class DaemonLauncher(
         callback.onLog("Deploying watchdog script...")
         
         // Step 1: Kill old processes and clean up.
-        // CRITICAL: Kill the watchdog script FIRST so it can't respawn the daemon
-        // between the two pkill calls. Reversing the order here causes the old
-        // watchdog to relaunch the daemon, and the fresh watchdog we're about
-        // to start loses the singleton lock race ("Another CameraDaemon instance
-        // is already running. Exiting.").
+        // Single broad pkill on 'cam_daemon' takes out start_cam_daemon (watchdog),
+        // byd_cam_daemon (daemon), and any orphans in one syscall — so neither
+        // can respawn the other between calls. No sleep race needed.
         // Also clear the disable sentinel — user is explicitly starting the daemon.
         val cleanupCmd = buildString {
             append("rm -f /data/local/tmp/camera_daemon.disabled 2>/dev/null; ")
-            append("pkill -9 -f 'start_cam_daemon' 2>/dev/null; ")
-            append("rm -f $scriptPath /data/local/tmp/cam_watchdog.pid 2>/dev/null; ")
-            append("sleep 1; ")
-            append("pkill -9 -f '$CAMERA_DAEMON_PROCESS' 2>/dev/null; ")
+            append("pkill -9 -f 'cam_daemon' 2>/dev/null; ")
             append("killall -9 $CAMERA_DAEMON_PROCESS 2>/dev/null; ")
-            append("rm -f /data/local/tmp/camera_daemon.lock 2>/dev/null; ")
-            append("sleep 1; echo done")
+            append("rm -f $scriptPath /data/local/tmp/cam_watchdog.pid /data/local/tmp/camera_daemon.lock 2>/dev/null; ")
+            append("echo done")
         }
         
         adbShellExecutor.execute(
@@ -624,18 +619,14 @@ class DaemonLauncher(
         logManager.debug(TAG, "Deploying Immortal Watchdog Script for AccSentryDaemon...")
         callback.onLog("Deploying watchdog script via ADB (UID 2000)...")
         
-        // Step 1: Kill EVERYTHING - daemon process, watchdog script, and any shell running the script
-        // Use multiple kill strategies to ensure complete cleanup:
-        // 1. pkill -f 'acc_sentry' - kills daemon by nice-name
-        // 2. pkill -f 'start_acc_sentry.sh' - kills watchdog script by script name
-        // 3. Kill any 'sh' process with the script in cmdline
+        // Step 1: Kill EVERYTHING in one syscall — single pkill on the broad
+        // 'acc_sentry' pattern takes out start_acc_sentry.sh (watchdog),
+        // acc_sentry_daemon (daemon), and any AccSentryDaemon class-loader
+        // shell wrappers simultaneously, so nothing survives to respawn anything.
         val cleanupCmd = buildString {
-            append("pkill -9 -f 'acc_sentry_daemon' 2>/dev/null; ")
-            append("pkill -9 -f 'start_acc_sentry.sh' 2>/dev/null; ")
-            append("pkill -9 -f 'AccSentryDaemon' 2>/dev/null; ")
-            append("rm -f $lockFilePath 2>/dev/null; ")
-            append("rm -f $watchdogScriptPath 2>/dev/null; ")
-            append("sleep 1; echo done")
+            append("pkill -9 -f 'acc_sentry' 2>/dev/null; ")
+            append("rm -f $lockFilePath $watchdogScriptPath 2>/dev/null; ")
+            append("echo done")
         }
         
         adbShellExecutor.execute(
@@ -1044,7 +1035,7 @@ class DaemonLauncher(
         callback.onLog("Stopping TelegramBotDaemon...")
         
         adbShellExecutor.execute(
-            command = "pkill -9 -f $TELEGRAM_DAEMON_PROCESS 2>/dev/null; rm -f /data/local/tmp/telegram_bot_daemon.lock 2>/dev/null; echo done",
+            command = "pkill -9 -f 'telegram_bot_daemon' 2>/dev/null; rm -f /data/local/tmp/telegram_bot_daemon.lock 2>/dev/null; echo done",
             callback = object : AdbShellExecutor.ShellCallback {
                 override fun onSuccess(output: String) {
                     logManager.info(TAG, "TelegramBotDaemon stopped")
@@ -1395,8 +1386,12 @@ class DaemonLauncher(
      */
     private fun killDaemonViaPrivilegedShell(processName: String, callback: LaunchCallback) {
         val killCmd = if (processName == CAMERA_DAEMON_PROCESS) {
-            // Write disable sentinel FIRST, then kill watchdog, then daemon
-            "echo 'disabled by ui at \$(date)' > /data/local/tmp/camera_daemon.disabled; pkill -9 -f 'start_cam_daemon'; rm -f /data/local/tmp/start_cam_daemon.sh /data/local/tmp/cam_watchdog.pid; sleep 1; pkill -9 -f '$processName'; rm -f /data/local/tmp/camera_daemon.lock"
+            // Hard kill the whole cam_daemon family FIRST — single pkill on the
+            // broad pattern catches start_cam_daemon (watchdog), byd_cam_daemon
+            // (daemon), and any orphans in one syscall. Then write the disable
+            // sentinel and clean up state files. No sleep needed because nothing
+            // is left alive to respawn anything.
+            "pkill -9 -f 'cam_daemon' 2>/dev/null; echo 'disabled by ui at \$(date)' > /data/local/tmp/camera_daemon.disabled; rm -f /data/local/tmp/start_cam_daemon.sh /data/local/tmp/cam_watchdog.pid /data/local/tmp/camera_daemon.lock 2>/dev/null"
         } else {
             "pkill -9 -f '$processName'"
         }
@@ -1432,19 +1427,18 @@ class DaemonLauncher(
             "rm -f /data/local/tmp/start_acc_sentry.sh 2>/dev/null; " +
             "echo done"
         } else if (processName == CAMERA_DAEMON_PROCESS) {
-            // CRITICAL: Kill watchdog FIRST, wait, then kill daemon, then clean up
-            // If we kill daemon first, watchdog respawns it before we can kill the watchdog
-            "pkill -9 -f 'start_cam_daemon' 2>/dev/null; " +
-            "rm -f /data/local/tmp/start_cam_daemon.sh 2>/dev/null; " +
-            "sleep 1; " +
-            "pkill -9 -f '$processName' 2>/dev/null; " +
+            // Hard kill the whole cam_daemon family FIRST in one syscall — pkill
+            // -f 'cam_daemon' matches start_cam_daemon (watchdog), byd_cam_daemon
+            // (daemon), and any orphans simultaneously, so nothing survives to
+            // respawn anything. Then clean up script + lock files.
+            "pkill -9 -f 'cam_daemon' 2>/dev/null; " +
             "killall -9 $processName 2>/dev/null; " +
-            "rm -f /data/local/tmp/camera_daemon.lock 2>/dev/null; " +
+            "rm -f /data/local/tmp/start_cam_daemon.sh /data/local/tmp/camera_daemon.lock 2>/dev/null; " +
             "echo done"
         } else {
             "pkill -9 -f '$processName' 2>/dev/null; killall -9 $processName 2>/dev/null; echo done"
         }
-        
+
         adbShellExecutor.execute(
             command = killCmd,
             callback = object : AdbShellExecutor.ShellCallback {
@@ -1470,8 +1464,11 @@ class DaemonLauncher(
     private fun killDaemonViaBothShells(processName: String, callback: LaunchCallback) {
         // First try privileged shell
         val privKillCmd = if (processName == CAMERA_DAEMON_PROCESS) {
-            // Write disable sentinel FIRST, then kill watchdog, then daemon
-            "echo 'disabled by ui at \$(date)' > /data/local/tmp/camera_daemon.disabled; pkill -9 -f 'start_cam_daemon'; rm -f /data/local/tmp/start_cam_daemon.sh /data/local/tmp/cam_watchdog.pid; sleep 1; pkill -9 -f '$processName'; rm -f /data/local/tmp/camera_daemon.lock"
+            // Hard kill the whole cam_daemon family FIRST in one syscall, then
+            // write the disable sentinel and clean up. See killDaemonViaPrivilegedShell
+            // for the rationale — broad pkill -f 'cam_daemon' matches watchdog
+            // and daemon together so neither has time to respawn the other.
+            "pkill -9 -f 'cam_daemon' 2>/dev/null; echo 'disabled by ui at \$(date)' > /data/local/tmp/camera_daemon.disabled; rm -f /data/local/tmp/start_cam_daemon.sh /data/local/tmp/cam_watchdog.pid /data/local/tmp/camera_daemon.lock 2>/dev/null"
         } else {
             "pkill -9 -f '$processName'"
         }
@@ -1484,12 +1481,10 @@ class DaemonLauncher(
             "rm -f /data/local/tmp/acc_sentry_daemon.lock 2>/dev/null; " +
             "rm -f /data/local/tmp/start_acc_sentry.sh 2>/dev/null"
         } else if (processName == CAMERA_DAEMON_PROCESS) {
-            "pkill -9 -f 'start_cam_daemon' 2>/dev/null; " +
-            "rm -f /data/local/tmp/start_cam_daemon.sh 2>/dev/null; " +
-            "sleep 1; " +
-            "pkill -9 -f '$processName' 2>/dev/null; " +
+            // Hard kill the cam_daemon family in one syscall, then clean state.
+            "pkill -9 -f 'cam_daemon' 2>/dev/null; " +
             "killall -9 $processName 2>/dev/null; " +
-            "rm -f /data/local/tmp/camera_daemon.lock 2>/dev/null"
+            "rm -f /data/local/tmp/start_cam_daemon.sh /data/local/tmp/camera_daemon.lock 2>/dev/null"
         } else {
             "pkill -9 -f '$processName' 2>/dev/null; killall -9 $processName 2>/dev/null"
         }

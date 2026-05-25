@@ -4,7 +4,6 @@ import android.content.Context
 import com.overdrive.app.logging.DaemonLogger
 import org.tensorflow.lite.Interpreter
 import org.tensorflow.lite.DataType
-import org.tensorflow.lite.gpu.GpuDelegate
 import org.tensorflow.lite.support.common.FileUtil
 import org.tensorflow.lite.support.common.ops.NormalizeOp
 import org.tensorflow.lite.support.image.ImageProcessor
@@ -29,37 +28,62 @@ data class Detection(
 )
 
 /**
- * YOLO11n TensorFlow Lite Detector with GPU Acceleration
- * 
- * SOTA Implementation:
- * - GPU delegate for <20% CPU usage
- * - Native C++ ImageProcessor (10x faster, SIMD-accelerated)
- * - Bilinear resizing for better accuracy on distant objects
+ * YOLO11n TensorFlow Lite Detector — CPU-only (XNNPACK).
+ *
+ * **Why CPU and not GPU on this hardware.** The Snapdragon 662 / Adreno 610
+ * is a unified-memory SoC: the H.265 hardware encoder, the Adreno GPU's
+ * compute units, and the CPU all share one DDR4 memory controller. When
+ * YOLO ran via the TFLite GPU delegate concurrently with the surveillance
+ * recording pipeline, OpenCL kernels saturated Adreno's compute units AND
+ * the memory bus simultaneously. The encoder's per-frame input fetch + ref
+ * frame access lost bandwidth, which manifested as 200–300 ms eglSwapBuffers
+ * stalls on the encoder GL thread — visible in recordings as freeze+skip
+ * during event windows where YOLO was busy.
+ *
+ * Tier 1+2 (separate AI-lane GL thread, PBO async readback) eliminated
+ * GL-pipeline contention but did NOT touch the underlying memory-bandwidth
+ * contention because YOLO inference itself was still GPU-bound. The only
+ * physical bypass is to move inference off the GPU entirely.
+ *
+ * **Why XNNPACK 4-thread.** TFLite's CPU backend ships XNNPACK by default
+ * (since 2.5). On ARM it dispatches to NEON SIMD kernels, and at 4 threads
+ * the inference cost on this hardware is ~200–300 ms vs ~50–80 ms via GPU
+ * delegate. That is well within {@code AI_COOLDOWN_MS = 500 ms}, so the
+ * trigger pathway sees no regression. The 150–200 ms additional latency is
+ * invisible to the user-facing trigger contract.
+ *
+ * **Thread isolation strategy (Android 10/11/12 portable).** The
+ * {@code aiExecutor} thread that calls into this detector runs at
+ * {@code Process.THREAD_PRIORITY_BACKGROUND} (nice +10). XNNPACK's worker
+ * pthreads inherit this nice value at spawn time. The encoder/drainer
+ * threads run at {@code THREAD_PRIORITY_FOREGROUND} (nice -2), giving a
+ * 12-point CFS priority gradient — the encoder side wins scheduler
+ * contention by ~10× weight regardless of which cores either thread lands
+ * on. On Android 10 the priority demotion ALSO confines these threads to
+ * the {@code background} cpuset (cores 0-3, A53 silver cluster); on
+ * Android 11+ EAS scheduling can migrate them under load, but the CFS
+ * gradient alone is what's portable and what actually keeps the encoder
+ * fed. The aiExecutor ALSO re-applies {@code THREAD_PRIORITY_BACKGROUND}
+ * at task entry as a defense against EAS migration that may otherwise
+ * reset the thread's priority class on long-lived executors.
+ *
+ * **Why not NNAPI.** Field-tested on this hardware: ~538 of ~546 ops fall
+ * through to XNNPACK on CPU anyway (the NNAPI driver only accelerates a
+ * handful of ops). Effective inference time ≈ pure CPU mode minus a small
+ * dispatch overhead — no benefit, more code surface, more failure modes.
+ *
+ * SOTA Implementation properties retained from prior version:
+ * - Native C++ ImageProcessor (SIMD-accelerated bilinear resize + normalize)
  * - Pre-allocated buffers (zero GC churn)
  * - Cache-friendly output parsing
  * - Height filter before NMS
  * - Ghost filter (max 50 detections)
  */
 class YoloDetector(private val context: Context) {
-    
-    private val logger = DaemonLogger.getInstance("YoloDetector")
-    
-    private var interpreter: Interpreter? = null
-    private var gpuDelegate: GpuDelegate? = null
-    private var isGpuEnabled = false
 
-    // True from the moment we hand work to interp.run() until the result
-    // tensor has been read back. On the GPU delegate path (Adreno 610),
-    // interp.run() returns as soon as the OpenCL command is enqueued, but
-    // the actual GPU work is still draining — anything that touches the
-    // GPU during that window (glReadPixels for the AI lane, mosaic shader
-    // for the next encoder frame) will block until the queue drains and
-    // produces the 280ms aiReadback stalls seen in field logs. The GL
-    // thread checks isGpuJobInFlight() before issuing a fresh readback so
-    // the pipeline isn't piled up with blocking GL ops behind the YOLO
-    // OpenCL job.
-    @Volatile
-    private var gpuJobInFlight: Boolean = false
+    private val logger = DaemonLogger.getInstance("YoloDetector")
+
+    private var interpreter: Interpreter? = null
 
     // Monitor that mutually excludes inference (interp.run) from
     // close() / re-init. Without it, a UI/IPC-thread close() can free
@@ -71,7 +95,6 @@ class YoloDetector(private val context: Context) {
 
     // SOTA: Pre-allocate all buffers to avoid GC
     private var inputImageBuffer: TensorImage? = null
-    private var inputByteBuffer: ByteBuffer? = null  // Reused for zero-copy
     private var outputBuffer: ByteBuffer? = null
 
     // Reusable shaped input buffer. Re-create only when image dimensions
@@ -84,17 +107,39 @@ class YoloDetector(private val context: Context) {
     private var shapedBufferH: Int = -1
     private var shapedBuffer: TensorBuffer? = null
     private var floatOutput: FloatArray? = null
-    
+
     // Model configuration
     private val modelPath = "models/yolo11n.tflite"
     private val inputSize = 640
-    
-    // SOTA: Native C++ image processor (10x faster than manual loops)
-    // Uses SIMD-accelerated bilinear resize + normalize
-    private val imageProcessor = ImageProcessor.Builder()
-        .add(ResizeOp(inputSize, inputSize, ResizeOp.ResizeMethod.BILINEAR))  // Better accuracy
-        .add(NormalizeOp(0f, 255f))  // Normalize 0-255 -> 0.0-1.0
-        .build()
+
+    // INT8 / FP32 model auto-detection. The Android side stays compatible
+    // with both yolo11n.tflite variants (FP32 default, INT8 produced by
+    // dev/quantize_yolo_int8.py) — init() inspects the loaded interpreter
+    // and routes preprocessing accordingly. There is no per-detect()
+    // overhead from this; the routing decision is cached.
+    //
+    // FP32 path: ImageProcessor does Resize + Normalize(0..1); output is
+    //   already float, no dequant needed.
+    // INT8 path: ImageProcessor does Resize only (the int8 input tensor's
+    //   embedded scale/zero_point handles the [0,255] -> int8 mapping
+    //   inside the interpreter); output is int8 and must be dequantized
+    //   to float via (raw - zeroPoint) * scale before parseOutput.
+    //
+    // outputIsQuantized governs the output post-processing path. For
+    // YOLOv11n int8 export the Ultralytics pipeline emits a single output
+    // tensor with shape [1, 84, 8400] of dtype UINT8 with non-trivial
+    // (scale, zero_point) — same shape as FP32 so parseOutput's iteration
+    // is unchanged after dequant.
+    private var inputIsQuantized = false
+    private var outputIsQuantized = false
+    private var outputScale = 0f
+    private var outputZeroPoint = 0
+    private var int8OutputBuffer: ByteArray? = null  // raw output for int8 path
+
+    // SOTA: Native C++ image processor (SIMD-accelerated bilinear resize
+    // + optional normalize). Built lazily in init() once we know the
+    // input tensor dtype.
+    private var imageProcessor: ImageProcessor? = null
     
     // COCO class IDs
     companion object {
@@ -120,106 +165,91 @@ class YoloDetector(private val context: Context) {
     }
     
     /**
-     * Initialize the detector with hardware acceleration.
-     * Fallback chain: GPU delegate → NNAPI (Hexagon DSP) → CPU (4 threads)
-     *
-     * DiLink 5 (Adreno 643 / Snapdragon 662) has incomplete OpenCL support —
-     * the GPU delegate fails on DEQUANTIZE/SPLIT ops. However, the Qualcomm
-     * NNAPI driver routes to the Hexagon DSP which handles quantized models
-     * well (~50-80ms vs ~200-300ms on CPU).
-     *
-     * NOTE: a previous revision tried NNAPI first to avoid GPU contention
-     * with the H.264/H.265 encoder. On this device's NNAPI-SL implementation
-     * only ~8 of ~546 ops actually run on the hardware accelerator and the
-     * rest fall through to XNNPACK on CPU (see the
-     * "SL_ANeuralNetworksDiagnostic_registerCallbacks" warnings) — making
-     * NNAPI ≈ CPU here. So GPU first remains correct on this hardware.
+     * Initialize the detector. CPU-only (XNNPACK 4-thread). See class
+     * doc for the rationale on why GPU/NNAPI tiers were removed.
      */
     fun init(): Boolean {
         try {
-            // CRITICAL: Load TFLite native libraries explicitly for daemon mode
+            // Load TFLite's CPU JNI library explicitly — daemon-mode
+            // processes don't always run JVM-side static linking
+            // automatically. tensorflowlite_gpu_jni is intentionally not
+            // loaded; the GPU delegate is no longer a dependency.
             try {
                 System.loadLibrary("tensorflowlite_jni")
-                System.loadLibrary("tensorflowlite_gpu_jni")
-                logger.info("TFLite native libraries loaded")
+                logger.info("TFLite native library loaded (CPU-only)")
             } catch (e: UnsatisfiedLinkError) {
-                logger.error("Failed to load TFLite native libraries: ${e.message}")
+                logger.error("Failed to load TFLite native library: ${e.message}")
                 return false
             }
 
             val modelFile = FileUtil.loadMappedFile(context, modelPath)
 
-            // === TIER 1: GPU Delegate ===
-            var loaded = false
+            // CPU XNNPACK, 4 threads. Worker pthreads inherit nice +10
+            // from the calling aiExecutor thread; the 12-point CFS gradient
+            // versus the encoder/drainer (nice -2) keeps the encoder fed
+            // even when YOLO threads happen to land on the same physical
+            // core.
             try {
-                val gpuOptions = Interpreter.Options()
-                gpuDelegate = GpuDelegate()
-                gpuOptions.addDelegate(gpuDelegate)
-                logger.info("Trying GPU delegate...")
-
-                interpreter = Interpreter(modelFile, gpuOptions)
+                val cpuOptions = Interpreter.Options()
+                cpuOptions.setNumThreads(4)
+                interpreter = Interpreter(modelFile, cpuOptions)
                 interpreter!!.allocateTensors()
-
-                isGpuEnabled = true
-                loaded = true
-                logger.info("GPU delegate applied successfully")
-            } catch (e: Throwable) {
-                logger.warn("GPU delegate failed: ${e.javaClass.simpleName}: ${e.message}")
-                interpreter?.close()
-                interpreter = null
-                gpuDelegate?.close()
-                gpuDelegate = null
-                isGpuEnabled = false
+            } catch (e: Exception) {
+                logger.error("Failed to initialize TFLite CPU interpreter: ${e.message}", e)
+                return false
             }
 
-            // === TIER 2: NNAPI (Hexagon DSP on Qualcomm) ===
-            if (!loaded) {
-                try {
-                    val nnapiOptions = Interpreter.Options()
-                    nnapiOptions.setUseNNAPI(true)
-                    logger.info("Trying NNAPI delegate (Hexagon DSP)...")
-
-                    interpreter = Interpreter(modelFile, nnapiOptions)
-                    interpreter!!.allocateTensors()
-
-                    isGpuEnabled = false  // Not GPU, but still hardware-accelerated
-                    loaded = true
-                    logger.info("NNAPI delegate applied successfully (~50-80ms inference)")
-                } catch (e: Throwable) {
-                    logger.warn("NNAPI delegate failed: ${e.javaClass.simpleName}: ${e.message}")
-                    interpreter?.close()
-                    interpreter = null
-                }
+            // Auto-detect FP32 vs INT8 model. Probe input tensor 0 + output
+            // tensor 0 dtype. yolo11n's standard export uses FLOAT32; the
+            // dev/quantize_yolo_int8.py script produces a UINT8/UINT8 variant.
+            val interp = interpreter!!
+            val inputTensor = interp.getInputTensor(0)
+            val outputTensor = interp.getOutputTensor(0)
+            val inputDtype = inputTensor.dataType()
+            val outputDtype = outputTensor.dataType()
+            inputIsQuantized = (inputDtype == DataType.UINT8 || inputDtype == DataType.INT8)
+            outputIsQuantized = (outputDtype == DataType.UINT8 || outputDtype == DataType.INT8)
+            if (outputIsQuantized) {
+                val q = outputTensor.quantizationParams()
+                outputScale = q.scale
+                outputZeroPoint = q.zeroPoint
             }
-            
-            // === TIER 3: CPU (4 threads) ===
-            if (!loaded) {
-                try {
-                    val cpuOptions = Interpreter.Options()
-                    cpuOptions.setNumThreads(4)
-                    logger.info("Falling back to CPU mode (4 threads)...")
-                    
-                    interpreter = Interpreter(modelFile, cpuOptions)
-                    interpreter!!.allocateTensors()
-                    
-                    isGpuEnabled = false
-                    loaded = true
-                    logger.info("CPU mode initialized (4 threads) - inference ~200-300ms")
-                } catch (e: Exception) {
-                    logger.error("CPU fallback also failed: ${e.message}", e)
-                    return false
-                }
-            }
-            
-            // SOTA: Initialize input buffer as UINT8 for zero-copy loading
-            // ImageProcessor will convert UINT8 -> FLOAT32 automatically
+
+            // Build the preprocessing pipeline that matches the model's
+            // expected input dtype:
+            //   - FP32 model: resize + normalize (0..255 -> 0.0..1.0)
+            //   - INT8 model: resize only; the interpreter's embedded
+            //     input quantization params handle the uint8 -> int8 mapping
+            //     internally with no host-side normalize step.
             inputImageBuffer = TensorImage(DataType.UINT8)
-            
-            // SOTA: Pre-allocate output buffer (zero GC churn)
-            outputBuffer = ByteBuffer.allocateDirect(1 * 84 * 8400 * 4)
-                .order(ByteOrder.nativeOrder())
-            
-            logger.info("Model loaded successfully (GPU=$isGpuEnabled, accelerated=$loaded)")
+            imageProcessor = if (inputIsQuantized) {
+                ImageProcessor.Builder()
+                    .add(ResizeOp(inputSize, inputSize, ResizeOp.ResizeMethod.BILINEAR))
+                    .build()
+            } else {
+                ImageProcessor.Builder()
+                    .add(ResizeOp(inputSize, inputSize, ResizeOp.ResizeMethod.BILINEAR))
+                    .add(NormalizeOp(0f, 255f))
+                    .build()
+            }
+
+            // Pre-allocate output buffer sized to the actual tensor dtype.
+            // FP32: 4 bytes/element. INT8/UINT8: 1 byte/element.
+            val outputElements = 84 * 8400
+            val outputBytes = outputElements * if (outputIsQuantized) 1 else 4
+            outputBuffer = ByteBuffer.allocateDirect(outputBytes).order(ByteOrder.nativeOrder())
+            if (outputIsQuantized) {
+                int8OutputBuffer = ByteArray(outputElements)
+            }
+
+            val mode = if (inputIsQuantized && outputIsQuantized) "INT8"
+                       else if (!inputIsQuantized && !outputIsQuantized) "FP32"
+                       else "MIXED($inputDtype/$outputDtype)"
+            logger.info("CPU XNNPACK initialized (4 threads, $mode model, " +
+                    (if (outputIsQuantized) "outScale=$outputScale outZp=$outputZeroPoint, " else "") +
+                    "encoder-isolated via nice gradient)")
+
+            logger.info("Model loaded successfully ($mode)")
             return true
         } catch (e: Exception) {
             logger.error("Failed to load model: ${e.message}", e)
@@ -274,52 +304,79 @@ class YoloDetector(private val context: Context) {
         // brief contention with close() is fine — close happens rarely
         // (toggle off, daemon shutdown).
         val output: FloatArray
-        gpuJobInFlight = true
-        try {
-            synchronized(interpLock) {
-                val interp = interpreter ?: return emptyList()
+        synchronized(interpLock) {
+            val interp = interpreter ?: return emptyList()
 
-                // Reuse the shaped TensorBuffer across calls. Re-allocate only on
-                // dimension change (rare). Same for the float output array.
-                var sb = shapedBuffer
-                if (sb == null || shapedBufferW != width || shapedBufferH != height) {
-                    sb = TensorBuffer.createFixedSize(intArrayOf(height, width, 3), DataType.UINT8)
-                    shapedBuffer = sb
-                    shapedBufferW = width
-                    shapedBufferH = height
-                }
-                sb.loadBuffer(ByteBuffer.wrap(processedData))
-
-                inputImageBuffer!!.load(sb)
-
-                // SOTA: Process with native C++ ops (bilinear resize + UINT8->FLOAT32 normalize)
-                val tensorImage = imageProcessor.process(inputImageBuffer)
-
-                // Run inference (GPU accelerated). On the OpenCL delegate path,
-                // interp.run() returns once the command is enqueued — the
-                // actual GPU work is draining. The asFloatBuffer().get() below
-                // is what forces the sync (it blocks until the result tensor
-                // is filled). gpuJobInFlight stays true across both so the GL
-                // thread knows the Adreno is busy.
-                outputBuffer!!.rewind()
-                interp.run(tensorImage.buffer, outputBuffer)
-
-                // Parse output. The .get() call below is the implicit GPU sync.
-                outputBuffer!!.rewind()
-                var fo = floatOutput
-                if (fo == null || fo.size != 84 * 8400) {
-                    fo = FloatArray(84 * 8400)
-                    floatOutput = fo
-                }
-                outputBuffer!!.asFloatBuffer().get(fo)
-                output = fo
+            // Reuse the shaped TensorBuffer across calls. Re-allocate only on
+            // dimension change (rare). Same for the float output array.
+            var sb = shapedBuffer
+            if (sb == null || shapedBufferW != width || shapedBufferH != height) {
+                sb = TensorBuffer.createFixedSize(intArrayOf(height, width, 3), DataType.UINT8)
+                shapedBuffer = sb
+                shapedBufferW = width
+                shapedBufferH = height
             }
-        } finally {
-            // Cleared inside finally so any exception path (interpreter null,
-            // OOM, native crash propagated as RuntimeException) still releases
-            // the GL thread instead of permanently parking it behind a stale
-            // flag.
-            gpuJobInFlight = false
+            sb.loadBuffer(ByteBuffer.wrap(processedData))
+
+            inputImageBuffer!!.load(sb)
+
+            // SOTA: Process with native C++ ops. Pipeline differs by model
+            // dtype: FP32 path normalizes 0..255 -> 0.0..1.0; INT8 path is
+            // resize-only and the interpreter's input quantization handles
+            // the uint8 mapping internally.
+            val tensorImage = imageProcessor!!.process(inputImageBuffer)
+
+            // Run inference (CPU XNNPACK). interp.run() blocks until the
+            // last layer is computed; there's no async/queue model on the
+            // CPU backend (unlike the previous GPU delegate).
+            outputBuffer!!.rewind()
+            interp.run(tensorImage.buffer, outputBuffer)
+            outputBuffer!!.rewind()
+
+            var fo = floatOutput
+            if (fo == null || fo.size != 84 * 8400) {
+                fo = FloatArray(84 * 8400)
+                floatOutput = fo
+            }
+
+            if (outputIsQuantized) {
+                // INT8 output path: bulk-copy the byte tensor to a Java
+                // byte[] in one JNI hop, then dequantize to float in
+                // Java loop. Dequant: f = (raw - zeroPoint) * scale.
+                // Cost: 84*8400 = 705,600 multiplications (~3-5 ms on
+                // Cortex-A53), still much cheaper than the FP32 model's
+                // larger XNNPACK kernel set inside interp.run().
+                val raw = int8OutputBuffer!!
+                outputBuffer!!.get(raw, 0, raw.size)
+                // For UINT8 outputs, raw value is in [0, 255]; for INT8,
+                // ByteBuffer.get returns signed [-128, 127] which is
+                // already the correct interpretation. The interpreter's
+                // quantization params encode which dtype was used.
+                val scale = outputScale
+                val zp = outputZeroPoint
+                val outDtype = interp.getOutputTensor(0).dataType()
+                if (outDtype == DataType.UINT8) {
+                    var i = 0
+                    while (i < raw.size) {
+                        // Unsigned read: raw[i] is a Java signed byte; mask
+                        // with 0xFF to get the [0, 255] value the model
+                        // produced.
+                        fo[i] = ((raw[i].toInt() and 0xFF) - zp) * scale
+                        i++
+                    }
+                } else {
+                    var i = 0
+                    while (i < raw.size) {
+                        fo[i] = (raw[i].toInt() - zp) * scale
+                        i++
+                    }
+                }
+            } else {
+                // FP32 output path: bulk-copy from direct ByteBuffer to the
+                // Java float[] in one JNI call.
+                outputBuffer!!.asFloatBuffer().get(fo)
+            }
+            output = fo
         }
 
         return parseOutput(
@@ -541,21 +598,6 @@ class YoloDetector(private val context: Context) {
     }
     
     /**
-     * Check if GPU is enabled
-     */
-    fun isGpuEnabled(): Boolean = isGpuEnabled
-
-    /**
-     * Returns true while a YOLO inference is using the GPU. The GL thread
-     * checks this before issuing glReadPixels for the AI lane — if the
-     * Adreno is mid-OpenCL the readback would block until the OpenCL
-     * queue drains (~250 ms in field logs). Skipping the readback lets
-     * the GL render loop keep up at 26 fps and the dropped frame is
-     * absorbed cheaply by acquireLatestImage on the next iteration.
-     */
-    fun isGpuJobInFlight(): Boolean = gpuJobInFlight
-    
-    /**
      * Clean up resources
      */
     fun close() {
@@ -564,17 +606,12 @@ class YoloDetector(private val context: Context) {
         // inside tensorflowlite_jni.
         synchronized(interpLock) {
             interpreter?.close()
-            gpuDelegate?.close()
             interpreter = null
-            gpuDelegate = null
             // Drop the reused buffers too — they'll be re-allocated on next init().
             shapedBuffer = null
             shapedBufferW = -1
             shapedBufferH = -1
             // floatOutput is shape-independent; safe to keep pooled.
         }
-        // Clear after lock release so a GL thread observing this flag never
-        // sees a stale `true` against a closed interpreter.
-        gpuJobInFlight = false
     }
 }

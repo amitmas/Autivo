@@ -24,6 +24,7 @@
     "dashboard_title": "Конструкторная панель - OverDrive"
   },
   "nav": {
+    "dashboard": "Панель",
     "live_view": "Прямая трансляция",
     "events": "События",
     "surveillance": "Наблюдение",
@@ -44,9 +45,8 @@
     "overview_group": "Обзор",
     "vehicle_group": "Автомобиль",
     "about_group": "О",
-    "telegram": "Telegram",
-    "dashboard": "Панель",
-    "brand_home": "OverDrive — открыть Панель"
+    "brand_home": "OverDrive — открыть Панель",
+    "telegram": "Telegram"
   },
   "status": {
     "device": "Устройство",
@@ -1640,28 +1640,23 @@
     "delivery_pointer": "Предпочтения доставки (события, которые достигают чата) в режиме прямого действия на вкладке уведомления → Telegram."
   },
   "dashboard": {
+    "heading": "Панель",
+    "subtitle": "Статус автомобиля, местоположение и основные команды.",
     "chip_device_pending": "Устройство...",
     "chip_surveillance_pending": "Наблюдение...",
     "chip_gps_pending": "GPS --",
     "chip_device_value": "Устройство {id}",
     "chip_surveillance_value": "Наблюдение {state}",
+    "chip_gps_live": "GPS в реальном времени",
+    "chip_gps_cached": "GPS из кэша",
     "kicker_position": "Положение",
     "kicker_commands": "Приказы",
     "kicker_vehicle": "Автомобиль",
-    "directions": "Направления",
-    "cmd_events": "События",
-    "metric_battery": "Аккумулятор",
-    "metric_range": "Диапазон",
-    "metric_network": "Сеть",
-    "unit_deg": "дег",
-    "heading": "Панель",
-    "subtitle": "Статус автомобиля, местоположение и основные команды.",
-    "chip_gps_live": "GPS в реальном времени",
-    "chip_gps_cached": "GPS из кэша",
     "card_location": "Местоположение автомобиля",
     "card_commands": "Быстрые команды",
     "card_info": "Основная информация",
     "open_live_view": "Открыть прямой эфир",
+    "directions": "Направления",
     "no_gps_fix": "Нет сигнала GPS",
     "gps_waiting": "Ожидание местоположения автомобиля",
     "position_available": "Местоположение доступно",
@@ -1670,15 +1665,23 @@
     "cmd_flash": "Мигнуть",
     "cmd_find": "Найти",
     "cmd_live": "Прямой эфир",
+    "cmd_trunk_open": "Открытый багажник",
+    "cmd_trunk_close": "Закрытый багажник",
+    "cmd_trips": "Поездки",
+    "metric_battery": "Аккумулятор",
+    "metric_range": "Диапазон",
+    "metric_network": "Сеть",
     "metric_lock": "Заблокировать",
     "status_locked": "Заблокировано",
     "status_unlocked": "Разблокировано",
     "network_mobile": "Мобильный",
+    "unit_deg": "дег",
     "time_seconds_ago": "{n} с назад",
     "time_minutes_ago": "{n} мин назад",
     "time_hours_ago": "{n} ч назад",
     "toast_command_sent": "Команда отправлена",
     "toast_command_failed": "Команда не выполнена",
-    "toast_no_location": "Местоположение автомобиля недоступно"
+    "toast_no_location": "Местоположение автомобиля недоступно",
+    "cmd_recordings": "Записи"
   }
 }

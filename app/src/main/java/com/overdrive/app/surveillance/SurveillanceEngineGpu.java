@@ -159,15 +159,24 @@ public class SurveillanceEngineGpu {
     private final ThreadLocal<byte[]> aiBufferTL = new ThreadLocal<>();
     // 2. Single Thread Executor: Prevents OS thread creation overhead.
     //    Runs at THREAD_PRIORITY_BACKGROUND so a 200-300ms CPU YOLO inference
-    //    can't preempt the camera-frame producer or encoder-feed thread. On
-    //    this device's NNAPI-SL stack, ~538 of ~546 model ops fall through to
-    //    XNNPACK on CPU even when "NNAPI" is enabled, so YOLO is in practice
-    //    a CPU-heavy task and must yield to higher-priority threads.
-    private final ExecutorService aiExecutor = Executors.newSingleThreadExecutor(r -> {
+    //    can't preempt the camera-frame producer or encoder-feed thread.
+    //
+    //    GPU delegate intentionally removed (see YoloDetector class doc):
+    //    on Adreno 610 / SD662 the GPU and the H.265 encoder share one DDR
+    //    bus, and concurrent OpenCL inference produced 200–300 ms eglSwap
+    //    stalls during recording. CPU XNNPACK at nice +10 wins/loses CFS
+    //    contention as scheduled and never competes with the encoder for
+    //    memory bandwidth on the GPU side.
+    //
+    //    The thread factory below sets BACKGROUND priority once at thread
+    //    creation. {@link #priorityAffirmingExecutor} re-applies it at the
+    //    start of every submitted task — this is the Android 11/12-portable
+    //    defense against EAS scheduler migration that can otherwise reset a
+    //    long-lived executor thread's priority class out from under us. On
+    //    Android 10 the re-apply is a no-op steady-state; cost is one
+    //    setThreadPriority syscall (~µs) per inference.
+    private final ExecutorService aiExecutorRaw = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(() -> {
-            // Drop to Linux nice +10 so a 200-300ms CPU YOLO pass can't
-            // preempt the camera/encoder feed. setThreadPriority works
-            // regardless of how Java's Thread.priority maps internally.
             try {
                 android.os.Process.setThreadPriority(
                         android.os.Process.THREAD_PRIORITY_BACKGROUND);
@@ -178,16 +187,43 @@ public class SurveillanceEngineGpu {
         t.setPriority(Thread.MIN_PRIORITY);
         return t;
     });
+
+    /**
+     * Wraps {@link #aiExecutorRaw} so every submitted Runnable is preceded
+     * by a {@code Process.setThreadPriority(THREAD_PRIORITY_BACKGROUND)}
+     * call. See the field comment above for why this is needed despite the
+     * thread factory already setting priority once.
+     */
+    private final ExecutorService aiExecutor = new java.util.concurrent.AbstractExecutorService() {
+        @Override public void execute(Runnable command) {
+            aiExecutorRaw.execute(() -> {
+                try {
+                    android.os.Process.setThreadPriority(
+                            android.os.Process.THREAD_PRIORITY_BACKGROUND);
+                } catch (Throwable ignored) {}
+                command.run();
+            });
+        }
+        @Override public void shutdown()                         { aiExecutorRaw.shutdown(); }
+        @Override public java.util.List<Runnable> shutdownNow()  { return aiExecutorRaw.shutdownNow(); }
+        @Override public boolean isShutdown()                    { return aiExecutorRaw.isShutdown(); }
+        @Override public boolean isTerminated()                  { return aiExecutorRaw.isTerminated(); }
+        @Override public boolean awaitTermination(long timeout, java.util.concurrent.TimeUnit unit)
+                throws InterruptedException                      { return aiExecutorRaw.awaitTermination(timeout, unit); }
+    };
     // 3. Atomic Flag for thread safety
     private final AtomicBoolean isAiRunning = new AtomicBoolean(false);
 
     // 4. Scheduler for staggered inference dispatch. Used by the baseline
     //    seeder to space the four per-quadrant YOLO calls ~500 ms apart.
-    //    Firing them back-to-back saturates the Adreno 610's unified compute
-    //    units and holds the GL thread hostage for ~1.6 s during seeding,
-    //    producing a visible playback freeze. We schedule the dispatch but
-    //    still run the actual detect() on aiExecutor so the TFLite GPU
-    //    delegate keeps its thread affinity.
+    //    Firing them back-to-back back-pressures the single-thread
+    //    aiExecutor with 4 × ~250 ms work items in a row (~1 s of pending
+    //    inference), which delays the next legitimate motion-triggered
+    //    YOLO call by up to a full second. Spacing the seed calls 500 ms
+    //    apart keeps the executor available for live work between ticks.
+    //    The actual detect() still runs on aiExecutor so all CPU TFLite
+    //    state stays on a single thread (TFLite Interpreter is not
+    //    thread-safe across runs).
     private final java.util.concurrent.ScheduledExecutorService aiScheduler =
         java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "SentryAiScheduler");
@@ -255,15 +291,17 @@ public class SurveillanceEngineGpu {
     // Foveated AI cropping: high-res 640×640 crop from raw camera strip
     private FoveatedCropper foveatedCropper = null;
     private int cameraTextureId = -1;  // OES texture for foveated crop
-    // GL thread handler — used to dispatch foveated crops back to GL thread
-    // because crop() touches GL state (FBO bind, glReadPixels). With the
-    // AI lane decoupled to AiLaneWorker, processFrame now runs off the GL
-    // thread and cannot directly call cropper.crop() — we must hop to GL.
+    // Vestigial. Foveated crops now run on AiLaneGl's dedicated GL thread
+    // (which calls serviceFoveatedRequestsOnGlThread once per AI tick),
+    // not posted via this handler. The setter is left in place because
+    // PanoramicCameraGpu still calls it during initialization for backwards
+    // compat with the API surface; the field is never read.
     private android.os.Handler glHandler = null;
-    // Camera FPS used to size the GL-hop wait budget (one frame + slack).
-    // Wired by PanoramicCameraGpu.setCameraTargetFps() at startup and on FPS
-    // changes; the cropOnGlThread budget tracks it. 0 until wired — the
-    // crop path falls back to a safe minimum so we never time out on cold start.
+    // Camera FPS — surfaced from PanoramicCameraGpu.setCameraTargetFps()
+    // for diagnostic logging in the periodic stats line. No longer
+    // load-bearing for any timeout (the cropOnGlThread path it used to
+    // size was removed when the foveated mailbox replaced post-Runnable
+    // dispatch).
     private volatile int cameraTargetFps = 0;
 
     // ==================== FOVEATED MAILBOX (Option B, full async) ====================
@@ -469,6 +507,45 @@ public class SurveillanceEngineGpu {
     // single-thread invariant (no need for explicit lock).
     private int[] mosaicJpegPixelsScratch = null;
     private android.graphics.Bitmap mosaicJpegBitmapScratch = null;
+
+    // Segment-metadata executor: hero JPEG compress + per-actor JPEGs +
+    // JSON sidecar + SRT sidecar.
+    //
+    // PROBLEM IT FIXES: when called from the segment-rotation listener,
+    // flushSegmentMetadata runs on a {@code GpuSegmentFinalizer-N} thread
+    // which is what {@code waitForFinalizers} blocks on at recording-close
+    // and pipeline-shutdown. Bitmap.compress(JPEG, 85) at 640×640 takes
+    // ~50 ms on the BYD SoC; with 4 actors per segment that's 200+ ms of
+    // the close-path's 2 s budget consumed by JPEG work. Multi-segment
+    // events stack the cost across segments and can blow the budget.
+    //
+    // FIX: dispatch flushSegmentMetadata to this dedicated single-thread
+    // executor so the finalizer thread returns immediately. The JPEG
+    // writes proceed in the background and don't gate close-path or
+    // rotation cadence. The executor has an unbounded queue (we want
+    // every segment's metadata to be written eventually, never dropped),
+    // but the close-path explicitly drains it before declaring shutdown
+    // complete via {@link #drainSegmentMetadata}.
+    //
+    // Thread is BACKGROUND priority (nice +10) so its JPEG work yields to
+    // the encoder/drainer/disk-writer if they need cycles.
+    private final java.util.concurrent.ExecutorService segmentMetadataExecutor =
+        java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(() -> {
+                try {
+                    android.os.Process.setThreadPriority(
+                            android.os.Process.THREAD_PRIORITY_BACKGROUND);
+                } catch (Throwable ignored) {}
+                r.run();
+            }, "SegmentMetadataWriter");
+            t.setDaemon(true);
+            return t;
+        });
+    // Track in-flight + queued metadata tasks so close-path can wait for
+    // them to finish before tearing down state they reference.
+    private final java.util.concurrent.atomic.AtomicInteger inFlightSegmentMetadata =
+        new java.util.concurrent.atomic.AtomicInteger(0);
+    private final Object segmentMetadataDrainLock = new Object();
     
     /**
      * Initializes the surveillance engine.
@@ -532,7 +609,7 @@ public class SurveillanceEngineGpu {
                     if (yoloLoaded) {
                         useObjectDetection = true;
                         logger.info("YOLO model loaded successfully - object detection enabled");
-                        logger.info("GPU acceleration: " + (yoloDetector.isGpuEnabled() ? "ENABLED" : "disabled (CPU fallback)"));
+                        logger.info("YOLO backend: CPU XNNPACK (4-thread, encoder-isolated via nice gradient)");
                     } else {
                         logger.warn("Failed to load YOLO model");
                         useObjectDetection = false;
@@ -555,7 +632,7 @@ public class SurveillanceEngineGpu {
                     if (yoloLoaded) {
                         useObjectDetection = true;
                         logger.info("YOLO model loaded successfully - object detection enabled");
-                        logger.info("GPU acceleration: " + (yoloDetector.isGpuEnabled() ? "ENABLED" : "disabled (CPU fallback)"));
+                        logger.info("YOLO backend: CPU XNNPACK (4-thread, encoder-isolated via nice gradient)");
                     } else {
                         logger.warn("Failed to load YOLO model");
                         useObjectDetection = false;
@@ -1009,17 +1086,18 @@ public class SurveillanceEngineGpu {
             final byte[] seedFrame = new byte[smallRgbFrame.length];
             System.arraycopy(smallRgbFrame, 0, seedFrame, 0, smallRgbFrame.length);
             // Stagger the four per-quadrant inferences instead of running them
-            // back-to-back. The Adreno 610 is a unified architecture; firing
-            // four ~400 ms GPU-delegate detect() calls in a tight loop holds
-            // the GL thread hostage for ~1.6 s and produces a visible freeze
-            // during the seeding window. Spacing them 500 ms apart turns one
-            // long stall into four short, individually unnoticeable hiccups
-            // — the Adreno gets time to drain GL+swap work between calls.
+            // back-to-back. With CPU XNNPACK each detect() runs ~250 ms; four
+            // back-to-back inferences would block aiExecutor for ~1 s during
+            // the seeding window, delaying the first legitimate
+            // motion-triggered YOLO call by up to a full second. Spacing
+            // them 500 ms apart keeps aiExecutor available for live work
+            // between ticks.
             //
             // Scheduling is on aiScheduler; each tick re-dispatches to
-            // aiExecutor so the TFLite GPU-delegate interpreter keeps its
-            // thread affinity (it was created on aiExecutor and must run
-            // there).
+            // aiExecutor because the TFLite Interpreter is not thread-safe
+            // across run() calls (interpLock serialises all detect() calls,
+            // and the single-thread aiExecutor is the contract that keeps
+            // the lock uncontended steady-state).
             final int qW = THUMBNAIL_WIDTH / 2;
             final int qH = THUMBNAIL_HEIGHT / 2;
             final long staggerMs = 500L;
@@ -3553,25 +3631,29 @@ public class SurveillanceEngineGpu {
             HardwareEventRecorderGpu enc = recorder.getEncoder();
             if (enc != null) {
                 enc.setSegmentListener((closedSegment, newSegment) -> {
-                    try {
-                        if (closedSegment != null) {
-                            flushSegmentMetadata(closedSegment);
-                        }
-                        // Update currentEventFile so stopRecording's flush
-                        // attaches to the LAST segment, not the first.
-                        if (newSegment != null) {
-                            currentEventFile = newSegment;
-                            // Restart the timeline collector for the new
-                            // segment so relMs in its sidecar is measured
-                            // from segment-N start, not event start.
-                            // Use the no-preRing variant: the pre-trigger
-                            // ring captured spans from BEFORE segment 1
-                            // began; replaying them at each rotation would
-                            // duplicate them across every segment's sidecar.
-                            timelineCollector.startCollectingNoPreRing();
-                        }
-                    } catch (Exception ex) {
-                        logger.warn("Per-segment flush failed: " + ex.getMessage());
+                    // CRITICAL: this listener fires on the
+                    // GpuSegmentFinalizer-N thread, which is what
+                    // waitForFinalizers blocks the recording-close and
+                    // pipeline-shutdown paths on. Heavy work here
+                    // (JPEG compress, fsync) directly extends close
+                    // latency and risks the 2s waitForFinalizers timeout
+                    // on multi-segment events.
+                    //
+                    // Dispatch the metadata flush to segmentMetadataExecutor
+                    // so the finalizer thread returns immediately. The
+                    // metadata is written in the background, drained by
+                    // the close-path via drainSegmentMetadata().
+                    if (closedSegment != null) {
+                        scheduleSegmentMetadataFlush(closedSegment, lastActors,
+                                timelineCollector.getRecordingStartTimeMs());
+                    }
+                    // Update currentEventFile + reset timeline INLINE on
+                    // the finalizer thread so the next segment's collector
+                    // origin is correct from frame 1. This part is cheap
+                    // (no I/O) and must not race the next rotation tick.
+                    if (newSegment != null) {
+                        currentEventFile = newSegment;
+                        timelineCollector.startCollectingNoPreRing();
                     }
                 });
             }
@@ -3650,8 +3732,18 @@ public class SurveillanceEngineGpu {
                     currentEventFile.getName(), currentEventFile.length() / 1024));
 
             // Flush metadata for the FINAL segment. Earlier segments were
-            // already flushed by the segment listener on each rotation.
+            // scheduled via the rotation listener and run on
+            // segmentMetadataExecutor in the background.
             flushSegmentMetadata(currentEventFile);
+
+            // Wait for the hero JPEG (and any earlier segments still
+            // queued) to land on disk. The notification path below reads
+            // the hero file directly to attach it to the rich Telegram /
+            // PWA push, so we MUST block until it's there. 2s budget is
+            // ample for one segment's worth of JPEG work; if it times out
+            // we proceed with whatever's on disk (the writeFallbackHeroFromMp4
+            // path below handles a missing hero).
+            drainSegmentMetadata(2_000);
 
             // Two-stage notification: replace the "Recording in progress…"
             // banner that fired at recording start with the rich threat
@@ -3708,43 +3800,45 @@ public class SurveillanceEngineGpu {
      * thrown to the caller, since rotation can't be aborted by a hero
      * write failure.
      */
-    private void flushSegmentMetadata(File segmentMp4) {
+    /**
+     * Schedule the segment metadata flush (thumbnails + JSON + SRT) for
+     * the given closed segment. Snapshots all engine state needed for the
+     * write at dispatch time so the actual I/O can happen on
+     * {@link #segmentMetadataExecutor} without racing the next segment's
+     * mutations.
+     *
+     * <p>The JSON+SRT sidecar write is dispatched synchronously here (it
+     * already routes onto its own writeExecutor inside the timeline
+     * collector — cheap on this thread). The thumbnail JPEG compress
+     * (the actually-expensive part) is what runs async.
+     *
+     * <p>Called from the segment-rotation listener and from
+     * {@link #stopRecording}'s final-segment flush. The close path drains
+     * via {@link #drainSegmentMetadata} before returning.
+     */
+    private void scheduleSegmentMetadataFlush(File segmentMp4,
+                                              java.util.List<Actor> actorsAtRotation,
+                                              long segmentStartMs) {
         if (segmentMp4 == null) return;
 
-        // Renormalize per-actor peak timestamps against THIS segment's
-        // timeline origin. Actor.peakSeverityRelMs was computed against
-        // whichever segment's origin was current when the peak was hit;
-        // if the peak fell in segment 1 and the actor is still alive in
-        // segment 2, the raw relMs would point at a wall-time before
-        // segment 2's start. Sidecar consumers (web events page,
-        // VideoPlayerFragment) build scrub-to-event markers off this
-        // field — without renormalization, the markers land outside the
-        // segment's playable range.
-        //
-        // Strategy: if the peak's wall time falls inside this segment's
-        // window [segmentStart, now], rewrite relMs against segmentStart.
-        // Otherwise drop relMs (writers treat -1 as "field absent" and
-        // omit it from the JSON). The actor is still emitted with all
-        // its other peak fields (severity tier, proximity, class) so
-        // badges and filters keep working.
-        long segmentStartMs = timelineCollector.getRecordingStartTimeMs();
-        java.util.List<Actor> rawActors = lastActors;
-        java.util.List<Actor> segmentActors;
-        if (rawActors == null || rawActors.isEmpty() || segmentStartMs <= 0) {
-            segmentActors = rawActors;
+        // Renormalize peak times against this segment's window — same logic
+        // as the inline path used to do.
+        final java.util.List<Actor> segmentActors;
+        if (actorsAtRotation == null || actorsAtRotation.isEmpty() || segmentStartMs <= 0) {
+            segmentActors = actorsAtRotation;
         } else {
-            segmentActors = new java.util.ArrayList<>(rawActors.size());
-            for (Actor a : rawActors) {
+            java.util.List<Actor> renormalized = new java.util.ArrayList<>(actorsAtRotation.size());
+            for (Actor a : actorsAtRotation) {
                 long renormalizedRelMs;
                 if (a.peakSeverityWallMs > 0 && a.peakSeverityWallMs >= segmentStartMs) {
                     renormalizedRelMs = a.peakSeverityWallMs - segmentStartMs;
                 } else {
-                    renormalizedRelMs = -1L;  // peak fell outside this segment
+                    renormalizedRelMs = -1L;
                 }
                 if (renormalizedRelMs == a.peakSeverityRelMs) {
-                    segmentActors.add(a);
+                    renormalized.add(a);
                 } else {
-                    segmentActors.add(new Actor(
+                    renormalized.add(new Actor(
                             a.actorId, a.classGroup,
                             a.firstSeenWallMs, a.lastSeenWallMs,
                             a.firstSeenRelMs, a.lastSeenRelMs,
@@ -3758,43 +3852,110 @@ public class SurveillanceEngineGpu {
                             a.lastBboxX, a.lastBboxY, a.lastBboxW, a.lastBboxH));
                 }
             }
+            segmentActors = renormalized;
         }
 
-        File heroFile = null;
-        if (thumbnailBuffer != null) {
-            try {
-                java.util.Map<Long, Long> relMap = new java.util.HashMap<>();
-                if (segmentActors != null) {
-                    for (Actor a : segmentActors) {
-                        if (a.peakSeverityRelMs >= 0) {
-                            relMap.put(a.actorId, a.peakSeverityRelMs);
-                        }
-                    }
+        // Compute the deterministic hero filename now (we don't yet know
+        // whether ThumbnailBuffer will produce one, but the JSON sidecar
+        // can record the filename it WILL have if produced).
+        String base = segmentMp4.getName();
+        if (base.endsWith(".mp4")) base = base.substring(0, base.length() - 4);
+        final String expectedHeroName = base + ".jpg";
+
+        // Build the actorId → relMs map up front (cheap; pure read).
+        final java.util.Map<Long, Long> relMap = new java.util.HashMap<>();
+        if (segmentActors != null) {
+            for (Actor a : segmentActors) {
+                if (a.peakSeverityRelMs >= 0) {
+                    relMap.put(a.actorId, a.peakSeverityRelMs);
                 }
-                heroFile = thumbnailBuffer.flushToDisk(segmentMp4, relMap);
-                if (heroFile != null) {
-                    logger.info("Hero thumbnail (" + segmentMp4.getName() + "): " + heroFile.getName());
-                }
-            } catch (Exception e) {
-                logger.warn("Thumbnail flush failed for " + segmentMp4.getName() + ": " + e.getMessage());
             }
         }
 
-        // Write timeline JSON sidecar alongside this segment.
+        // Capture the buffer reference so the async task uses what was
+        // current at dispatch time. ThumbnailBuffer.flushToDisk clears the
+        // buffer's internal slots after writing, so this snapshot wins
+        // over a subsequent rotation's clear.
+        final ThumbnailBuffer bufferAtDispatch = thumbnailBuffer;
+
+        // Hand off the slow JPEG compress to the dedicated background
+        // executor. The finalizer thread returns immediately.
+        inFlightSegmentMetadata.incrementAndGet();
+        segmentMetadataExecutor.execute(() -> {
+            try {
+                if (bufferAtDispatch != null) {
+                    try {
+                        File heroFile = bufferAtDispatch.flushToDisk(segmentMp4, relMap);
+                        if (heroFile != null) {
+                            logger.info("Hero thumbnail (" + segmentMp4.getName() + "): " + heroFile.getName());
+                        }
+                    } catch (Exception e) {
+                        logger.warn("Thumbnail flush failed for " + segmentMp4.getName() + ": " + e.getMessage());
+                    }
+                }
+            } finally {
+                inFlightSegmentMetadata.decrementAndGet();
+                synchronized (segmentMetadataDrainLock) {
+                    segmentMetadataDrainLock.notifyAll();
+                }
+            }
+        });
+
+        // The JSON+SRT sidecar's stopAndWrite ALREADY routes file I/O
+        // through its own writeExecutor — cheap to call inline here.
+        // Calling it on the dispatch thread (rotation listener or
+        // stopRecording) means the timeline collector's collecting=false
+        // gate flips immediately, so the next segment's
+        // startCollectingNoPreRing call observes the correct state.
         try {
-            timelineCollector.stopAndWrite(segmentMp4, segmentActors,
-                    heroFile != null ? heroFile.getName() : null);
+            timelineCollector.stopAndWrite(segmentMp4, segmentActors, expectedHeroName);
         } catch (Exception e) {
             logger.warn("Timeline write failed for " + segmentMp4.getName() + ": " + e.getMessage());
         }
+    }
 
-        // Reset the metadata buffers for the next segment. ThumbnailBuffer
-        // already self-clears in flushToDisk; timelineCollector needs an
-        // explicit reset before the rotation listener calls startCollecting
-        // for the new segment. Don't clear lastActors — the next segment's
-        // first frame should have continuity with the actors that crossed
-        // the rotation boundary (so a person mid-loiter doesn't get a fresh
-        // actorId on every rotation).
+    /**
+     * Wait until all queued segment-metadata writes have finished. Called
+     * by the close path so a stopRecording → daemon-shutdown sequence
+     * doesn't lose the last segment's hero thumbnail. Bounded by
+     * timeoutMs; logs and returns false if we time out (the daemon will
+     * still proceed with shutdown, the metadata may be corrupt — but the
+     * partial state on disk is recoverable on next launch).
+     */
+    private boolean drainSegmentMetadata(long timeoutMs) {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        synchronized (segmentMetadataDrainLock) {
+            while (inFlightSegmentMetadata.get() > 0) {
+                long remaining = deadline - System.currentTimeMillis();
+                if (remaining <= 0) {
+                    logger.warn("drainSegmentMetadata timed out with "
+                            + inFlightSegmentMetadata.get() + " in flight");
+                    return false;
+                }
+                try { segmentMetadataDrainLock.wait(remaining); }
+                catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Convenience wrapper for the FINAL-segment flush in {@link #stopRecording}.
+     * Snapshots {@code lastActors} + the timeline collector's current start
+     * time, then delegates to {@link #scheduleSegmentMetadataFlush}.
+     *
+     * <p>The async dispatch is the same as the rotation-listener path. The
+     * difference is that {@link #stopRecording} calls {@link #drainSegmentMetadata}
+     * after this so the user-facing notification path can read the hero
+     * file off disk.
+     */
+    private void flushSegmentMetadata(File segmentMp4) {
+        if (segmentMp4 == null) return;
+        scheduleSegmentMetadataFlush(segmentMp4, lastActors,
+                timelineCollector.getRecordingStartTimeMs());
     }
     
     /**
@@ -3970,21 +4131,6 @@ public class SurveillanceEngineGpu {
      */
     public boolean isActive() {
         return active;
-    }
-
-    /**
-     * Returns true while the underlying YOLO detector has a GPU OpenCL
-     * job in flight (between interp.run() and the implicit sync that
-     * reads the result tensor). The GL render loop checks this before
-     * issuing glReadPixels for the AI lane — if the Adreno is mid-job,
-     * the readback would block until the OpenCL queue drained, producing
-     * the ~250 ms aiReadback stalls observed during active recording.
-     *
-     * Safe to call from any thread (volatile read inside YoloDetector).
-     */
-    public boolean isAiGpuJobInFlight() {
-        YoloDetector d = yoloDetector;
-        return d != null && d.isGpuJobInFlight();
     }
 
     /**
@@ -4477,6 +4623,21 @@ public class SurveillanceEngineGpu {
     
     public void release() {
         disable();
+
+        // Drain any in-flight segment-metadata writes BEFORE we shut
+        // down the executor. Skipping this would discard hero JPEGs
+        // mid-compress. 2s budget matches stopRecording's drain budget.
+        drainSegmentMetadata(2_000);
+        segmentMetadataExecutor.shutdown();
+        try {
+            if (!segmentMetadataExecutor.awaitTermination(500,
+                    java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                segmentMetadataExecutor.shutdownNow();
+            }
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            segmentMetadataExecutor.shutdownNow();
+        }
 
         // SOTA FIX: Shutdown the executor
         aiExecutor.shutdownNow();

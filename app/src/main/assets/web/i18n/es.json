@@ -24,6 +24,7 @@
     "dashboard_title": "Tablero de control - OverDrive"
   },
   "nav": {
+    "dashboard": "Panel",
     "live_view": "Vista en vivo",
     "events": "Eventos",
     "surveillance": "Vigilancia",
@@ -44,9 +45,8 @@
     "overview_group": "Presentación general",
     "vehicle_group": "Vehículo",
     "about_group": "En cuanto a",
-    "telegram": "Telegram",
-    "dashboard": "Panel",
-    "brand_home": "OverDrive — abrir Panel"
+    "brand_home": "OverDrive — abrir Panel",
+    "telegram": "Telegram"
   },
   "status": {
     "device": "Dispositivo",
@@ -1640,28 +1640,23 @@
     "delivery_pointer": "Las preferencias de entrega (que los eventos llegan al chat) se encuentran en directo en la pestaña Notificaciones → Telegram."
   },
   "dashboard": {
+    "heading": "Panel",
+    "subtitle": "Estado del vehículo, posición y controles principales.",
     "chip_device_pending": "Dispositivo...",
     "chip_surveillance_pending": "La vigilancia...",
     "chip_gps_pending": "GPS --",
     "chip_device_value": "Dispositivo {id}",
     "chip_surveillance_value": "Supervisión {state}",
+    "chip_gps_live": "GPS en vivo",
+    "chip_gps_cached": "GPS en caché",
     "kicker_position": "Posición",
     "kicker_commands": "Los comandos",
     "kicker_vehicle": "Vehículo",
-    "directions": "Direcciones",
-    "cmd_events": "Eventos",
-    "metric_battery": "Batería",
-    "metric_range": "Rango de trabajo",
-    "metric_network": "Redes",
-    "unit_deg": "de la",
-    "heading": "Panel",
-    "subtitle": "Estado del vehículo, posición y controles principales.",
-    "chip_gps_live": "GPS en vivo",
-    "chip_gps_cached": "GPS en caché",
     "card_location": "Ubicación del vehículo",
     "card_commands": "Controles rápidos",
     "card_info": "Información principal",
     "open_live_view": "Abrir vista en vivo",
+    "directions": "Direcciones",
     "no_gps_fix": "Sin señal GPS",
     "gps_waiting": "Esperando la posición del vehículo",
     "position_available": "Posición disponible",
@@ -1670,15 +1665,23 @@
     "cmd_flash": "Luces",
     "cmd_find": "Localizar",
     "cmd_live": "En vivo",
+    "cmd_trunk_open": "El maletero abierto",
+    "cmd_trunk_close": "Cuerpo cerrado",
+    "cmd_trips": "Viajes",
+    "metric_battery": "Batería",
+    "metric_range": "Rango de trabajo",
+    "metric_network": "Redes",
     "metric_lock": "Bloquear",
     "status_locked": "Bloqueado",
     "status_unlocked": "Desbloqueado",
     "network_mobile": "Móvil",
+    "unit_deg": "de la",
     "time_seconds_ago": "hace {n} s",
     "time_minutes_ago": "hace {n} min",
     "time_hours_ago": "hace {n} h",
     "toast_command_sent": "Comando enviado",
     "toast_command_failed": "Falló el comando",
-    "toast_no_location": "Ubicación del coche no disponible"
+    "toast_no_location": "Ubicación del coche no disponible",
+    "cmd_recordings": "Grabaciones"
   }
 }

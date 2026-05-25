@@ -139,6 +139,36 @@ public class GpuMosaicRecorder {
     private static final int SURFACE_ERROR_REINIT_THRESHOLD = 3;
     private volatile boolean needsReinit = false;
 
+    // Per-stage timing diagnostic for drawFrame.
+    //
+    // The encoder GL thread's drawFrame() bundles five distinct GPU/CPU
+    // operations under one timer in PanoramicCameraGpu.renderLoop's stage
+    // log: makeCurrent + clear + mosaic-shader-draw + overlay-upload-and-
+    // draw + eglSwapBuffersWithTimestamp. When the bundled "mosaic+swap"
+    // worst-frame goes high, we can't tell which sub-stage was responsible.
+    //
+    // This per-stage timer logs the worst frame in a 30s window (matching
+    // the parent stage timer's cadence) and breaks out:
+    //   - mc:    makeCurrent
+    //   - cls:   clear
+    //   - shd:   mosaic shader bind + draw
+    //   - ovl:   overlay (texSubImage2D upload + composite draw)
+    //   - swap:  eglSwapBuffersWithTimestamp itself (this is what blocks
+    //            on encoder input-pool backpressure)
+    //
+    // Once a stutter event is captured, the dominant sub-stage tells us
+    // where to look — overlay upload vs shader draw vs encoder backpressure
+    // produce identical "mosaic+swap=207ms" symptoms in the parent log.
+    private static final long DRAW_STAGE_LOG_INTERVAL_MS = 30_000L;
+    private long drawStageWindowStartMs = 0;
+    private long drawStageWorstTotalNs = 0;
+    private long drawStageWorstMakeCurrentNs = 0;
+    private long drawStageWorstClearNs = 0;
+    private long drawStageWorstShaderNs = 0;
+    private long drawStageWorstOverlayNs = 0;
+    private long drawStageWorstSwapNs = 0;
+    private int  drawStageWindowFrames = 0;
+
     // Per-quadrant strip-X offsets resolved from the camera profile + user role
     // mapping. Default mirrors the legacy Seal layout (TL=Front, TR=Right,
     // BL=Rear, BR=Left). The fragment shader is rebuilt at construction time
@@ -426,8 +456,13 @@ public class GpuMosaicRecorder {
 
         long startTime = System.nanoTime();
 
+        // Per-stage diagnostic timing. Cheap (~50ns nanoTime + Long math
+        // per call); only the worst frame in a 30s window is logged.
+        long t0 = startTime;
+
         // Make encoder surface current
         eglCore.makeCurrent(encoderSurface);
+        long tAfterMakeCurrentNs = System.nanoTime();
 
         // Set viewport to encoder resolution (profile-driven: Seal=2560x1920, Tang=2560x1440)
         GLES20.glViewport(0, 0, viewportWidth, viewportHeight);
@@ -435,6 +470,7 @@ public class GpuMosaicRecorder {
         // Clear
         GLES20.glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT);
+        long tAfterClearNs = System.nanoTime();
 
         // Use our shader program
         GLES20.glUseProgram(programId);
@@ -458,6 +494,7 @@ public class GpuMosaicRecorder {
         // Disable vertex arrays
         GLES20.glDisableVertexAttribArray(aPositionLocation);
         GLES20.glDisableVertexAttribArray(aTexCoordLocation);
+        long tAfterShaderNs = System.nanoTime();
 
         // OVERLAY PASS: Composite telemetry overlay if enabled
         if (overlayEnabled && overlayRecordingModeAllowed && overlayRenderer != null) {
@@ -523,6 +560,7 @@ public class GpuMosaicRecorder {
                 }
             }
         }
+        long tAfterOverlayNs = System.nanoTime();
 
         // Push the HAL sensor timestamp straight through. MediaCodec uses the
         // value stamped on the encoder surface via eglPresentationTimeANDROID
@@ -547,7 +585,7 @@ public class GpuMosaicRecorder {
         } catch (RuntimeException e) {
             consecutiveSurfaceErrors++;
             if (consecutiveSurfaceErrors >= SURFACE_ERROR_REINIT_THRESHOLD) {
-                logger.error("Encoder surface dead after " + consecutiveSurfaceErrors + 
+                logger.error("Encoder surface dead after " + consecutiveSurfaceErrors +
                     " consecutive errors, requesting reinit");
                 needsReinit = true;
                 encoderSurface = null;  // Prevent further attempts
@@ -558,15 +596,60 @@ public class GpuMosaicRecorder {
             }
             return;
         }
+        long tAfterSwapNs = System.nanoTime();
 
         // Track draw duration to detect encoder backpressure
-        long elapsedNs = System.nanoTime() - startTime;
+        long elapsedNs = tAfterSwapNs - startTime;
         lastDrawDurationNs = elapsedNs;
 
         if (elapsedNs > maxDrawDurationNs) {
             consecutiveSlowFrames++;
         } else {
             consecutiveSlowFrames = 0;
+        }
+
+        // Per-stage diagnostic: track the worst frame in a 30s window so we
+        // can localize the dominant cost on bad frames. The PARENT stage
+        // timer in PanoramicCameraGpu sees this whole method as
+        // "mosaic+swap"; if its worst frame exceeds the per-frame budget,
+        // this log will tell us which sub-stage was responsible (overlay
+        // upload? swap blocking on encoder backpressure? shader draw?).
+        long stageTotalNs   = tAfterSwapNs       - t0;
+        long stageMakeNs    = tAfterMakeCurrentNs - t0;
+        long stageClearNs   = tAfterClearNs      - tAfterMakeCurrentNs;
+        long stageShaderNs  = tAfterShaderNs     - tAfterClearNs;
+        long stageOverlayNs = tAfterOverlayNs    - tAfterShaderNs;
+        long stageSwapNs    = tAfterSwapNs       - tAfterOverlayNs;
+        drawStageWindowFrames++;
+        if (stageTotalNs > drawStageWorstTotalNs) {
+            drawStageWorstTotalNs       = stageTotalNs;
+            drawStageWorstMakeCurrentNs = stageMakeNs;
+            drawStageWorstClearNs       = stageClearNs;
+            drawStageWorstShaderNs      = stageShaderNs;
+            drawStageWorstOverlayNs     = stageOverlayNs;
+            drawStageWorstSwapNs        = stageSwapNs;
+        }
+        long nowMsForStage = System.currentTimeMillis();
+        if (drawStageWindowStartMs == 0) {
+            drawStageWindowStartMs = nowMsForStage;
+        } else if (nowMsForStage - drawStageWindowStartMs >= DRAW_STAGE_LOG_INTERVAL_MS) {
+            logger.info(String.format(
+                    "DrawStage(worst/30s): total=%dms mc=%dms cls=%dms shd=%dms ovl=%dms swap=%dms (frames=%d)",
+                    drawStageWorstTotalNs       / 1_000_000,
+                    drawStageWorstMakeCurrentNs / 1_000_000,
+                    drawStageWorstClearNs       / 1_000_000,
+                    drawStageWorstShaderNs      / 1_000_000,
+                    drawStageWorstOverlayNs     / 1_000_000,
+                    drawStageWorstSwapNs        / 1_000_000,
+                    drawStageWindowFrames));
+            drawStageWorstTotalNs = 0;
+            drawStageWorstMakeCurrentNs = 0;
+            drawStageWorstClearNs = 0;
+            drawStageWorstShaderNs = 0;
+            drawStageWorstOverlayNs = 0;
+            drawStageWorstSwapNs = 0;
+            drawStageWindowFrames = 0;
+            drawStageWindowStartMs = nowMsForStage;
         }
 
         // Update stats (only count if actually recording to file)

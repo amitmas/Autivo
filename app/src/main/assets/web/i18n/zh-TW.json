@@ -24,6 +24,7 @@
     "dashboard_title": "控制板 - OverDrive"
   },
   "nav": {
+    "dashboard": "儀表板",
     "live_view": "即時畫面",
     "events": "事件",
     "surveillance": "監控",
@@ -44,9 +45,8 @@
     "overview_group": "概述",
     "vehicle_group": "汽車",
     "about_group": "關於",
-    "telegram": "Telegram",
-    "dashboard": "儀表板",
-    "brand_home": "OverDrive — 開啟儀表板"
+    "brand_home": "OverDrive — 開啟儀表板",
+    "telegram": "Telegram"
   },
   "status": {
     "device": "裝置",
@@ -1640,28 +1640,23 @@
     "delivery_pointer": "在通知 → Telegram 標籤上,"
   },
   "dashboard": {
+    "heading": "儀表板",
+    "subtitle": "車輛狀態、位置和主要控制。",
     "chip_device_pending": "這種裝置...",
     "chip_surveillance_pending": "監控工作 -",
     "chip_gps_pending": "GPS --",
     "chip_device_value": "裝置{id}",
     "chip_surveillance_value": "監控系統{state}",
+    "chip_gps_live": "GPS即時",
+    "chip_gps_cached": "GPS快取",
     "kicker_position": "位置",
     "kicker_commands": "命令",
     "kicker_vehicle": "汽車",
-    "directions": "導航方式",
-    "cmd_events": "事件",
-    "metric_battery": "沒有電池",
-    "metric_range": "範圍",
-    "metric_network": "網路",
-    "unit_deg": "排行榜",
-    "heading": "儀表板",
-    "subtitle": "車輛狀態、位置和主要控制。",
-    "chip_gps_live": "GPS即時",
-    "chip_gps_cached": "GPS快取",
     "card_location": "車輛位置",
     "card_commands": "快捷控制",
     "card_info": "主要資訊",
     "open_live_view": "開啟即時畫面",
+    "directions": "導航方式",
     "no_gps_fix": "無GPS定位",
     "gps_waiting": "等待車輛位置",
     "position_available": "位置可用",
@@ -1670,15 +1665,23 @@
     "cmd_flash": "閃燈",
     "cmd_find": "尋車",
     "cmd_live": "即時",
+    "cmd_trunk_open": "打開箱子",
+    "cmd_trunk_close": "密封的行李箱",
+    "cmd_trips": "行程",
+    "metric_battery": "沒有電池",
+    "metric_range": "範圍",
+    "metric_network": "網路",
     "metric_lock": "鎖定",
     "status_locked": "已鎖定",
     "status_unlocked": "已解鎖",
     "network_mobile": "行動數據",
+    "unit_deg": "排行榜",
     "time_seconds_ago": "{n}秒前",
     "time_minutes_ago": "{n}分鐘前",
     "time_hours_ago": "{n}小時前",
     "toast_command_sent": "命令已傳送",
     "toast_command_failed": "命令失敗",
-    "toast_no_location": "無法取得車輛位置"
+    "toast_no_location": "無法取得車輛位置",
+    "cmd_recordings": "錄影"
   }
 }

@@ -1897,13 +1897,17 @@ select.md-input ~ .md-label {
     background: rgba(26, 26, 46, 0.95);
     border: 2px solid rgba(0, 212, 170, 0.4);
     border-radius: var(--radius-lg);
-    cursor: pointer;
+    cursor: grab;
     overflow: hidden;
     box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4), 0 0 15px rgba(0, 212, 170, 0.15);
-    transition: all 0.2s ease;
+    transition: transform 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
     z-index: 50;
     display: flex;
     flex-direction: column;
+    touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+    will-change: transform, top, left, right, bottom;
 }
 
 .mini-preview:hover {
@@ -1912,7 +1916,28 @@ select.md-input ~ .md-label {
     box-shadow: 0 4px 25px rgba(0, 0, 0, 0.5), 0 0 25px rgba(0, 212, 170, 0.35);
 }
 
-/* No position change needed - same position for both views */
+/* Active drag state — Material-3 elevation lift + brand glow.
+   Disable the position transition during free drag so the chip tracks the
+   pointer; the .snap-anim class is added on release for the slide-to-corner
+   animation. */
+.mini-preview.dragging {
+    cursor: grabbing;
+    transform: scale(1.10);
+    border-color: var(--brand-primary);
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.6), 0 0 40px rgba(0, 212, 170, 0.45);
+    transition: transform 140ms cubic-bezier(0.2, 0.8, 0.2, 1),
+                box-shadow 140ms cubic-bezier(0.2, 0.8, 0.2, 1),
+                border-color 140ms ease;
+}
+
+.mini-preview.snap-anim {
+    transition: top 240ms cubic-bezier(0.2, 0.7, 0.2, 1),
+                left 240ms cubic-bezier(0.2, 0.7, 0.2, 1),
+                right 240ms cubic-bezier(0.2, 0.7, 0.2, 1),
+                bottom 240ms cubic-bezier(0.2, 0.7, 0.2, 1),
+                transform 240ms cubic-bezier(0.2, 0.7, 0.2, 1),
+                box-shadow 240ms cubic-bezier(0.2, 0.7, 0.2, 1);
+}
 
 .mini-preview-content {
     flex: 1;

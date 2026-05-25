@@ -24,6 +24,7 @@
     "dashboard_title": "대시보드 - OverDrive"
   },
   "nav": {
+    "dashboard": "대시보드",
     "live_view": "실시간 보기",
     "events": "이벤트",
     "surveillance": "감시",
@@ -44,9 +45,8 @@
     "overview_group": "개요",
     "vehicle_group": "차량",
     "about_group": "에 관한 것",
-    "telegram": "Telegram",
-    "dashboard": "대시보드",
-    "brand_home": "OverDrive — 대시보드 열기"
+    "brand_home": "OverDrive — 대시보드 열기",
+    "telegram": "Telegram"
   },
   "status": {
     "device": "기기",
@@ -1640,28 +1640,23 @@
     "delivery_pointer": "전달 선호도 (이러한 이벤트가 채팅에 도달하는 경우) 는 알림 → Telegram 탭에서 생중계됩니다."
   },
   "dashboard": {
+    "heading": "대시보드",
+    "subtitle": "차량 상태, 위치 및 주요 제어.",
     "chip_device_pending": "장치--",
     "chip_surveillance_pending": "감시--",
     "chip_gps_pending": "GPS --",
     "chip_device_value": "장치 {id}",
     "chip_surveillance_value": "감시 장치 {state}",
+    "chip_gps_live": "GPS 실시간",
+    "chip_gps_cached": "GPS 캐시",
     "kicker_position": "위치",
     "kicker_commands": "명령",
     "kicker_vehicle": "차량",
-    "directions": "방향",
-    "cmd_events": "이벤트",
-    "metric_battery": "배터리",
-    "metric_range": "범위",
-    "metric_network": "네트워크",
-    "unit_deg": "기하급수",
-    "heading": "대시보드",
-    "subtitle": "차량 상태, 위치 및 주요 제어.",
-    "chip_gps_live": "GPS 실시간",
-    "chip_gps_cached": "GPS 캐시",
     "card_location": "차량 위치",
     "card_commands": "빠른 제어",
     "card_info": "주요 정보",
     "open_live_view": "라이브 뷰 열기",
+    "directions": "방향",
     "no_gps_fix": "GPS 신호 없음",
     "gps_waiting": "차량 위치 수신 중",
     "position_available": "위치 정보 사용 가능",
@@ -1670,15 +1665,23 @@
     "cmd_flash": "라이트 점멸",
     "cmd_find": "차량 찾기",
     "cmd_live": "라이브",
+    "cmd_trunk_open": "열리는 트렁크",
+    "cmd_trunk_close": "닫힌 트렁크",
+    "cmd_trips": "주행 기록",
+    "metric_battery": "배터리",
+    "metric_range": "범위",
+    "metric_network": "네트워크",
     "metric_lock": "잠금",
     "status_locked": "잠김",
     "status_unlocked": "잠금 해제됨",
     "network_mobile": "모바일",
+    "unit_deg": "기하급수",
     "time_seconds_ago": "{n}초 전",
     "time_minutes_ago": "{n}분 전",
     "time_hours_ago": "{n}시간 전",
     "toast_command_sent": "명령을 보냈습니다",
     "toast_command_failed": "명령이 실패했습니다",
-    "toast_no_location": "차량 위치를 사용할 수 없음"
+    "toast_no_location": "차량 위치를 사용할 수 없음",
+    "cmd_recordings": "녹화"
   }
 }

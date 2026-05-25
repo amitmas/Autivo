@@ -62,24 +62,29 @@ class CameraDaemonController(
     
     override fun stop(callback: DaemonCallback) {
         callback.onStatusChanged(DaemonStatus.STOPPING, "Stopping camera daemon...")
-        
-        // Try graceful shutdown via TCP command first
+
+        // Try graceful shutdown via TCP command first so the daemon can flush
+        // recordings + release codecs cleanly. Then hard-kill everything.
         Thread {
             sendShutdownCommand()
             Thread.sleep(500)
-            
-            // Kill the watchdog script FIRST so it can't respawn the daemon,
-            // then kill the daemon and related processes. Without this, the
-            // watchdog sees the daemon die and relaunches it immediately.
+
+            // Plant the disable sentinel BEFORE the kill so any watchdog we
+            // miss (orphan process, race) sees it on its next iteration and
+            // exits instead of respawning the daemon. Then a single broad
+            // pkill on 'cam_daemon' takes out start_cam_daemon (watchdog),
+            // byd_cam_daemon (daemon), and any orphans in one syscall — no
+            // sleep race, no kill-order dependency. Related binaries
+            // (ffmpeg, mediamtx) get their own pass since they don't match
+            // the cam_daemon pattern.
             val killCommands = buildString {
-                append("pkill -9 -f 'start_cam_daemon' 2>/dev/null; ")
-                append("rm -f /data/local/tmp/start_cam_daemon.sh 2>/dev/null; ")
-                append("sleep 1; ")
+                append("echo 'disabled by ui at \$(date)' > /data/local/tmp/camera_daemon.disabled; ")
+                append("pkill -9 -f 'cam_daemon' 2>/dev/null; ")
                 RELATED_PROCESSES.forEach { proc ->
                     append("pkill -9 -f '$proc' 2>/dev/null; ")
                     append("killall -9 $proc 2>/dev/null; ")
                 }
-                append("rm -f /data/local/tmp/camera_daemon.lock 2>/dev/null; ")
+                append("rm -f /data/local/tmp/start_cam_daemon.sh /data/local/tmp/cam_watchdog.pid /data/local/tmp/camera_daemon.lock 2>/dev/null; ")
                 append("echo done")
             }
             adbLauncher.executeShellCommand(
@@ -124,16 +129,16 @@ class CameraDaemonController(
     
     override fun cleanup() {
         sendShutdownCommand()
-        // Kill the watchdog first so the daemon stays dead.
+        // Same single-syscall family kill as stop() above. cleanup() runs on
+        // ViewModel teardown so we don't need the disable sentinel here —
+        // the user is exiting the app, not telling the daemon to stay dead.
         val killCommands = buildString {
-            append("pkill -9 -f 'start_cam_daemon' 2>/dev/null; ")
-            append("rm -f /data/local/tmp/start_cam_daemon.sh 2>/dev/null; ")
-            append("sleep 1; ")
+            append("pkill -9 -f 'cam_daemon' 2>/dev/null; ")
             RELATED_PROCESSES.forEach { proc ->
                 append("pkill -9 -f '$proc' 2>/dev/null; ")
                 append("killall -9 $proc 2>/dev/null; ")
             }
-            append("rm -f /data/local/tmp/camera_daemon.lock 2>/dev/null; ")
+            append("rm -f /data/local/tmp/start_cam_daemon.sh /data/local/tmp/cam_watchdog.pid /data/local/tmp/camera_daemon.lock 2>/dev/null; ")
             append("echo done")
         }
         adbLauncher.executeShellCommand(

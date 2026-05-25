@@ -458,7 +458,7 @@
         if (!canvasEl || !modelId || !color) { cb(false); return; }
         ensureSpriteCacheModule(function (cache) {
             if (!cache) { cb(false); return; }
-            cache.get(modelId, color, view).then(function (entry) {
+            cache.get(modelId, color, view, canvasEl).then(function (entry) {
                 if (!entry || !entry.blob) { cb(false); return; }
                 cache.paintInto(canvasEl, entry).then(cb);
             }, function () { cb(false); });
@@ -473,13 +473,13 @@
         if (!inst || !canvasEl || !modelId || !color) return;
         ensureSpriteCacheModule(function (cache) {
             if (!cache) return;
-            var key = cache.buildKey(modelId, color, view);
+            var key = cache.buildKey(modelId, color, view, canvasEl);
             if (snapshotsTaken[key]) return;
             snapshotsTaken[key] = true;
             inst.onceAfterRender(function () {
                 cache.snapshot(canvasEl).then(function (blob) {
                     if (!blob) { delete snapshotsTaken[key]; return; }
-                    cache.put(modelId, color, view, blob,
+                    cache.put(modelId, color, view, canvasEl, blob,
                               canvasEl.width, canvasEl.height);
                 });
             });
@@ -490,11 +490,11 @@
     // (different page in the same session, or a re-mount) can take a
     // fresh snapshot. Called when a pendingSidebarSnapshot is dropped
     // before its render callback ran.
-    function clearSnapshotFlag(modelId, color, view) {
+    function clearSnapshotFlag(modelId, color, view, canvasEl) {
         if (!modelId || !color) return;
         ensureSpriteCacheModule(function (cache) {
             if (!cache) return;
-            delete snapshotsTaken[cache.buildKey(modelId, color, view)];
+            delete snapshotsTaken[cache.buildKey(modelId, color, view, canvasEl)];
         });
     }
 
@@ -657,7 +657,8 @@
                             && (pendingSidebarSnapshot.modelId !== modelId
                                 || pendingSidebarSnapshot.color !== hexColor)) {
                         clearSnapshotFlag(pendingSidebarSnapshot.modelId,
-                                          pendingSidebarSnapshot.color, 'side');
+                                          pendingSidebarSnapshot.color, 'side',
+                                          sidebarCanvas);
                     }
                     pendingSidebarSnapshot = { modelId: modelId, color: hexColor };
                 }

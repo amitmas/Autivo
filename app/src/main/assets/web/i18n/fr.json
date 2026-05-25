@@ -24,6 +24,7 @@
     "dashboard_title": "Tableau de bord - OverDrive"
   },
   "nav": {
+    "dashboard": "Tableau de bord",
     "live_view": "Vue en direct",
     "events": "Évènements",
     "surveillance": "Surveillance",
@@ -44,9 +45,8 @@
     "overview_group": "Vue d'ensemble",
     "vehicle_group": "Véhicule",
     "about_group": "À propos de",
-    "telegram": "Telegram",
-    "dashboard": "Tableau de bord",
-    "brand_home": "OverDrive — ouvrir le tableau de bord"
+    "brand_home": "OverDrive — ouvrir le tableau de bord",
+    "telegram": "Telegram"
   },
   "status": {
     "device": "Appareil",
@@ -1640,28 +1640,23 @@
     "delivery_pointer": "Les préférences de livraison (quels événements atteignent le chat) sont en direct sur l'onglet Notifications → Telegram."
   },
   "dashboard": {
+    "heading": "Tableau de bord",
+    "subtitle": "État du véhicule, position et commandes principales.",
     "chip_device_pending": "Le dispositif...",
     "chip_surveillance_pending": "Surveillance -",
     "chip_gps_pending": "GPS --",
     "chip_device_value": "Appareil {id}",
     "chip_surveillance_value": "Surveillance {state}",
+    "chip_gps_live": "GPS en direct",
+    "chip_gps_cached": "GPS en cache",
     "kicker_position": "Position",
     "kicker_commands": "Les commandes",
     "kicker_vehicle": "Véhicule",
-    "directions": "Directions",
-    "cmd_events": "Événements",
-    "metric_battery": "Batterie",
-    "metric_range": "Département",
-    "metric_network": "Réseau",
-    "unit_deg": "dégagement",
-    "heading": "Tableau de bord",
-    "subtitle": "État du véhicule, position et commandes principales.",
-    "chip_gps_live": "GPS en direct",
-    "chip_gps_cached": "GPS en cache",
     "card_location": "Position du véhicule",
     "card_commands": "Commandes rapides",
     "card_info": "Informations principales",
     "open_live_view": "Ouvrir la vue en direct",
+    "directions": "Directions",
     "no_gps_fix": "Pas de fix GPS",
     "gps_waiting": "En attente de la position du véhicule",
     "position_available": "Position disponible",
@@ -1670,15 +1665,23 @@
     "cmd_flash": "Clignoter",
     "cmd_find": "Localiser",
     "cmd_live": "En direct",
+    "cmd_trunk_open": "Trunk ouvert",
+    "cmd_trunk_close": "Coupe de porte fermée",
+    "cmd_trips": "Trajets",
+    "metric_battery": "Batterie",
+    "metric_range": "Département",
+    "metric_network": "Réseau",
     "metric_lock": "Verrouiller",
     "status_locked": "Verrouillé",
     "status_unlocked": "Déverrouillé",
     "network_mobile": "Mobile",
+    "unit_deg": "dégagement",
     "time_seconds_ago": "il y a {n} s",
     "time_minutes_ago": "il y a {n} min",
     "time_hours_ago": "il y a {n} h",
     "toast_command_sent": "Commande envoyée",
     "toast_command_failed": "Échec de la commande",
-    "toast_no_location": "Position du véhicule indisponible"
+    "toast_no_location": "Position du véhicule indisponible",
+    "cmd_recordings": "Enregistrements"
   }
 }

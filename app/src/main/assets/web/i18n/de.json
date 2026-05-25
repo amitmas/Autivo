@@ -24,6 +24,7 @@
     "dashboard_title": "Dashboard - OverDrive"
   },
   "nav": {
+    "dashboard": "Dashboard",
     "live_view": "Live-Ansicht",
     "events": "Ereignisse",
     "surveillance": "Überwachung",
@@ -44,9 +45,8 @@
     "overview_group": "Überblick",
     "vehicle_group": "Fahrzeug",
     "about_group": "Über",
-    "telegram": "Telegram",
-    "dashboard": "Dashboard",
-    "brand_home": "OverDrive — Dashboard öffnen"
+    "brand_home": "OverDrive — Dashboard öffnen",
+    "telegram": "Telegram"
   },
   "status": {
     "device": "Gerät",
@@ -1640,28 +1640,23 @@
     "delivery_pointer": "Die Liefervorlieben (die Ereignisse erreichen den Chat) finden Sie im Tab \"Benachrichtigungen → Telegram\"."
   },
   "dashboard": {
+    "heading": "Dashboard",
+    "subtitle": "Fahrzeugstatus, Position und Hauptsteuerung.",
     "chip_device_pending": "Das Gerät...",
     "chip_surveillance_pending": "Überwachung -",
     "chip_gps_pending": "GPS --",
     "chip_device_value": "Gerät {id}",
     "chip_surveillance_value": "Überwachungszwecke {state}",
+    "chip_gps_live": "GPS live",
+    "chip_gps_cached": "GPS zwischengespeichert",
     "kicker_position": "Position",
     "kicker_commands": "Befehle",
     "kicker_vehicle": "Fahrzeug",
-    "directions": "Anweisungen",
-    "cmd_events": "Ereignisse",
-    "metric_battery": "Batterie",
-    "metric_range": "Reichweite",
-    "metric_network": "Netzwerk",
-    "unit_deg": "der",
-    "heading": "Dashboard",
-    "subtitle": "Fahrzeugstatus, Position und Hauptsteuerung.",
-    "chip_gps_live": "GPS live",
-    "chip_gps_cached": "GPS zwischengespeichert",
     "card_location": "Fahrzeugposition",
     "card_commands": "Schnellsteuerung",
     "card_info": "Hauptinformationen",
     "open_live_view": "Live-Ansicht öffnen",
+    "directions": "Anweisungen",
     "no_gps_fix": "Kein GPS-Signal",
     "gps_waiting": "Warte auf Fahrzeugposition",
     "position_available": "Position verfügbar",
@@ -1670,15 +1665,23 @@
     "cmd_flash": "Blinken",
     "cmd_find": "Finden",
     "cmd_live": "Live",
+    "cmd_trunk_open": "Öffneter Kofferraum",
+    "cmd_trunk_close": "Schließbarer Kofferraum",
+    "cmd_trips": "Fahrten",
+    "metric_battery": "Batterie",
+    "metric_range": "Reichweite",
+    "metric_network": "Netzwerk",
     "metric_lock": "Sperren",
     "status_locked": "Gesperrt",
     "status_unlocked": "Entsperrt",
     "network_mobile": "Mobil",
+    "unit_deg": "der",
     "time_seconds_ago": "vor {n} s",
     "time_minutes_ago": "vor {n} min",
     "time_hours_ago": "vor {n} h",
     "toast_command_sent": "Befehl gesendet",
     "toast_command_failed": "Befehl fehlgeschlagen",
-    "toast_no_location": "Fahrzeugposition nicht verfügbar"
+    "toast_no_location": "Fahrzeugposition nicht verfügbar",
+    "cmd_recordings": "Aufnahmen"
   }
 }

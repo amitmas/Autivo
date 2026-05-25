@@ -24,6 +24,7 @@
     "dashboard_title": "Kontrolleringsbord - OverDrive"
   },
   "nav": {
+    "dashboard": "Dashbord",
     "live_view": "Direktevisning",
     "events": "Hendelser",
     "surveillance": "Overvåking",
@@ -44,9 +45,8 @@
     "overview_group": "Oversikt",
     "vehicle_group": "Køretøy",
     "about_group": "Om",
-    "telegram": "Telegram",
-    "dashboard": "Dashbord",
-    "brand_home": "OverDrive — åpne Dashbord"
+    "brand_home": "OverDrive — åpne Dashbord",
+    "telegram": "Telegram"
   },
   "status": {
     "device": "Enhet",
@@ -1640,28 +1640,23 @@
     "delivery_pointer": "Leveringspreferanser (som hendelser når chatten) er live på fanen Notifikasjoner → Telegram."
   },
   "dashboard": {
+    "heading": "Dashbord",
+    "subtitle": "Kjøretøystatus, posisjon og hovedkontroller.",
     "chip_device_pending": "Enheten...",
     "chip_surveillance_pending": "Overvåkning -",
     "chip_gps_pending": "GPS --",
     "chip_device_value": "Anordning {id}",
     "chip_surveillance_value": "Overvåkning {state}",
+    "chip_gps_live": "GPS live",
+    "chip_gps_cached": "GPS bufret",
     "kicker_position": "Posisjon",
     "kicker_commands": "Kommandoer",
     "kicker_vehicle": "Køretøy",
-    "directions": "Retninger",
-    "cmd_events": "Hendelser",
-    "metric_battery": "Batterier",
-    "metric_range": "Avstand",
-    "metric_network": "Nettverk",
-    "unit_deg": "deg",
-    "heading": "Dashbord",
-    "subtitle": "Kjøretøystatus, posisjon og hovedkontroller.",
-    "chip_gps_live": "GPS live",
-    "chip_gps_cached": "GPS bufret",
     "card_location": "Kjøretøyposisjon",
     "card_commands": "Hurtigkontroller",
     "card_info": "Hovedinfo",
     "open_live_view": "Åpne sanntidsvisning",
+    "directions": "Retninger",
     "no_gps_fix": "Ingen GPS-fix",
     "gps_waiting": "Venter på kjøretøyposisjon",
     "position_available": "Posisjon tilgjengelig",
@@ -1670,15 +1665,23 @@
     "cmd_flash": "Blink",
     "cmd_find": "Finn",
     "cmd_live": "Live",
+    "cmd_trunk_open": "Åpen bagagerum",
+    "cmd_trunk_close": "Slått bagagerum",
+    "cmd_trips": "Turer",
+    "metric_battery": "Batterier",
+    "metric_range": "Avstand",
+    "metric_network": "Nettverk",
     "metric_lock": "Lås",
     "status_locked": "Låst",
     "status_unlocked": "Ulåst",
     "network_mobile": "Mobil",
+    "unit_deg": "deg",
     "time_seconds_ago": "{n} s siden",
     "time_minutes_ago": "{n} min siden",
     "time_hours_ago": "{n} t siden",
     "toast_command_sent": "Kommando sendt",
     "toast_command_failed": "Kommando mislyktes",
-    "toast_no_location": "Kjøretøyposisjon ikke tilgjengelig"
+    "toast_no_location": "Kjøretøyposisjon ikke tilgjengelig",
+    "cmd_recordings": "Opptak"
   }
 }

@@ -109,17 +109,49 @@ public class SurveillanceCommandHandler implements TelegramCommandHandler {
         }
     }
     
+    private static final String[] CPU_THERMAL_KEYWORDS = {
+        "cpu", "soc", "cluster", "little", "big", "prime",
+        "cpu-thermal", "cpu_thermal", "cpuss", "cpuss-0", "cpuss-1",
+        "cpu-0-0", "cpu-0-1", "cpu-1-0", "cpu-1-1", "tsens_tz_sensor"
+    };
+
     private String getTemperature(CommandContext ctx) {
-        try {
-            String temp = ctx.execShell("cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null");
-            if (temp != null && !temp.isEmpty()) {
-                int milliC = Integer.parseInt(temp.trim());
-                float c = milliC / 1000.0f;
-                String emoji = c > 60 ? "🔥" : (c > 45 ? "🌡️" : "✅");
-                return String.format("%s %.0f°C", emoji, c);
-            }
-        } catch (Exception ignored) {}
-        return "N/A";
+        double c = readCpuTemperatureCelsius();
+        if (c <= 0) return "N/A";
+        String emoji = c > 60 ? "🔥" : (c > 45 ? "🌡️" : "✅");
+        return String.format("%s %.0f°C", emoji, c);
+    }
+
+    private double readCpuTemperatureCelsius() {
+        for (int i = 0; i < 30; i++) {
+            try {
+                java.io.File typeFile = new java.io.File("/sys/class/thermal/thermal_zone" + i + "/type");
+                if (!typeFile.exists()) continue;
+                String type;
+                try (java.io.BufferedReader br = new java.io.BufferedReader(new java.io.FileReader(typeFile))) {
+                    type = br.readLine();
+                }
+                if (type == null) continue;
+                String typeLower = type.toLowerCase().trim();
+                boolean match = false;
+                for (String kw : CPU_THERMAL_KEYWORDS) {
+                    if (typeLower.contains(kw)) { match = true; break; }
+                }
+                if (!match) continue;
+
+                java.io.File tempFile = new java.io.File("/sys/class/thermal/thermal_zone" + i + "/temp");
+                if (!tempFile.exists()) continue;
+                String tempLine;
+                try (java.io.BufferedReader br = new java.io.BufferedReader(new java.io.FileReader(tempFile))) {
+                    tempLine = br.readLine();
+                }
+                if (tempLine == null || tempLine.trim().isEmpty()) continue;
+                double raw = Double.parseDouble(tempLine.trim());
+                double result = raw > 1000 ? raw / 1000.0 : raw;
+                if (result >= 10 && result <= 120) return result;
+            } catch (Exception ignored) {}
+        }
+        return 0;
     }
     
     private boolean isDaemonRunning(String processName, CommandContext ctx) {

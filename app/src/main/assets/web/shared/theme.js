@@ -264,14 +264,38 @@
             return;
         }
 
-        // Events / Trips / Notifications — these are scrollable list pages
-        // with a top filter bar and (on mobile) a bottom mobile-nav bar.
-        // Default bottom-right works on desktop; on mobile we shift above
-        // the mobile-nav (which is roughly 60-64px tall).
-        if (document.querySelector('.mobile-nav, .footer-bar, .tab-bar')) {
-            wrap.style.bottom = 'calc(80px + env(safe-area-inset-bottom, 0px))';
+        // Events / Trips / Notifications / Recording / Surveillance — these
+        // are scrollable list/form pages with a top filter bar and (on mobile)
+        // a bottom mobile-nav OR a sticky `.footer-bar` Apply-Changes panel.
+        // The footer-bar grows with `padding-bottom: calc(12px + 40px + safe-area)`
+        // on mobile (~108px tall, taller than the prior hardcoded 80px floor),
+        // which means the FAB landed INSIDE the footer-bar overlapping the
+        // Apply Changes button. Measure the actual rendered footer/nav height
+        // and clear it by 12px so the picker always sits above whatever
+        // sticky chrome the page has.
+        var stickyBottom = document.querySelector('.footer-bar, .mobile-nav, .tab-bar');
+        if (stickyBottom) {
+            var stickyH = stickyBottom.getBoundingClientRect().height || 0;
+            // Defensive minimum — if the bar hasn't laid out yet (zero
+            // height), use 80px as the legacy fallback so the picker still
+            // clears a typical mobile-nav. The ResizeObserver below also
+            // re-measures once layout completes.
+            var clearance = Math.max(stickyH + 12, 80);
+            wrap.style.bottom = 'calc(' + clearance + 'px + env(safe-area-inset-bottom, 0px))';
             wrap.style.right = '16px';
             wrap.setAttribute('data-popup', 'up');
+            // Re-measure when the sticky bar resizes (Apply Changes button
+            // toggling disabled state, footer becoming visible, soft keyboard
+            // appearing). Stash the observer on the wrap so re-runs of
+            // applyPickerAnchor don't stack duplicate observers.
+            if (typeof ResizeObserver !== 'undefined' && !wrap._stickyRO) {
+                wrap._stickyRO = new ResizeObserver(function () {
+                    var h = stickyBottom.getBoundingClientRect().height || 0;
+                    var c = Math.max(h + 12, 80);
+                    wrap.style.bottom = 'calc(' + c + 'px + env(safe-area-inset-bottom, 0px))';
+                });
+                wrap._stickyRO.observe(stickyBottom);
+            }
             return;
         }
 

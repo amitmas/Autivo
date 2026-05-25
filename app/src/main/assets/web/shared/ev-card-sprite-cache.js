@@ -44,7 +44,12 @@
     // body-paint detection, GLB swap). The version is stamped into the
     // cache key so old sprites become unreachable and LRU eviction
     // sweeps them out — no manual purge required.
-    var SPRITE_VERSION = 1;
+    //
+    // v2: keys gained a canvas-size bucket so distinct surfaces sharing
+    // the same `view` (e.g. sidebar EV-card and dashboard hero, both
+    // 'side') stop trampling each other's sprites. v1 entries lack the
+    // size segment and become unreachable — eviction reclaims them.
+    var SPRITE_VERSION = 2;
 
     // Keep the cache from growing unbounded as the user tries paint
     // colours. The realistic upper bound is:
@@ -93,16 +98,44 @@
         return d >= 1.5 ? 2 : 1;
     }
 
-    function buildKey(modelId, color, view) {
+    // Bucket the canvas footprint into a coarse "size class". The
+    // sidebar EV-card (~280×200) and the dashboard hero (~1180×380 on
+    // desktop, ~window-width × 200 on mobile) both render in `view='side'`
+    // — without a size segment they collide on a single key and the
+    // last surface to render overwrites the other's sprite. Painting
+    // it back stretches the larger source into the smaller canvas
+    // (or vice versa) and the car looks zoomed-in / squashed.
+    //
+    // Why the CSS client size and not the backing-buffer width: callers
+    // that read the cache may not have laid out the canvas yet, but
+    // they know its CSS box. Snapshot-time we ALSO have CSS box (the
+    // 3D canvas was rendered to fit it). Both sides agree at CSS-box
+    // resolution; backing buffer would re-introduce DPR drift after
+    // we already bucket DPR separately.
+    //
+    // 32-px rounding gives forgiveness against minor layout drift
+    // (browser zoom, sidebar collapse animations) while still
+    // separating the sidebar (~280) from the hero (~1180).
+    function sizeBucket(canvasEl) {
+        if (!canvasEl) return '0x0';
+        var w = canvasEl.clientWidth  || canvasEl.width  || 0;
+        var h = canvasEl.clientHeight || canvasEl.height || 0;
+        var bw = Math.round(w / 32) * 32;
+        var bh = Math.round(h / 32) * 32;
+        return bw + 'x' + bh;
+    }
+
+    function buildKey(modelId, color, view, canvasEl) {
         // Lower-case the colour so '#1A1A1E' and '#1a1a1e' don't fork.
         var c = (color || '').toLowerCase();
         var v = (view === 'top') ? 'top' : 'side';
         return 'v' + SPRITE_VERSION + '|'
-             + (modelId || '') + '|' + c + '|' + v + '|' + dprBucket();
+             + (modelId || '') + '|' + c + '|' + v + '|' + dprBucket()
+             + '|' + sizeBucket(canvasEl);
     }
 
-    function get(modelId, color, view) {
-        var key = buildKey(modelId, color, view);
+    function get(modelId, color, view, canvasEl) {
+        var key = buildKey(modelId, color, view, canvasEl);
         return openDb().then(function (db) {
             return new Promise(function (resolve, reject) {
                 var tx = db.transaction(STORE, 'readonly');
@@ -113,8 +146,8 @@
         }).catch(function () { return null; });
     }
 
-    function put(modelId, color, view, blob, w, h) {
-        var key = buildKey(modelId, color, view);
+    function put(modelId, color, view, canvasEl, blob, w, h) {
+        var key = buildKey(modelId, color, view, canvasEl);
         return openDb().then(function (db) {
             return new Promise(function (resolve) {
                 var tx = db.transaction(STORE, 'readwrite');

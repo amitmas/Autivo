@@ -957,7 +957,210 @@
         })();
         
         document.getElementById('miniPreviewContent').innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m22 8-6 4 6 4V8Z"/><rect width="14" height="12" x="2" y="6" rx="2"/></svg>';
-        
+
+        // Draggable mini-preview chip with snap-to-corner.
+        //
+        // Pattern: AssistiveTouch / Google Translate floating bubble.
+        // Pointer down starts a drag; the chip tracks the pointer freely
+        // (top/left set per-frame, no transition). On release we measure
+        // the chip centre vs the four corners of its containing rail and
+        // animate to the nearest one. Position persists in localStorage
+        // (corner only, so the chip lands correctly on next load even if
+        // viewport size changes) and we treat any pointer move under
+        // ~5px as a click — that keeps the existing tab-toggle behaviour
+        // intact for users who never want to drag.
+        (function () {
+            var chip = document.getElementById('miniPreview');
+            if (!chip) return;
+            var rail = chip.parentElement;     // .live-tabs-view (positioned)
+            var STORAGE_KEY = 'liveview.miniPreviewCorner';
+            var MARGIN = 16;                   // distance from rail edge after snap
+            var TOP_RESERVED = 80;             // header / top-bar safe zone
+            var BOTTOM_RESERVED = 16;          // map info bar / nav safe zone
+            var DRAG_THRESHOLD = 5;            // px before we treat as drag, not click
+
+            // Map a corner key to the four position properties. We set all
+            // four explicitly (auto for the unused pair) so the stylesheet's
+            // `top: 80px; left: 24px` defaults don't fight our snap-target
+            // when we land on bottom-right etc.
+            function applyCorner(corner, animate) {
+                if (animate) {
+                    chip.classList.add('snap-anim');
+                    setTimeout(function () { chip.classList.remove('snap-anim'); }, 260);
+                }
+                var topRes = TOP_RESERVED + 'px';
+                var leftRes = MARGIN + 'px';
+                var rightRes = MARGIN + 'px';
+                var bottomRes = (BOTTOM_RESERVED + 60) + 'px';
+                if (corner === 'tl') {
+                    chip.style.top = topRes; chip.style.left = leftRes;
+                    chip.style.right = 'auto'; chip.style.bottom = 'auto';
+                } else if (corner === 'tr') {
+                    chip.style.top = topRes; chip.style.right = rightRes;
+                    chip.style.left = 'auto'; chip.style.bottom = 'auto';
+                } else if (corner === 'bl') {
+                    chip.style.bottom = bottomRes; chip.style.left = leftRes;
+                    chip.style.top = 'auto'; chip.style.right = 'auto';
+                } else {
+                    chip.style.bottom = bottomRes; chip.style.right = rightRes;
+                    chip.style.top = 'auto'; chip.style.left = 'auto';
+                }
+            }
+
+            // Restore last corner on first paint. Default to bottom-left so
+            // the chip doesn't overlap the camera tab's top bar (connection
+            // pill / decoder chip on the left, quality select / fullscreen
+            // on the right) or the My Location / Directions FABs on the map
+            // tab (top-right). User can drag to any corner.
+            var savedCorner = 'bl';
+            try {
+                var s = localStorage.getItem(STORAGE_KEY);
+                if (s && /^(tl|tr|bl|br)$/.test(s)) savedCorner = s;
+            } catch (e) { /* localStorage blocked — ignore */ }
+            applyCorner(savedCorner, false);
+
+            // Use Pointer Events when present (Chrome 55+, so the BYD
+            // Chrome 58 WebView qualifies) and fall back to touch + mouse
+            // events otherwise. Move/up handlers are bound to *document*
+            // — not the chip — so the drag survives the pointer leaving
+            // the chip's bounds even when setPointerCapture silently fails
+            // on some embedded WebView builds.
+            var startX = 0, startY = 0;
+            var startLeft = 0, startTop = 0;
+            var moved = false;
+            var activeId = null;          // pointerId / touch identifier / null for mouse
+
+            function pickCoords(ev) {
+                if (ev.touches && ev.touches.length) return { x: ev.touches[0].clientX, y: ev.touches[0].clientY };
+                if (ev.changedTouches && ev.changedTouches.length) return { x: ev.changedTouches[0].clientX, y: ev.changedTouches[0].clientY };
+                return { x: ev.clientX, y: ev.clientY };
+            }
+
+            function beginDrag(ev) {
+                if (ev.button !== undefined && ev.button !== 0) return false;
+                var coords = pickCoords(ev);
+                if (coords.x === undefined) return false;
+                var railRect = rail.getBoundingClientRect();
+                var chipRect = chip.getBoundingClientRect();
+                startX = coords.x;
+                startY = coords.y;
+                startLeft = chipRect.left - railRect.left;
+                startTop = chipRect.top - railRect.top;
+                moved = false;
+                chip.style.top = startTop + 'px';
+                chip.style.left = startLeft + 'px';
+                chip.style.right = 'auto';
+                chip.style.bottom = 'auto';
+                chip.classList.remove('snap-anim');
+                return true;
+            }
+
+            function moveDrag(ev) {
+                var coords = pickCoords(ev);
+                if (coords.x === undefined) return;
+                var dx = coords.x - startX;
+                var dy = coords.y - startY;
+                if (!moved && Math.abs(dx) + Math.abs(dy) < DRAG_THRESHOLD) return;
+                if (!moved) {
+                    moved = true;
+                    chip.classList.add('dragging');
+                }
+                // Stop the WebView from interpreting the drag as a scroll
+                // / refresh-pull. touch-action:none on the chip handles
+                // pointer/touch events that originate on it; the document-
+                // level fallback below still needs the explicit prevent.
+                if (ev.cancelable) ev.preventDefault();
+                var railRect = rail.getBoundingClientRect();
+                var chipW = chip.offsetWidth, chipH = chip.offsetHeight;
+                var nextLeft = Math.max(MARGIN, Math.min(railRect.width - chipW - MARGIN, startLeft + dx));
+                var nextTop = Math.max(TOP_RESERVED, Math.min(railRect.height - chipH - BOTTOM_RESERVED - 60, startTop + dy));
+                chip.style.left = nextLeft + 'px';
+                chip.style.top = nextTop + 'px';
+            }
+
+            function endDrag() {
+                if (!moved) return;
+                chip.classList.remove('dragging');
+                var railRect = rail.getBoundingClientRect();
+                var chipRect = chip.getBoundingClientRect();
+                var cx = (chipRect.left + chipRect.right) / 2 - railRect.left;
+                var cy = (chipRect.top + chipRect.bottom) / 2 - railRect.top;
+                var corner = (cy < railRect.height / 2 ? 't' : 'b') + (cx < railRect.width / 2 ? 'l' : 'r');
+                applyCorner(corner, true);
+                try { localStorage.setItem(STORAGE_KEY, corner); } catch (e) {}
+                // Swallow the synthetic click that fires after a drag so
+                // we don't toggle tabs immediately after dropping.
+                var swallow = function (e) { e.stopPropagation(); e.preventDefault(); };
+                chip.addEventListener('click', swallow, true);
+                setTimeout(function () { chip.removeEventListener('click', swallow, true); }, 0);
+            }
+
+            // ── Pointer Events path (preferred on Chrome 58+) ──────────
+            if (window.PointerEvent) {
+                chip.addEventListener('pointerdown', function (ev) {
+                    if (activeId !== null) return;
+                    if (!beginDrag(ev)) return;
+                    activeId = ev.pointerId;
+                    try { chip.setPointerCapture(ev.pointerId); } catch (e) {}
+                });
+                document.addEventListener('pointermove', function (ev) {
+                    if (activeId === null || ev.pointerId !== activeId) return;
+                    moveDrag(ev);
+                });
+                var pUp = function (ev) {
+                    if (activeId === null || ev.pointerId !== activeId) return;
+                    try { chip.releasePointerCapture(activeId); } catch (e) {}
+                    endDrag();
+                    activeId = null;
+                };
+                document.addEventListener('pointerup', pUp);
+                document.addEventListener('pointercancel', pUp);
+            } else {
+                // ── Touch + mouse fallback (very old WebViews) ─────────
+                chip.addEventListener('touchstart', function (ev) {
+                    if (activeId !== null || !ev.touches || !ev.touches.length) return;
+                    if (!beginDrag(ev)) return;
+                    activeId = ev.touches[0].identifier;
+                }, { passive: true });
+                document.addEventListener('touchmove', function (ev) {
+                    if (activeId === null) return;
+                    moveDrag(ev);
+                }, { passive: false });
+                var tEnd = function () {
+                    if (activeId === null) return;
+                    endDrag();
+                    activeId = null;
+                };
+                document.addEventListener('touchend', tEnd);
+                document.addEventListener('touchcancel', tEnd);
+
+                chip.addEventListener('mousedown', function (ev) {
+                    if (activeId !== null) return;
+                    if (!beginDrag(ev)) return;
+                    activeId = 'mouse';
+                });
+                document.addEventListener('mousemove', function (ev) {
+                    if (activeId !== 'mouse') return;
+                    moveDrag(ev);
+                });
+                document.addEventListener('mouseup', function () {
+                    if (activeId !== 'mouse') return;
+                    endDrag();
+                    activeId = null;
+                });
+            }
+
+            // Re-snap on viewport resize (e.g. BYD landscape↔portrait
+            // rotation) so a corner valid in one orientation is also
+            // valid in the other.
+            window.addEventListener('resize', function () {
+                try {
+                    var s = localStorage.getItem(STORAGE_KEY);
+                    if (s && /^(tl|tr|bl|br)$/.test(s)) applyCorner(s, false);
+                } catch (e) {}
+            });
+        })();
+
         document.addEventListener('fullscreenchange', () => {
             if (!document.fullscreenElement && BYD.stream.isFullscreen) {
                 BYD.stream.isFullscreen = false;

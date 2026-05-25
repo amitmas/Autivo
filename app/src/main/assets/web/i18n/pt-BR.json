@@ -24,6 +24,7 @@
     "dashboard_title": "Painel de controlo - OverDrive"
   },
   "nav": {
+    "dashboard": "Painel",
     "live_view": "Visualização ao vivo",
     "events": "Eventos",
     "surveillance": "Vigilância",
@@ -44,9 +45,8 @@
     "overview_group": "Visão geral",
     "vehicle_group": "Veículo",
     "about_group": "Sobre",
-    "telegram": "Telegram",
-    "dashboard": "Painel",
-    "brand_home": "OverDrive — abrir Painel"
+    "brand_home": "OverDrive — abrir Painel",
+    "telegram": "Telegram"
   },
   "status": {
     "device": "Dispositivo",
@@ -1640,28 +1640,23 @@
     "delivery_pointer": "As preferências de entrega (que acontecimentos chegam ao chat) estão ao vivo na guia Notificações → Telegram."
   },
   "dashboard": {
+    "heading": "Painel",
+    "subtitle": "Status do veículo, posição e controles principais.",
     "chip_device_pending": "Dispositivo...",
     "chip_surveillance_pending": "A vigilância...",
     "chip_gps_pending": "GPS --",
     "chip_device_value": "Dispositivo {id}",
     "chip_surveillance_value": "Sistema de vigilância {state}",
+    "chip_gps_live": "GPS ao vivo",
+    "chip_gps_cached": "GPS em cache",
     "kicker_position": "Posição",
     "kicker_commands": "Comandações",
     "kicker_vehicle": "Veículo",
-    "directions": "Orientações",
-    "cmd_events": "Eventos",
-    "metric_battery": "Bateria",
-    "metric_range": "Distância",
-    "metric_network": "Rede",
-    "unit_deg": "DEG",
-    "heading": "Painel",
-    "subtitle": "Status do veículo, posição e controles principais.",
-    "chip_gps_live": "GPS ao vivo",
-    "chip_gps_cached": "GPS em cache",
     "card_location": "Localização do veículo",
     "card_commands": "Controles rápidos",
     "card_info": "Informações principais",
     "open_live_view": "Abrir visualização ao vivo",
+    "directions": "Orientações",
     "no_gps_fix": "Sem fix de GPS",
     "gps_waiting": "Aguardando posição do veículo",
     "position_available": "Posição disponível",
@@ -1670,15 +1665,23 @@
     "cmd_flash": "Pisca",
     "cmd_find": "Localizar",
     "cmd_live": "Ao vivo",
+    "cmd_trunk_open": "Caixa aberta",
+    "cmd_trunk_close": "Caminho fechado",
+    "cmd_trips": "Viagens",
+    "metric_battery": "Bateria",
+    "metric_range": "Distância",
+    "metric_network": "Rede",
     "metric_lock": "Bloquear",
     "status_locked": "Bloqueado",
     "status_unlocked": "Desbloqueado",
     "network_mobile": "Móvel",
+    "unit_deg": "DEG",
     "time_seconds_ago": "há {n} s",
     "time_minutes_ago": "há {n} min",
     "time_hours_ago": "há {n} h",
     "toast_command_sent": "Comando enviado",
     "toast_command_failed": "Falha no comando",
-    "toast_no_location": "Localização do veículo indisponível"
+    "toast_no_location": "Localização do veículo indisponível",
+    "cmd_recordings": "Gravações"
   }
 }

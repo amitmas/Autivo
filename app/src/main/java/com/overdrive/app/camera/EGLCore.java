@@ -29,72 +29,165 @@ public class EGLCore {
     private EGLDisplay eglDisplay = EGL14.EGL_NO_DISPLAY;
     private EGLContext eglContext = EGL14.EGL_NO_CONTEXT;
     private EGLConfig eglConfig = null;
-    
+    private final int glesVersion;       // requested
+    private final boolean recordable;
+    // The GLES version we actually got (may differ from glesVersion if the
+    // driver rejected the requested GLES3+RECORDABLE combo and we fell back
+    // to GLES2 inside the constructor). AI-lane PBO code reads this so it
+    // can degrade gracefully on a fallback device.
+    private final java.util.concurrent.atomic.AtomicInteger actualGlesVersionRef =
+        new java.util.concurrent.atomic.AtomicInteger(0);
+    // True if we initialized eglDisplay ourselves; false if we inherit it from
+    // a parent (share group). Determines whether release() should call
+    // eglTerminate — terminating a shared display would break the parent.
+    private final boolean ownsDisplay;
+
     /**
-     * Creates and initializes an EGL context with RECORDABLE flag.
-     * 
-     * The RECORDABLE flag is critical for MediaCodec encoder compatibility,
-     * allowing the encoder to receive frames directly from GPU surfaces.
-     * 
-     * @throws RuntimeException if EGL initialization fails
+     * Default ctor — GLES 3 + RECORDABLE. The encoder context uses this.
      */
     public EGLCore() {
-        // Get default display
-        eglDisplay = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY);
-        if (eglDisplay == EGL14.EGL_NO_DISPLAY) {
-            throw new RuntimeException("Unable to get EGL14 display");
+        this(3, true, null);
+    }
+
+    /**
+     * Create a context that shares textures, FBOs, shader programs, and PBOs
+     * with {@code parent}. Used by the AI-lane GL thread so it can sample the
+     * camera OES texture allocated by the encoder thread without copying.
+     *
+     * The new context lives on the same {@code EGLDisplay} as {@code parent}
+     * (we do NOT call {@code eglInitialize} again — calling it twice on the
+     * same display is fine but {@code release()} of the child must not call
+     * {@code eglTerminate}, which would tear down the parent's display).
+     *
+     * @param parent encoder/main EGLCore. Must outlive the returned core.
+     * @return a fresh EGLCore in the same share group, GLES 3, non-recordable
+     *         (AI lane never feeds MediaCodec).
+     */
+    public static EGLCore createShared(EGLCore parent) {
+        if (parent == null) throw new IllegalArgumentException("parent EGLCore is null");
+        if (parent.eglContext == EGL14.EGL_NO_CONTEXT) {
+            throw new IllegalStateException("parent EGL context is not initialized");
         }
-        
-        // Initialize EGL
-        int[] version = new int[2];
-        if (!EGL14.eglInitialize(eglDisplay, version, 0, version, 1)) {
-            throw new RuntimeException("Unable to initialize EGL14");
+        // Use the parent's ACTUAL GLES version, not the requested one. If
+        // the parent's constructor fell back from GLES3 to GLES2 because
+        // the driver rejected the GLES3+RECORDABLE config combo, the
+        // requested-version field still reads 3 — and asking the child
+        // for GLES3 against a GLES2 parent produces a cross-version share
+        // group that most Adreno drivers refuse with EGL_NO_CONTEXT.
+        return new EGLCore(parent.getActualGlesVersion(), false, parent);
+    }
+
+    /**
+     * @param glesVersion 2 or 3. Tier 2 PBO/fence-sync requires 3.
+     * @param recordable adds {@code EGL_RECORDABLE_ANDROID} to the config.
+     *                   Required for the MediaCodec encoder surface; harmful
+     *                   for other paths because it constrains the chosen
+     *                   config (some Adreno builds drop GLES3 configs when
+     *                   RECORDABLE is also requested).
+     * @param parent     null = create a fresh display + ungrouped context.
+     *                   non-null = inherit display + share textures/programs.
+     */
+    private EGLCore(int glesVersion, boolean recordable, EGLCore parent) {
+        if (glesVersion != 2 && glesVersion != 3) {
+            throw new IllegalArgumentException("glesVersion must be 2 or 3, got " + glesVersion);
         }
-        
-        logger.debug( "EGL initialized: version " + version[0] + "." + version[1]);
-        
-        // Choose config with RECORDABLE flag (required for encoder!)
-        int[] configAttribs = {
-            EGL14.EGL_RED_SIZE, 8,
-            EGL14.EGL_GREEN_SIZE, 8,
-            EGL14.EGL_BLUE_SIZE, 8,
-            EGL14.EGL_ALPHA_SIZE, 8,
-            EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
-            EGLExt.EGL_RECORDABLE_ANDROID, 1,  // Critical for encoder compatibility
+        this.glesVersion = glesVersion;
+        this.recordable = recordable;
+
+        if (parent != null) {
+            // Inherit the parent's display so the share group is valid. We do
+            // NOT take ownership; release() must not eglTerminate.
+            eglDisplay = parent.eglDisplay;
+            ownsDisplay = false;
+        } else {
+            eglDisplay = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY);
+            if (eglDisplay == EGL14.EGL_NO_DISPLAY) {
+                throw new RuntimeException("Unable to get EGL14 display");
+            }
+            int[] version = new int[2];
+            if (!EGL14.eglInitialize(eglDisplay, version, 0, version, 1)) {
+                throw new RuntimeException("Unable to initialize EGL14");
+            }
+            logger.debug("EGL initialized: version " + version[0] + "." + version[1]);
+            ownsDisplay = true;
+        }
+
+        // Build the config attrib list. RECORDABLE only on the encoder context
+        // — adding it to the AI-lane shared context would constrain config
+        // selection for no benefit, since the AI lane never feeds MediaCodec.
+        //
+        // Driver fallback: a few Adreno builds reject "GLES3 + RECORDABLE"
+        // configs even though GLES 3.2 is otherwise supported. If chooseConfig
+        // fails for the requested version we fall back to GLES 2 — Tier 2's
+        // PBO/fence-sync calls are GLES 3 entry points, so the AI-lane code
+        // gates on the GLES version at runtime via this field.
+        int actualGles = glesVersion;
+        eglConfig = chooseConfigOrFallback(eglDisplay, actualGles, recordable);
+        if (eglConfig == null && actualGles == 3) {
+            logger.warn("GLES3 EGL config unavailable (recordable=" + recordable
+                    + "); falling back to GLES2");
+            actualGles = 2;
+            eglConfig = chooseConfigOrFallback(eglDisplay, actualGles, recordable);
+        }
+        if (eglConfig == null) {
+            throw new RuntimeException("No EGL configs found (gles=" + glesVersion
+                + ", recordable=" + recordable + ")");
+        }
+        logger.debug("EGL config chosen (gles=" + actualGles + ", recordable=" + recordable + ")");
+
+        int[] contextAttribs = {
+            EGL14.EGL_CONTEXT_CLIENT_VERSION, actualGles,
             EGL14.EGL_NONE
         };
-        
+
+        EGLContext shareWith = (parent != null) ? parent.eglContext : EGL14.EGL_NO_CONTEXT;
+        eglContext = EGL14.eglCreateContext(eglDisplay, eglConfig, shareWith, contextAttribs, 0);
+
+        if (eglContext == EGL14.EGL_NO_CONTEXT) {
+            throw new RuntimeException("Failed to create EGL context (gles=" + actualGles + ")");
+        }
+        // Mutate field so getGlesVersion() reports what we actually got.
+        actualGlesVersionRef.set(actualGles);
+        logger.debug("EGL context created (gles=" + actualGles + ", shared=" + (parent != null) + ")");
+
+        checkEglError("EGLCore constructor");
+    }
+
+    // EGL extension token — not in the public EGL14 constants, but defined by
+    // the KHR_create_context extension and accepted by every Adreno driver
+    // since Adreno 3xx. The numeric value is part of the EGL spec.
+    private static final int EGL_OPENGL_ES3_BIT_KHR = 0x0040;
+
+    /** @return the actual GLES version this context was created with (2 or 3). */
+    public int getActualGlesVersion() {
+        int v = actualGlesVersionRef.get();
+        return v != 0 ? v : glesVersion;
+    }
+
+    private static EGLConfig chooseConfigOrFallback(EGLDisplay display,
+                                                    int glesVersion,
+                                                    boolean recordable) {
+        int rType = (glesVersion == 3) ? EGL_OPENGL_ES3_BIT_KHR : EGL14.EGL_OPENGL_ES2_BIT;
+        java.util.List<Integer> attribs = new java.util.ArrayList<>(20);
+        attribs.add(EGL14.EGL_RED_SIZE);   attribs.add(8);
+        attribs.add(EGL14.EGL_GREEN_SIZE); attribs.add(8);
+        attribs.add(EGL14.EGL_BLUE_SIZE);  attribs.add(8);
+        attribs.add(EGL14.EGL_ALPHA_SIZE); attribs.add(8);
+        attribs.add(EGL14.EGL_RENDERABLE_TYPE); attribs.add(rType);
+        if (recordable) {
+            attribs.add(EGLExt.EGL_RECORDABLE_ANDROID); attribs.add(1);
+        }
+        attribs.add(EGL14.EGL_NONE);
+        int[] configAttribs = new int[attribs.size()];
+        for (int i = 0; i < attribs.size(); i++) configAttribs[i] = attribs.get(i);
+
         EGLConfig[] configs = new EGLConfig[1];
         int[] numConfigs = new int[1];
-        if (!EGL14.eglChooseConfig(eglDisplay, configAttribs, 0,
+        if (!EGL14.eglChooseConfig(display, configAttribs, 0,
                 configs, 0, configs.length, numConfigs, 0)) {
-            throw new RuntimeException("Unable to find suitable EGL config");
+            return null;
         }
-        
-        if (numConfigs[0] == 0) {
-            throw new RuntimeException("No EGL configs found");
-        }
-        
-        eglConfig = configs[0];
-        logger.debug( "EGL config chosen with RECORDABLE flag");
-        
-        // Create OpenGL ES 2.0 context
-        int[] contextAttribs = {
-            EGL14.EGL_CONTEXT_CLIENT_VERSION, 2,
-            EGL14.EGL_NONE
-        };
-        
-        eglContext = EGL14.eglCreateContext(eglDisplay, eglConfig,
-                EGL14.EGL_NO_CONTEXT, contextAttribs, 0);
-        
-        if (eglContext == EGL14.EGL_NO_CONTEXT) {
-            throw new RuntimeException("Failed to create EGL context");
-        }
-        
-        logger.debug( "EGL context created successfully");
-        
-        // Verify EGL state
-        checkEglError("EGLCore constructor");
+        return numConfigs[0] > 0 ? configs[0] : null;
     }
     
     /**
@@ -262,21 +355,24 @@ public class EGLCore {
     public void release() {
         if (eglDisplay != EGL14.EGL_NO_DISPLAY) {
             // Unbind current context
-            EGL14.eglMakeCurrent(eglDisplay, 
+            EGL14.eglMakeCurrent(eglDisplay,
                     EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT);
-            
-            // Destroy context
+
+            // Destroy our own context. The display itself is only torn down by
+            // the owner — child cores in the same share group must NOT call
+            // eglTerminate or the parent's textures/programs disappear too.
             if (eglContext != EGL14.EGL_NO_CONTEXT) {
                 EGL14.eglDestroyContext(eglDisplay, eglContext);
                 eglContext = EGL14.EGL_NO_CONTEXT;
             }
-            
-            // Terminate display
-            EGL14.eglTerminate(eglDisplay);
+
+            if (ownsDisplay) {
+                EGL14.eglTerminate(eglDisplay);
+            }
             eglDisplay = EGL14.EGL_NO_DISPLAY;
         }
-        
-        logger.debug( "EGL resources released");
+
+        logger.debug("EGL resources released" + (ownsDisplay ? "" : " (shared display)"));
     }
     
     /**

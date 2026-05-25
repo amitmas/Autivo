@@ -543,9 +543,235 @@ public class MqttConnectionManager {
                 // Cabin temp
                 if (!Double.isNaN(vd.insideTempCelsius)) payload.put("cabin_temp", vd.insideTempCelsius);
 
-                // Per-tyre temperature is not available via the public
-                // BYD SDK on real firmwares — keys removed to avoid
-                // publishing stale/zero values.
+                // ==================== FULL PARITY (every remaining BydVehicleData field) ====================
+                // Identity
+                if (vd.vin != null) payload.put("vin", vd.vin);
+
+                // HV battery — pack/cell voltage (range-gated to filter phantom zeros / OBD glitches)
+                if (!Double.isNaN(vd.hvPackVoltage) && vd.hvPackVoltage >= 100 && vd.hvPackVoltage <= 1000)
+                    payload.put("hv_pack_v", vd.hvPackVoltage);
+                if (!Double.isNaN(vd.highCellVoltage) && vd.highCellVoltage >= 2.0 && vd.highCellVoltage <= 4.5)
+                    payload.put("cell_v_max", vd.highCellVoltage);
+                if (!Double.isNaN(vd.lowCellVoltage) && vd.lowCellVoltage >= 2.0 && vd.lowCellVoltage <= 4.5)
+                    payload.put("cell_v_min", vd.lowCellVoltage);
+                double cellVDelta = vd.getCellVoltageDelta();
+                if (!Double.isNaN(cellVDelta) && cellVDelta >= 0 && cellVDelta <= 1.0)
+                    payload.put("cell_v_delta", cellVDelta);
+                if (!Double.isNaN(vd.socHevPercent) && vd.socHevPercent >= 0 && vd.socHevPercent <= 100)
+                    payload.put("soc_hev", vd.socHevPercent);
+                if (!Double.isNaN(vd.capacityAh) && vd.capacityAh > 0 && vd.capacityAh <= 1000)
+                    payload.put("capacity_ah", vd.capacityAh);
+
+                // HV battery — temperature (max/min/avg + delta + auxiliary). Range gate matches batt_temp.
+                if (!Double.isNaN(vd.highCellTempC) && vd.highCellTempC >= -40 && vd.highCellTempC <= 80)
+                    payload.put("cell_t_max", vd.highCellTempC);
+                if (!Double.isNaN(vd.lowCellTempC) && vd.lowCellTempC >= -40 && vd.lowCellTempC <= 80)
+                    payload.put("cell_t_min", vd.lowCellTempC);
+                if (!Double.isNaN(vd.avgCellTempC) && vd.avgCellTempC >= -40 && vd.avgCellTempC <= 80)
+                    payload.put("cell_t_avg", vd.avgCellTempC);
+                double cellTDelta = vd.getCellTempDelta();
+                if (!Double.isNaN(cellTDelta) && cellTDelta >= 0 && cellTDelta <= 50)
+                    payload.put("cell_t_delta", cellTDelta);
+                if (!Double.isNaN(vd.waterTempC) && vd.waterTempC >= -40 && vd.waterTempC <= 130)
+                    payload.put("coolant_temp", vd.waterTempC);
+                if (!Double.isNaN(vd.bodyworkBattTempC) && vd.bodyworkBattTempC >= -40 && vd.bodyworkBattTempC <= 80)
+                    payload.put("bodywork_batt_temp", vd.bodyworkBattTempC);
+                if (!Double.isNaN(vd.insideTempC) && vd.insideTempC >= -40 && vd.insideTempC <= 80)
+                    payload.put("inside_temp", vd.insideTempC);
+
+                // 12V battery (voltage12v is already source-validated to 8.0–16.0V in BydDataCollector)
+                if (!Double.isNaN(vd.voltage12v)) payload.put("volt_12v", vd.voltage12v);
+                if (vd.voltageLevelRaw != BydVehicleData.UNAVAILABLE) payload.put("volt_12v_level", vd.voltageLevelRaw);
+                if (vd.battery12vLevel != BydVehicleData.UNAVAILABLE) payload.put("batt_12v_level", vd.battery12vLevel);
+
+                // Motor / drivetrain
+                if (vd.frontMotorSpeed != BydVehicleData.UNAVAILABLE
+                        && vd.frontMotorSpeed >= -25000 && vd.frontMotorSpeed <= 25000)
+                    payload.put("motor_front_rpm", vd.frontMotorSpeed);
+                if (vd.rearMotorSpeed != BydVehicleData.UNAVAILABLE
+                        && vd.rearMotorSpeed >= -25000 && vd.rearMotorSpeed <= 25000)
+                    payload.put("motor_rear_rpm", vd.rearMotorSpeed);
+                if (!Double.isNaN(vd.frontMotorTorque)
+                        && vd.frontMotorTorque >= -2000 && vd.frontMotorTorque <= 2000)
+                    payload.put("motor_front_torque", vd.frontMotorTorque);
+                if (vd.engineSpeedRpm != BydVehicleData.UNAVAILABLE
+                        && vd.engineSpeedRpm >= 0 && vd.engineSpeedRpm <= 15000)
+                    payload.put("engine_rpm", vd.engineSpeedRpm);
+                if (vd.accelPercent != BydVehicleData.UNAVAILABLE
+                        && vd.accelPercent >= 0 && vd.accelPercent <= 100)
+                    payload.put("accel_pct", vd.accelPercent);
+                if (vd.brakePercent != BydVehicleData.UNAVAILABLE
+                        && vd.brakePercent >= 0 && vd.brakePercent <= 100)
+                    payload.put("brake_pct", vd.brakePercent);
+                if (!Double.isNaN(vd.steeringAngleDegrees)
+                        && vd.steeringAngleDegrees >= -1080 && vd.steeringAngleDegrees <= 1080)
+                    payload.put("steering_deg", vd.steeringAngleDegrees);
+                if (!Double.isNaN(vd.slopeDegrees)
+                        && vd.slopeDegrees >= -90 && vd.slopeDegrees <= 90)
+                    payload.put("slope_deg", vd.slopeDegrees);
+
+                // Energy / range / consumption
+                if (vd.energyMode != BydVehicleData.UNAVAILABLE) payload.put("energy_mode", vd.energyMode);
+                if (vd.operationMode != BydVehicleData.UNAVAILABLE) payload.put("op_mode", vd.operationMode);
+                if (!Double.isNaN(vd.totalElecCon) && vd.totalElecCon >= 0) payload.put("total_elec_con", vd.totalElecCon);
+                if (!Double.isNaN(vd.totalFuelCon) && vd.totalFuelCon >= 0) payload.put("total_fuel_con", vd.totalFuelCon);
+                if (vd.fuelRangeKm != BydVehicleData.UNAVAILABLE
+                        && vd.fuelRangeKm >= 0 && vd.fuelRangeKm <= 3000) payload.put("fuel_range_km", vd.fuelRangeKm);
+                if (!Double.isNaN(vd.fuelPercent) && vd.fuelPercent >= 0 && vd.fuelPercent <= 100)
+                    payload.put("fuel_pct", vd.fuelPercent);
+                if (vd.bodyworkRangeKm != BydVehicleData.UNAVAILABLE
+                        && vd.bodyworkRangeKm >= 0 && vd.bodyworkRangeKm <= 3000) payload.put("bodywork_range_km", vd.bodyworkRangeKm);
+                if (vd.evMileageKm != BydVehicleData.UNAVAILABLE && vd.evMileageKm >= 0)
+                    payload.put("ev_mileage_km", vd.evMileageKm);
+
+                // Charging detail
+                if (vd.chargingState != BydVehicleData.UNAVAILABLE) payload.put("charging_state", vd.chargingState);
+                if (vd.chargerWorkState != BydVehicleData.UNAVAILABLE) payload.put("charger_state", vd.chargerWorkState);
+                if (vd.chargingMode != BydVehicleData.UNAVAILABLE) payload.put("charging_mode", vd.chargingMode);
+                if (vd.chargingGunState != BydVehicleData.UNAVAILABLE) payload.put("charging_gun", vd.chargingGunState);
+                if (vd.chargingType != BydVehicleData.UNAVAILABLE) payload.put("charging_type", vd.chargingType);
+                if (vd.chargingPercent != BydVehicleData.UNAVAILABLE
+                        && vd.chargingPercent >= 0 && vd.chargingPercent <= 100)
+                    payload.put("charging_pct", vd.chargingPercent);
+                if (!Double.isNaN(vd.chargingCapacityKwh) && vd.chargingCapacityKwh >= 0
+                        && vd.chargingCapacityKwh <= 1000)
+                    payload.put("charging_capacity_kwh", vd.chargingCapacityKwh);
+                payload.put("charging_v2l", vd.vtolCharging ? 1 : 0);
+                if (vd.wirelessChargingLeftState != BydVehicleData.UNAVAILABLE) payload.put("wireless_charging_left", vd.wirelessChargingLeftState);
+                if (vd.wirelessChargingRightState != BydVehicleData.UNAVAILABLE) payload.put("wireless_charging_right", vd.wirelessChargingRightState);
+                if (vd.wirelessChargingStatus != BydVehicleData.UNAVAILABLE) payload.put("wireless_charging_status", vd.wirelessChargingStatus);
+
+                // Tyres — flat per-corner keys (FL/FR/RL/RR). Pressure in kPa, gate to plausible 0–600 range
+                // (an unset/error reading often returns 0 or a sentinel; skip those individually).
+                if (vd.tyrePressure != null && vd.tyrePressure.length >= 4) {
+                    String[] corners = {"tyre_p_fl", "tyre_p_fr", "tyre_p_rl", "tyre_p_rr"};
+                    for (int i = 0; i < 4; i++) {
+                        int p = vd.tyrePressure[i];
+                        if (p > 0 && p <= 600) payload.put(corners[i], p);
+                    }
+                }
+                if (vd.tyrePressureState != null && vd.tyrePressureState.length >= 4) {
+                    payload.put("tyre_p_state_fl", vd.tyrePressureState[0]);
+                    payload.put("tyre_p_state_fr", vd.tyrePressureState[1]);
+                    payload.put("tyre_p_state_rl", vd.tyrePressureState[2]);
+                    payload.put("tyre_p_state_rr", vd.tyrePressureState[3]);
+                }
+                if (vd.tyreAirLeakState != null && vd.tyreAirLeakState.length >= 4) {
+                    payload.put("tyre_leak_fl", vd.tyreAirLeakState[0]);
+                    payload.put("tyre_leak_fr", vd.tyreAirLeakState[1]);
+                    payload.put("tyre_leak_rl", vd.tyreAirLeakState[2]);
+                    payload.put("tyre_leak_rr", vd.tyreAirLeakState[3]);
+                }
+                if (vd.tyreSignalState != null && vd.tyreSignalState.length >= 4) {
+                    payload.put("tyre_signal_fl", vd.tyreSignalState[0]);
+                    payload.put("tyre_signal_fr", vd.tyreSignalState[1]);
+                    payload.put("tyre_signal_rl", vd.tyreSignalState[2]);
+                    payload.put("tyre_signal_rr", vd.tyreSignalState[3]);
+                }
+                // Per-tyre temperature: emit only corners with plausible readings.
+                // Most BYD firmwares leave these UNAVAILABLE; some return 0 when stale.
+                if (vd.tyreTemperature != null && vd.tyreTemperature.length >= 4) {
+                    String[] tCorners = {"tyre_t_fl", "tyre_t_fr", "tyre_t_rl", "tyre_t_rr"};
+                    for (int i = 0; i < 4; i++) {
+                        int t = vd.tyreTemperature[i];
+                        if (t != BydVehicleData.UNAVAILABLE && t >= -40 && t <= 120) {
+                            payload.put(tCorners[i], t);
+                        }
+                    }
+                }
+                if (vd.tyreSystemState != BydVehicleData.UNAVAILABLE) payload.put("tyre_system_state", vd.tyreSystemState);
+                if (vd.tyreTemperatureState != BydVehicleData.UNAVAILABLE) payload.put("tyre_temp_state", vd.tyreTemperatureState);
+
+                // Doors / windows — array values at flat keys
+                if (vd.doorLockStatus != null) {
+                    JSONArray a = new JSONArray();
+                    for (int s : vd.doorLockStatus) a.put(s);
+                    payload.put("door_lock", a);
+                }
+                if (vd.windowOpenPercent != null) {
+                    JSONArray a = new JSONArray();
+                    for (int p : vd.windowOpenPercent) a.put(p);
+                    payload.put("window_open", a);
+                }
+
+                // Lights
+                if (vd.leftTurnState != BydVehicleData.UNAVAILABLE) payload.put("light_left_turn", vd.leftTurnState);
+                if (vd.rightTurnState != BydVehicleData.UNAVAILABLE) payload.put("light_right_turn", vd.rightTurnState);
+                payload.put("light_low_beam", vd.lowBeam ? 1 : 0);
+                payload.put("light_high_beam", vd.highBeam ? 1 : 0);
+                payload.put("light_rear_fog", vd.rearFog ? 1 : 0);
+                payload.put("light_front_fog", vd.frontFog ? 1 : 0);
+                payload.put("light_hazard", vd.hazard ? 1 : 0);
+                payload.put("light_drl", vd.dayTimeLight ? 1 : 0);
+
+                // Climate
+                if (vd.acStartState != BydVehicleData.UNAVAILABLE) payload.put("ac_on", vd.acStartState);
+                if (vd.acCycleMode != BydVehicleData.UNAVAILABLE) payload.put("ac_cycle", vd.acCycleMode);
+                if (vd.acWindMode != BydVehicleData.UNAVAILABLE) payload.put("ac_wind", vd.acWindMode);
+                if (vd.acFanLevel != BydVehicleData.UNAVAILABLE) payload.put("ac_fan", vd.acFanLevel);
+                if (vd.tempUnit != BydVehicleData.UNAVAILABLE) payload.put("temp_unit", vd.tempUnit);
+
+                // Seats
+                if (vd.seatbeltStatus != null) {
+                    JSONArray a = new JSONArray();
+                    for (int s : vd.seatbeltStatus) a.put(s);
+                    payload.put("seatbelt", a);
+                }
+                if (vd.seatHeat != null) {
+                    JSONArray a = new JSONArray();
+                    for (int s : vd.seatHeat) a.put(s);
+                    payload.put("seat_heat", a);
+                }
+                if (vd.seatCool != null) {
+                    JSONArray a = new JSONArray();
+                    for (int s : vd.seatCool) a.put(s);
+                    payload.put("seat_cool", a);
+                }
+
+                // Bodywork
+                if (vd.wiperState != BydVehicleData.UNAVAILABLE) payload.put("wiper_state", vd.wiperState);
+                if (vd.sunroofState != BydVehicleData.UNAVAILABLE) payload.put("sunroof_state", vd.sunroofState);
+                if (vd.sunroofPosition != BydVehicleData.UNAVAILABLE) payload.put("sunroof_pos", vd.sunroofPosition);
+                if (vd.sunshadePercent != BydVehicleData.UNAVAILABLE) payload.put("sunshade_pct", vd.sunshadePercent);
+                payload.put("drift_mode", vd.driftModeEnabled ? 1 : 0);
+
+                // Engine (PHEV)
+                if (vd.engineCoolantLevel != BydVehicleData.UNAVAILABLE) payload.put("engine_coolant_level", vd.engineCoolantLevel);
+                if (vd.oilLevel != BydVehicleData.UNAVAILABLE) payload.put("oil_level", vd.oilLevel);
+                if (vd.engineCode != null) payload.put("engine_code", vd.engineCode);
+
+                // Safety / radar
+                if (vd.passengerDetection != null) {
+                    JSONArray a = new JSONArray();
+                    for (int p : vd.passengerDetection) a.put(p);
+                    payload.put("passenger_detection", a);
+                }
+                if (vd.emergencyAlarmState != BydVehicleData.UNAVAILABLE) payload.put("emergency_alarm", vd.emergencyAlarmState);
+                if (vd.powerLevel != BydVehicleData.UNAVAILABLE) payload.put("power_level", vd.powerLevel);
+                if (vd.mcuStatus != BydVehicleData.UNAVAILABLE) payload.put("mcu_status", vd.mcuStatus);
+                if (vd.radarDistances != null) {
+                    JSONArray a = new JSONArray();
+                    for (int d : vd.radarDistances) a.put(d);
+                    payload.put("radar_distances", a);
+                }
+                payload.put("speed_limit_warning", vd.speedLimitWarning ? 1 : 0);
+
+                // Air quality (negative readings are sensor errors)
+                if (vd.pm25Inside != BydVehicleData.UNAVAILABLE && vd.pm25Inside >= 0 && vd.pm25Inside <= 1000)
+                    payload.put("pm25_inside", vd.pm25Inside);
+                if (vd.pm25Outside != BydVehicleData.UNAVAILABLE && vd.pm25Outside >= 0 && vd.pm25Outside <= 1000)
+                    payload.put("pm25_outside", vd.pm25Outside);
+
+                // Key proximity
+                if (vd.keyStartState != BydVehicleData.UNAVAILABLE) payload.put("key_start_state", vd.keyStartState);
+                if (vd.keyMissingInd != BydVehicleData.UNAVAILABLE) payload.put("key_missing", vd.keyMissingInd);
+                if (vd.keyBtLowPowerMode != BydVehicleData.UNAVAILABLE) payload.put("key_bt_low_power", vd.keyBtLowPowerMode);
+                if (vd.keyPowerLowInd != BydVehicleData.UNAVAILABLE) payload.put("key_power_low", vd.keyPowerLowInd);
+                if (vd.keyDetectionReminder != BydVehicleData.UNAVAILABLE) payload.put("key_detection_reminder", vd.keyDetectionReminder);
+                if (vd.smartKeyWarnState != BydVehicleData.UNAVAILABLE) payload.put("smart_key_warn", vd.smartKeyWarnState);
+
+                // Snapshot timestamp (when BydDataCollector polled the SDK; differs from `utc` if cached)
+                if (vd.timestamp > 0) payload.put("vd_timestamp", vd.timestamp / 1000);
             }
 
         } catch (Exception e) {

@@ -323,28 +323,206 @@ const MQTT = {
 
     // ==================== TELEMETRY ====================
 
-    updateTelemetryTable(t) {
-        const fields = {
-            tlm_utc:         t.utc != null ? new Date(t.utc * 1000).toLocaleTimeString(BYD.i18n.getLang()) : '--',
-            tlm_soc:         t.soc != null ? t.soc.toFixed(1) + '%' : '--%',
-            tlm_power:       t.power != null ? t.power.toFixed(1) + ' kW' : '-- kW',
-            tlm_speed:       t.speed != null ? BYD.units.speed(t.speed) : '-- ' + BYD.units.speedLabel(),
-            tlm_lat:         t.lat != null ? t.lat.toFixed(6) : '--',
-            tlm_lon:         t.lon != null ? t.lon.toFixed(6) : '--',
-            tlm_is_charging: t.is_charging != null ? (t.is_charging ? BYD.i18n.t('common.yes') : BYD.i18n.t('common.no')) : '--',
-            tlm_is_parked:   t.is_parked != null ? (t.is_parked ? BYD.i18n.t('common.yes') : BYD.i18n.t('common.no')) : '--',
-            tlm_elevation:   t.elevation != null ? t.elevation.toFixed(1) + ' m' : '-- m',
-            tlm_gear:        t.gear || '--',
-            tlm_ext_temp:    t.ext_temp != null ? t.ext_temp.toFixed(1) + ' °C' : '-- °C',
-            tlm_batt_temp:   t.batt_temp != null ? t.batt_temp.toFixed(1) + ' °C' : '-- °C',
-            tlm_odometer:    t.odometer != null ? BYD.units.dist(t.odometer, 1) : '-- ' + BYD.units.distLabel(),
-            tlm_soh:         t.soh != null ? t.soh.toFixed(1) + '%' : '--%'
-        };
+    // Per-key formatters for the live preview. Keys not listed fall through
+    // to the generic formatter (numbers get .toFixed(2), arrays/objects get
+    // JSON.stringify, booleans → yes/no, strings/ints unchanged).
+    // Only entries actually emitted by MqttConnectionManager.collectTelemetry
+    // need to be here; missing keys silently use the generic path.
+    _tlmFormat(key, v) {
+        if (v == null) return '--';
+        const yesNo = (x) => x ? BYD.i18n.t('common.yes') : BYD.i18n.t('common.no');
+        switch (key) {
+            // Time
+            case 'utc':
+            case 'vd_timestamp':
+                return new Date(v * 1000).toLocaleTimeString(BYD.i18n.getLang());
 
-        for (const [id, value] of Object.entries(fields)) {
-            const el = document.getElementById(id);
-            if (el) el.textContent = value;
+            // Booleans encoded as 0/1
+            case 'is_charging': case 'is_dcfc': case 'is_parked':
+            case 'charging_v2l': case 'drift_mode': case 'speed_limit_warning':
+            case 'light_low_beam': case 'light_high_beam': case 'light_rear_fog':
+            case 'light_front_fog': case 'light_hazard': case 'light_drl':
+                return yesNo(v);
+
+            // Percentages
+            case 'soc': case 'soc_hev': case 'soh': case 'soh_oem':
+            case 'fuel_pct': case 'charging_pct':
+            case 'accel_pct': case 'brake_pct': case 'sunshade_pct':
+                return (+v).toFixed(1) + '%';
+
+            // Power / energy
+            case 'power': case 'trip_kwh': case 'consumption_50km':
+            case 'charging_capacity_kwh': case 'capacity':
+                return (+v).toFixed(1) + (key === 'consumption_50km' ? ' kWh/100km' : ' kWh');
+
+            // Voltages
+            case 'volt_12v':
+            case 'cell_v_max': case 'cell_v_min': case 'cell_v_delta':
+                return (+v).toFixed(3) + ' V';
+            case 'hv_pack_v':
+                return (+v).toFixed(1) + ' V';
+
+            // Temperatures
+            case 'ext_temp': case 'batt_temp': case 'cabin_temp': case 'inside_temp':
+            case 'cell_t_max': case 'cell_t_min': case 'cell_t_avg': case 'cell_t_delta':
+            case 'coolant_temp': case 'bodywork_batt_temp':
+            case 'tyre_t_fl': case 'tyre_t_fr': case 'tyre_t_rl': case 'tyre_t_rr':
+                return (+v).toFixed(1) + ' °C';
+
+            // Distance
+            case 'odometer': case 'trip_km':
+                return BYD.units.dist(+v, 1);
+            case 'ev_range_km': case 'fuel_range_km': case 'bodywork_range_km':
+            case 'ev_mileage_km':
+                return (+v).toFixed(0) + ' km';
+
+            // Speed
+            case 'speed':
+                return BYD.units.speed(+v);
+
+            // Tyre pressure (kPa raw)
+            case 'tyre_p_fl': case 'tyre_p_fr': case 'tyre_p_rl': case 'tyre_p_rr':
+                return v + ' kPa';
+
+            // Coordinates
+            case 'lat': case 'lon':
+                return (+v).toFixed(6);
+
+            // Capacity / charge current
+            case 'capacity_ah':
+                return (+v).toFixed(1) + ' Ah';
+
+            // Range / time
+            case 'elevation':         return (+v).toFixed(1) + ' m';
+            case 'heading':           return (+v).toFixed(0) + '°';
+            case 'steering_deg':      return (+v).toFixed(1) + '°';
+            case 'slope_deg':         return (+v).toFixed(1) + '°';
+            case 'trip_hours':
+            case 'driving_time_hours':
+            case 'charging_eta_hours':
+                return (+v).toFixed(2) + ' h';
+            case 'charging_eta_minutes':
+                return v + ' min';
+            case 'motor_front_rpm': case 'motor_rear_rpm': case 'engine_rpm':
+                return v + ' rpm';
+            case 'motor_front_torque':
+                return (+v).toFixed(1) + ' Nm';
+            case 'pm25_inside': case 'pm25_outside':
+                return v + ' µg/m³';
+
+            default: {
+                // Generic: arrays/objects → JSON; numbers → 2dp; strings → unchanged
+                if (Array.isArray(v)) return JSON.stringify(v);
+                if (typeof v === 'object') return JSON.stringify(v);
+                if (typeof v === 'number') {
+                    return Number.isInteger(v) ? String(v) : v.toFixed(2);
+                }
+                return String(v);
+            }
         }
+    },
+
+    // Stable order for known keys; everything else gets appended alphabetically
+    // afterwards. Keeping the original 14 fields at the top so the table doesn't
+    // visually reshuffle when the new BYD parity fields land.
+    _tlmKeyOrder: [
+        'utc', 'soc', 'power', 'speed', 'lat', 'lon',
+        'is_charging', 'is_dcfc', 'is_parked',
+        'elevation', 'heading', 'gear',
+        'ext_temp', 'batt_temp', 'cabin_temp', 'inside_temp',
+        'odometer', 'soh', 'soh_oem', 'capacity', 'capacity_ah',
+        // Extended (existing)
+        'ev_range_km', 'trip_km', 'trip_hours', 'trip_kwh',
+        'consumption_50km', 'driving_time_hours',
+        'charging_eta_hours', 'charging_eta_minutes', 'key_battery',
+        // Identity
+        'vin',
+        // HV battery
+        'hv_pack_v', 'cell_v_max', 'cell_v_min', 'cell_v_delta',
+        'soc_hev',
+        'cell_t_max', 'cell_t_min', 'cell_t_avg', 'cell_t_delta',
+        'coolant_temp', 'bodywork_batt_temp',
+        // 12V
+        'volt_12v', 'volt_12v_level', 'batt_12v_level',
+        // Drivetrain
+        'motor_front_rpm', 'motor_rear_rpm', 'motor_front_torque',
+        'engine_rpm', 'accel_pct', 'brake_pct',
+        'steering_deg', 'slope_deg',
+        // Energy
+        'energy_mode', 'op_mode', 'total_elec_con', 'total_fuel_con',
+        'fuel_range_km', 'fuel_pct', 'bodywork_range_km', 'ev_mileage_km',
+        // Charging
+        'charging_state', 'charger_state', 'charging_mode', 'charging_gun',
+        'charging_type', 'charging_pct', 'charging_capacity_kwh', 'charging_v2l',
+        'wireless_charging_left', 'wireless_charging_right', 'wireless_charging_status',
+        // Tyres
+        'tyre_p_fl', 'tyre_p_fr', 'tyre_p_rl', 'tyre_p_rr',
+        'tyre_p_state_fl', 'tyre_p_state_fr', 'tyre_p_state_rl', 'tyre_p_state_rr',
+        'tyre_leak_fl', 'tyre_leak_fr', 'tyre_leak_rl', 'tyre_leak_rr',
+        'tyre_signal_fl', 'tyre_signal_fr', 'tyre_signal_rl', 'tyre_signal_rr',
+        'tyre_t_fl', 'tyre_t_fr', 'tyre_t_rl', 'tyre_t_rr',
+        'tyre_system_state', 'tyre_temp_state',
+        // Body
+        'door_lock', 'window_open',
+        'light_left_turn', 'light_right_turn',
+        'light_low_beam', 'light_high_beam', 'light_rear_fog',
+        'light_front_fog', 'light_hazard', 'light_drl',
+        // Climate
+        'ac_on', 'ac_cycle', 'ac_wind', 'ac_fan', 'temp_unit',
+        // Seats
+        'seatbelt', 'seat_heat', 'seat_cool',
+        // Bodywork
+        'wiper_state', 'sunroof_state', 'sunroof_pos', 'sunshade_pct',
+        'drift_mode',
+        // Engine (PHEV)
+        'engine_coolant_level', 'oil_level', 'engine_code',
+        // Safety / radar
+        'passenger_detection', 'emergency_alarm',
+        'power_level', 'mcu_status', 'radar_distances',
+        'speed_limit_warning',
+        // Air
+        'pm25_inside', 'pm25_outside',
+        // Key
+        'key_start_state', 'key_missing', 'key_bt_low_power',
+        'key_power_low', 'key_detection_reminder', 'smart_key_warn',
+        // Snapshot meta
+        'vd_timestamp'
+    ],
+
+    updateTelemetryTable(t) {
+        const tbody = document.getElementById('telemetryBody');
+        if (!tbody) return;
+
+        const seen = new Set();
+        const ordered = [];
+        for (const k of this._tlmKeyOrder) {
+            if (k in t) { ordered.push(k); seen.add(k); }
+        }
+        // Append any unknown keys (e.g. fields added on the Java side without
+        // updating _tlmKeyOrder) so nothing silently disappears.
+        const extras = Object.keys(t).filter(k => !seen.has(k)).sort();
+        for (const k of extras) ordered.push(k);
+
+        if (ordered.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="2" style="text-align:center;color:var(--text-muted);padding:24px;">--</td></tr>';
+            return;
+        }
+
+        // Build with textContent (no innerHTML key/value injection). Safer and
+        // avoids re-parsing the whole tree if a string ever contains '<'.
+        const rows = [];
+        for (const k of ordered) {
+            const tr = document.createElement('tr');
+            const tdK = document.createElement('td');
+            tdK.textContent = k;
+            const tdV = document.createElement('td');
+            tdV.textContent = this._tlmFormat(k, t[k]);
+            tr.appendChild(tdK);
+            tr.appendChild(tdV);
+            rows.push(tr);
+        }
+        tbody.innerHTML = '';
+        for (const r of rows) tbody.appendChild(r);
     },
 
     // ==================== UTILITIES ====================

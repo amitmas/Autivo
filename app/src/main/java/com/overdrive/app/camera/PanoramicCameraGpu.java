@@ -140,6 +140,16 @@ public class PanoramicCameraGpu {
     // (MOTION_PROCESS_INTERVAL_MS) keeps actual processing at ~10 fps so
     // there's no need for a separate frame-skip counter on the GL side.
     private com.overdrive.app.camera.AiLaneWorker aiLaneWorker;
+    // Tier-1 SOTA fix: dedicated AI-lane GL thread on a shared EGL context.
+    // The encoder GL thread now does ONLY consume→draw→swap; the readback
+    // and foveated crops live here, on a separate hardware-queue submission
+    // path that no longer stalls eglSwapBuffers when YOLO OpenCL is busy.
+    private AiLaneGl aiLaneGl;
+    // Monotonic per-bound-frame counter. AiLaneGl polls this via the
+    // CameraState callback to detect "is there a new frame to read?"; we
+    // bump it after every successful HAL bind in consumeLatestImageAndBind.
+    private final java.util.concurrent.atomic.AtomicLong cameraFrameSeq =
+            new java.util.concurrent.atomic.AtomicLong(0);
     // Last measured camera FPS, computed in the 2-min Stats log. Surfaced
     // via getMeasuredFps() so the UI can show actualFps when it falls below
     // requested (HAL clamp; e.g. user requests 30, HAL emits ~26).
@@ -281,11 +291,11 @@ public class PanoramicCameraGpu {
             });
         }
         this.aiLaneWorker.setSentry(sentry);
-        // Sentry needs the GL handler so its foveated crops (which touch GL
-        // state) can hop back to GL thread when called from AiLaneWorker.
-        if (sentry != null && glHandler != null) {
-            sentry.setGlHandler(glHandler);
-        }
+        // Sentry's foveated crops now run on the AiLaneGl thread, so we
+        // don't hand it the encoder GL handler any more — that path posted
+        // crops back to the encoder thread and competed with the render
+        // loop for handler slots. With AiLaneGl, the crop runs inline on
+        // its own GL context.
         if (sentry != null) {
             sentry.setCameraTargetFps(targetFps);
         }
@@ -381,10 +391,15 @@ public class PanoramicCameraGpu {
         glThread.start();
         glHandler = new Handler(glThread.getLooper());
 
-        // Now that the GL handler exists, give it to the sentry so its
-        // foveated crops can hop back to GL when called from AiLaneWorker.
+        // Tier 1 wiring: the AI-lane GL thread needs the camera frame seq
+        // and texture id, both of which live on this instance. Implement
+        // CameraState here.
+        final AiLaneGl.CameraState aiCameraState = new AiLaneGl.CameraState() {
+            @Override public int getCameraTextureId() { return cameraTextureId; }
+            @Override public long getFrameSeq()      { return cameraFrameSeq.get(); }
+        };
+
         if (sentry != null) {
-            sentry.setGlHandler(glHandler);
             sentry.setCameraTargetFps(targetFps);
         }
 
@@ -393,23 +408,41 @@ public class PanoramicCameraGpu {
             try {
                 initializeGl();
                 startCamera();
-                
+
                 // SOTA: Setup event callback for HAL error detection (-10086, 8)
                 if (cameraCoordinator != null && cameraObj != null) {
                     cameraCoordinator.setupEventCallback(cameraObj);
                 }
-                
+
+                // Tier 1: bring up the AI-lane GL thread now that the
+                // encoder EGL context (eglCore) exists. start() blocks
+                // until the shared context is current on its thread —
+                // that's what guarantees the parent context is observed
+                // alive at the moment of share-group create. After that,
+                // initialize the AI-lane GL state (foveated cropper) on
+                // the AI-lane thread.
+                aiLaneGl = new AiLaneGl(eglCore, aiCameraState);
+                aiLaneGl.start();
+                aiLaneGl.setConsumers(downscaler, foveatedCropper, sentry, aiLaneWorker);
+
+                final boolean cropperReady = aiLaneGl.runOnGlThreadBlocking(() -> {
+                    if (foveatedCropper != null) foveatedCropper.init();
+                }, 1500);
+                if (!cropperReady) {
+                    logger.warn("FoveatedCropper init on AI-lane thread did not complete in 1.5s");
+                }
+
                 running = true;
-                
+
                 // Start render loop
                 glHandler.post(this::renderLoop);
-                
+
                 // Start watchdog
                 startWatchdog();
-                
-                logger.info( "GPU camera pipeline started");
+
+                logger.info("GPU camera pipeline started (AI lane on dedicated GL thread)");
             } catch (Exception e) {
-                logger.error( "Failed to start GPU pipeline", e);
+                logger.error("Failed to start GPU pipeline", e);
                 throw new RuntimeException(e);
             }
         });
@@ -446,17 +479,33 @@ public class PanoramicCameraGpu {
         }
         
         if (downscaler != null) {
-            downscaler.init();  // Default RGB mode
-            logger.debug( "Downscaler initialized");
+            // The downscaler's init() spawns ITS OWN HandlerThread+EGL for the
+            // legacy ImageReader-backed probe path (readPixels). That path is
+            // independent of the AI-lane GL context — it's used by the
+            // camera-profile probe (PanoramicCameraGpu#1125,1193) and the
+            // diagnostics camera-mapping snapshot endpoint, neither of which
+            // is event-correlated. So leave it set up on the encoder thread.
+            //
+            // The hot path (readPixelsDirect) lazy-allocates its FBO + PBO
+            // ring on the *current* GL thread the first time it's called.
+            // With Tier 1 wiring, that first call lands on the AiLaneGl
+            // thread, so the FBO/PBOs end up in the AI-lane share-group
+            // context — not here. AiLaneGl.shutdown() calls
+            // GpuDownscaler.releaseDirectResources() to free them on the
+            // matching context (see T1-H1 fix).
+            downscaler.init();
+            logger.debug("Downscaler initialized (probe path on its own thread)");
         }
-        
-        // Initialize foveated cropper for high-res AI crops
-        // Pass strip dims and per-quadrant offsets so the foveated crop math
-        // is correct on Tang (5120x720) and on user-remapped Seal layouts.
+
+        // Construct the foveated cropper, but defer its init to the AI-lane
+        // GL thread (see brings up AiLaneGl below). Allocating its FBOs +
+        // shader on the encoder thread would put them in the encoder
+        // context's command stream, which defeats the whole point of
+        // Tier 1 — the readback in crop() would still serialize against
+        // the encoder thread's eglSwapBuffers.
         foveatedCropper = new FoveatedCropper(width, height, quadrantStripOffsetX);
-        foveatedCropper.init();
-        
-        logger.info( "OpenGL initialized (texture=" + cameraTextureId + ")");
+
+        logger.info("OpenGL initialized (texture=" + cameraTextureId + ")");
     }
     
     /**
@@ -903,6 +952,10 @@ public class PanoramicCameraGpu {
             // confirmed. See field comment on hwTsLatchedFallback.
             currentFrameTimestampNs = nextFrameTimestampNs(image);
             transferredOwnership = true;
+            // Bump the per-bind seq counter so the AI-lane GL thread can
+            // detect a fresh frame is ready. Bumped AFTER the bind succeeds
+            // so we never advertise a half-bound texture.
+            cameraFrameSeq.incrementAndGet();
             return true;
         } catch (Throwable t) {
             logger.warn("consumeLatestImageAndBind error: " + t.getMessage());
@@ -1316,89 +1369,27 @@ public class PanoramicCameraGpu {
                 localStreamEncoder.drainEncoder();
             }
 
-            // PASS 2: AI Lane (decoupled, async).
+            // PASS 2 + 3: AI lane.
             //
-            // GL thread: read pixels (~5-15ms) and post the byte[] to the AI
-            // worker. Worker runs sentry.processFrame on its own thread —
-            // V2 motion native (~30-100ms) and YOLO (which already dispatches
-            // to its own aiExecutor inside SurveillanceEngineGpu) no longer
-            // block the GL render loop.
+            // SOTA: All AI-lane GL work (mosaic readback + foveated crop)
+            // moved off this thread to AiLaneGl, which owns a separate EGL
+            // context in the same share group. We just publish "a new
+            // camera frame is ready" via the seq counter and let that
+            // thread pick it up. Stays decoupled from eglSwap cadence even
+            // when the Adreno's hardware queue is busy with YOLO OpenCL —
+            // any glReadPixels stall now lands on the AI thread, not here.
             //
-            // Drop-not-queue: if the worker is still processing the previous
-            // frame, the new frame is recycled and dropped. V2 motion is
-            // throttled to 10 fps internally so backlog has zero benefit.
-            //
-            // FRAME-COUNTER THROTTLE: AI readback runs once per
-            // AI_READBACK_FRAME_MODULO frames the GL thread processes.
-            // Wall-clock throttling collapses when readback duration approaches
-            // the interval — the GL thread always finds the timer expired and
-            // every frame triggers readback, capping the loop at ~8 fps.
-            // Frame-modulo is immune: AI rate scales with HAL emission rate.
-            //
-            // Foveated cropper still runs on GL thread (inside processFrame's
-            // call chain via setFoveatedCropper), but only when sentry
-            // schedules it after motion detection — not every frame.
+            // glFlush ensures texture writes from this context are visible
+            // to the share-group sibling. Without it, the AI thread may
+            // sample stale bytes despite holding a "fresh" texture id —
+            // share-group visibility for textures is per-EGL-flush.
             long stageBeforeAiReadbackNs = System.nanoTime();
             long stageAfterAiReadbackNs = stageBeforeAiReadbackNs;
             long stageAfterAiSubmitNs = stageBeforeAiReadbackNs;
-            if (sentry != null && sentry.isActive() && downscaler != null && aiLaneWorker != null) {
-                boolean aiFrameTurn = (frameCounter % AI_READBACK_FRAME_MODULO == 0);
-                // Three-way gate: own cadence (frame-modulo), worker idle,
-                // and Adreno not mid-OpenCL. The third check is the new
-                // one — without it, glReadPixels on the next line would
-                // implicitly join the GPU command queue and block until
-                // the YOLO inference finished, producing ~250 ms stalls.
-                // sentry.isAiGpuJobInFlight() is a volatile read; cheap
-                // enough to call every iteration.
-                if (!aiFrameTurn || aiLaneWorker.isBusy() || sentry.isAiGpuJobInFlight()) {
-                    // Not this frame's turn, the worker is still processing
-                    // the previous frame, or the Adreno is mid-YOLO. Skip
-                    // readback so the GL thread can keep mosaic+swap flowing
-                    // and drain the ImageReader pool at HAL rate.
-                    stageWindowAiReadbackSkips++;
-                } else {
-                    try {
-                        byte[] smallFrame = downscaler.readPixelsDirect(cameraTextureId);
-                        stageAfterAiReadbackNs = System.nanoTime();
-                        if (smallFrame != null) {
-                            // Lazy-wire foveated cropper once. GL thread safe.
-                            if (foveatedCropper != null && foveatedCropper.isInitialized()
-                                    && sentry.getFoveatedCropper() == null) {
-                                sentry.setFoveatedCropper(foveatedCropper, cameraTextureId);
-                            }
-                            // submitFrame is non-blocking: queues if worker idle,
-                            // recycles+drops if busy. Either way, GL thread
-                            // continues to next camera frame immediately.
-                            aiLaneWorker.submitFrame(smallFrame);
-                        }
-                        stageAfterAiSubmitNs = System.nanoTime();
-                    } catch (Exception e) {
-                        logger.warn("AI lane error: " + (e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName()));
-                    }
-                }
-            }
-
-            // PASS 3: Service the foveated mailbox.
-            //
-            // Old design posted foveated crops to glHandler from the AI worker
-            // and blocked, contending with this very render loop's self-post
-            // for handler slots. New design pulls the crop INTO the render
-            // loop: AI worker marks a request flag, this code services at
-            // most one request per frame on the same GL thread that just ran
-            // mosaic+swap. No handler-queue contention, no posted Runnables.
-            //
-            // Gated on isAiGpuJobInFlight: crop's glReadPixels can implicitly
-            // sync against the OpenCL command queue on Adreno even with
-            // glFlush() instead of glFinish(). Staying conservative — if YOLO
-            // is mid-inference, defer the crop one frame. Worst case the AI
-            // worker sees a slot that's one tick older; V2 motion runs at
-            // 10Hz so that's <100ms of staleness, invisible.
-            if (sentry != null && sentry.isActive() && !sentry.isAiGpuJobInFlight()) {
-                try {
-                    sentry.serviceFoveatedRequestsOnGlThread();
-                } catch (Throwable t) {
-                    logger.warn("Foveated service error: " + t.getMessage());
-                }
+            AiLaneGl localAiLane = aiLaneGl;
+            if (localAiLane != null && localAiLane.isRunning()) {
+                android.opengl.GLES20.glFlush();
+                localAiLane.notifyFrame(cameraFrameSeq.get());
             }
 
             // Per-stage timing roll-up. We track only the worst frame per
@@ -1423,15 +1414,19 @@ public class PanoramicCameraGpu {
             if (stageTimingWindowStartMs == 0) {
                 stageTimingWindowStartMs = nowMs;
             } else if (nowMs - stageTimingWindowStartMs >= STAGE_TIMING_LOG_INTERVAL_MS) {
+                // After Tier 1, AI readback runs on AiLaneGl's thread —
+                // the aiReadback / aiSubmit slots here capture only the
+                // notify-publish overhead (typically <50 µs). The encoder
+                // thread's worst-frame total is now dominated by
+                // mosaic+swap, which is what we expected to expose.
                 logger.info(String.format(
-                        "Stage(worst/2s): total=%dms acq=%dms mosaic+swap=%dms aiReadback=%dms aiSubmit=%dms (frames=%d, aiSkips=%d)",
+                        "Stage(worst/30s, encoder-thread): total=%dms acq=%dms mosaic+swap=%dms (notifyOverhead readback=%dms submit=%dms; frames=%d)",
                         stageWorstTotalNs / 1_000_000,
                         stageWorstAcquireNs / 1_000_000,
                         stageWorstMosaicNs / 1_000_000,
                         stageWorstAiReadbackNs / 1_000_000,
                         stageWorstAiSubmitNs / 1_000_000,
-                        stageWindowFrames,
-                        stageWindowAiReadbackSkips));
+                        stageWindowFrames));
                 stageWorstTotalNs = 0;
                 stageWorstAcquireNs = 0;
                 stageWorstMosaicNs = 0;
@@ -2217,6 +2212,22 @@ public class PanoramicCameraGpu {
             aiLaneWorker = null;
         }
 
+        // Tier 1: shut down the AI-lane GL thread before destroying the
+        // encoder EGL context. The lane's shared context lives in the same
+        // share group as eglCore — if eglCore went down first, the lane's
+        // textures/programs would become orphans and its GL teardown would
+        // log spurious errors. Order: shut lane (releases its GL state on
+        // its own thread, including the foveated cropper FBOs), then we
+        // can safely tear down eglCore here.
+        if (aiLaneGl != null) {
+            try { aiLaneGl.shutdown(); } catch (Throwable ignored) {}
+            aiLaneGl = null;
+        }
+        // foveatedCropper.release() is called by AiLaneGl.shutdown() above
+        // (the cropper's GL resources live in the AI-lane context). Just
+        // null the reference here.
+        foveatedCropper = null;
+
         // Tear down the dialog-preview sampler. It owns its own EGL context
         // (shared with our eglCore) on its own HandlerThread; if we don't
         // release it the context outlives this pipeline instance and leaks
@@ -2226,12 +2237,6 @@ public class PanoramicCameraGpu {
                 try { highResSampler.release(); } catch (Throwable ignored) {}
                 highResSampler = null;
             }
-        }
-
-        // Release foveated cropper before GL context is destroyed
-        if (foveatedCropper != null) {
-            foveatedCropper.release();
-            foveatedCropper = null;
         }
 
         // Releases whichever consumer (SurfaceTexture or ImageReader) is active.

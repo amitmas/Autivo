@@ -24,6 +24,7 @@
     "dashboard_title": "デッシュボード - OverDrive"
   },
   "nav": {
+    "dashboard": "ダッシュボード",
     "live_view": "ライブビュー",
     "events": "イベント",
     "surveillance": "監視",
@@ -44,9 +45,8 @@
     "overview_group": "概要",
     "vehicle_group": "車両",
     "about_group": "について",
-    "telegram": "Telegram",
-    "dashboard": "ダッシュボード",
-    "brand_home": "OverDrive — ダッシュボードを開く"
+    "brand_home": "OverDrive — ダッシュボードを開く",
+    "telegram": "Telegram"
   },
   "status": {
     "device": "デバイス",
@@ -1640,28 +1640,23 @@
     "delivery_pointer": "配信設定 (チャットに届くイベント) は,通知 → Telegramタブでライブです."
   },
   "dashboard": {
+    "heading": "ダッシュボード",
+    "subtitle": "車両ステータス、位置、主要操作。",
     "chip_device_pending": "装置...",
     "chip_surveillance_pending": "監視 -",
     "chip_gps_pending": "GPS --",
     "chip_device_value": "装置 {id}",
     "chip_surveillance_value": "監視 {state}",
+    "chip_gps_live": "GPSライブ",
+    "chip_gps_cached": "GPSキャッシュ",
     "kicker_position": "位置",
     "kicker_commands": "命令",
     "kicker_vehicle": "車両",
-    "directions": "指示",
-    "cmd_events": "イベント",
-    "metric_battery": "バッテリー",
-    "metric_range": "範囲",
-    "metric_network": "ネットワーク",
-    "unit_deg": "デグ",
-    "heading": "ダッシュボード",
-    "subtitle": "車両ステータス、位置、主要操作。",
-    "chip_gps_live": "GPSライブ",
-    "chip_gps_cached": "GPSキャッシュ",
     "card_location": "車両の位置",
     "card_commands": "クイック操作",
     "card_info": "主な情報",
     "open_live_view": "ライブビューを開く",
+    "directions": "指示",
     "no_gps_fix": "GPS未取得",
     "gps_waiting": "車両の位置を取得中",
     "position_available": "位置情報あり",
@@ -1670,15 +1665,23 @@
     "cmd_flash": "ライト点滅",
     "cmd_find": "車を探す",
     "cmd_live": "ライブ",
+    "cmd_trunk_open": "オープントランク",
+    "cmd_trunk_close": "閉ざされたトランク",
+    "cmd_trips": "走行履歴",
+    "metric_battery": "バッテリー",
+    "metric_range": "範囲",
+    "metric_network": "ネットワーク",
     "metric_lock": "ロック",
     "status_locked": "ロック中",
     "status_unlocked": "ロック解除中",
     "network_mobile": "モバイル",
+    "unit_deg": "デグ",
     "time_seconds_ago": "{n}秒前",
     "time_minutes_ago": "{n}分前",
     "time_hours_ago": "{n}時間前",
     "toast_command_sent": "コマンドを送信しました",
     "toast_command_failed": "コマンドが失敗しました",
-    "toast_no_location": "車両の位置が取得できません"
+    "toast_no_location": "車両の位置が取得できません",
+    "cmd_recordings": "録画"
   }
 }

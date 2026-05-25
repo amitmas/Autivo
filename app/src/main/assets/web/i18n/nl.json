@@ -24,6 +24,7 @@
     "dashboard_title": "Dashboard - OverDrive"
   },
   "nav": {
+    "dashboard": "Dashboard",
     "live_view": "Live-weergave",
     "events": "Gebeurtenissen",
     "surveillance": "Bewaking",
@@ -44,9 +45,8 @@
     "overview_group": "Overzicht",
     "vehicle_group": "Voertuig",
     "about_group": "Over",
-    "telegram": "Telegram",
-    "dashboard": "Dashboard",
-    "brand_home": "OverDrive — Dashboard openen"
+    "brand_home": "OverDrive — Dashboard openen",
+    "telegram": "Telegram"
   },
   "status": {
     "device": "Apparaat",
@@ -1640,28 +1640,23 @@
     "delivery_pointer": "Afleveringsvoorkeuren (waartoe de gebeurtenissen de chat bereiken) worden live geplaatst op het tabblad Notifications → Telegram."
   },
   "dashboard": {
+    "heading": "Dashboard",
+    "subtitle": "Voertuigstatus, locatie en hoofdbediening.",
     "chip_device_pending": "Een apparaat...",
     "chip_surveillance_pending": "Bewaking...",
     "chip_gps_pending": "GPS --",
     "chip_device_value": "Vervaardiging {id}",
     "chip_surveillance_value": "Bewaking {state}",
+    "chip_gps_live": "GPS live",
+    "chip_gps_cached": "GPS gecachet",
     "kicker_position": "Positie",
     "kicker_commands": "Bevelen",
     "kicker_vehicle": "Voertuig",
-    "directions": "Aanwijzingen",
-    "cmd_events": "Gebeurtenissen",
-    "metric_battery": "Batterij",
-    "metric_range": "Afstand",
-    "metric_network": "Netwerk",
-    "unit_deg": "Deelt",
-    "heading": "Dashboard",
-    "subtitle": "Voertuigstatus, locatie en hoofdbediening.",
-    "chip_gps_live": "GPS live",
-    "chip_gps_cached": "GPS gecachet",
     "card_location": "Voertuiglocatie",
     "card_commands": "Snelle bediening",
     "card_info": "Hoofdinfo",
     "open_live_view": "Live-weergave openen",
+    "directions": "Aanwijzingen",
     "no_gps_fix": "Geen GPS-fix",
     "gps_waiting": "Wachten op voertuigpositie",
     "position_available": "Positie beschikbaar",
@@ -1670,15 +1665,23 @@
     "cmd_flash": "Knipperen",
     "cmd_find": "Vinden",
     "cmd_live": "Live",
+    "cmd_trunk_open": "Open kofferbak",
+    "cmd_trunk_close": "Sluitde kofferbak",
+    "cmd_trips": "Ritten",
+    "metric_battery": "Batterij",
+    "metric_range": "Afstand",
+    "metric_network": "Netwerk",
     "metric_lock": "Vergrendelen",
     "status_locked": "Vergrendeld",
     "status_unlocked": "Ontgrendeld",
     "network_mobile": "Mobiel",
+    "unit_deg": "Deelt",
     "time_seconds_ago": "{n} s geleden",
     "time_minutes_ago": "{n} min geleden",
     "time_hours_ago": "{n} u geleden",
     "toast_command_sent": "Commando verzonden",
     "toast_command_failed": "Commando mislukt",
-    "toast_no_location": "Voertuiglocatie niet beschikbaar"
+    "toast_no_location": "Voertuiglocatie niet beschikbaar",
+    "cmd_recordings": "Opnames"
   }
 }

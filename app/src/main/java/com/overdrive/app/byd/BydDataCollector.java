@@ -794,8 +794,19 @@ public class BydDataCollector {
                             // Validate: implied capacity should be within 50-150% of any BYD pack
                             double soc = b.socPercent;
                             if (!Double.isNaN(soc) && soc > 5) {
+                                // SOC-as-kWh PHEV firmware bug: HAL echoes SOC% in the kWh field.
+                                // Reject before the implied-capacity range check, because at
+                                // SOC=84 the bogus 84.1 produces impliedCap=100, which falls
+                                // inside the 10-130 BEV-friendly window and would otherwise
+                                // be accepted. The Priority-3 getBatteryPowerHEV path is the
+                                // PHEV-correct source; let this slot stay NaN for it to fill.
+                                boolean looksLikeSocMimic = Math.abs(evVal - soc) < 5.0;
                                 double impliedCap = evVal / (soc / 100.0);
-                                if (impliedCap >= 10 && impliedCap <= 130) {
+                                if (looksLikeSocMimic) {
+                                    logger.debug("getBatteryRemainPowerEV rejected: " +
+                                        String.format("%.1f", evVal) + " kWh ≈ SOC " +
+                                        String.format("%.0f", soc) + "% — SOC-as-kWh firmware bug");
+                                } else if (impliedCap >= 10 && impliedCap <= 130) {
                                     b.remainKwh(evVal);
                                     kwhWrittenThisCycle = true;
                                     logger.debug("remainKwh from getBatteryRemainPowerEV: " +
@@ -836,8 +847,18 @@ public class BydDataCollector {
                             // Validate against SOC
                             double soc = b.socPercent;
                             if (!Double.isNaN(soc) && soc > 5) {
+                                // SOC-as-kWh PHEV firmware bug — same guard as Priority 1.
+                                // The Sealion 6 DM-i HAL returns raw=841 (84.1 kWh) at 84% SOC;
+                                // impliedCap=100 passes a generic [10,130] gate even though
+                                // the pack is only 18.3 kWh. Let Priority 3 fill this slot.
+                                boolean looksLikeSocMimic = Math.abs(kwh - soc) < 5.0;
                                 double impliedCap = kwh / (soc / 100.0);
-                                if (impliedCap >= 10 && impliedCap <= 130) {
+                                if (looksLikeSocMimic) {
+                                    logger.debug("getRemainingBatteryPower rejected: " +
+                                        String.format("%.1f", kwh) + " kWh ≈ SOC " +
+                                        String.format("%.0f", soc) + "% — SOC-as-kWh firmware bug (raw=" +
+                                        rawVal + ")");
+                                } else if (impliedCap >= 10 && impliedCap <= 130) {
                                     b.remainKwh(kwh);
                                     kwhWrittenThisCycle = true;
                                     logger.debug("remainKwh from getRemainingBatteryPower: " +
@@ -855,6 +876,47 @@ public class BydDataCollector {
                 }
             }
             
+            // Priority 3: BodyworkDevice.getBatteryPowerHEV() — PHEV-native energy reading.
+            //
+            // Reintroduced after the priority chain dropped it post-v15. On Sealion-class
+            // PHEVs whose Power/Statistic getters echo SOC% in the kWh field (the
+            // SOC-as-kWh firmware bug guarded above), this getter returns the actual
+            // remaining kWh — e.g. ~15 kWh at 84% SOC on an 18.3 kWh pack instead of 84.1.
+            //
+            // Caveat: on some BEVs this same getter ALSO returns SOC% (the inverse bug).
+            // The looksLikeSocPercent guard below catches that case and refuses to write,
+            // so this priority only activates when the value is in real kWh units.
+            //
+            // Always populate b.socHevPercent (informational HAL metric) regardless of
+            // whether we accept the reading as remainKwh.
+            if (!kwhWrittenThisCycle && bodyworkDevice != null) {
+                try {
+                    Object hev = BydDeviceHelper.callGetter(bodyworkDevice, "getBatteryPowerHEV");
+                    if (hev instanceof Number) {
+                        double hevVal = ((Number) hev).doubleValue();
+                        if (hevVal >= 0) {
+                            b.socHevPercent(hevVal);
+                            double soc = b.socPercent;
+                            boolean looksLikeSocPercent = !Double.isNaN(soc)
+                                    && soc > 0 && Math.abs(hevVal - soc) < 3.0;
+                            if (!looksLikeSocPercent && hevVal > 1 && hevVal < 120) {
+                                b.remainKwh(hevVal);
+                                kwhWrittenThisCycle = true;
+                                logger.debug("remainKwh from getBatteryPowerHEV: " +
+                                    String.format("%.1f", hevVal) + " (soc=" +
+                                    String.format("%.1f", soc) + "%)");
+                            } else if (looksLikeSocPercent) {
+                                logger.debug("getBatteryPowerHEV returned " +
+                                    String.format("%.1f", hevVal) + " ≈ SOC " +
+                                    String.format("%.1f", soc) + "% — treating as SOC%, not kWh");
+                            }
+                        }
+                    }
+                } catch (Exception e) {
+                    logger.debug("getBatteryPowerHEV failed: " + e.getMessage());
+                }
+            }
+
             // getBatteryCapacity() — semantics vary by model:
             // - Newer models: returns Ah rating (fixed, e.g. 150 for Atto 3)
             // - Older models: returns remaining energy in 0.1 kWh units (changes with SOC)
@@ -1711,15 +1773,48 @@ public class BydDataCollector {
         if (cachedDrivetrain != 0 && (now - lastDrivetrainProbeMs) < DRIVETRAIN_REPROBE_MS) {
             return cachedDrivetrain == 2;
         }
+
+        // ── Pre-probe: capacity-based PHEV gate ────────────────────────────
+        // If the daemon has already locked in a known small (<30 kWh) nominal
+        // pack — typically because the user picked a Sealion 6 / Song / Tang
+        // DM-i in the model selector — that signal is far stronger than the
+        // live fuel HAL probes. The fuel HAL on these PHEVs goes through a
+        // warm-up period where getFuelPercentageValue / getFuelDrivingRangeValue
+        // can BOTH return BMS sentinels (255/2046/etc), which the
+        // sentinel-AND-sentinel branch below would incorrectly latch as BEV
+        // for 60s. That regression dropped fuel-percent display on PHEVs in
+        // v17. Restoring the v12-era capacity-first behaviour: small known
+        // nominal → PHEV verdict, full TTL.
+        //
+        // Inverse risk (BEV with <30 kWh nominal) is ~zero — the smallest BYD
+        // BEV is the Atto 3 at 49.9 kWh. Capacity sub-30 kWh uniquely names a
+        // PHEV pack across the catalog.
+        double knownNominal = 0;
+        try {
+            com.overdrive.app.abrp.SohEstimator sohEst =
+                com.overdrive.app.monitor.SocHistoryDatabase.getInstance().getSohEstimator();
+            if (sohEst != null) knownNominal = sohEst.getNominalCapacityKwh();
+        } catch (Exception ignored) {}
+        if (knownNominal > 0 && knownNominal < 30.0) {
+            cachedDrivetrain = 2;
+            lastDrivetrainProbeMs = now;
+            logger.info("computeIsPhev → PHEV (capacity-gate, nominal="
+                + String.format("%.1f", knownNominal) + " kWh)");
+            return true;
+        }
+
         boolean fuelPctSentinel = false;
         boolean fuelRangeSentinel = false;
         boolean fuelPctReal = false;
         boolean fuelRangeReal = false;
+        int fuelPctRaw = Integer.MIN_VALUE;
+        int fuelRangeRaw = Integer.MIN_VALUE;
         if (statisticDevice != null) {
             try {
                 Object fp = BydDeviceHelper.callGetter(statisticDevice, "getFuelPercentageValue");
                 if (fp instanceof Number) {
                     int v = ((Number) fp).intValue();
+                    fuelPctRaw = v;
                     if (isBevFuelSentinel(v)) fuelPctSentinel = true;
                     // 0 is intentionally NOT counted as "real" — a BEV that
                     // happens to return 0 instead of a sentinel would falsely
@@ -1733,6 +1828,7 @@ public class BydDataCollector {
                 Object fr = BydDeviceHelper.callGetter(statisticDevice, "getFuelDrivingRangeValue");
                 if (fr instanceof Number) {
                     int v = ((Number) fr).intValue();
+                    fuelRangeRaw = v;
                     if (isBevFuelSentinel(v)) fuelRangeSentinel = true;
                     else if (v > 0 && v < 1500) fuelRangeReal = true;
                 }
@@ -1746,11 +1842,15 @@ public class BydDataCollector {
         if (fuelPctReal && fuelRangeReal) {
             cachedDrivetrain = 2;
             lastDrivetrainProbeMs = now;
+            logger.info("computeIsPhev → PHEV (fuelPct=" + fuelPctRaw
+                + ", fuelRange=" + fuelRangeRaw + ")");
             return true;
         }
         if (fuelPctSentinel && fuelRangeSentinel) {
             cachedDrivetrain = 1;
             lastDrivetrainProbeMs = now;
+            logger.info("computeIsPhev → BEV (both fuel signals at sentinel: pct="
+                + fuelPctRaw + ", range=" + fuelRangeRaw + ")");
             return false;
         }
         // One real + one sentinel is the "PHEV with empty tank or 0 km" case.
@@ -1763,16 +1863,17 @@ public class BydDataCollector {
             // happened (DRIVETRAIN_REPROBE_MS - 5000) ms ago, so the next call
             // in >5s will re-probe.
             lastDrivetrainProbeMs = now - (DRIVETRAIN_REPROBE_MS - 5_000);
+            logger.info("computeIsPhev → PHEV (mixed signals: pct=" + fuelPctRaw
+                + ", range=" + fuelRangeRaw + ") — short TTL re-probe");
             return true;
         }
-        // Unknown — defer to capacity-based heuristic, do NOT cache.
-        try {
-            com.overdrive.app.abrp.SohEstimator sohEst =
-                com.overdrive.app.monitor.SocHistoryDatabase.getInstance().getSohEstimator();
-            if (sohEst != null && sohEst.getNominalCapacityKwh() > 0) {
-                return sohEst.getNominalCapacityKwh() < 30.0;
-            }
-        } catch (Exception ignored) {}
+        // Capacity gate already ran above with knownNominal < 30. Fall through
+        // here only when nominal isn't known yet OR is >=30 (BEV-sized) — both
+        // resolve to BEV verdict, deliberately uncached so the next probe can
+        // re-evaluate once SohEstimator picks up a real nominal.
+        logger.info("computeIsPhev → BEV (no fuel signals, no small nominal: "
+            + "pct=" + fuelPctRaw + ", range=" + fuelRangeRaw
+            + ", nominal=" + String.format("%.1f", knownNominal) + " kWh) — uncached");
         return false;
     }
 

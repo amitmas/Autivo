@@ -24,6 +24,7 @@
     "dashboard_title": "bảng điều khiển - OverDrive"
   },
   "nav": {
+    "dashboard": "Bảng điều khiển",
     "live_view": "Xem trực tiếp",
     "events": "Sự kiện",
     "surveillance": "Giám sát",
@@ -44,9 +45,8 @@
     "overview_group": "Tổng quan",
     "vehicle_group": "Chiếc xe",
     "about_group": "Về",
-    "telegram": "Telegram",
-    "dashboard": "Bảng điều khiển",
-    "brand_home": "OverDrive — mở Bảng điều khiển"
+    "brand_home": "OverDrive — mở Bảng điều khiển",
+    "telegram": "Telegram"
   },
   "status": {
     "device": "Thiết bị",
@@ -1640,28 +1640,23 @@
     "delivery_pointer": "Ưu tiên giao hàng (những sự kiện tiếp cận trò chuyện) trực tiếp trên tab Thông báo → Telegram."
   },
   "dashboard": {
+    "heading": "Bảng điều khiển",
+    "subtitle": "Trạng thái xe, vị trí và điều khiển chính.",
     "chip_device_pending": "Thiết bị...",
     "chip_surveillance_pending": "Giám sát...",
     "chip_gps_pending": "GPS --",
     "chip_device_value": "Thiết bị {id}",
     "chip_surveillance_value": "Phòng giám sát {state}",
+    "chip_gps_live": "GPS trực tiếp",
+    "chip_gps_cached": "GPS đã lưu",
     "kicker_position": "Vị trí",
     "kicker_commands": "Các lệnh",
     "kicker_vehicle": "Chiếc xe",
-    "directions": "Các hướng dẫn",
-    "cmd_events": "Sự kiện",
-    "metric_battery": "Phòng pin",
-    "metric_range": "Phạm vi",
-    "metric_network": "Mạng lưới",
-    "unit_deg": "deg",
-    "heading": "Bảng điều khiển",
-    "subtitle": "Trạng thái xe, vị trí và điều khiển chính.",
-    "chip_gps_live": "GPS trực tiếp",
-    "chip_gps_cached": "GPS đã lưu",
     "card_location": "Vị trí xe",
     "card_commands": "Điều khiển nhanh",
     "card_info": "Thông tin chính",
     "open_live_view": "Mở chế độ xem trực tiếp",
+    "directions": "Các hướng dẫn",
     "no_gps_fix": "Không có tín hiệu GPS",
     "gps_waiting": "Đang chờ vị trí xe",
     "position_available": "Có vị trí",
@@ -1670,15 +1665,23 @@
     "cmd_flash": "Nháy đèn",
     "cmd_find": "Tìm",
     "cmd_live": "Trực tiếp",
+    "cmd_trunk_open": "Thùng mở",
+    "cmd_trunk_close": "Thùng bể đóng",
+    "cmd_trips": "Chuyến đi",
+    "metric_battery": "Phòng pin",
+    "metric_range": "Phạm vi",
+    "metric_network": "Mạng lưới",
     "metric_lock": "Khóa",
     "status_locked": "Đã khóa",
     "status_unlocked": "Đã mở khóa",
     "network_mobile": "Di động",
+    "unit_deg": "deg",
     "time_seconds_ago": "{n} giây trước",
     "time_minutes_ago": "{n} phút trước",
     "time_hours_ago": "{n} giờ trước",
     "toast_command_sent": "Đã gửi lệnh",
     "toast_command_failed": "Lệnh thất bại",
-    "toast_no_location": "Không có vị trí xe"
+    "toast_no_location": "Không có vị trí xe",
+    "cmd_recordings": "Bản ghi"
   }
 }

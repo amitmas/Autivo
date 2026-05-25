@@ -61,6 +61,17 @@ public class PerformanceMonitor {
     private long lastAppCpuTime = 0;
     private long lastCpuTimeForApp = 0;  // Tracks CPU time baseline for app CPU calculation
     private long lastIdleTime = 0;
+
+    // GPU busy tracking — kgsl exposes "busy total" cumulative ticks on most
+    // MSM kernels (filename varies: gpu_busy / gpubusy / gpu_busy_time). Usage
+    // must be computed as a delta between consecutive samples.
+    // -1 sentinel means "no prior sample yet, can't compute delta".
+    private long lastGpuBusy = -1;
+    private long lastGpuTotal = -1;
+    // Cache the resolved sysfs path once we find one that returns valid data,
+    // so we don't pay 4× File.exists() every second forever.
+    private java.io.File resolvedGpuBusyFile = null;
+    private boolean gpuBusyResolutionLogged = false;
     
     // Scheduler
     private ScheduledExecutorService scheduler;
@@ -385,64 +396,59 @@ public class PerformanceMonitor {
     
     private void collectGpuMetrics(PerformanceSnapshot snapshot) {
         try {
-            // SOTA: Auto-detect GPU via /sys/class/devfreq/
-            // Modern kernels expose GPU as a generic 'devfreq' device - works on MediaTek, Snapdragon, Exynos
+            // Auto-detect GPU via /sys/class/devfreq/.
+            // Modern kernels expose GPU as a generic 'devfreq' device — works
+            // on MediaTek, Snapdragon, Exynos.
             java.io.File devfreqDir = new java.io.File("/sys/class/devfreq/");
             if (devfreqDir.exists() && devfreqDir.isDirectory()) {
                 java.io.File[] devices = devfreqDir.listFiles();
                 if (devices != null) {
                     for (java.io.File device : devices) {
                         String name = device.getName().toLowerCase();
-                        // Filter for known GPU device names
                         if (name.contains("kgsl") ||   // Adreno (Qualcomm)
                             name.contains("mali") ||   // Mali (ARM)
                             name.contains("gpu")  ||   // Generic
                             name.contains("g3d")) {    // PowerVR/Other
-                            
-                            // 1. Get Frequency
+
                             long freq = readLongFromFile(new java.io.File(device, "cur_freq"));
                             if (freq > 0) {
                                 snapshot.gpuFreqMhz = normalizeFrequency(freq);
-                                // logger.debug("GPU freq from devfreq/" + name + " = " + snapshot.gpuFreqMhz + " MHz");
                             }
-                            
-                            // 2. Get Load/Busy - different drivers expose load differently
-                            // Try standard 'load' (0-100)
+
                             long load = readLongFromFile(new java.io.File(device, "load"));
                             if (load >= 0 && load <= 100) {
                                 snapshot.gpuUsagePercent = load;
-                                // logger.debug("GPU load from devfreq/" + name + "/load = " + load + "%");
                                 break;
                             }
-                            
-                            // Try 'gpu_busy_percentage' (Qualcomm specific)
+
                             long busyPercent = readLongFromFile(new java.io.File(device, "gpu_busy_percentage"));
                             if (busyPercent >= 0 && busyPercent <= 100) {
                                 snapshot.gpuUsagePercent = busyPercent;
-                                // logger.debug("GPU busy from devfreq/" + name + "/gpu_busy_percentage = " + busyPercent + "%");
                                 break;
                             }
-                            
-                            // If we found freq but no load, continue to try other methods
+
                             if (snapshot.gpuFreqMhz > 0) break;
                         }
                     }
                 }
             }
-            
-            // Fallback: Try legacy kgsl paths directly (Qualcomm Adreno)
+
+            // Legacy kgsl freq path if devfreq didn't yield one.
             if (snapshot.gpuFreqMhz == 0) {
                 long freq = readLongFromFile(new java.io.File("/sys/class/kgsl/kgsl-3d0/gpuclk"));
                 if (freq > 0) {
                     snapshot.gpuFreqMhz = normalizeFrequency(freq);
-                    // logger.debug("GPU freq from kgsl/gpuclk = " + snapshot.gpuFreqMhz + " MHz");
                 }
             }
-            
-            // Try kgsl gpu_busy (returns "busy_time total_time" format)
+
+            // kgsl "busy total" counters — cumulative ticks since boot on most
+            // msm_kgsl drivers. Filename varies across kernel forks
+            // (gpu_busy / gpubusy / gpu_busy_time). Compute usage as a delta
+            // between consecutive samples; raw ratio converges to a
+            // meaningless boot-average otherwise.
             if (snapshot.gpuUsagePercent == 0) {
-                java.io.File gpuBusyFile = new java.io.File("/sys/class/kgsl/kgsl-3d0/gpu_busy");
-                if (gpuBusyFile.exists() && gpuBusyFile.canRead()) {
+                java.io.File gpuBusyFile = resolveGpuBusyFile();
+                if (gpuBusyFile != null) {
                     try (BufferedReader br = new BufferedReader(new FileReader(gpuBusyFile))) {
                         String line = br.readLine();
                         if (line != null) {
@@ -451,32 +457,126 @@ public class PerformanceMonitor {
                                 long busy = Long.parseLong(parts[0]);
                                 long total = Long.parseLong(parts[1]);
                                 if (total > 0) {
-                                    snapshot.gpuUsagePercent = (busy * 100.0) / total;
-                                    // logger.debug("GPU usage from kgsl/gpu_busy = " + snapshot.gpuUsagePercent + "%");
+                                    if (lastGpuBusy >= 0 && lastGpuTotal >= 0
+                                            && busy >= lastGpuBusy && total > lastGpuTotal) {
+                                        long dBusy = busy - lastGpuBusy;
+                                        long dTotal = total - lastGpuTotal;
+                                        if (dTotal > 0) {
+                                            double usage = (dBusy * 100.0) / dTotal;
+                                            if (usage < 0) usage = 0;
+                                            if (usage > 100) usage = 100;
+                                            snapshot.gpuUsagePercent = usage;
+                                        }
+                                    }
+                                    lastGpuBusy = busy;
+                                    lastGpuTotal = total;
                                 }
                             }
                         }
                     } catch (Exception ignored) {}
                 }
             }
-            
-            // If still no usage, estimate from frequency ratio
+
+            // If still no usage, estimate from frequency ratio. This is what
+            // the original code did and what the user is used to seeing —
+            // governor's clock ratio, not real busy time, but always populated.
             if (snapshot.gpuUsagePercent == 0 && snapshot.gpuFreqMhz > 0) {
                 double maxFreq = readGpuMaxFrequency();
                 if (maxFreq > 0) {
                     snapshot.gpuUsagePercent = Math.min(100, (snapshot.gpuFreqMhz / maxFreq) * 100);
-                    // logger.debug("GPU usage estimated from freq ratio: " + snapshot.gpuFreqMhz + "/" + maxFreq + " = " + snapshot.gpuUsagePercent + "%");
                 }
             }
-            
-            // GPU temperature
+
+            // GPU temperature is independent of usage.
             snapshot.gpuTempCelsius = readGpuTemperature();
-            
+
         } catch (Exception e) {
             logger.debug("GPU metrics error: " + e.getMessage());
         }
     }
     
+    /**
+     * Read GPU max frequency for load estimation. Returns 650 MHz as a
+     * conservative Adreno default if no sysfs path resolves.
+     */
+    private double readGpuMaxFrequency() {
+        String[] paths = {
+            "/sys/class/kgsl/kgsl-3d0/max_gpuclk",
+            "/sys/class/kgsl/kgsl-3d0/devfreq/max_freq",
+            "/sys/class/devfreq/kgsl-3d0/max_freq",
+            "/sys/devices/platform/mali.0/max_clock",
+            "/sys/class/misc/mali0/device/max_clock",
+            "/sys/class/kgsl/kgsl-3d0/gpu_available_frequencies",
+            "/sys/class/kgsl/kgsl-3d0/devfreq/available_frequencies"
+        };
+        for (String path : paths) {
+            try (BufferedReader br = new BufferedReader(new FileReader(path))) {
+                String line = br.readLine();
+                if (line == null || line.trim().isEmpty()) continue;
+                if (path.contains("available_frequencies")) {
+                    long maxRaw = 0;
+                    for (String f : line.trim().split("\\s+")) {
+                        try {
+                            long v = Long.parseLong(f.trim());
+                            if (v > maxRaw) maxRaw = v;
+                        } catch (NumberFormatException ignored) {}
+                    }
+                    if (maxRaw > 0) return normalizeFrequency(maxRaw);
+                } else {
+                    try {
+                        long v = Long.parseLong(line.trim());
+                        if (v > 0) return normalizeFrequency(v);
+                    } catch (NumberFormatException ignored) {}
+                }
+            } catch (Exception ignored) {}
+        }
+        // Conservative estimate for Adreno GPUs — matches the original behavior
+        // before the multi-sample rewrite.
+        return 650.0;
+    }
+
+    /**
+     * Probe for the sysfs file that exposes kgsl "busy total" counters and
+     * cache the winner. Different msm_kgsl kernel forks publish under
+     * different filenames; without this we'd pin to the wrong one and silently
+     * fall through to "no GPU usage available".
+     *
+     * Validates by reading the file and confirming it parses as two whitespace-
+     * separated longs — bare existence isn't enough because some kernels expose
+     * an empty placeholder. Returns null if nothing usable is found.
+     */
+    private java.io.File resolveGpuBusyFile() {
+        if (resolvedGpuBusyFile != null) return resolvedGpuBusyFile;
+
+        // Single canonical kgsl path — matches pre-session behavior. Probing
+        // alternates risked promoting an unrelated counter (e.g. one that
+        // resets per-read) over the freq-ratio fallback the user is used to.
+        java.io.File f = new java.io.File("/sys/class/kgsl/kgsl-3d0/gpu_busy");
+        if (f.exists() && f.canRead()) {
+            try (BufferedReader br = new BufferedReader(new FileReader(f))) {
+                String line = br.readLine();
+                if (line != null) {
+                    String[] parts = line.trim().split("\\s+");
+                    if (parts.length >= 2) {
+                        Long.parseLong(parts[0]);
+                        Long.parseLong(parts[1]);
+                        resolvedGpuBusyFile = f;
+                        if (!gpuBusyResolutionLogged) {
+                            logger.info("GPU busy counter resolved: /sys/class/kgsl/kgsl-3d0/gpu_busy");
+                            gpuBusyResolutionLogged = true;
+                        }
+                        return f;
+                    }
+                }
+            } catch (Exception ignored) {}
+        }
+        if (!gpuBusyResolutionLogged) {
+            logger.info("GPU busy counter not found at /sys/class/kgsl/kgsl-3d0/gpu_busy; using freq-ratio");
+            gpuBusyResolutionLogged = true;
+        }
+        return null;
+    }
+
     /**
      * Normalize frequency to MHz - handles Hz, KHz, MHz inputs
      */
@@ -604,62 +704,6 @@ public class PerformanceMonitor {
             } catch (Exception ignored) {}
         }
         return 0;
-    }
-    
-    /**
-     * Read GPU max frequency for load estimation.
-     */
-    private double readGpuMaxFrequency() {
-        String[] paths = {
-            "/sys/class/kgsl/kgsl-3d0/max_gpuclk",
-            "/sys/class/kgsl/kgsl-3d0/devfreq/max_freq",
-            "/sys/class/devfreq/kgsl-3d0/max_freq",
-            "/sys/devices/platform/mali.0/max_clock",
-            "/sys/class/misc/mali0/device/max_clock",
-            // Additional Qualcomm paths
-            "/sys/class/kgsl/kgsl-3d0/gpu_available_frequencies",
-            "/sys/class/kgsl/kgsl-3d0/devfreq/available_frequencies"
-        };
-        
-        for (String path : paths) {
-            try {
-                BufferedReader reader = new BufferedReader(new FileReader(path));
-                String line = reader.readLine();
-                reader.close();
-                if (line != null && !line.trim().isEmpty()) {
-                    // Handle available_frequencies format (space-separated list, highest first or last)
-                    if (path.contains("available_frequencies")) {
-                        String[] freqs = line.trim().split("\\s+");
-                        long maxFreq = 0;
-                        for (String f : freqs) {
-                            try {
-                                long freq = Long.parseLong(f.trim());
-                                if (freq > maxFreq) maxFreq = freq;
-                            } catch (Exception ignored) {}
-                        }
-                        if (maxFreq > 0) {
-                            if (maxFreq > 1000000) return maxFreq / 1000000.0;
-                            else if (maxFreq > 1000) return maxFreq / 1000.0;
-                            else return maxFreq;
-                        }
-                    }
-                    
-                    long freq = Long.parseLong(line.trim());
-                    // Convert to MHz based on magnitude
-                    if (freq > 1000000) {
-                        return freq / 1000000.0;  // Hz to MHz
-                    } else if (freq > 1000) {
-                        return freq / 1000.0;  // KHz to MHz
-                    } else {
-                        return freq;  // Already MHz
-                    }
-                }
-            } catch (Exception ignored) {}
-        }
-        
-        // Fallback: estimate max based on typical Adreno GPU max frequencies
-        // If we're reading from kgsl (Qualcomm), assume typical max of 600-700 MHz
-        return 650.0;  // Conservative estimate for Adreno GPUs
     }
     
     /**
