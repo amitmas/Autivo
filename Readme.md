@@ -6,7 +6,7 @@
 <p align="center">Advanced Sentry Mode for BYD Vehicles</p>
 <p align="center">
   <a href="https://github.com/yash-srivastava/Overdrive-release/releases/tag/alpha">Download Alpha</a> •
-  <a href="https://overdrive-5lc.pages.dev/">Website</a> •
+  <a href="https://www.overdrive.qd.je">Website</a> •
   <a href="https://discord.gg/PZutk9fg4h">Discord</a> •
   <a href="#features">Features</a> •
   <a href="#quick-start-use-pre-built-apk">Setup Guide</a>
