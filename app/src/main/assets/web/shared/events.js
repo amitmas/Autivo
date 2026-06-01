@@ -326,18 +326,191 @@ BYD.events = {
     },
 
     /**
-     * Set v3 actor / severity / proximity filter (item 6).
+     * Set v3 actor / severity / proximity / place filter (item 6 + place).
      * Empty value clears the row. Updates chip active states.
+     *
+     * Place IS server-side — sent as the {@code place} query param to
+     * /api/recordings so pagination + totalCount stay honest under the
+     * filter. The previous client-side approach hid matching clips on
+     * later pages because the server returned only one page at a time.
      */
     setActorFilter(kind, value) {
-        if (!this.actorFilter) this.actorFilter = { class: '', severity: '', proximity: '' };
+        if (!this.actorFilter) {
+            this.actorFilter = { class: '', severity: '', proximity: '', place: '' };
+        }
         this.actorFilter[kind] = value || '';
         const rowSel = '.filter-tabs[data-filter-row="' + kind + '"] .filter-chip';
         document.querySelectorAll(rowSel).forEach(chip => {
             chip.classList.toggle('active', (chip.dataset[kind] || '') === (value || ''));
         });
         this.currentPage = 1;
+        // All four filters round-trip to the server now. The chip-row
+        // re-render piggybacks on the loadRecordings completion — see
+        // loadRecordings() which calls loadPlaceChips() after the fetch.
         this.loadRecordings();
+    },
+
+    /**
+     * Rebuild the dynamic Place chip row from the currently loaded
+     * recordings. Called from loadRecordings() after each successful
+     * fetch. Hidden when no clip in the loaded set carries a
+     * place.short — legacy/feature-disabled users never see this row.
+     *
+     * Chip identity is the lowercase short label; the chip TEXT is the
+     * canonical mixed-case form picked from the most recently captured
+     * clip in each bucket. Top 8 by count, alpha-tiebreak.
+     */
+    /**
+     * Fetch the chip set from /api/recordings/places, scoped by the
+     * SAME filter context as the recordings list (type, date, class,
+     * severity, proximity — minus the place filter itself, since
+     * narrowing the chips by the active place would always return only
+     * the active chip).
+     *
+     * <p>This replaces the previous client-side derivation from
+     * `this.recordings` which was page-bounded — places that existed
+     * only on later pages would never show up as chips. The server
+     * now does the full scan + bucket + top-N once per filter change.
+     */
+    async loadPlaceChips() {
+        const row = document.getElementById('placeFilterRow');
+        if (!row) return;
+        // In-flight token: a rapid succession of filter taps can dispatch
+        // two parallel loadPlaceChips. Without this guard the later
+        // request's response could lose the race to the earlier one and
+        // memoize a stale result, producing a momentary chip-row
+        // inconsistency. We keep a monotonic seq and only honour the
+        // most recent response — older fetches finish but their state
+        // updates are dropped.
+        const seq = (this._placeChipsSeq = (this._placeChipsSeq || 0) + 1);
+        try {
+            const params = [];
+            if (this.currentFilter !== 'all') params.push('type=' + this.currentFilter);
+            if (this.selectedDate) params.push('date=' + this.selectedDate);
+            if (this.actorFilter && this.actorFilter.class)     params.push('class=' + encodeURIComponent(this.actorFilter.class));
+            if (this.actorFilter && this.actorFilter.severity)  params.push('severity=' + encodeURIComponent(this.actorFilter.severity));
+            if (this.actorFilter && this.actorFilter.proximity) params.push('proximity=' + encodeURIComponent(this.actorFilter.proximity));
+            const queryStr = params.join('&');
+            // Fetch memo: paging through the same filter set (prev/next
+            // page) reissues loadRecordings → loadPlaceChips with the
+            // same query string. The chip set is identical because place
+            // is excluded from the chip endpoint's params; replay the
+            // last response instead of round-tripping. Invalidated by:
+            //   - any class/severity/proximity/type/date filter change
+            //     (changes queryStr)
+            //   - delete/batch-delete (clears memo via _placeFetchMemo
+            //     reset in the delete handlers below).
+            // We deliberately memo the FETCH only — _renderPlaceChipsFromServer
+            // still runs because the active place filter may differ
+            // (its memo via _placeChipsSignature handles DOM-skip when
+            // both filter + chip set are unchanged).
+            if (this._placeFetchMemoQuery === queryStr && this._placeFetchMemoData) {
+                // Memo replay is synchronous, so the seq guard is not
+                // strictly required here, but check anyway for symmetry
+                // with the fetch path.
+                if (seq !== this._placeChipsSeq) return;
+                this._renderPlaceChipsFromServer(row, this._placeFetchMemoData.places || []);
+                return;
+            }
+            const url = '/api/recordings/places' + (queryStr ? '?' + queryStr : '');
+            const res = await fetch(url);
+            const data = await res.json();
+            // Stale-response guard — drop everything if a newer fetch was
+            // dispatched while we were awaiting. Do this BEFORE writing
+            // the memo so a stale result can't shadow the fresh one.
+            if (seq !== this._placeChipsSeq) return;
+            if (!data || !data.success) {
+                row.style.display = 'none';
+                return;
+            }
+            this._placeFetchMemoQuery = queryStr;
+            this._placeFetchMemoData = data;
+            this._renderPlaceChipsFromServer(row, data.places || []);
+        } catch (e) {
+            console.warn('loadPlaceChips failed:', e);
+            // Same stale-response guard for the failure path.
+            if (seq !== this._placeChipsSeq) return;
+            row.style.display = 'none';
+        }
+    },
+
+    /**
+     * Drop the cached chip-set fetch. Called from the delete/batch-delete
+     * handlers so the chip row reflects "places where clips still exist"
+     * after a destructive action. Without this, a user deleting the last
+     * Cheras clip would still see a "Cheras" chip until they changed
+     * another filter.
+     */
+    _invalidatePlaceMemo() {
+        this._placeFetchMemoQuery = null;
+        this._placeFetchMemoData = null;
+        this._placeChipsSignature = '';
+    },
+
+    /**
+     * Render the chip row from a {@code [{key, label, count}]} array
+     * fetched from the server. Memoizes via a signature that includes
+     * the active filter key so paginations within the same chip set
+     * skip the DOM mutation entirely.
+     */
+    _renderPlaceChipsFromServer(row, places) {
+        if (!places || places.length === 0) {
+            row.style.display = 'none';
+            // If the active filter is no longer in the server set,
+            // clear it. This can happen if the user deletes every
+            // matching clip while the filter is on.
+            if (this.actorFilter && this.actorFilter.place) {
+                this.actorFilter.place = '';
+                // The current /api/recordings response WAS fetched
+                // with a place filter that's now invalid; trigger a
+                // refetch so the visible list stops showing nothing.
+                this.loadRecordings();
+            }
+            this._placeChipsSignature = '';
+            return;
+        }
+        row.style.display = '';
+
+        const activePlaceLower = (this.actorFilter && this.actorFilter.place || '').toLowerCase();
+
+        // Memo signature: order-stable join of chip keys + active key.
+        // Pure paginations don't refetch chips (loadRecordings does, but
+        // the same query params produce the same server output, so this
+        // memo skips the DOM rebuild).
+        const signature = activePlaceLower + '|' + places.map(p => p.key || '').join(',');
+        if (this._placeChipsSignature === signature) return;
+        this._placeChipsSignature = signature;
+
+        // Replace data chips while keeping the static "Any" chip at index 0.
+        const anyChip = row.querySelector('.filter-chip[data-place=""]');
+        Array.from(row.querySelectorAll('.filter-chip')).forEach(c => {
+            if (c !== anyChip) c.remove();
+        });
+        if (anyChip) anyChip.classList.toggle('active', !activePlaceLower);
+
+        // Drop a place filter that's no longer in the server set.
+        if (activePlaceLower && !places.some(p => (p.key || '') === activePlaceLower)) {
+            this.actorFilter.place = '';
+            // Re-fetch the recordings list — the place arg we sent on
+            // loadRecordings is now a no-match. Without this, the user
+            // sees an empty list with no UI clue what's blocking it.
+            this.loadRecordings();
+            return;
+        }
+
+        places.forEach(place => {
+            const btn = document.createElement('button');
+            const key = place.key || '';
+            btn.className = 'filter-chip' + (key === activePlaceLower ? ' active' : '');
+            btn.setAttribute('data-place', key);
+            // textContent escapes everything — the label flows through
+            // untrusted (Nominatim / user-edited SafeLocation strings).
+            btn.textContent = place.label || key;
+            btn.addEventListener('click', () => {
+                BYD.events.setActorFilter('place', key === activePlaceLower ? '' : key);
+            });
+            row.appendChild(btn);
+        });
     },
     
     updateRecordingsTitle() {
@@ -358,12 +531,12 @@ BYD.events = {
         const prevBtn = document.getElementById('prevPageBtn');
         const nextBtn = document.getElementById('nextPageBtn');
         const info = document.getElementById('paginationInfo');
-        
+
         if (this.totalPages <= 1) {
             pagination.style.display = 'none';
             return;
         }
-        
+
         pagination.style.display = 'flex';
         prevBtn.disabled = this.currentPage <= 1;
         nextBtn.disabled = this.currentPage >= this.totalPages;
@@ -526,17 +699,20 @@ BYD.events = {
             const params = [];
             if (this.currentFilter !== 'all') params.push('type=' + this.currentFilter);
             if (this.selectedDate) params.push('date=' + this.selectedDate);
-            // v3 actor filters (item 6)
+            // v3 actor filters (item 6) + place filter (item 7) — all
+            // server-side now so pagination + totalCount stay honest
+            // under any combination of narrowing chips.
             if (this.actorFilter && this.actorFilter.class)     params.push('class=' + encodeURIComponent(this.actorFilter.class));
             if (this.actorFilter && this.actorFilter.severity)  params.push('severity=' + encodeURIComponent(this.actorFilter.severity));
             if (this.actorFilter && this.actorFilter.proximity) params.push('proximity=' + encodeURIComponent(this.actorFilter.proximity));
+            if (this.actorFilter && this.actorFilter.place)     params.push('place=' + encodeURIComponent(this.actorFilter.place));
             params.push('page=' + this.currentPage);
             params.push('pageSize=' + this.pageSize);
             url += '?' + params.join('&');
-            
+
             const res = await fetch(url);
             const data = await res.json();
-            
+
             if (data.success) {
                 this.recordings = data.recordings || [];
                 this.totalPages = data.totalPages || 1;
@@ -545,6 +721,13 @@ BYD.events = {
                 this.updatePagination();
                 document.getElementById('recordingsCount').textContent =
                     BYD.i18n.plural('events.video_count', this.totalCount);
+                // Refresh the chip row from the dedicated places endpoint
+                // — scoped by the SAME filter context (minus place
+                // itself) so the user sees "places reachable under the
+                // current Sentry/Dashcam/date narrowing." Kicked off
+                // AFTER the recordings render so the user-visible list
+                // doesn't wait on this auxiliary fetch.
+                this.loadPlaceChips();
             }
         } catch (e) {
             console.error('Failed to load recordings:', e);
@@ -555,14 +738,28 @@ BYD.events = {
     renderRecordings() {
         const list = document.getElementById('recordingsList');
 
-        // Inflight placeholder always renders FIRST so it's visible even when
-        // the rest of the page is empty (deep-link arrived faster than any
-        // pagination of older recordings finished).
-        const inflightHtml = this.inflightFilename
+        // Inflight placeholder. We only render it when there's NO active
+        // narrowing filter — class/severity/proximity/place all hide it.
+        // Reason: the placeholder represents a not-yet-finalized .mp4
+        // whose sidecar hasn't been written, so its place/severity/etc
+        // are unknowable. Showing it under an active filter would have
+        // it vanish (without being replaced) when the .mp4 finalizes
+        // and the filter excludes it. The filter-based bar lets the
+        // user see the active recording in the unfiltered or type-only
+        // views; stricter narrowing implies "show me clips matching X"
+        // which the placeholder can't promise to deliver.
+        const filterNarrowing = !!(this.actorFilter
+                && (this.actorFilter.class || this.actorFilter.severity
+                        || this.actorFilter.proximity || this.actorFilter.place));
+        const inflightHtml = (this.inflightFilename && !filterNarrowing)
             ? this.renderInflightCard(this.inflightFilename)
             : '';
 
-        if (this.recordings.length === 0) {
+        // Server applies every filter (type, date, class, severity,
+        // proximity, place). The list arrives ready to render.
+        const visible = this.recordings;
+
+        if (visible.length === 0) {
             if (inflightHtml) {
                 list.innerHTML = inflightHtml;
             } else {
@@ -571,7 +768,7 @@ BYD.events = {
             return;
         }
 
-        list.innerHTML = inflightHtml + this.recordings.map(rec => {
+        list.innerHTML = inflightHtml + visible.map(rec => {
             const thumbId = this._thumbDomId(rec.filename);
             const badge = rec.type === 'sentry' ? BYD.i18n.t('events.badge_sentry') : rec.type === 'proximity' ? BYD.i18n.t('events.badge_proximity') : BYD.i18n.t('events.badge_normal');
             const fname = rec.filename.length > 28 ? rec.filename.substring(0, 25) + '...' : rec.filename;
@@ -617,6 +814,24 @@ BYD.events = {
             if (proxLabel)        actorPills += '<span class="pill prox-' + (rec.peakProximity || 'UNKNOWN') + '">' + proxLabel + '</span>';
             const actorRow = actorPills ? '<div class="actor-summary">' + actorPills + '</div>' : '';
 
+            // v3 geo enrichment — server-side parser populates rec.place
+            // (medium/short/displayName/source/countryCode). Hidden when
+            // missing so legacy clips and clips with no GPS fix render
+            // exactly as before. HTML-escape the place name because it
+            // can contain user-edited SafeLocation labels and
+            // OpenStreetMap-emitted strings; both flow through the
+            // sidecar untrusted.
+            let placeRow = '';
+            if (rec.place && (rec.place.medium || rec.place.short)) {
+                const placeText = rec.place.medium || rec.place.short || '';
+                const escaped = String(placeText)
+                    .replace(/&/g, '&amp;')
+                    .replace(/</g, '&lt;')
+                    .replace(/>/g, '&gt;')
+                    .replace(/"/g, '&quot;');
+                placeRow = '<div class="recording-place">📍 ' + escaped + '</div>';
+            }
+
             return '<div class="recording-card' + (isSelected ? ' selected' : '') + (sevClass ? ' ' + sevClass : '') + '" data-filename="' + rec.filename + '" onclick="' + cardClick + '">' +
                 checkbox +
                 '<div class="recording-thumbnail" id="' + thumbId + '" data-thumb="' + thumbUrl + '">' +
@@ -627,6 +842,7 @@ BYD.events = {
                 '<div class="recording-info">' +
                 '<div class="recording-name"><span class="recording-badge ' + rec.type + '">' + badge + '</span>' + sevBadge + fname + '</div>' +
                 '<div class="recording-meta"><span>' + rec.dateFormatted + '</span><span>' + rec.timeFormatted + '</span><span>' + rec.sizeFormatted + '</span></div>' +
+                placeRow +
                 actorRow +
                 '</div>' +
                 (this.selectMode ? '' : 
@@ -829,8 +1045,12 @@ BYD.events = {
         try {
             const res = await fetch('/api/recordings/' + filename, { method: 'DELETE' });
             const data = await res.json();
-            
+
             if (data.success) {
+                // Drop the place-chip fetch memo so the row re-derives
+                // from the post-delete set; otherwise a now-empty bucket
+                // would still show as a chip until the next filter flip.
+                this._invalidatePlaceMemo();
                 await this.loadDatesWithRecordings();
                 await this.loadStorageStats();
                 await this.loadRecordings();
@@ -935,6 +1155,9 @@ BYD.events = {
                 if (BYD.core && BYD.core.showToast) {
                     BYD.core.showToast(msg, data.failed > 0 ? 'warning' : 'success');
                 }
+                // Same memo invalidation as single-delete — keeps the
+                // chip row in sync after a multi-clip purge.
+                this._invalidatePlaceMemo();
                 this.exitSelectMode();
                 await this.loadDatesWithRecordings();
                 await this.loadStorageStats();

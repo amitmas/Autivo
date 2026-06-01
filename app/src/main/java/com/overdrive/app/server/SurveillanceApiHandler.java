@@ -557,6 +557,16 @@ public class SurveillanceApiHandler {
                 if (camCfg != null) {
                     config.put("cameraId", camCfg.optInt("probedCameraId", -1));
                     config.put("cameraManualOverride", camCfg.optBoolean("manualOverride", false));
+                    // Persisted ingestion mode. Default = "default" (legacy
+                    // ImageReader + 4-strip → 2x2). UI uses this to pre-select
+                    // the radio group; absence falls back to default.
+                    config.put("cameraMode",
+                        camCfg.optString("cameraMode", "default"));
+                    // Red-calibration-overlay GL mask flag — the only
+                    // user-controllable mitigation. The dialog reads this
+                    // to pre-check the switch.
+                    config.put("dilink4RedMask",
+                        camCfg.optBoolean("dilink4RedMask", false));
                 }
             } catch (Exception ignored) {}
         } else {
@@ -1434,6 +1444,68 @@ public class SurveillanceApiHandler {
                     return;
                 }
                 CameraDaemon.log("Manual camera ID cleared — will auto-detect on next pipeline init");
+                configChanged = true;
+            }
+
+            // DiLink 4 red-overlay GL mask. Only effective when
+            // cameraMode=dilink4. Cosmetic suppression of the HAL's
+            // 'calibration failed' chrome — replaces saturated red pixels
+            // with a neighbour sample (or luminance gray as a last resort).
+            // The 2x2 quadrant arrangement itself is hardcoded in
+            // GpuSurveillancePipeline — every DiLink 4 trim observed emits
+            // the same mosaic so there's nothing to tune there.
+            if (configJson.has("dilink4RedMask")) {
+                org.json.JSONObject camCfg = new org.json.JSONObject();
+                try {
+                    camCfg.put("dilink4RedMask",
+                        configJson.optBoolean("dilink4RedMask", false));
+                } catch (org.json.JSONException je) {
+                    HttpResponse.sendJsonError(out, "Failed to build camera config: " + je.getMessage());
+                    return;
+                }
+                boolean saved = com.overdrive.app.config.UnifiedConfigManager
+                    .updateSection("camera", camCfg);
+                if (!saved) {
+                    HttpResponse.sendJsonError(out,
+                        "Could not persist red-overlay flag");
+                    return;
+                }
+                CameraDaemon.log("DiLink 4 red-overlay flag updated: " + camCfg);
+                configChanged = true;
+            }
+
+            // Camera ingestion mode: "default" (legacy ImageReader + 4-strip
+            // → 2x2 rearrangement) vs "dilink4" (esco SurfaceTexture +
+            // passthrough). Persisted under camera.cameraMode and read by
+            // PanoramicCameraGpu / GpuSurveillancePipeline at init. Save
+            // triggers the same prepare-restart flow as a manual cam-id
+            // change so the new mode takes effect.
+            if (configJson.has("cameraMode")) {
+                String mode = configJson.optString("cameraMode", "default")
+                    .toLowerCase(java.util.Locale.US);
+                if (!"default".equals(mode) && !"dilink4".equals(mode)) {
+                    HttpResponse.sendJsonError(out,
+                        "cameraMode must be 'default' or 'dilink4', got '" + mode + "'");
+                    return;
+                }
+                org.json.JSONObject camCfg = new org.json.JSONObject();
+                try {
+                    camCfg.put("cameraMode", mode);
+                } catch (org.json.JSONException je) {
+                    HttpResponse.sendJsonError(out, "Failed to build camera config: " + je.getMessage());
+                    return;
+                }
+                boolean saved = com.overdrive.app.config.UnifiedConfigManager
+                    .updateSection("camera", camCfg);
+                if (!saved) {
+                    CameraDaemon.log("Failed to persist cameraMode=" + mode
+                        + " — UnifiedConfigManager.updateSection returned false");
+                    HttpResponse.sendJsonError(out,
+                        "Could not persist camera mode (filesystem permission?)");
+                    return;
+                }
+                CameraDaemon.log("Camera ingestion mode set: " + mode
+                    + " (will take effect on next daemon restart)");
                 configChanged = true;
             }
 

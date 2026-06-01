@@ -817,15 +817,33 @@ public class PerformanceApiHandler {
                 sohEst.clearUserNominal();
             } else {
                 double kwh = req.getDouble("nominalKwh");
-                if (kwh < 15.0 || kwh > 120.0) {
+                // Floor is drivetrain-aware: 8 kWh on PHEV (Blade DM-i users
+                // who want to enter a usable-frame value like ~12.9 kWh on
+                // Tang DM-i), 15 kWh on BEV. SohEstimator does the strict
+                // per-drivetrain validation; we just gate the API range so
+                // an obviously implausible value bounces with a clear error.
+                if (kwh < 8.0 || kwh > 120.0) {
                     JSONObject err = new JSONObject();
                     err.put("success", false);
-                    err.put("error", "nominalKwh must be between 15 and 120");
+                    err.put("error", "nominalKwh must be between 8 and 120");
                     HttpResponse.sendJson(out, err.toString());
                     return true;
                 }
                 changed = true;
+                double prevNominal = sohEst.getNominalCapacityKwh();
                 sohEst.setNominalCapacityKwhFromUser(kwh);
+                // setNominalCapacityKwhFromUser silently rejects values below
+                // its drivetrain-aware floor (e.g. 12.9 kWh on a misclassified
+                // BEV). Surface that to the client so it doesn't show a
+                // "saved" toast for a no-op.
+                if (Math.abs(sohEst.getNominalCapacityKwh() - kwh) > 0.01
+                        && Math.abs(sohEst.getNominalCapacityKwh() - prevNominal) < 0.01) {
+                    JSONObject err = new JSONObject();
+                    err.put("success", false);
+                    err.put("error", "nominalKwh rejected — outside drivetrain-specific plausible range");
+                    HttpResponse.sendJson(out, err.toString());
+                    return true;
+                }
             }
 
             // Whenever the capacity baseline changes, the previously

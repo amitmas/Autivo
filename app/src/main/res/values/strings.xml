@@ -109,6 +109,24 @@
     <string name="tailscale_proxy_explainer">Routes MQTT through Tailscale so you can reach a private broker on your tailnet without port forwarding.</string>
     <string name="tailscale_proxy_warning">While enabled, MQTT to public brokers (HiveMQ, AWS IoT, etc.) will fail — Tailscale only routes to your tailnet. Saving will restart the daemon.</string>
 
+    <!-- Camera ingestion mode selector (Default vs DiLink 4) -->
+    <string name="camera_mode_title">Ingestion Mode</string>
+    <string name="camera_mode_subtitle">Pick the path that matches your head unit. Default fits most BYD models; DiLink 4 is required on newer trims (Han / Tang 2024+) where the AVM HAL emits a pre-stitched 2x2 mosaic.</string>
+    <string name="camera_mode_option_default">Default — works on Seal, Atto, Dolphin (most cars)</string>
+    <string name="camera_mode_option_dilink4">DiLink 4 — newer Han / Tang variants</string>
+    <string name="camera_mode_current_default">Current: Default</string>
+    <string name="camera_mode_current_dilink4">Current: DiLink 4</string>
+    <string name="camera_mode_save">Apply mode</string>
+    <string name="camera_mode_hint">Changing the mode restarts the camera daemon. If video looks wrong (squished, missing quadrants, red overlay), try the other mode.</string>
+
+    <!-- DiLink 4 quadrant tweaks (only effective when cameraMode = DiLink 4) -->
+    <string name="camera_dilink4_tweaks_title">DiLink 4 Quadrant Tweaks</string>
+    <string name="camera_dilink4_tweaks_subtitle">Per-vehicle adjustments for the DiLink 4 path. Only effective when DiLink 4 mode is selected above.</string>
+    <string name="camera_dilink4_save">Apply tweaks</string>
+    <string name="camera_dilink4_hint">Toggle these only if the HAL paints a red "calibration failed" chrome over the feed. Daemon restart applies the change.</string>
+    <string name="camera_dilink4_red_mask_label">Suppress red calibration overlay (GL)</string>
+    <string name="camera_dilink4_red_mask_subtitle">Adds a fragment-shader pass that detects bright-red HAL "calibration failed" pixels and replaces them with a neighbour sample (or luminance gray when the banner is too large to inpaint). Cosmetic only — does not affect the underlying calibration state.</string>
+
     <!-- dialog_camera_selection -->
     <string name="camera_selection_title">Camera Selection</string>
     <string name="camera_selection_subtitle">Select panoramic camera source</string>
@@ -247,6 +265,7 @@
     <string name="recording_lib_filter_section_what">What</string>
     <string name="recording_lib_filter_section_severity">Severity</string>
     <string name="recording_lib_filter_section_type">Type</string>
+    <string name="recording_lib_filter_section_place">Place</string>
     <string name="recording_lib_chip_type_normal">Normal</string>
     <string name="recording_lib_chip_type_proximity">Proximity</string>
     <string name="recording_lib_date_today">Today</string>
@@ -306,6 +325,16 @@
     <string name="soh_dialog_model_not_selected">Not selected</string>
     <string name="soh_dialog_capacity_not_detected">Not detected</string>
     <string name="soh_dialog_calibration_format">%1$.1f%% on %2$s</string>
+    <string name="soh_dialog_frame_anchor_label">Observed full-charge</string>
+    <string name="soh_dialog_frame_anchor_format">%1$.2f kWh observed at full (%2$d/%3$d samples)</string>
+    <string name="soh_dialog_frame_anchor_pending_format">%1$.2f kWh observed at full (collecting %2$d/%3$d samples)</string>
+    <string name="soh_dialog_frame_mismatch_title">Pack-capacity frame mismatch</string>
+    <string name="soh_dialog_frame_mismatch_format">Vehicle reports %1$.1f kWh at full charge but pack capacity is set to %2$.1f kWh. The number above may reflect a unit mismatch (nameplate vs usable), not real degradation. Consider entering %1$.1f kWh to match what the vehicle reports.</string>
+    <string name="soh_dialog_use_observed_value">Use observed value</string>
+    <string name="soh_dialog_use_observed_value_pending">Saving…</string>
+    <string name="toast_soh_observed_value_saved">Pack capacity updated to %1$.1f kWh.</string>
+    <string name="toast_soh_observed_value_failed">Could not update pack capacity (%1$s).</string>
+    <string name="diagnostics_battery_needs_review">Needs review</string>
 
     <!-- ============================================================
          Step 2: Kotlin / Java UI literal extraction
@@ -810,6 +839,9 @@
     <string name="settings_privacy_storage_count_format">%1$d clip</string>
     <string name="settings_privacy_storage_count_format_plural">%1$d clips</string>
     <string name="settings_privacy_reset_subtitle">Choose categories: recordings, events, daemon configs, cached telemetry…</string>
+
+    <!-- Place tagging (reverse geocoding) — recording row chip fallback. -->
+    <string name="recording_unknown_location">No location</string>
 
     <!-- ============================================================== -->
     <!-- Diagnostics health-tile values (Camera + Battery)                -->

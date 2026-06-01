@@ -11,7 +11,8 @@
     "charging_stopped": "Opladen stopte bij {0}%",
     "charging_complete": "Batterij bij {0}%  klaar om te ontkoppelen",
     "recording_started": "Opname is begonnen.",
-    "recording_ended": "Opname is afgelopen."
+    "recording_ended": "Opname is afgelopen.",
+    "location_prefix": "Plaats: {0}"
   },
   "errors": {
     "rate_limited_locked_for_seconds": "Te veel pogingen  gesloten voor {0}s",
@@ -35,6 +36,7 @@
     "models_invalid_json": "Niet geldig JSON",
     "models_unknown_id_with_id": "Onbekend model-ID: {0}",
     "models_invalid_color": "Niet geldige kleur (verwacht #RRGGBB)",
+    "models_invalid_drive_side": "Ongeldige voertuigindeling (verwacht «lhd» of «rhd»)",
     "models_nothing_to_update": "Niets te updaten.",
     "models_persist_failed": "Niet volharden",
     "models_id_required": "ID is vereist",
@@ -99,8 +101,7 @@
     "mqtt_not_initialized": "MQTT niet geïnitieerd",
     "max_connections_reached": "Maximaal bereikte verbindingen ({0})",
     "missing_connection_id": "Ontbrekende verbindings-ID",
-    "connection_not_found": "Verbinding niet gevonden: {0}",
-    "models_invalid_drive_side": "Ongeldige voertuigindeling (verwacht «lhd» of «rhd»)"
+    "connection_not_found": "Verbinding niet gevonden: {0}"
   },
   "notifications": {
     "charging_started": "Opladen is gestart .",
@@ -119,7 +120,9 @@
     "area_hood": "Hoed",
     "area_trunk": "Kofferbak",
     "area_fuel_cap": "Brandstofkap",
-    "area_door_n": "Door {0}"
+    "area_door_n": "Door {0}",
+    "soh_frame_mismatch_title": "Overweging van de capaciteitsbehoeften van de batterij",
+    "soh_frame_mismatch_body": "Het voertuig rapporteert {0} kWh op volledige lading, maar de verpakkingscapaciteit is ingesteld op {1} kWh."
   },
   "telegram": {
     "recording_caption": " Opname ({0}) - {1}s",

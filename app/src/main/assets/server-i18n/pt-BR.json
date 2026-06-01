@@ -11,7 +11,8 @@
     "charging_stopped": "A carga parou em {0}%",
     "charging_complete": "Bateria em {0}%  pronta para desconectar",
     "recording_started": "A gravação começou.",
-    "recording_ended": "A gravação terminou."
+    "recording_ended": "A gravação terminou.",
+    "location_prefix": "Localização: {0}"
   },
   "errors": {
     "rate_limited_locked_for_seconds": "Muitas tentativas bloqueadas para {0}s",
@@ -35,6 +36,7 @@
     "models_invalid_json": "Invalida JSON",
     "models_unknown_id_with_id": "Identificação do modelo desconhecida: {0}",
     "models_invalid_color": "Cor inválida (esperado #RRGGBB)",
+    "models_invalid_drive_side": "Layout do veículo inválido (esperado «lhd» ou «rhd»)",
     "models_nothing_to_update": "Nada para atualizar.",
     "models_persist_failed": "Não conseguiu persistir.",
     "models_id_required": "é necessário o id",
@@ -99,8 +101,7 @@
     "mqtt_not_initialized": "MQTT não iniciado",
     "max_connections_reached": "Conexões máximas alcançadas ({0})",
     "missing_connection_id": "Identificação de conexão desaparecida",
-    "connection_not_found": "Conexão não encontrada: {0}",
-    "models_invalid_drive_side": "Layout do veículo inválido (esperado «lhd» ou «rhd»)"
+    "connection_not_found": "Conexão não encontrada: {0}"
   },
   "notifications": {
     "charging_started": "Carregamento iniciado",
@@ -119,7 +120,9 @@
     "area_hood": "Capuz",
     "area_trunk": "Tropeço",
     "area_fuel_cap": "Capa de combustível",
-    "area_door_n": "Porta {0}"
+    "area_door_n": "Porta {0}",
+    "soh_frame_mismatch_title": "Revisão das necessidades de capacidade da bateria",
+    "soh_frame_mismatch_body": "O veículo informa {0} kWh com carga total, mas a capacidade de embalagem é definida para {1} kWh."
   },
   "telegram": {
     "recording_caption": " Registo ({0}) - {1}s",

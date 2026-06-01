@@ -943,6 +943,7 @@ public class GpuSurveillancePipeline {
         com.overdrive.app.camera.ResolvedCameraConfig resolvedCamera =
             com.overdrive.app.camera.CameraConfigResolver.resolve(getVehicleModel());
         float[] quadrantStripOffsetX = resolvedCamera.getQuadrantStripOffsetX();
+        float[] quadrantCornerOffsetsXY = resolvedCamera.getQuadrantCornerOffsetsXY();
 
         // 2. Create GPU mosaic recorder (shared) with profile-driven viewport
         // and per-quadrant offsets. Tang gets 2560x1440 instead of 2560x1920.
@@ -1011,7 +1012,8 @@ public class GpuSurveillancePipeline {
                 + resolvedCamera.getPanoWidth() + "x" + resolvedCamera.getPanoHeight()
                 + " — restart the daemon to apply the new profile dimensions");
         }
-        camera = new PanoramicCameraGpu(cameraWidth, cameraHeight, quadrantStripOffsetX);
+        camera = new PanoramicCameraGpu(cameraWidth, cameraHeight,
+            quadrantStripOffsetX, quadrantCornerOffsetsXY);
         camera.setConsumers(recorder, downscaler, sentry);
 
         // Camera FPS config — must match the encoder FPS used above (loadTargetFps())
@@ -1073,11 +1075,53 @@ public class GpuSurveillancePipeline {
             }, "PendingRecCheck").start();
         });
         
-        // Always 4-camera mosaic — both devices output the same strip format
+        // esco-parity: when the camera is using the SurfaceTexture path, the
+        // BYD HAL emits its final framing into the producer surface directly
+        // Layout 3 = DiLink 4 (HAL emits 2x2 natively but in non-canonical
+        // arrangement; recorder/stream/cropper rearrange via per-role corner
+        // remap below). Layout 0 = legacy 4-strip → 2x2 rearrangement. The
+        // camera class returns 3 whenever cameraMode=dilink4 is selected
+        // (USE_ESCO_SURFACE_TEXTURE_PATH path), 0 for every other car.
+        int layoutMode = camera != null ? camera.getCameraLayoutMode() : 0;
         if (recorder != null) {
-            recorder.setCameraLayout(0);
+            recorder.setCameraLayout(layoutMode);
+            // DiLink 4 layout is hardcoded to the only known-good arrangement
+            // for that HAL: Front=TL X-flipped, Rear=TR Y-flipped, Left=BL
+            // Y-flipped, Right=BR no flip. No user-tunable surface — every
+            // DiLink 4 trim seen so far emits this exact mosaic.
+            recorder.setProducerCornerMap(
+                new float[] { 0.0f, 0.0f },  // Front  → TL
+                new float[] { 0.5f, 0.5f },  // Right  → BR
+                new float[] { 0.5f, 0.0f },  // Rear   → TR
+                new float[] { 0.0f, 0.5f }); // Left   → BL
+            recorder.setFlipFlags(
+                new float[] { 1.0f, 1.0f },  // Front  X+Y-flip
+                new float[] { 0.0f, 1.0f },  // Right  Y-flip
+                new float[] { 0.0f, 0.0f },  // Rear   no flip
+                new float[] { 0.0f, 0.0f }); // Left   no flip
+            // Red-overlay mask (HAL 'calibration failed' chrome suppression).
+            // Off by default; user opts in when the car is uncalibrated and
+            // the chrome is in the way.
+            try {
+                org.json.JSONObject camCfg = com.overdrive.app.config
+                    .UnifiedConfigManager.loadConfig().optJSONObject("camera");
+                if (camCfg != null) {
+                    recorder.setRedMaskEnabled(
+                        camCfg.optBoolean("dilink4RedMask", false));
+                    // APA center inset — esco APACropFilter parity. Default
+                    // 240/2560 = 0.09375 trims the chrome-painted seams on
+                    // byd_apa firmware. Only applied when cameraLayout=3
+                    // because the inset uniform is gated by uApaMode>2.5.
+                    if (layoutMode == 3) {
+                        recorder.setApaCenterInset(
+                            (float) camCfg.optDouble("dilink4ApaCenterInset", 0.09375));
+                    }
+                }
+            } catch (Throwable t) {
+                logger.warn("Failed to read dilink4RedMask from config: " + t.getMessage());
+            }
         }
-        
+
         // 6. Create adaptive bitrate controller
         bitrateController = new AdaptiveBitrateController(encoder, 6_000_000);
         
@@ -1635,16 +1679,52 @@ public class GpuSurveillancePipeline {
         
         // Create stream scaler
         logger.info("Creating stream scaler...");
-        // Stream scaler picks the same per-quadrant offsets so user-mapped
-        // role-to-slice mappings affect single-direction streaming too.
-        float[] streamQuadrantStripOffsetX = com.overdrive.app.camera.CameraConfigResolver
-            .resolve(getVehicleModel())
-            .getQuadrantStripOffsetX();
+        // Stream scaler picks the same per-role offsets used by the
+        // recorder so user-mapped role-to-slice mappings affect
+        // single-direction streaming too. We pass BOTH 4-strip offsets and
+        // 2x2 corners; the shader picks based on uApaMode (cameraLayout).
+        com.overdrive.app.camera.ResolvedCameraConfig streamCfg =
+            com.overdrive.app.camera.CameraConfigResolver.resolve(getVehicleModel());
+        float[] streamQuadrantStripOffsetX = streamCfg.getQuadrantStripOffsetX();
         streamScaler = new com.overdrive.app.streaming.GpuStreamScaler(
             streamWidth, streamHeight, streamQuadrantStripOffsetX);
-        
-        // Always 4-camera mosaic for streaming
-        streamScaler.setCameraLayout(0);
+
+        // Match the recorder's layout choice. esco-parity passthrough (3)
+        // when SurfaceTexture path is active; legacy 4-cam mosaic (0)
+        // otherwise.
+        boolean streamUsingEscoPath =
+            (camera != null && camera.isUsingEscoSurfaceTexturePath());
+        streamScaler.setCameraLayout(streamUsingEscoPath ? 3 : 0);
+
+        // Hardcoded Variant A corner+flip constants on DiLink 4. Mirrors
+        // GpuMosaicRecorder so live stream and recording stay aligned. On
+        // legacy cars the uniforms are unused (uApaMode != 3 path).
+        if (streamUsingEscoPath) {
+            streamScaler.setProducerCornerMap(
+                new float[] { 0.0f, 0.0f },  // Front  → producer TL
+                new float[] { 0.5f, 0.5f },  // Right  → producer BR
+                new float[] { 0.5f, 0.0f },  // Rear   → producer TR
+                new float[] { 0.0f, 0.5f }); // Left   → producer BL
+            streamScaler.setFlipFlags(
+                new float[] { 1.0f, 1.0f },  // Front  X+Y-flip
+                new float[] { 0.0f, 1.0f },  // Right  Y-flip
+                new float[] { 0.0f, 0.0f },  // Rear   no flip
+                new float[] { 0.0f, 0.0f }); // Left   no flip
+            // Red-overlay suppression follows the recorder. Read the same
+            // unified-config flag so the live preview matches the MP4.
+            try {
+                org.json.JSONObject camCfgStream = com.overdrive.app.config
+                    .UnifiedConfigManager.loadConfig().optJSONObject("camera");
+                if (camCfgStream != null) {
+                    streamScaler.setRedMaskEnabled(
+                        camCfgStream.optBoolean("dilink4RedMask", false));
+                    streamScaler.setApaCenterInset(
+                        (float) camCfgStream.optDouble("dilink4ApaCenterInset", 0.09375));
+                }
+            } catch (Throwable t) {
+                logger.warn("Stream scaler red-mask flag read failed: " + t.getMessage());
+            }
+        }
         
         // Initialize on GL thread and WAIT for completion
         // This ensures the scaler is ready before we set streaming components
@@ -1880,7 +1960,7 @@ public class GpuSurveillancePipeline {
             return "unknown";
         }
     }
-    
+
     /**
      * Checks if running.
      * 

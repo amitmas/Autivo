@@ -86,6 +86,49 @@ public class GpuDownscaler {
     private int aPositionLocation;
     private int aTexCoordLocation;
     private int uCameraTexLocation;
+    private int uTexMatrixLocation;
+    private int uApaModeLocation;
+    private int uApplyManualYFlipLocation;
+    // Per-role producer corner + flip uniforms — main programId.
+    private int uProducerForFrontLocation = -1;
+    private int uProducerForRightLocation = -1;
+    private int uProducerForRearLocation = -1;
+    private int uProducerForLeftLocation = -1;
+    private int uFlipForFrontLocation = -1;
+    private int uFlipForRightLocation = -1;
+    private int uFlipForRearLocation = -1;
+    private int uFlipForLeftLocation = -1;
+    private int uRedMaskStrengthLocation = -1;
+    private volatile boolean redMaskEnabled = false;
+    private int uApaCenterInsetLocation = -1;
+    private volatile float apaCenterInset = 0.0f;
+    // Producer-corner remap + per-role X/Y flip flags (Variant A on
+    // DiLink 4). UI thread writes via setProducerCornerMap/setFlipFlags;
+    // GL thread reads in drawFrame paths under producerCornerMapLock.
+    private final float[] producerCornerMap = {
+        0.00f, 0.00f,
+        0.50f, 0.00f,
+        0.00f, 0.50f,
+        0.50f, 0.50f
+    };
+    private final float[] flipFlags = {
+        0f, 0f,  0f, 0f,  0f, 0f,  0f, 0f
+    };
+    private final Object producerCornerMapLock = new Object();
+
+    // SurfaceTexture transform matrix and layout selector. Written from
+    // the camera GL thread via setTextureMatrix / setCameraLayout, read on
+    // every readPixels / readPixelsDirect call. Plain copy is safe — both
+    // setters and the readers run on the same GL thread (the AI-lane GL
+    // thread for direct path, the probe thread for legacy readPixels;
+    // neither concurrently with the camera thread for this instance).
+    private final float[] currentTexMatrix = {
+        1f, 0f, 0f, 0f,
+        0f, 1f, 0f, 0f,
+        0f, 0f, 1f, 0f,
+        0f, 0f, 0f, 1f,
+    };
+    private volatile int cameraLayout = 0;  // 0=4-strip rearrange, 3=passthrough
     
     // Vertex buffers
     private FloatBuffer vertexBuffer;
@@ -101,23 +144,35 @@ public class GpuDownscaler {
          1.0f,  1.0f
     };
     
-    // Texture coordinates (flipped vertically for correct orientation)
-    // OpenGL renders with Y=0 at bottom, but images expect Y=0 at top
+    // Texture coordinates — UN-flipped V. Vertex shader applies manual
+    // Y-flip on legacy (uTexMatrix=identity); DiLink 4's matrix handles it.
     private static final float[] TEX_COORDS = {
-        0.0f, 1.0f,  // Bottom-left vertex → top-left of texture
-        1.0f, 1.0f,  // Bottom-right vertex → top-right of texture
-        0.0f, 0.0f,  // Top-left vertex → bottom-left of texture
-        1.0f, 0.0f   // Top-right vertex → bottom-right of texture
+        0.0f, 0.0f,
+        1.0f, 0.0f,
+        0.0f, 1.0f,
+        1.0f, 1.0f
     };
     
-    // Vertex shader
+    // Vertex shader. esco-parity: applies the SurfaceTexture transform
+    // matrix so AI-lane samples land inside the HAL's "live" sub-region
+    // even when the producer surface contains chrome/letterbox. Identity
+    // by default — legacy ImageReader path is unaffected.
+    //
+    // Manual Y-flip: legacy ImageReader path used pre-flipped TEX_COORDS;
+    // we now flip in the vertex shader instead (uApplyManualYFlip=1.0).
+    // DiLink 4 path uses the SurfaceTexture matrix's built-in Y-flip
+    // (uApplyManualYFlip=0.0). Both yield producer-top at top-of-frame.
     private static final String VERTEX_SHADER =
         "attribute vec4 aPosition;\n" +
         "attribute vec2 aTexCoord;\n" +
+        "uniform mat4 uTexMatrix;\n" +
+        "uniform float uApplyManualYFlip;\n" +
         "varying vec2 vTexCoord;\n" +
         "void main() {\n" +
         "    gl_Position = aPosition;\n" +
-        "    vTexCoord = aTexCoord;\n" +
+        "    vec2 src = aTexCoord;\n" +
+        "    if (uApplyManualYFlip > 0.5) src.y = 1.0 - src.y;\n" +
+        "    vTexCoord = (uTexMatrix * vec4(src, 0.0, 1.0)).xy;\n" +
         "}\n";
     
     /**
@@ -258,7 +313,20 @@ public class GpuDownscaler {
         aPositionLocation = GLES20.glGetAttribLocation(programId, "aPosition");
         aTexCoordLocation = GLES20.glGetAttribLocation(programId, "aTexCoord");
         uCameraTexLocation = GLES20.glGetUniformLocation(programId, "uCameraTex");
-        
+        uTexMatrixLocation = GLES20.glGetUniformLocation(programId, "uTexMatrix");
+        uApaModeLocation = GLES20.glGetUniformLocation(programId, "uApaMode");
+        uApplyManualYFlipLocation = GLES20.glGetUniformLocation(programId, "uApplyManualYFlip");
+        uProducerForFrontLocation = GLES20.glGetUniformLocation(programId, "uProducerForFront");
+        uProducerForRightLocation = GLES20.glGetUniformLocation(programId, "uProducerForRight");
+        uProducerForRearLocation  = GLES20.glGetUniformLocation(programId, "uProducerForRear");
+        uProducerForLeftLocation  = GLES20.glGetUniformLocation(programId, "uProducerForLeft");
+        uFlipForFrontLocation = GLES20.glGetUniformLocation(programId, "uFlipForFront");
+        uFlipForRightLocation = GLES20.glGetUniformLocation(programId, "uFlipForRight");
+        uFlipForRearLocation  = GLES20.glGetUniformLocation(programId, "uFlipForRear");
+        uFlipForLeftLocation  = GLES20.glGetUniformLocation(programId, "uFlipForLeft");
+        uRedMaskStrengthLocation = GLES20.glGetUniformLocation(programId, "uRedMaskStrength");
+        uApaCenterInsetLocation = GLES20.glGetUniformLocation(programId, "uApaCenterInset");
+
         vertexBuffer = GlUtil.createFloatBuffer(VERTEX_COORDS);
         texCoordBuffer = GlUtil.createFloatBuffer(TEX_COORDS);
     }
@@ -298,14 +366,45 @@ public class GpuDownscaler {
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, textureId);
         GLES20.glUniform1i(uCameraTexLocation, 0);
-        
+        if (uTexMatrixLocation >= 0) {
+            GLES20.glUniformMatrix4fv(uTexMatrixLocation, 1, false, currentTexMatrix, 0);
+        }
+        if (uApaModeLocation >= 0) {
+            GLES20.glUniform1f(uApaModeLocation, (float) cameraLayout);
+        }
+        if (uApplyManualYFlipLocation >= 0) {
+            GLES20.glUniform1f(uApplyManualYFlipLocation,
+                cameraLayout == 3 ? 0.0f : 1.0f);
+        }
+        if (uProducerForFrontLocation >= 0) {
+            float[] m = new float[8];
+            float[] f = new float[8];
+            snapshotProducerCornersAndFlips(m, f);
+            GLES20.glUniform2f(uProducerForFrontLocation, m[0], m[1]);
+            GLES20.glUniform2f(uProducerForRightLocation, m[2], m[3]);
+            GLES20.glUniform2f(uProducerForRearLocation,  m[4], m[5]);
+            GLES20.glUniform2f(uProducerForLeftLocation,  m[6], m[7]);
+            if (uFlipForFrontLocation >= 0) {
+                GLES20.glUniform2f(uFlipForFrontLocation, f[0], f[1]);
+                GLES20.glUniform2f(uFlipForRightLocation, f[2], f[3]);
+                GLES20.glUniform2f(uFlipForRearLocation,  f[4], f[5]);
+                GLES20.glUniform2f(uFlipForLeftLocation,  f[6], f[7]);
+            }
+        }
+        if (uRedMaskStrengthLocation >= 0) {
+            GLES20.glUniform1f(uRedMaskStrengthLocation, redMaskEnabled ? 1.0f : 0.0f);
+        }
+        if (uApaCenterInsetLocation >= 0) {
+            GLES20.glUniform1f(uApaCenterInsetLocation, apaCenterInset);
+        }
+
         // Draw quad
         GLES20.glEnableVertexAttribArray(aPositionLocation);
         GLES20.glVertexAttribPointer(aPositionLocation, 2, GLES20.GL_FLOAT, false, 0, vertexBuffer);
-        
+
         GLES20.glEnableVertexAttribArray(aTexCoordLocation);
         GLES20.glVertexAttribPointer(aTexCoordLocation, 2, GLES20.GL_FLOAT, false, 0, texCoordBuffer);
-        
+
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
         
         GLES20.glDisableVertexAttribArray(aPositionLocation);
@@ -420,6 +519,19 @@ public class GpuDownscaler {
     private int directAPosition = -1;
     private int directATexCoord = -1;
     private int directUCameraTex = -1;
+    private int directUTexMatrix = -1;
+    private int directUApaMode = -1;
+    private int directUApplyManualYFlip = -1;
+    private int directUProducerForFront = -1;
+    private int directUProducerForRight = -1;
+    private int directUProducerForRear = -1;
+    private int directUProducerForLeft = -1;
+    private int directUFlipForFront = -1;
+    private int directUFlipForRight = -1;
+    private int directUFlipForRear = -1;
+    private int directUFlipForLeft = -1;
+    private int directURedMaskStrength = -1;
+    private int directUApaCenterInset = -1;
     private byte[] directRgbBuffer = null;
     private byte[] directScratchRgba = null;  // bulk-copy RGBA scratch for Y-flip pack
     private boolean directInitialized = false;
@@ -491,6 +603,37 @@ public class GpuDownscaler {
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, cameraTextureId);
         GLES20.glUniform1i(directUCameraTex, 0);
+        if (directUTexMatrix >= 0) {
+            GLES20.glUniformMatrix4fv(directUTexMatrix, 1, false, currentTexMatrix, 0);
+        }
+        if (directUApaMode >= 0) {
+            GLES20.glUniform1f(directUApaMode, (float) cameraLayout);
+        }
+        if (directUApplyManualYFlip >= 0) {
+            GLES20.glUniform1f(directUApplyManualYFlip,
+                cameraLayout == 3 ? 0.0f : 1.0f);
+        }
+        if (directUProducerForFront >= 0) {
+            float[] m = new float[8];
+            float[] f = new float[8];
+            snapshotProducerCornersAndFlips(m, f);
+            GLES20.glUniform2f(directUProducerForFront, m[0], m[1]);
+            GLES20.glUniform2f(directUProducerForRight, m[2], m[3]);
+            GLES20.glUniform2f(directUProducerForRear,  m[4], m[5]);
+            GLES20.glUniform2f(directUProducerForLeft,  m[6], m[7]);
+            if (directUFlipForFront >= 0) {
+                GLES20.glUniform2f(directUFlipForFront, f[0], f[1]);
+                GLES20.glUniform2f(directUFlipForRight, f[2], f[3]);
+                GLES20.glUniform2f(directUFlipForRear,  f[4], f[5]);
+                GLES20.glUniform2f(directUFlipForLeft,  f[6], f[7]);
+            }
+        }
+        if (directURedMaskStrength >= 0) {
+            GLES20.glUniform1f(directURedMaskStrength, redMaskEnabled ? 1.0f : 0.0f);
+        }
+        if (directUApaCenterInset >= 0) {
+            GLES20.glUniform1f(directUApaCenterInset, apaCenterInset);
+        }
 
         GLES20.glEnableVertexAttribArray(directAPosition);
         GLES20.glVertexAttribPointer(directAPosition, 2, GLES20.GL_FLOAT, false, 0, vertexBuffer);
@@ -606,6 +749,19 @@ public class GpuDownscaler {
                 directAPosition = GLES20.glGetAttribLocation(directProgram, "aPosition");
                 directATexCoord = GLES20.glGetAttribLocation(directProgram, "aTexCoord");
                 directUCameraTex = GLES20.glGetUniformLocation(directProgram, "uCameraTex");
+                directUTexMatrix = GLES20.glGetUniformLocation(directProgram, "uTexMatrix");
+                directUApaMode = GLES20.glGetUniformLocation(directProgram, "uApaMode");
+                directUApplyManualYFlip = GLES20.glGetUniformLocation(directProgram, "uApplyManualYFlip");
+                directUProducerForFront = GLES20.glGetUniformLocation(directProgram, "uProducerForFront");
+                directUProducerForRight = GLES20.glGetUniformLocation(directProgram, "uProducerForRight");
+                directUProducerForRear  = GLES20.glGetUniformLocation(directProgram, "uProducerForRear");
+                directUProducerForLeft  = GLES20.glGetUniformLocation(directProgram, "uProducerForLeft");
+                directUFlipForFront = GLES20.glGetUniformLocation(directProgram, "uFlipForFront");
+                directUFlipForRight = GLES20.glGetUniformLocation(directProgram, "uFlipForRight");
+                directUFlipForRear  = GLES20.glGetUniformLocation(directProgram, "uFlipForRear");
+                directUFlipForLeft  = GLES20.glGetUniformLocation(directProgram, "uFlipForLeft");
+                directURedMaskStrength = GLES20.glGetUniformLocation(directProgram, "uRedMaskStrength");
+                directUApaCenterInset = GLES20.glGetUniformLocation(directProgram, "uApaCenterInset");
             }
 
             // Single render FBO.
@@ -710,6 +866,37 @@ public class GpuDownscaler {
             GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
             GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, cameraTextureId);
             GLES20.glUniform1i(directUCameraTex, 0);
+            if (directUTexMatrix >= 0) {
+                GLES20.glUniformMatrix4fv(directUTexMatrix, 1, false, currentTexMatrix, 0);
+            }
+            if (directUApaMode >= 0) {
+                GLES20.glUniform1f(directUApaMode, (float) cameraLayout);
+            }
+            if (directUApplyManualYFlip >= 0) {
+                GLES20.glUniform1f(directUApplyManualYFlip,
+                    cameraLayout == 3 ? 0.0f : 1.0f);
+            }
+            if (directUProducerForFront >= 0) {
+                float[] m = new float[8];
+                float[] f = new float[8];
+                snapshotProducerCornersAndFlips(m, f);
+                GLES20.glUniform2f(directUProducerForFront, m[0], m[1]);
+                GLES20.glUniform2f(directUProducerForRight, m[2], m[3]);
+                GLES20.glUniform2f(directUProducerForRear,  m[4], m[5]);
+                GLES20.glUniform2f(directUProducerForLeft,  m[6], m[7]);
+                if (directUFlipForFront >= 0) {
+                    GLES20.glUniform2f(directUFlipForFront, f[0], f[1]);
+                    GLES20.glUniform2f(directUFlipForRight, f[2], f[3]);
+                    GLES20.glUniform2f(directUFlipForRear,  f[4], f[5]);
+                    GLES20.glUniform2f(directUFlipForLeft,  f[6], f[7]);
+                }
+            }
+            if (directURedMaskStrength >= 0) {
+                GLES20.glUniform1f(directURedMaskStrength, redMaskEnabled ? 1.0f : 0.0f);
+            }
+            if (directUApaCenterInset >= 0) {
+                GLES20.glUniform1f(directUApaCenterInset, apaCenterInset);
+            }
 
             GLES20.glEnableVertexAttribArray(directAPosition);
             GLES20.glVertexAttribPointer(directAPosition, 2, GLES20.GL_FLOAT, false, 0, vertexBuffer);
@@ -769,6 +956,19 @@ public class GpuDownscaler {
                 directAPosition = GLES20.glGetAttribLocation(directProgram, "aPosition");
                 directATexCoord = GLES20.glGetAttribLocation(directProgram, "aTexCoord");
                 directUCameraTex = GLES20.glGetUniformLocation(directProgram, "uCameraTex");
+                directUTexMatrix = GLES20.glGetUniformLocation(directProgram, "uTexMatrix");
+                directUApaMode = GLES20.glGetUniformLocation(directProgram, "uApaMode");
+                directUApplyManualYFlip = GLES20.glGetUniformLocation(directProgram, "uApplyManualYFlip");
+                directUProducerForFront = GLES20.glGetUniformLocation(directProgram, "uProducerForFront");
+                directUProducerForRight = GLES20.glGetUniformLocation(directProgram, "uProducerForRight");
+                directUProducerForRear  = GLES20.glGetUniformLocation(directProgram, "uProducerForRear");
+                directUProducerForLeft  = GLES20.glGetUniformLocation(directProgram, "uProducerForLeft");
+                directUFlipForFront = GLES20.glGetUniformLocation(directProgram, "uFlipForFront");
+                directUFlipForRight = GLES20.glGetUniformLocation(directProgram, "uFlipForRight");
+                directUFlipForRear  = GLES20.glGetUniformLocation(directProgram, "uFlipForRear");
+                directUFlipForLeft  = GLES20.glGetUniformLocation(directProgram, "uFlipForLeft");
+                directURedMaskStrength = GLES20.glGetUniformLocation(directProgram, "uRedMaskStrength");
+                directUApaCenterInset = GLES20.glGetUniformLocation(directProgram, "uApaCenterInset");
             }
 
             int[] texIds = new int[1];
@@ -831,6 +1031,88 @@ public class GpuDownscaler {
     public int getBytesPerPixel() { return 4; }
     public void recycleBuffer(byte[] buffer) { }
     public String getPoolStats() { return "Async ImageReader (zero-stutter)"; }
+
+    /**
+     * Publishes the SurfaceTexture transform matrix that subsequent draws
+     * (drawFrame / readPixelsDirect / readPixelsSync) will upload to the
+     * shader's uTexMatrix. Plain copy — same GL thread as the readers.
+     */
+    public void setTextureMatrix(float[] matrix4x4) {
+        if (matrix4x4 == null || matrix4x4.length < 16) return;
+        System.arraycopy(matrix4x4, 0, currentTexMatrix, 0, 16);
+    }
+
+    /**
+     * Selects between layouts:
+     *   0 = legacy 4-strip → 2x2 rearrangement (Seal/Atto)
+     *   3 = esco-parity passthrough (HAL emits final framing natively)
+     * Other values fall through to layout 0 in the shader.
+     */
+    public void setCameraLayout(int layout) { this.cameraLayout = layout; }
+
+    /**
+     * Per-role producer corner XY map for DiLink 4. Each pair is the
+     * top-left of the role's 0.5×0.5 sub-rect inside the producer surface,
+     * in {Front, Right, Rear, Left} order. Default = canonical 2x2.
+     * On DiLink 4 the pipeline pushes Variant A constants here so the
+     * AI-lane downscaled mosaic is canonically arranged (Front=TL,
+     * Right=TR, Rear=BL, Left=BR upright) — which is what V2 motion's
+     * hardcoded quadrant indexing assumes.
+     */
+    public void setProducerCornerMap(float[] front, float[] right,
+                                     float[] rear, float[] left) {
+        if (front == null || right == null || rear == null || left == null
+                || front.length < 2 || right.length < 2
+                || rear.length  < 2 || left.length  < 2) {
+            return;
+        }
+        synchronized (producerCornerMapLock) {
+            producerCornerMap[0] = front[0]; producerCornerMap[1] = front[1];
+            producerCornerMap[2] = right[0]; producerCornerMap[3] = right[1];
+            producerCornerMap[4] = rear[0];  producerCornerMap[5] = rear[1];
+            producerCornerMap[6] = left[0];  producerCornerMap[7] = left[1];
+        }
+    }
+
+    /** Per-role X/Y flip flags ({xFlip, yFlip} ∈ {0,1}). {Front, Right, Rear, Left}. */
+    public void setFlipFlags(float[] front, float[] right,
+                             float[] rear, float[] left) {
+        if (front == null || right == null || rear == null || left == null
+                || front.length < 2 || right.length < 2
+                || rear.length  < 2 || left.length  < 2) {
+            return;
+        }
+        synchronized (producerCornerMapLock) {
+            flipFlags[0] = front[0]; flipFlags[1] = front[1];
+            flipFlags[2] = right[0]; flipFlags[3] = right[1];
+            flipFlags[4] = rear[0];  flipFlags[5] = rear[1];
+            flipFlags[6] = left[0];  flipFlags[7] = left[1];
+        }
+    }
+
+    /**
+     * Enables or disables the GL red-overlay suppression on the AI lane.
+     * Mirrors GpuMosaicRecorder.setRedMaskEnabled. Off by default; pipeline
+     * pulls dilink4RedMask from unified config and pushes it through.
+     */
+    /** APA center inset (esco APACropFilter parity). See {@link
+     *  com.overdrive.app.surveillance.GpuMosaicRecorder#setApaCenterInset}. */
+    public void setApaCenterInset(float inset) {
+        this.apaCenterInset = Math.max(0.0f, Math.min(0.20f, inset));
+    }
+
+    public void setRedMaskEnabled(boolean enabled) {
+        this.redMaskEnabled = enabled;
+    }
+
+    /** Snapshot the producer corner+flip arrays into caller-provided
+     *  scratch buffers under lock. Caller uploads as uniforms after. */
+    private void snapshotProducerCornersAndFlips(float[] m, float[] f) {
+        synchronized (producerCornerMapLock) {
+            System.arraycopy(producerCornerMap, 0, m, 0, 8);
+            System.arraycopy(flipFlags, 0, f, 0, 8);
+        }
+    }
     
     // SOTA FIX: Reusable RGB buffer to eliminate 900KB allocation per frame
     private byte[] reusableRgbBuffer = null;
@@ -955,27 +1237,71 @@ public class GpuDownscaler {
      * strip-X offsets baked in. Order: {Front=TL, Right=TR, Rear=BL, Left=BR}.
      */
     private static String buildFragmentShader(float[] offsets) {
+        // uApaMode > 2.5 = DiLink 4 / 2x2-native HAL. The producer surface
+        // emits a non-canonical 2x2 (e.g. Variant A: Front X-mirrored at TL,
+        // Rear Y-flipped at TR, Left Y-flipped at BL, Right at BR). We
+        // rearrange to the canonical Front=TL / Right=TR / Rear=BL / Left=BR
+        // upright layout — same math as GpuMosaicRecorder — so V2 motion's
+        // hardcoded quadrant-index assumption (Q0=Front, Q1=Right, Q2=Rear,
+        // Q3=Left at fixed grid positions) holds and the FoveatedCropper
+        // sees a coherent canonical frame.
+        // Legacy (uApaMode <= 0.5) → 4-strip → 2x2 rearrangement, unchanged.
         return String.format(Locale.US,
             "#extension GL_OES_EGL_image_external : require\n" +
             "precision mediump float;\n" +
             "uniform samplerExternalOES uCameraTex;\n" +
+            "uniform float uApaMode;\n" +
+            "uniform vec2 uProducerForFront;\n" +
+            "uniform vec2 uProducerForRight;\n" +
+            "uniform vec2 uProducerForRear;\n" +
+            "uniform vec2 uProducerForLeft;\n" +
+            "uniform vec2 uFlipForFront;\n" +
+            "uniform vec2 uFlipForRight;\n" +
+            "uniform vec2 uFlipForRear;\n" +
+            "uniform vec2 uFlipForLeft;\n" +
+            "uniform float uRedMaskStrength;\n" +
+            "uniform float uApaCenterInset;\n" +
             "varying vec2 vTexCoord;\n" +
             "void main() {\n" +
-            "    vec2 gridPos = step(0.5, vTexCoord);\n" +
-            "    float frontOffset = %.5ff;\n" +
-            "    float rightOffset = %.5ff;\n" +
-            "    float rearOffset  = %.5ff;\n" +
-            "    float leftOffset  = %.5ff;\n" +
-            "    float stripOffsetX;\n" +
-            "    if (gridPos.x < 0.5) {\n" +
-            "        stripOffsetX = gridPos.y < 0.5 ? frontOffset : rearOffset;\n" +
+            "    vec2 samplePos;\n" +
+            "    if (uApaMode > 2.5) {\n" +
+            "        bool inRight = (vTexCoord.x >= 0.5 && vTexCoord.y <  0.5);\n" +
+            "        bool inRear  = (vTexCoord.x <  0.5 && vTexCoord.y >= 0.5);\n" +
+            "        bool inLeft  = (vTexCoord.x >= 0.5 && vTexCoord.y >= 0.5);\n" +
+            "        vec2 localOffset = vec2(0.0);\n" +
+            "        if (inRight) localOffset = vec2(0.5, 0.0);\n" +
+            "        else if (inRear) localOffset = vec2(0.0, 0.5);\n" +
+            "        else if (inLeft) localOffset = vec2(0.5, 0.5);\n" +
+            "        vec2 local = vTexCoord - localOffset;\n" +
+            "        vec2 producerCorner = uProducerForFront;\n" +
+            "        vec2 flip = uFlipForFront;\n" +
+            "        if (inRight) { producerCorner = uProducerForRight; flip = uFlipForRight; }\n" +
+            "        else if (inRear)  { producerCorner = uProducerForRear;  flip = uFlipForRear;  }\n" +
+            "        else if (inLeft)  { producerCorner = uProducerForLeft;  flip = uFlipForLeft;  }\n" +
+            "        vec2 sampledLocal = local;\n" +
+            "        if (flip.x > 0.5) sampledLocal.x = 0.5 - sampledLocal.x;\n" +
+            "        if (flip.y > 0.5) sampledLocal.y = 0.5 - sampledLocal.y;\n" +
+            "        samplePos = producerCorner + sampledLocal;\n" +
+            com.overdrive.app.camera.GlUtil.APA_CENTER_INSET_GLSL +
             "    } else {\n" +
-            "        stripOffsetX = gridPos.y < 0.5 ? rightOffset : leftOffset;\n" +
+            "        vec2 gridPos = step(0.5, vTexCoord);\n" +
+            "        float frontOffset = %.5ff;\n" +
+            "        float rightOffset = %.5ff;\n" +
+            "        float rearOffset  = %.5ff;\n" +
+            "        float leftOffset  = %.5ff;\n" +
+            "        float stripOffsetX;\n" +
+            "        if (gridPos.x < 0.5) {\n" +
+            "            stripOffsetX = gridPos.y < 0.5 ? frontOffset : rearOffset;\n" +
+            "        } else {\n" +
+            "            stripOffsetX = gridPos.y < 0.5 ? rightOffset : leftOffset;\n" +
+            "        }\n" +
+            "        float localX = mod(vTexCoord.x, 0.5) * 0.5;\n" +
+            "        float localY = mod(vTexCoord.y, 0.5) * 2.0;\n" +
+            "        samplePos = vec2(localX + stripOffsetX, localY);\n" +
             "    }\n" +
-            "    float localX = mod(vTexCoord.x, 0.5) * 0.5;\n" +
-            "    float localY = mod(vTexCoord.y, 0.5) * 2.0;\n" +
-            "    vec2 samplePos = vec2(localX + stripOffsetX, localY);\n" +
-            "    gl_FragColor = texture2D(uCameraTex, samplePos);\n" +
+            "    vec4 src = texture2D(uCameraTex, samplePos);\n" +
+            com.overdrive.app.camera.GlUtil.RED_MASK_GLSL +
+            "    gl_FragColor = src;\n" +
             "}\n",
             offsets[0], offsets[1], offsets[2], offsets[3]);
     }

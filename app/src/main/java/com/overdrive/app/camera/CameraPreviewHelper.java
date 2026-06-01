@@ -148,7 +148,9 @@ public final class CameraPreviewHelper {
         return cropMosaicJpegToSlice(mosaicJpeg, slice);
     }
 
-    /** Direct GL render of one slice at full per-camera resolution. */
+    /** Direct GL render of one slice at full per-camera resolution.
+     *  Layout-aware: passes 2x2 corner XY + per-role flip when DiLink 4
+     *  mode is active, 4-strip stripOffsetX otherwise. */
     private static byte[] highResSliceJpeg(PanoramicSlice slice) {
         try {
             com.overdrive.app.surveillance.GpuSurveillancePipeline p =
@@ -156,6 +158,25 @@ public final class CameraPreviewHelper {
             if (p == null) return null;
             com.overdrive.app.camera.PanoramicCameraGpu cam = p.getCamera();
             if (cam == null) return null;
+            if (cam.isUsingEscoSurfaceTexturePath()) {
+                // 2x2-native HAL on DiLink 4. Slice → role → Variant A
+                // corner+flip mapping (matches recorder / stream / cropper).
+                //   FRONT (slice4) → producer TL  X-flip
+                //   RIGHT (slice3) → producer BR  no flip
+                //   REAR  (slice1) → producer TR  Y-flip
+                //   LEFT  (slice2) → producer BL  Y-flip
+                float cx, cy, fx, fy;
+                switch (slice) {
+                    case SLICE_4: cx = 0.0f; cy = 0.0f; fx = 1.0f; fy = 1.0f; break; // Front
+                    case SLICE_3: cx = 0.5f; cy = 0.5f; fx = 0.0f; fy = 1.0f; break; // Right
+                    case SLICE_1: cx = 0.5f; cy = 0.0f; fx = 0.0f; fy = 0.0f; break; // Rear
+                    case SLICE_2: cx = 0.0f; cy = 0.5f; fx = 0.0f; fy = 0.0f; break; // Left
+                    default:      cx = slice.getCornerX(); cy = slice.getCornerY();
+                                  fx = 0.0f; fy = 0.0f; break;
+                }
+                return cam.samplePerQuadrantJpeg(
+                    slice.getStripOffsetX(), cx, cy, fx, fy);
+            }
             return cam.samplePerQuadrantJpeg(slice.getStripOffsetX());
         } catch (Throwable t) {
             logger.warn("highResSliceJpeg failed: " + t.getMessage());

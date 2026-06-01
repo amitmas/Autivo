@@ -11,7 +11,8 @@
     "charging_stopped": "Ricarica interrotta al {0}%",
     "charging_complete": "Batteria al {0}% — pronta per scollegare il cavo",
     "recording_started": "Registrazione avviata",
-    "recording_ended": "Registrazione terminata"
+    "recording_ended": "Registrazione terminata",
+    "location_prefix": "Località: {0}"
   },
   "errors": {
     "rate_limited_locked_for_seconds": "Troppi tentativi — bloccato per {0}s",
@@ -35,6 +36,7 @@
     "models_invalid_json": "JSON non valido",
     "models_unknown_id_with_id": "ID modello sconosciuto: {0}",
     "models_invalid_color": "Colore non valido (atteso #RRGGBB)",
+    "models_invalid_drive_side": "Disposizione del veicolo non valida (atteso «lhd» o «rhd»)",
     "models_nothing_to_update": "Niente da aggiornare",
     "models_persist_failed": "Salvataggio non riuscito",
     "models_id_required": "id obbligatorio",
@@ -99,8 +101,7 @@
     "mqtt_not_initialized": "MQTT non inizializzato",
     "max_connections_reached": "Numero massimo di connessioni raggiunto ({0})",
     "missing_connection_id": "ID connessione mancante",
-    "connection_not_found": "Connessione non trovata: {0}",
-    "models_invalid_drive_side": "Disposizione del veicolo non valida (atteso «lhd» o «rhd»)"
+    "connection_not_found": "Connessione non trovata: {0}"
   },
   "notifications": {
     "charging_started": "Ricarica avviata",
@@ -119,7 +120,9 @@
     "area_hood": "Cofano",
     "area_trunk": "Bagagliaio",
     "area_fuel_cap": "Sportello carburante",
-    "area_door_n": "Porta {0}"
+    "area_door_n": "Porta {0}",
+    "soh_frame_mismatch_title": "Rivista delle esigenze di capacità della batteria",
+    "soh_frame_mismatch_body": "Il veicolo segnala {0} kWh a piena carica ma la capacità del pacchetto è impostata su {1} kWh."
   },
   "telegram": {
     "recording_caption": "📹 Registrazione ({0}) - {1}s",

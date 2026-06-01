@@ -140,7 +140,23 @@ BYD.performance = {
         
         // Fetch SOH detail status
         await this.fetchSohStatus();
-        
+
+        // Push-notification deep link: #soh-fix lands the user on the SOH
+        // card with the frame-mismatch banner visible. Scroll into view +
+        // briefly highlight so it's obvious which control answers the
+        // notification's "needs review" prompt. Listen for hashchange too
+        // — when a click hits an already-open tab, sw.js navigates the
+        // existing window which only updates location.hash, no reload.
+        var self = this;
+        if (window.location.hash === '#soh-fix') {
+            this._scrollToSohFixBanner();
+        }
+        window.addEventListener('hashchange', function () {
+            if (window.location.hash === '#soh-fix') {
+                self._scrollToSohFixBanner();
+            }
+        });
+
         // Start SOC polling (less frequent)
         this.socPollInterval = setInterval(() => this.fetchSocHistory(), this.SOC_UPDATE_INTERVAL);
         
@@ -2306,6 +2322,129 @@ BYD.performance = {
                 hint.style.display = 'none';
             }
         }
+
+        // Frame mismatch banner — same logic as native dialog: PHEV-only
+        // (BEV daemon never populates frameAnchor.mismatch), gated on the
+        // anchor having stabilized. Also serves as the landing target for
+        // the vehicle.health.soh.frame_mismatch push notification.
+        var fa = data.frameAnchor || {};
+        var mismatch = !!fa.mismatch && (typeof fa.peakKwh === 'number') && fa.peakKwh > 0;
+        var banner = document.getElementById('sohFrameMismatchBanner');
+        var bodyEl = document.getElementById('sohFrameMismatchBody');
+        var actionBtn = document.getElementById('sohFrameMismatchAction');
+        if (banner) {
+            if (mismatch && nominalSet) {
+                banner.style.display = '';
+                if (bodyEl) {
+                    bodyEl.textContent = BYD.i18n.t('soh.frame_mismatch_body', {
+                        peak: fa.peakKwh.toFixed(1),
+                        nominal: data.nominalCapacityKwh.toFixed(1)
+                    });
+                }
+                if (actionBtn && !actionBtn._sohWired) {
+                    actionBtn._sohWired = true;
+                    var self = this;
+                    actionBtn.addEventListener('click', function () {
+                        self.applyObservedNominal(fa.peakKwh, actionBtn);
+                    });
+                }
+                // Refresh the captured peakKwh on every poll so the click
+                // handler always sees the latest reading. Without this, a
+                // banner shown on the first poll would stale the value
+                // even after the daemon raised the peak.
+                if (actionBtn) actionBtn._sohPeakKwh = fa.peakKwh;
+            } else {
+                banner.style.display = 'none';
+            }
+        }
+    },
+
+    /**
+     * One-tap "Use observed value": POST the observed peak as the user nominal.
+     * Mirrors the native MainActivity.applyObservedNominal flow so both
+     * surfaces stay in lockstep.
+     */
+    applyObservedNominal: function(observedKwhArg, btn) {
+        // Read live peak from the button (set every poll) so a banner that's
+        // been visible for a few cycles uses the current value, not the
+        // one captured at first render.
+        var observedKwh = (btn && typeof btn._sohPeakKwh === 'number')
+            ? btn._sohPeakKwh : observedKwhArg;
+        if (!(observedKwh > 0)) return;
+        var self = this;
+        var originalLabel = btn ? btn.textContent : '';
+        if (btn) {
+            btn.disabled = true;
+            btn.textContent = BYD.i18n.t('soh.use_observed_value_pending') || 'Saving…';
+        }
+        var rounded = Math.round(observedKwh * 10) / 10;
+        fetch('/api/performance/soh/nominal', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ nominalKwh: rounded })
+        }).then(function (resp) {
+            return resp.json().catch(function () { return {}; }).then(function (j) {
+                return { ok: resp.ok && j.success !== false, body: j };
+            });
+        }).then(function (r) {
+            if (r.ok) {
+                if (BYD.core && BYD.core.showToast) {
+                    BYD.core.showToast(
+                        BYD.i18n.t('soh.observed_value_saved', { kwh: rounded.toFixed(1) }),
+                        'success');
+                }
+                // Re-fetch so the banner hides and the headline updates without a reload.
+                self.fetchSohStatus();
+            } else {
+                if (btn) {
+                    btn.disabled = false;
+                    btn.textContent = originalLabel;
+                }
+                if (BYD.core && BYD.core.showToast) {
+                    BYD.core.showToast(
+                        BYD.i18n.t('soh.observed_value_failed',
+                            { error: (r.body && r.body.error) || 'unknown' }),
+                        'warning');
+                }
+            }
+        }).catch(function (e) {
+            if (btn) {
+                btn.disabled = false;
+                btn.textContent = originalLabel;
+            }
+            if (BYD.core && BYD.core.showToast) {
+                BYD.core.showToast(
+                    BYD.i18n.t('soh.observed_value_failed', { error: e.message || 'network' }),
+                    'warning');
+            }
+        });
+    },
+
+    /**
+     * Scroll the SOH detail card into view and pulse the frame-mismatch
+     * banner so the deep-link click from the push notification is
+     * immediately obvious. No-op if the SOH card isn't on the page or the
+     * banner is hidden (mismatch already cleared between notification fire
+     * and page open — race-tolerant).
+     */
+    _scrollToSohFixBanner: function() {
+        var banner = document.getElementById('sohFrameMismatchBanner');
+        var card = document.getElementById('sohDetailCard');
+        // Wait one frame so the just-rendered banner has its computed style
+        // before we scroll/animate. Without rAF the scroll target can be
+        // off-screen if the SOH tab content was lazily expanded.
+        requestAnimationFrame(function () {
+            if (card && card.scrollIntoView) {
+                try { card.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch (_) {
+                    card.scrollIntoView();
+                }
+            }
+            if (banner && banner.style.display !== 'none') {
+                banner.style.transition = 'box-shadow 600ms ease-out';
+                banner.style.boxShadow = '0 0 0 4px rgba(255,176,0,0.45)';
+                setTimeout(function () { banner.style.boxShadow = ''; }, 1500);
+            }
+        });
     },
 
     _formatModelId: function(id) {

@@ -11,7 +11,8 @@
     "charging_stopped": "{0}%에서 충전 중지",
     "charging_complete": "{0}%에 있는 배터리",
     "recording_started": "녹음 시작",
-    "recording_ended": "녹음 종료"
+    "recording_ended": "녹음 종료",
+    "location_prefix": "위치: {0}"
   },
   "errors": {
     "rate_limited_locked_for_seconds": "너무 많은 시도  {0}를 위해 잠금",
@@ -35,6 +36,7 @@
     "models_invalid_json": "유효하지 않은 JSON",
     "models_unknown_id_with_id": "알려지지 않은 모델 아이디: {0}",
     "models_invalid_color": "유효하지 않은 색상 (예산 #RRGGBB)",
+    "models_invalid_drive_side": "차량 레이아웃이 잘못되었습니다(\"lhd\" 또는 \"rhd\" 필요)",
     "models_nothing_to_update": "업데이트할 게 없어",
     "models_persist_failed": "고집하지 못했어요",
     "models_id_required": "아이디가 필요합니다",
@@ -99,8 +101,7 @@
     "mqtt_not_initialized": "MQTT 초기화되지 않은",
     "max_connections_reached": "최대 연결 ({0})",
     "missing_connection_id": "결실된 연결 ID",
-    "connection_not_found": "연결이 발견되지 않았습니다: {0}",
-    "models_invalid_drive_side": "차량 레이아웃이 잘못되었습니다(\"lhd\" 또는 \"rhd\" 필요)"
+    "connection_not_found": "연결이 발견되지 않았습니다: {0}"
   },
   "notifications": {
     "charging_started": "충전 시작",
@@ -119,7 +120,9 @@
     "area_hood": "호드",
     "area_trunk": "트렁크",
     "area_fuel_cap": "연료 뚜",
-    "area_door_n": "문 {0}"
+    "area_door_n": "문 {0}",
+    "soh_frame_mismatch_title": "배터리 용량 필요성 검토",
+    "soh_frame_mismatch_body": "차량은 {0} kWh를 전 충전 상태로 보고하지만 패키지 용량은 {1} kWh로 설정되어 있습니다."
   },
   "telegram": {
     "recording_caption": " 녹음 ({0}) - {1}",

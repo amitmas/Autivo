@@ -25,11 +25,40 @@ import com.overdrive.app.monitor.AccMonitor;
  * LIFECYCLE:
  * - start() when pipeline starts (any mode, any ACC state)
  * - stop() when pipeline stops OR daemon shuts down
+ *
+ * <p><b>DiLink 4 carve-out.</b> On byd_apa firmware (cameraMode=dilink4) the
+ * AVC app is the entity that paints the red 'calibration failed' chrome on
+ * top of our preview surface. esco actively evicts AVC from the foreground
+ * to suppress that overlay. We approximate the same behaviour by simply
+ * NOT warming AVC up and NOT poking it on a keep-alive timer when
+ * cameraMode=dilink4 — every public entry point ({@link #warmupAndWait()},
+ * {@link #startKeepAlive()}) checks {@link #shouldSuppressAvc()} and
+ * no-ops on that path. Legacy cars (90% of the fleet) keep full warmup +
+ * keep-alive behaviour bit-exact.
  */
 public class AvcHalWarmup {
 
     private static final String TAG = "AvcHalWarmup";
     private static final DaemonLogger logger = DaemonLogger.getInstance(TAG);
+
+    /**
+     * True when the active camera mode is "dilink4" — in which case we want
+     * com.byd.avc OUT of the way, not warmed up. Reads the unified config
+     * fresh; cheap (single JSON load) and called only at warmup/keep-alive
+     * entry points (not per-frame).
+     */
+    private static boolean shouldSuppressAvc() {
+        try {
+            org.json.JSONObject root = com.overdrive.app.config
+                .UnifiedConfigManager.loadConfig();
+            org.json.JSONObject cam = root != null ? root.optJSONObject("camera") : null;
+            if (cam == null) return false;
+            String mode = cam.optString("cameraMode", "default");
+            return "dilink4".equalsIgnoreCase(mode);
+        } catch (Throwable t) {
+            return false;
+        }
+    }
 
     /** Time to wait after launching com.byd.avc before opening our camera. */
     private static final long HAL_WARMUP_DELAY_MS = 4000;
@@ -62,6 +91,17 @@ public class AvcHalWarmup {
      * @return true if warmup completed, false if interrupted
      */
     public boolean warmupAndWait() {
+        if (shouldSuppressAvc()) {
+            logger.info("Skipping AVC warmup — cameraMode=dilink4 (AVC paints "
+                + "the red 'calibration failed' chrome on byd_apa firmware; "
+                + "esco evicts it, we just don't wake it up).");
+            // AVC may already be running from boot. Force-stop it once so
+            // it can't keep painting on top of our preview. Idempotent;
+            // if it's not running this is a no-op. UID 2000 (shell) has
+            // permission to force-stop user apps.
+            forceStopAvc();
+            return true;
+        }
         logger.info("Warming up camera HAL via com.byd.avc (waiting " +
             HAL_WARMUP_DELAY_MS + "ms)...");
 
@@ -88,6 +128,11 @@ public class AvcHalWarmup {
      * Call this after the pipeline has started successfully.
      */
     public synchronized void startKeepAlive() {
+        if (shouldSuppressAvc()) {
+            logger.info("Skipping AVC keep-alive — cameraMode=dilink4. "
+                + "AVC is the painter we want OFF, not propped up.");
+            return;
+        }
         if (active) {
             logger.info("Keep-alive already running");
             return;
@@ -164,6 +209,43 @@ public class AvcHalWarmup {
             }
         } catch (Exception e) {
             logger.warn("Failed to launch com.byd.avc: " + e.getMessage());
+        }
+    }
+
+    /**
+     * One-shot force-stop of com.byd.avc. Used on dilink4 to prevent the
+     * BYD compositor from painting its red 'calibration failed' chrome on
+     * top of our AVM preview. Mirrors the practical effect of esco's
+     * UsageStatsManager-driven eviction without needing PACKAGE_USAGE_STATS.
+     * Best-effort; logs but does not throw.
+     */
+    private static final String[] AVC_FORCE_STOP_CMD = new String[]{
+        "am", "force-stop", "com.byd.avc"
+    };
+
+    /** Shared across the 5 AvcHalWarmup instances created during a cold
+     *  start (CameraDaemon, RecordingModeManager, two StreamingApiHandler
+     *  one-shots). Each pre-camera-open path calls warmupAndWait, which
+     *  on dilink4 falls into forceStopAvc. Without this guard we'd shell
+     *  out 3+ times in the first second; harmless but noisy and slow. */
+    private static final java.util.concurrent.atomic.AtomicBoolean
+        forceStoppedThisProcess = new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    private void forceStopAvc() {
+        if (!forceStoppedThisProcess.compareAndSet(false, true)) {
+            // Already done in this process — skip.
+            return;
+        }
+        try {
+            Process p = Runtime.getRuntime().exec(AVC_FORCE_STOP_CMD);
+            int rc = p.waitFor();
+            if (rc == 0) {
+                logger.info("Force-stopped com.byd.avc (dilink4 chrome suppressor).");
+            } else {
+                logger.warn("am force-stop com.byd.avc exited rc=" + rc);
+            }
+        } catch (Exception e) {
+            logger.warn("Failed to force-stop com.byd.avc: " + e.getMessage());
         }
     }
 }

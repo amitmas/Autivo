@@ -291,4 +291,6 @@ public final class SrtWriter {
     public static final String K_CHARGING_COMPLETE = "srt.charging_complete";
     public static final String K_RECORDING_STARTED = "srt.recording_started";
     public static final String K_RECORDING_ENDED   = "srt.recording_ended";
+    /** "Location: {0}" — first arg is the resolved place short label. */
+    public static final String K_LOCATION_PREFIX   = "srt.location_prefix";
 }

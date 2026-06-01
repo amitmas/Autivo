@@ -11,7 +11,8 @@
     "charging_stopped": "在{0}%停止充电",
     "charging_complete": "电池在{0}% 准备解电",
     "recording_started": "录音开始",
-    "recording_ended": "录音结束"
+    "recording_ended": "录音结束",
+    "location_prefix": "位置:{0}"
   },
   "errors": {
     "rate_limited_locked_for_seconds": "太多的尝试锁定了{0}s",
@@ -35,6 +36,7 @@
     "models_invalid_json": "无效的JSON",
     "models_unknown_id_with_id": "不知名型号:{0}",
     "models_invalid_color": "无效颜色 (预期#RRGGBB)",
+    "models_invalid_drive_side": "车辆布局无效(应为「lhd」或「rhd」)",
     "models_nothing_to_update": "没有什么要更新的.",
     "models_persist_failed": "不能坚持",
     "models_id_required": "需要ID",
@@ -99,8 +101,7 @@
     "mqtt_not_initialized": "MQTT未初始化",
     "max_connections_reached": "达到最大的连接 ({0})",
     "missing_connection_id": "缺失连接身份证",
-    "connection_not_found": "没有找到连接:{0}",
-    "models_invalid_drive_side": "车辆布局无效(应为「lhd」或「rhd」)"
+    "connection_not_found": "没有找到连接:{0}"
   },
   "notifications": {
     "charging_started": "开始充电",
@@ -119,7 +120,9 @@
     "area_hood": "子",
     "area_trunk": "箱子",
     "area_fuel_cap": "燃料盖",
-    "area_door_n": "门{0}"
+    "area_door_n": "门{0}",
+    "soh_frame_mismatch_title": "电池容量需求审查",
+    "soh_frame_mismatch_body": "车辆报告{0} kWh充电,但包装容量设置为{1} kWh."
   },
   "telegram": {
     "recording_caption": "记录 ({0}) - {1}",

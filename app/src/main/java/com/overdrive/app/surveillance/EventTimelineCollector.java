@@ -226,6 +226,26 @@ public class EventTimelineCollector {
     public synchronized void stopAndWrite(File mp4File,
                                           java.util.List<Actor> actors,
                                           String heroThumbnail) {
+        stopAndWrite(mp4File, actors, heroThumbnail, null, null, null);
+    }
+
+    /**
+     * Geo-aware overload — adds {@code geo.start} / {@code geo.peak} /
+     * {@code geo.end} fields to the v3 sidecar. Each snapshot may be null;
+     * the JSON writer omits absent ones rather than emitting empty objects.
+     *
+     * <p>This overload is preferred when the recorder side has captured
+     * locations (HardwareEventRecorderGpu's startGeo* fields). Called from
+     * SurveillanceEngineGpu.scheduleSegmentMetadataFlush via the same
+     * writeExecutor as the legacy 3-arg form, so ordering with hero +
+     * per-actor JPEG writes is unchanged.
+     */
+    public synchronized void stopAndWrite(File mp4File,
+                                          java.util.List<Actor> actors,
+                                          String heroThumbnail,
+                                          com.overdrive.app.geo.GeoSnapshot startGeo,
+                                          com.overdrive.app.geo.GeoSnapshot peakGeo,
+                                          com.overdrive.app.geo.GeoSnapshot endGeo) {
         if (!collecting) return;
         collecting = false;
 
@@ -258,22 +278,122 @@ public class EventTimelineCollector {
                         ? java.util.Collections.<Actor>emptyList()
                         : new java.util.ArrayList<>(actors);
         final String heroThumb = heroThumbnail;
+        // End snapshot wasn't passed by older callers; capture it now if the
+        // overload was invoked with a null endGeo. Done on this thread (the
+        // dispatch thread) instead of inside the executor so the GPS reading
+        // matches the time the .mp4 actually finalized.
+        //
+        // Cold-start fallback: if the recorder didn't capture a startGeo
+        // (no GPS fix at trigger time, e.g. parking-garage exit, fresh
+        // ACC-on, or a sub-2-min event that ended before the rotation
+        // re-capture path could fire), poll the live GpsMonitor here.
+        //
+        // Staleness gate: GpsMonitor.hasLocation() returns true even for
+        // fixes loaded from a stale cache (last drive's coordinates),
+        // which would mis-tag an indoor-parking surveillance clip with
+        // home address from yesterday. Reject any fix whose age exceeds
+        // 5 minutes. The recorder-captured snapshot already passed an
+        // implicit freshness gate (it was current at trigger time) so
+        // this only applies to the fallback path.
+        //
+        // relMs semantics: pass 0 (start-of-clip) so the JSON's geo.start
+        // block carries `tMs: 0`, matching the documented contract on
+        // GeoSnapshot. Using durationMs would emit an end-of-clip stamp
+        // that no reader currently consumes but a future one might.
+        com.overdrive.app.geo.GeoSnapshot resolvedStart = startGeo;
+        if (resolvedStart == null || !resolvedStart.hasFix()) {
+            com.overdrive.app.geo.GeoSnapshot late =
+                    com.overdrive.app.geo.GeoSnapshot.capture(0L);
+            // Adopt only if a fix exists AND it's recent enough to be
+            // attributable to this recording's geographic neighbourhood.
+            // Require BOTH an explicit fresh age (no `ageMs < 0` permissive
+            // branch — that would let a cache-loaded fix with a corrupt
+            // lastUpdate slip through) AND a non-cached origin so that a
+            // freshly-booted daemon with yesterday's persisted fix doesn't
+            // mis-tag indoor-parking surveillance with home address.
+            final long MAX_FALLBACK_AGE_MS = 5L * 60L * 1000L;
+            boolean fromCache = false;
+            try {
+                fromCache = com.overdrive.app.monitor.GpsMonitor.getInstance()
+                        .getLocationJson().optBoolean("loadedFromCache", false);
+            } catch (Throwable ignored) {
+                fromCache = true;  // Fail closed — assume cached if probe failed.
+            }
+            if (late.hasFix()
+                    && !fromCache
+                    && late.ageMs >= 0L
+                    && late.ageMs <= MAX_FALLBACK_AGE_MS) {
+                resolvedStart = late;
+            }
+        }
+        final com.overdrive.app.geo.GeoSnapshot startG = resolvedStart;
+        final com.overdrive.app.geo.GeoSnapshot peakG  = peakGeo;
+        final com.overdrive.app.geo.GeoSnapshot endG   = (endGeo != null)
+                ? endGeo
+                : com.overdrive.app.geo.GeoSnapshot.capture(durationMs);
 
         writeExecutor.execute(() -> {
             writeJsonSidecar(mp4File, starts, ends, types, confs, counts, cams, count,
-                    durationMs, actorsCopy, heroThumb);
+                    durationMs, actorsCopy, heroThumb, startG, peakG, endG);
             // SRT subtitle sidecar — localized prose so VLC / video.js / ExoPlayer
             // can show "Person detected close range" / "Charging started · 4.3 kW"
             // without re-encoding the burned-in English overlay. Wrapped so an
             // SRT failure can never poison the JSON write above (which the
             // recordings UI depends on).
             try {
-                writeSrtSidecar(mp4File, starts, ends, types, count, actorsCopy);
+                writeSrtSidecar(mp4File, starts, ends, types, count, actorsCopy, startG);
             } catch (Throwable t) {
                 logger.warn("SRT sidecar write failed for "
                         + mp4File.getName() + ": " + t.getMessage());
             }
+
+            // Async place-name resolve. Cache hits land synchronously and we
+            // can write them with the JSON; misses kick off a background
+            // resolve that re-merges the sidecar when it completes. The whole
+            // step is gated by the geocoding feature flag.
+            try {
+                maybeResolveAndMergePlace(mp4File, startG);
+            } catch (Throwable t) {
+                logger.warn("Place resolve dispatch failed for "
+                        + mp4File.getName() + ": " + t.getMessage());
+            }
         });
+    }
+
+    /**
+     * Kick off the place-name resolve for {@code startGeo}. The resolver
+     * fast-paths SafeLocation + cache, so the common case is a synchronous
+     * write; otherwise the JSON sidecar gets a {@code geo.place} field
+     * appended a second or two later when Tier B / C completes.
+     *
+     * <p>{@code flow} is derived from the mp4 filename: {@code event_*}
+     * → {@code "surveillance"}, everything else → {@code "recording"}.
+     * The resolver applies the matching per-flow {@code allowOnline} gate
+     * for Tier C.
+     */
+    private static void maybeResolveAndMergePlace(File mp4File,
+                                                  com.overdrive.app.geo.GeoSnapshot startGeo) {
+        if (mp4File == null || startGeo == null || !startGeo.hasFix()) return;
+        String flow = inferFlow(mp4File.getName());
+        com.overdrive.app.geo.GeocodingResolver resolver =
+                com.overdrive.app.geo.GeocodingResolver.getInstance();
+        // Try cached-only first so the JSON we just wrote is updated in
+        // place even before the resolver thread schedules the async part.
+        com.overdrive.app.geo.PlaceResult fast =
+                resolver.resolveCachedOnly(startGeo.lat, startGeo.lng, flow);
+        if (fast != null) {
+            com.overdrive.app.geo.SidecarGeoUpdater.mergePlaceForMp4(mp4File, fast);
+            return;
+        }
+        resolver.resolveAsync(startGeo.lat, startGeo.lng, flow, place -> {
+            if (place == null) return;
+            com.overdrive.app.geo.SidecarGeoUpdater.mergePlaceForMp4(mp4File, place);
+        });
+    }
+
+    private static String inferFlow(String filename) {
+        if (filename == null) return "recording";
+        return filename.startsWith("event_") ? "surveillance" : "recording";
     }
 
     /**
@@ -300,9 +420,33 @@ public class EventTimelineCollector {
     private void writeSrtSidecar(File mp4File,
                                  long[] starts, long[] ends, byte[] types,
                                  int spanCount,
-                                 java.util.List<Actor> actors) {
+                                 java.util.List<Actor> actors,
+                                 com.overdrive.app.geo.GeoSnapshot startGeo) {
         SrtWriter srt = new SrtWriter();
         srt.addEvent(0L, SrtWriter.K_RECORDING_STARTED);
+
+        // Place-name SRT prefix — frozen at write-time. If the cache or
+        // SafeLocation overlay has a hit for the start coords we add a
+        // second t=0 entry carrying the short label. Online resolution is
+        // deliberately NOT awaited here: the SRT must be deterministic and
+        // synchronous next to the .mp4. A miss leaves the SRT exactly as it
+        // was before — no degraded user experience.
+        try {
+            if (startGeo != null && startGeo.hasFix()) {
+                String flow = inferFlow(mp4File != null ? mp4File.getName() : null);
+                com.overdrive.app.geo.PlaceResult cached =
+                        com.overdrive.app.geo.GeocodingResolver.getInstance()
+                                .resolveCachedOnly(startGeo.lat, startGeo.lng, flow);
+                if (cached != null) {
+                    String label = cached.shortLabel();
+                    if (label != null && !label.isEmpty()) {
+                        srt.addEvent(0L, SrtWriter.K_LOCATION_PREFIX, label);
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+            // SRT prefix is decorative; failures must never block sidecar write.
+        }
 
         // Actor-driven entries (preferred — they carry class + proximity)
         if (actors != null) {
@@ -555,9 +699,22 @@ public class EventTimelineCollector {
     private void writeJsonSidecar(File mp4File, long[] starts, long[] ends,
                                    byte[] types, float[] confs, byte[] counts,
                                    byte[] cameras, int count, long durationMs) {
-        // Backwards-compat overload: delegate to the v3 writer with no actors/hero.
+        // Backwards-compat overload: delegate to the v3 writer with no actors/hero/geo.
         writeJsonSidecar(mp4File, starts, ends, types, confs, counts, cameras,
-                count, durationMs, java.util.Collections.<Actor>emptyList(), null);
+                count, durationMs, java.util.Collections.<Actor>emptyList(),
+                null, null, null, null);
+    }
+
+    /**
+     * Backwards-compat 11-arg overload (no geo). Retained for any caller
+     * that still threads only actors + hero through.
+     */
+    private void writeJsonSidecar(File mp4File, long[] starts, long[] ends,
+                                   byte[] types, float[] confs, byte[] counts,
+                                   byte[] cameras, int count, long durationMs,
+                                   java.util.List<Actor> actors, String heroThumbnail) {
+        writeJsonSidecar(mp4File, starts, ends, types, confs, counts, cameras,
+                count, durationMs, actors, heroThumbnail, null, null, null);
     }
 
     /**
@@ -570,11 +727,19 @@ public class EventTimelineCollector {
      *   - {@code stats.{personCount,vehicleCount,bikeCount,animalCount}}
      *   - {@code stats.peakProximity}
      *   - {@code heroThumbnail}    basename of the JPEG sibling file
+     *   - {@code geo.start} / {@code geo.peak} / {@code geo.end} — coords
+     *     captured at recording start / peak severity / finalize.
+     *   - {@code geo.place} — reverse-geocoded place name (added later by
+     *     {@link com.overdrive.app.geo.SidecarGeoUpdater} when the resolver
+     *     completes; absent when the geocoding feature is off).
      */
     private void writeJsonSidecar(File mp4File, long[] starts, long[] ends,
                                    byte[] types, float[] confs, byte[] counts,
                                    byte[] cameras, int count, long durationMs,
-                                   java.util.List<Actor> actors, String heroThumbnail) {
+                                   java.util.List<Actor> actors, String heroThumbnail,
+                                   com.overdrive.app.geo.GeoSnapshot startGeo,
+                                   com.overdrive.app.geo.GeoSnapshot peakGeo,
+                                   com.overdrive.app.geo.GeoSnapshot endGeo) {
         final String[] CAMERA_NAMES = {"front", "right", "rear", "left"};
 
         try {
@@ -711,6 +876,21 @@ public class EventTimelineCollector {
 
             if (heroThumbnail != null && !heroThumbnail.isEmpty()) {
                 root.put("heroThumbnail", heroThumbnail);
+            }
+
+            // ---- Geo block (v3 addition) ----
+            // start / peak / end are independent: a clip with a fix at start
+            // but no fix at finalize emits only `start`. The block itself is
+            // omitted entirely when no fix at any moment; readers see the
+            // sidecar in pre-geo shape and behave as before.
+            if ((startGeo != null && startGeo.hasFix())
+                    || (peakGeo != null && peakGeo.hasFix())
+                    || (endGeo != null && endGeo.hasFix())) {
+                JSONObject geo = new JSONObject();
+                if (startGeo != null && startGeo.hasFix()) geo.put("start", startGeo.toJson());
+                if (peakGeo  != null && peakGeo.hasFix())  geo.put("peak",  peakGeo.toJson());
+                if (endGeo   != null && endGeo.hasFix())   geo.put("end",   endGeo.toJson());
+                root.put("geo", geo);
             }
 
             String jsonName = mp4File.getName().replace(".mp4", ".json");

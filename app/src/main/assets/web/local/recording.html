@@ -224,6 +224,59 @@
                     </div>
                 </div>
 
+                <!-- Place Tagging (reverse geocoding) — Capture tab.
+                     Per-flow split: this controls the "recording" flow only
+                     (dashcam continuous + drive-mode + proximity guard).
+                     Surveillance.html exposes the matching surveillance
+                     toggles. The custom Nominatim URL is shared between
+                     both surfaces (advanced sub-section). -->
+                <div class="card" data-tab="capture">
+                    <div class="card-header">
+                        <div class="card-title">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/>
+                                <circle cx="12" cy="10" r="3"/>
+                            </svg>
+                            <span data-i18n="recording.geocoding_title">Place Tagging</span>
+                        </div>
+                    </div>
+                    <div class="card-body">
+                        <div class="setting-row">
+                            <div class="setting-info">
+                                <div class="setting-name" data-i18n="recording.geocoding_enabled_name">Tag dashcam recordings with place names</div>
+                                <div class="setting-desc" data-i18n="recording.geocoding_enabled_desc">Reverse-geocode the recording-start GPS into a district/city label and save it next to each clip's sidecar. Off by default.</div>
+                            </div>
+                            <div class="setting-control">
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="geocodingEnabled" onchange="RecSettings.toggleGeocodingEnabled()">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                        </div>
+                        <div class="setting-row">
+                            <div class="setting-info">
+                                <div class="setting-name" data-i18n="recording.geocoding_online_name">Use online resolver</div>
+                                <div class="setting-desc" data-i18n="recording.geocoding_online_desc">Falls back to OpenStreetMap Nominatim when the on-device geocoder cannot name a location. Sends only the recording-start coordinates and your device language.</div>
+                            </div>
+                            <div class="setting-control">
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="geocodingOnline" onchange="RecSettings.toggleGeocodingOnline()">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                        </div>
+                        <div class="setting-row" style="border-bottom:none;">
+                            <div class="setting-info" style="flex:1 1 auto;">
+                                <div class="setting-name" data-i18n="recording.geocoding_custom_url_name">Custom Nominatim URL</div>
+                                <div class="setting-desc" data-i18n="recording.geocoding_custom_url_desc">Optional. Point to a self-hosted instance to skip the public OSM endpoint entirely. Shared with surveillance.</div>
+                            </div>
+                            <div class="setting-control">
+                                <input type="url" id="geocodingCustomUrl" class="text-input" inputmode="url" placeholder="https://nominatim.example.com" onchange="RecSettings.saveGeocodingCustomUrl()" />
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- Video Quality -->
                 <div class="card" data-tab="quality">
                     <div class="card-header">

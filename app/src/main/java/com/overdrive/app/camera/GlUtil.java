@@ -20,6 +20,67 @@ import java.nio.FloatBuffer;
 public class GlUtil {
     private static final String TAG = "GlUtil";
     private static final DaemonLogger logger = DaemonLogger.getInstance(TAG);
+
+    /**
+     * GLSL fragment-shader fragment that suppresses the BYD AVM HAL's
+     * translucent red overlay. Reads existing local `vec4 src`, mutates
+     * `src` in place. Caller must declare `uniform float uRedMaskStrength;`
+     * and bind it per frame; gating on `uRedMaskStrength > 0.5` is included
+     * so legacy cars where the uniform is never written (driver default 0.0)
+     * pass through cleanly.
+     *
+     * <p>The HAL composites {@code displayed = (1-α)·orig + α·(1,0,0)}.
+     * The red excess {@code α ≈ src.r - max(src.g, src.b)} estimates the
+     * blend strength per pixel, and we recover
+     * {@code orig = (src - α·(1,0,0)) / (1-α)}. We only apply this when
+     * the pixel is meaningfully red-shifted ({@code r > g+0.05 AND r > b+0.05}),
+     * sparing warm tones (sunset, taillights, red cars) where g/b are close
+     * to r. The opaque calibration banner where α saturates produces an
+     * implausible (clamped-negative) {@code orig.r}; we leave those pixels
+     * as-is — the goal is the overall translucent wash, not the banner.
+     */
+    /**
+     * GLSL fragment-shader fragment that mirrors esco's
+     * {@code APACropFilter(240, 0)} (esco {@code ml/C7609b.java}): trims
+     * {@code uApaCenterInset} of producer-UV off the LEFT and RIGHT outer
+     * edges of the full producer, leaves the vertical axis untouched.
+     *
+     * <p>Caller declares {@code uniform float uApaCenterInset;} and runs
+     * this snippet on a {@code vec2 samplePos} that is already in producer
+     * UV {@code [0, 1]^2}. The snippet linearly remaps
+     * {@code samplePos.x: [0, 1] -> [inset, 1 - inset]} so the consumer
+     * sees the byd_apa producer's middle band stretched horizontally to
+     * its full output rect, exactly like esco. Default uniform 0 → no-op
+     * (legacy path bit-exact).
+     *
+     * <p>Esco's filter cropped the FULL producer surface (the unstitched
+     * 4-up byd_apa frame) before its per-role lens-select. Our pipeline
+     * skips esco's intermediate FBOs and samples directly from the OES
+     * texture, so we apply the same horizontal remap right before the
+     * {@code texture2D} sample — algebraically identical effect.
+     */
+    public static final String APA_CENTER_INSET_GLSL =
+        "    if (uApaCenterInset > 0.0001) {\n" +
+        "        // Linear remap samplePos.x: [0, 1] -> [inset, 1 - inset].\n" +
+        "        samplePos.x = uApaCenterInset\n" +
+        "                    + samplePos.x * (1.0 - 2.0 * uApaCenterInset);\n" +
+        "    }\n";
+
+    public static final String RED_MASK_GLSL =
+        "    if (uRedMaskStrength > 0.5) {\n" +
+        "        float gb = max(src.g, src.b);\n" +
+        "        if (src.r > gb + 0.05) {\n" +
+        "            // Inverse alpha-blend the translucent red wash.\n" +
+        "            //   src   = (1-a)*orig + a*(1,0,0)\n" +
+        "            //   orig  = (src - a*(1,0,0)) / (1-a)\n" +
+        "            // a is the per-pixel red excess; clamp to keep the\n" +
+        "            // 1/(1-a) factor numerically sane on near-saturated reds.\n" +
+        "            float a = clamp(src.r - gb, 0.0, 0.85);\n" +
+        "            float inv = 1.0 / max(1.0 - a, 0.05);\n" +
+        "            vec3 orig = vec3((src.r - a) * inv, src.g * inv, src.b * inv);\n" +
+        "            src = vec4(clamp(orig, 0.0, 1.0), src.a);\n" +
+        "        }\n" +
+        "    }\n";
     
     /**
      * Creates an external texture for camera input.

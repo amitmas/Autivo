@@ -675,6 +675,18 @@
         .actor-summary .prox-MID        { color: #c2c2c2; }
         .actor-summary .prox-FAR        { color: #888; }
 
+        /* Place chip — populated from sidecar geo.place via the daemon's
+           RecordingsApiHandler. Hidden when empty so legacy clips and
+           clips with no resolved place look identical to before. */
+        .recording-place {
+            font-size: 11px;
+            color: var(--text-muted);
+            margin-top: 2px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
         .recording-card.sev-alert    { box-shadow: inset 3px 0 0 #ff9b3d; }
         .recording-card.sev-critical { box-shadow: inset 3px 0 0 #ff6b6b; }
 
@@ -731,6 +743,18 @@
         .filter-chip.sev-notice.active   { background: rgba(160,160,160,0.20); }
         .filter-chip.sev-alert.active    { background: rgba(255,136,0,0.20);   color: #ff9b3d; }
         .filter-chip.sev-critical.active { background: rgba(239,68,68,0.25);   color: #ff6b6b; }
+
+        /* Place chips can carry user-edited SafeLocation labels and
+           Nominatim strings — both can be arbitrarily long ("Wonderfully
+           Quaint Borough of South-Eastern …"). Cap each chip's width so
+           one rogue label can't push the rest of the row past the
+           horizontal scroller's intended scroll budget; the chip
+           ellipsises individually rather than overflowing the row. */
+        .filter-tabs-row2[data-filter-row="place"] .filter-chip {
+            max-width: 160px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
         
         .recording-meta {
             font-size: 11px;
@@ -1287,6 +1311,19 @@
                         <button class="filter-chip" data-proximity="CLOSE"      onclick="BYD.events.setActorFilter('proximity','CLOSE')" data-i18n="events.proximity_close">Close</button>
                         <button class="filter-chip" data-proximity="MID"        onclick="BYD.events.setActorFilter('proximity','MID')" data-i18n="events.proximity_mid">Mid</button>
                         <button class="filter-chip" data-proximity="FAR"        onclick="BYD.events.setActorFilter('proximity','FAR')" data-i18n="events.proximity_far">Far</button>
+                    </div>
+                    <!--
+                      Place chip row — dynamically populated from
+                      `rec.place.short` of the currently loaded recordings
+                      (descending count, alpha-tiebreak, capped at 8).
+                      Hidden until at least one tagged clip is present in
+                      the loaded set, so legacy/feature-disabled users
+                      never see this row appear.
+                    -->
+                    <div class="filter-tabs filter-tabs-row2" data-filter-row="place" id="placeFilterRow" style="display:none;">
+                        <span class="filter-row-label" data-i18n="events.filter_place">Place:</span>
+                        <button class="filter-chip active" data-place="" onclick="BYD.events.setActorFilter('place','')" data-i18n="events.actor_any">Any</button>
+                        <!-- Data chips injected by BYD.events.renderPlaceChips() -->
                     </div>
                 </div>
                 

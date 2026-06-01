@@ -478,6 +478,7 @@ public class BydCameraCoordinator {
 
     public void setupEventCallback(Object cameraObj) {
         if (cameraObj == null) return;
+        if (eventCallbackSet) return;  // already wired; resetEventCallbackState clears
 
         try {
             Class<?> avmClass = Class.forName("android.hardware.AVMCamera");

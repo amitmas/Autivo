@@ -118,6 +118,15 @@
       "severity": "critical",
       "defaultClickUrl": "/vehicle-control.html",
       "note": "AC, DC charger, charging gun, or C10 breakdown reported by BMS"
+    },
+    {
+      "id": "vehicle.health.soh.frame_mismatch",
+      "label": "Battery capacity mismatch",
+      "group": "Vehicle",
+      "defaultEnabled": true,
+      "severity": "warn",
+      "defaultClickUrl": "/performance.html#soh-fix",
+      "note": "Fires once per anchor lifetime when the BMS's full-charge kWh disagrees with the user-set pack capacity by >15% — usually a nameplate-vs-usable mix-up on PHEV (e.g. Tang DM-i 21.5 nominal vs ~13 usable). The Battery Health dialog has a one-tap fix."
     }
   ]
 }

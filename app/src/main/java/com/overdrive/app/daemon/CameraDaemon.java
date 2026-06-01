@@ -490,6 +490,54 @@ public class CameraDaemon {
         // Initialize Safe Location Manager (geofence zones)
         com.overdrive.app.surveillance.SafeLocationManager.getInstance().init();
 
+        // Pre-warm the geocode cache so the first recording's place
+        // resolution is a synchronous in-memory hit instead of a 2.5 MB
+        // disk read on the recorder-stop path. Gated on at least one flow
+        // having geocoding enabled — for the >95% of users who never
+        // opt in, paying a 4 MB JSON read at every daemon boot is pure
+        // waste. Users who enable the feature later trigger the natural
+        // lazy-load path (first put / first get) at no perceptible cost.
+        try {
+            boolean recordingOn = com.overdrive.app.config.UnifiedConfigManager
+                    .isGeocodingEnabledForFlow("recording");
+            boolean surveillanceOn = com.overdrive.app.config.UnifiedConfigManager
+                    .isGeocodingEnabledForFlow("surveillance");
+            if (recordingOn || surveillanceOn) {
+                com.overdrive.app.geo.GeoCache.getInstance().ensureLoaded();
+            }
+        } catch (Throwable t) {
+            log("GeoCache prewarm failed: " + t.getMessage());
+        }
+
+        // Recordings parse-cache + inverted-index warmup. The very first
+        // /api/recordings call after a daemon restart pays a directory
+        // walk + sidecar parse for every recording (100-1000 typical).
+        // On the recorder thread that's invisible, but the HTTP worker
+        // thread that handles the user's first events.html load shows a
+        // 1-3 s spinner. Warming up here on a low-priority background
+        // thread shifts that cost off the user-visible path.
+        //
+        // We dispatch on a daemon thread (NORM_PRIORITY - 2) so the
+        // initial scan competes with neither the recorder pipeline nor
+        // any HTTP worker. Failure is silent — warmup is a perf hint,
+        // not a correctness guarantee.
+        Thread warmupThread = new Thread(() -> {
+            try {
+                // Two-second nap so we don't fight the recorder pipeline
+                // setup / IPC / camera HAL warmup that the daemon does
+                // in parallel right after init.
+                Thread.sleep(2000);
+                com.overdrive.app.server.RecordingsApiHandler.warmupCache();
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            } catch (Throwable t) {
+                log("Recordings cache warmup failed: " + t.getMessage());
+            }
+        }, "RecordingsCacheWarmup");
+        warmupThread.setDaemon(true);
+        warmupThread.setPriority(Thread.NORM_PRIORITY - 2);
+        warmupThread.start();
+
         // Initialize SohEstimator (load persisted SOH — capacity detection deferred until collector is ready)
         try {
             sohEstimator = new SohEstimator();
@@ -857,9 +905,11 @@ public class CameraDaemon {
                 avcHalWarmup.startKeepAlive();
                 log("AVC keep-alive started (pipeline running, accOn=" + AccMonitor.isAccOn() + ")");
             }
+            // Heartbeat is dilink4-only and self-gates inside; safe on legacy.
+            startCameraActiveHeartbeatIfNeeded();
         }
     }
-    
+
     /**
      * Stops the AVC keep-alive watchdog.
      * Called when pipeline stops or daemon shuts down.
@@ -869,6 +919,97 @@ public class CameraDaemon {
             avcHalWarmup.stopKeepAlive();
             log("AVC keep-alive stopped");
         }
+        stopCameraActiveHeartbeat();
+    }
+
+    // ==================== CAMERA-ACTIVE HEARTBEAT ====================
+    //
+    // AccSentryDaemon (UID 2000, separate process) runs a 10s keepalive
+    // that calls setBacklightState(false). On byd_apa firmware that tears
+    // down the AVMCamera preview surface and emits HAL event=8. To stop
+    // that, we publish surveillance.cameraActiveUntilMs ~5s ahead of now
+    // every 4s while the GPU pipeline is consuming frames; AccSentryDaemon
+    // reads the same key cross-process and skips its backlight-off tick
+    // while we're hot. Gated on cameraMode=dilink4 — legacy cars don't
+    // have the HAL-display coupling and shouldn't suppress power-save.
+    private static volatile Thread cameraActiveHeartbeatThread = null;
+    private static volatile boolean cameraActiveHeartbeatRunning = false;
+    private static final long CAMERA_ACTIVE_TICK_MS = 4_000L;
+    private static final long CAMERA_ACTIVE_LEASE_MS = 8_000L;
+
+    public static void startCameraActiveHeartbeatIfNeeded() {
+        if (gpuPipeline == null || !gpuPipeline.isRunning()) return;
+        if (!isDilink4ModeActive()) return;
+        if (cameraActiveHeartbeatRunning) return;
+        cameraActiveHeartbeatRunning = true;
+        cameraActiveHeartbeatThread = new Thread(() -> {
+            log("Camera-active heartbeat started (dilink4, " +
+                CAMERA_ACTIVE_LEASE_MS + "ms lease, refreshed every " +
+                CAMERA_ACTIVE_TICK_MS + "ms)");
+            while (cameraActiveHeartbeatRunning) {
+                try {
+                    if (gpuPipeline != null && gpuPipeline.isRunning()) {
+                        publishCameraActiveLease();
+                    }
+                    Thread.sleep(CAMERA_ACTIVE_TICK_MS);
+                } catch (InterruptedException ie) {
+                    break;
+                } catch (Throwable t) {
+                    log("Camera-active heartbeat error: " + t.getMessage());
+                    try { Thread.sleep(1_000L); } catch (InterruptedException ie) { break; }
+                }
+            }
+            // Best-effort lease clear so AccSentryDaemon stops suppressing
+            // the backlight as soon as we tear the pipeline down. A stuck
+            // future-dated lease would keep the screen on for up to 8s
+            // after pipeline.stop() — recoverable but messy.
+            try { clearCameraActiveLease(); } catch (Throwable ignored) {}
+            log("Camera-active heartbeat stopped");
+        }, "CamActiveHeartbeat");
+        cameraActiveHeartbeatThread.setDaemon(true);
+        cameraActiveHeartbeatThread.start();
+    }
+
+    public static void stopCameraActiveHeartbeat() {
+        if (!cameraActiveHeartbeatRunning) return;
+        cameraActiveHeartbeatRunning = false;
+        Thread t = cameraActiveHeartbeatThread;
+        if (t != null) t.interrupt();
+        cameraActiveHeartbeatThread = null;
+    }
+
+    private static boolean isDilink4ModeActive() {
+        try {
+            org.json.JSONObject c = com.overdrive.app.config.UnifiedConfigManager
+                .loadConfig().optJSONObject("camera");
+            if (c == null) return false;
+            return "dilink4".equalsIgnoreCase(c.optString("cameraMode", "default"));
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private static void publishCameraActiveLease() {
+        try {
+            org.json.JSONObject patch = new org.json.JSONObject();
+            patch.put("cameraActiveUntilMs",
+                System.currentTimeMillis() + CAMERA_ACTIVE_LEASE_MS);
+            com.overdrive.app.config.UnifiedConfigManager
+                .updateSection("surveillance", patch);
+        } catch (Throwable t) {
+            // Throttle — log only on first failure per minute, otherwise
+            // a stuck unified-config write would flood the daemon log.
+            log("publishCameraActiveLease failed: " + t.getMessage());
+        }
+    }
+
+    private static void clearCameraActiveLease() {
+        try {
+            org.json.JSONObject patch = new org.json.JSONObject();
+            patch.put("cameraActiveUntilMs", 0L);
+            com.overdrive.app.config.UnifiedConfigManager
+                .updateSection("surveillance", patch);
+        } catch (Throwable ignored) {}
     }
     
     // ==================== GETTERS ====================
@@ -1247,6 +1388,17 @@ public class CameraDaemon {
                     PermissionGranter.cancel();
                 } catch (Exception e) {
                     log("Shutdown hook: PermissionGranter cancel error: " + e.getMessage());
+                }
+
+                // 1.5. Flush the geocode cache. Puts are coalesced (30 s
+                //      window) so a graceful shutdown that occurs inside
+                //      the window would otherwise drop the latest reverse-
+                //      geocode hits. Inline flush is bounded (≤ 4 MB JSON
+                //      write) and finishes well within the shutdown budget.
+                try {
+                    com.overdrive.app.geo.GeoCache.getInstance().flushNow();
+                } catch (Exception e) {
+                    log("Shutdown hook: GeoCache flush error: " + e.getMessage());
                 }
                 
                 // 2. Stop the GPU pipeline (releases MediaCodec encoder slot, camera HAL, EGL).

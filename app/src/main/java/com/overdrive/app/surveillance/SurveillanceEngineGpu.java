@@ -4291,6 +4291,39 @@ public class SurveillanceEngineGpu {
                 body = sb.toString();
             }
 
+            // Place suffix — appended only when the resolver has a synchronous
+            // hit (cache or SafeLocation). Online resolution is deliberately
+            // never awaited from the publish path: the push must fire as
+            // soon as the .mp4 finalizes, not after a 6-second Nominatim
+            // round-trip. A miss leaves the body unchanged. Coords are
+            // never leaked into the body — better silent on location than
+            // posting "3.0509, 101.7166" into a Telegram chat.
+            String placeMid = null;
+            String placeCC = null;
+            try {
+                HardwareEventRecorderGpu enc = (recorder != null) ? recorder.getEncoder() : null;
+                if (enc != null && enc.hasStartGeo()) {
+                    // Always "surveillance" flow on this path — this is the
+                    // sentry/proximity publish exit.
+                    com.overdrive.app.geo.PlaceResult place =
+                            com.overdrive.app.geo.GeocodingResolver.getInstance()
+                                    .resolveCachedOnly(enc.getStartGeoLat(),
+                                            enc.getStartGeoLng(), "surveillance");
+                    if (place != null) {
+                        String mid = place.mediumLabel();
+                        if (mid != null && !mid.isEmpty()) {
+                            body = body + " · " + mid;
+                            placeMid = mid;
+                            if (!place.countryCode.isEmpty()) {
+                                placeCC = place.countryCode;
+                            }
+                        }
+                    }
+                }
+            } catch (Throwable placeErr) {
+                logger.debug("publishMotionFinal place lookup failed: " + placeErr.getMessage());
+            }
+
             org.json.JSONObject data = new org.json.JSONObject();
             String url;
             if (videoFilename != null) {
@@ -4327,6 +4360,8 @@ public class SurveillanceEngineGpu {
                 data.put("closestProximity", closest.name());
             }
             if (camHint != null) data.put("camera", camHint);
+            if (placeMid != null) data.put("place", placeMid);
+            if (placeCC  != null) data.put("placeCountry", placeCC);
 
             com.overdrive.app.notifications.NotificationEvent.Severity nsev;
             if (peakSev == Actor.Severity.CRITICAL) {
@@ -4433,12 +4468,39 @@ public class SurveillanceEngineGpu {
         recorder.triggerEventRecording(currentEventFile.getAbsolutePath(), 0L);
         recording = true;
 
-        // Segment rotation listener: just track the new segment filename so
-        // a future stop() flushes the right path. No timeline / hero work.
+        // Segment rotation listener: track the new segment filename for the
+        // future stop() AND submit the closed segment to the geo sidecar
+        // writer. Continuous-mode reuses the event_*.mp4 prefix to share
+        // downstream plumbing, so the recorder's own filename-based
+        // skip-sentry guard correctly skips these in HardwareEventRecorderGpu;
+        // we have to do the submit here. Flow="recording" because
+        // continuous-mode is NOT sentry surveillance — it's a parking
+        // dashcam mode that the user opts into separately, and gating
+        // on the "recording" flow's geocoding toggle matches that
+        // mental model.
         try {
             HardwareEventRecorderGpu enc = recorder.getEncoder();
             if (enc != null) {
                 enc.setSegmentListener((closedSegment, newSegment) -> {
+                    if (closedSegment != null) {
+                        try {
+                            com.overdrive.app.geo.GeoSnapshot startGeo;
+                            if (enc.hasClosedStartGeo()) {
+                                startGeo = new com.overdrive.app.geo.GeoSnapshot(
+                                        enc.getClosedStartGeoLat(), enc.getClosedStartGeoLng(),
+                                        enc.getClosedStartGeoAccuracy(), enc.getClosedStartGeoAgeMs(),
+                                        enc.getClosedStartGeoCapturedAtMs(), 0L);
+                            } else {
+                                startGeo = com.overdrive.app.geo.GeoSnapshot.empty();
+                            }
+                            com.overdrive.app.geo.LocationSidecarWriter
+                                    .getInstance()
+                                    .submit(closedSegment, "recording", startGeo);
+                        } catch (Throwable t) {
+                            logger.warn("Continuous segment sidecar submit failed: "
+                                    + t.getMessage());
+                        }
+                    }
                     if (newSegment != null) {
                         currentEventFile = newSegment;
                     }
@@ -4462,13 +4524,62 @@ public class SurveillanceEngineGpu {
             return;
         }
         logger.info("Stopping continuous recording");
+
+        // Snapshot the final-segment file + active geo BEFORE the close.
+        // After stopEventRecording the recorder clears its state and we
+        // lose the binding from "active recording" → "the file that just
+        // finalized." The recorder's own close path will run its
+        // filename-based sidecar submit, but it skips event_*.mp4 to
+        // avoid double-writing for sentry — which means continuous-mode
+        // (which intentionally reuses the event_* prefix) gets skipped
+        // too. We submit explicitly here, mirroring the rotation
+        // listener's behavior for the final segment.
+        File finalSegment = currentEventFile;
+        com.overdrive.app.geo.GeoSnapshot finalStartGeo = null;
+        try {
+            HardwareEventRecorderGpu enc = recorder.getEncoder();
+            if (enc != null && enc.hasStartGeo()) {
+                finalStartGeo = new com.overdrive.app.geo.GeoSnapshot(
+                        enc.getStartGeoLat(), enc.getStartGeoLng(),
+                        enc.getStartGeoAccuracy(), enc.getStartGeoAgeMs(),
+                        enc.getStartGeoCapturedAtMs(), 0L);
+            }
+        } catch (Throwable t) {
+            logger.warn("Continuous final-segment geo snapshot failed: " + t.getMessage());
+        }
+
         try {
             recorder.stopEventRecording(true, 0);
         } catch (Throwable t) {
             logger.warn("Continuous recorder stop error: " + t.getMessage());
         }
+        // Drop the segment listener that startContinuousRecording set so
+        // a leftover closure can't fire during the gap between sessions.
+        // Mirrors what the smart-mode close path does inside
+        // stopRecording. If the next mode start is smart vs continuous,
+        // its own setSegmentListener() will install the right one.
+        try {
+            HardwareEventRecorderGpu enc = recorder.getEncoder();
+            if (enc != null) enc.setSegmentListener(null);
+        } catch (Throwable ignored) {}
         recording = false;
         currentEventFile = null;
+
+        // Submit AFTER the close so the .mp4 has been renamed from .tmp.
+        // LocationSidecarWriter is non-blocking — disk work happens on
+        // its own background executor.
+        if (finalSegment != null) {
+            try {
+                com.overdrive.app.geo.GeoSnapshot startGeo = finalStartGeo != null
+                        ? finalStartGeo
+                        : com.overdrive.app.geo.GeoSnapshot.empty();
+                com.overdrive.app.geo.LocationSidecarWriter
+                        .getInstance()
+                        .submit(finalSegment, "recording", startGeo);
+            } catch (Throwable t) {
+                logger.warn("Continuous final-segment sidecar submit failed: " + t.getMessage());
+            }
+        }
     }
 
     /**
@@ -4996,7 +5107,61 @@ public class SurveillanceEngineGpu {
         // gate flips immediately, so the next segment's
         // startCollectingNoPreRing call observes the correct state.
         try {
-            timelineCollector.stopAndWrite(segmentMp4, segmentActors, expectedHeroName);
+            // Build geo snapshots from the recorder's captured startGeo
+            // fields plus the peak-actor's wall-clock instant. The end
+            // snapshot is captured inside stopAndWrite at executor-dispatch
+            // time so it reflects the moment of finalize.
+            //
+            // syncHero==true means "publish path / final segment" — read
+            // the active startGeo*. syncHero==false means "rotation
+            // listener / closed segment" — read closedStartGeo* which
+            // rotateSegmentLocked stashed before refreshing the active
+            // fields for the new segment. Without this distinction every
+            // rotated segment's geo.start would carry the NEXT segment's
+            // GPS, misattributing location on multi-segment recordings.
+            com.overdrive.app.geo.GeoSnapshot startGeo =
+                    com.overdrive.app.geo.GeoSnapshot.empty();
+            com.overdrive.app.geo.GeoSnapshot peakGeo  = null;
+            try {
+                HardwareEventRecorderGpu enc = (recorder != null) ? recorder.getEncoder() : null;
+                if (enc != null) {
+                    if (syncHero && enc.hasStartGeo()) {
+                        startGeo = new com.overdrive.app.geo.GeoSnapshot(
+                                enc.getStartGeoLat(), enc.getStartGeoLng(),
+                                enc.getStartGeoAccuracy(), enc.getStartGeoAgeMs(),
+                                enc.getStartGeoCapturedAtMs(), 0L);
+                    } else if (!syncHero && enc.hasClosedStartGeo()) {
+                        startGeo = new com.overdrive.app.geo.GeoSnapshot(
+                                enc.getClosedStartGeoLat(), enc.getClosedStartGeoLng(),
+                                enc.getClosedStartGeoAccuracy(), enc.getClosedStartGeoAgeMs(),
+                                enc.getClosedStartGeoCapturedAtMs(), 0L);
+                    }
+                }
+            } catch (Throwable t) {
+                logger.warn("startGeo lookup failed: " + t.getMessage());
+            }
+            // Peak: the threat actor is the highest-severity non-static
+            // entry in segmentActors. Use peakSeverityRelMs (already
+            // renormalized to this segment's window earlier in this
+            // method). Capturing GPS at THIS moment is the closest we'll
+            // get to the threat-time location in real time, since we don't
+            // log lat/lng per-frame in the engine. For "at-rest" parked
+            // surveillance this collapses to startGeo, which is correct.
+            if (segmentActors != null) {
+                long peakRelMs = -1L;
+                for (Actor a : segmentActors) {
+                    if (a == null || a.isStatic) continue;
+                    if (a.peakSeverityRelMs >= 0
+                            && (peakRelMs < 0 || a.peakSeverityRelMs > peakRelMs)) {
+                        peakRelMs = a.peakSeverityRelMs;
+                    }
+                }
+                if (peakRelMs >= 0) {
+                    peakGeo = com.overdrive.app.geo.GeoSnapshot.capture(peakRelMs);
+                }
+            }
+            timelineCollector.stopAndWrite(segmentMp4, segmentActors,
+                    expectedHeroName, startGeo, peakGeo, /* endGeo = capture inside */ null);
         } catch (Exception e) {
             logger.warn("Timeline write failed for " + segmentMp4.getName() + ": " + e.getMessage());
         }

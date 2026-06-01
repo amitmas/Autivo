@@ -11,7 +11,8 @@
     "charging_stopped": "Ladding stoppet ved {0}%",
     "charging_complete": "Batteri på {0}%  klar til å trekke av",
     "recording_started": "Opptakingen startet.",
-    "recording_ended": "Opprettingen er avsluttet."
+    "recording_ended": "Opprettingen er avsluttet.",
+    "location_prefix": "Sted: {0}"
   },
   "errors": {
     "rate_limited_locked_for_seconds": "For mange forsøk  låst for {0}s",
@@ -35,6 +36,7 @@
     "models_invalid_json": "Invalide JSON",
     "models_unknown_id_with_id": "Ukjent modell-id: {0}",
     "models_invalid_color": "Ugyldig farge (forventet #RRGGBB)",
+    "models_invalid_drive_side": "Ugyldig bilkonfigurasjon (forventet «lhd» eller «rhd»)",
     "models_nothing_to_update": "Ingenting å oppdatere",
     "models_persist_failed": "Manglet på å holde fast",
     "models_id_required": "ID er nødvendig",
@@ -99,8 +101,7 @@
     "mqtt_not_initialized": "MQTT ikke initialisert",
     "max_connections_reached": "Max tilkobling nådd ({0})",
     "missing_connection_id": "Fraværende tilkoblings-ID",
-    "connection_not_found": "Forbindelse ikke funnet: {0}",
-    "models_invalid_drive_side": "Ugyldig bilkonfigurasjon (forventet «lhd» eller «rhd»)"
+    "connection_not_found": "Forbindelse ikke funnet: {0}"
   },
   "notifications": {
     "charging_started": "Lading startet.",
@@ -119,7 +120,9 @@
     "area_hood": "Hode",
     "area_trunk": "Trunk",
     "area_fuel_cap": "Brenselkap",
-    "area_door_n": "Dør {0}"
+    "area_door_n": "Dør {0}",
+    "soh_frame_mismatch_title": "Oversikt over behovene for batterikapacitet",
+    "soh_frame_mismatch_body": "Køretøy rapporterer {0} kWh på full ladning, men pakkekapasiteten er satt til {1} kWh."
   },
   "telegram": {
     "recording_caption": " Opptak ({0}) - {1}s",

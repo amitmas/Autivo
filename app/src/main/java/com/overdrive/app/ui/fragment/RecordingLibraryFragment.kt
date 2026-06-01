@@ -143,6 +143,16 @@ class RecordingLibraryFragment : Fragment() {
     private val actorClassFilter = mutableSetOf<String>()  // lowercased class group names
     private val severityFilter = mutableSetOf<String>()    // "ALERT" / "CRITICAL"
 
+    /**
+     * v3 place filter — short labels (district / city) to keep. Parent
+     * (RecordingsFragment) owns the toolbar chip UI; this set is the
+     * authoritative state pushed in via [applyAll]. Empty = show all
+     * places (and clips with no place tag pass through).
+     *
+     * Comparison is case-insensitive; entries stored lowercased.
+     */
+    private val placeFilter = mutableSetOf<String>()
+
     private val dayHeaderFormat = SimpleDateFormat("MMM d, yyyy", Locale.getDefault())
 
     // SOTA: Background executor for scanning operations
@@ -165,6 +175,16 @@ class RecordingLibraryFragment : Fragment() {
      * prev/next playlist in sync with what the user actually sees.
      */
     var onListChanged: ((List<RecordingFile>) -> Unit)? = null
+
+    /**
+     * Fires only when the underlying file set CHANGES (delete / batch
+     * delete / external rescan after invalidate). Distinct from
+     * [onListChanged] which fires on every filter pass / re-render — the
+     * parent fragment uses this to refresh its chip-derivation scan
+     * (which walks every directory) WITHOUT re-walking on every chip
+     * click. Pre-existing scan-cache (5s) absorbs back-to-back fires.
+     */
+    var onContentChanged: (() -> Unit)? = null
 
     override fun onCreateView(
         inflater: LayoutInflater,
@@ -303,7 +323,8 @@ class RecordingLibraryFragment : Fragment() {
         month: Int,
         day: Int,
         extraSource: RecordingFilter? = null,
-        narrowToDate: Boolean = false
+        narrowToDate: Boolean = false,
+        places: Set<String> = emptySet()
     ) {
         currentFilter = source
         extraFilter = extraSource
@@ -311,6 +332,8 @@ class RecordingLibraryFragment : Fragment() {
         actorClassFilter.addAll(actorClasses.map { it.lowercase() })
         severityFilter.clear()
         severityFilter.addAll(severity.map { it.uppercase() })
+        placeFilter.clear()
+        placeFilter.addAll(places.map { it.lowercase() })
         calendar.set(year, month, 1)
         selectedDay = day
         // Caller decides whether to narrow. The parent flips this true only
@@ -683,7 +706,9 @@ class RecordingLibraryFragment : Fragment() {
                 extraFilter?.let { include(it) }
                 val typeFiltered = allRecordings.filter { it.type in acceptedTypes }
 
-                val recordings = if (actorClassFilter.isEmpty() && severityFilter.isEmpty()) {
+                val recordings = if (actorClassFilter.isEmpty()
+                        && severityFilter.isEmpty()
+                        && placeFilter.isEmpty()) {
                     typeFiltered
                 } else {
                     typeFiltered.filter { rec ->
@@ -695,6 +720,20 @@ class RecordingLibraryFragment : Fragment() {
                         // pass through" rule.
                         val hasSidecar = rec.peakSeverity != null ||
                             rec.actorClasses.isNotEmpty()
+                        // Place is independent of "has sidecar" — a continuous
+                        // Dashcam clip can carry a place block when geocoding
+                        // is enabled. So we evaluate place gating BEFORE the
+                        // sidecar bypass, and let the sidecar bypass apply
+                        // only to actor/severity.
+                        val placeOk = placeFilter.isEmpty() || run {
+                            val short = rec.placeShortLabel?.lowercase()
+                            // Clips with no place tag are excluded when a
+                            // place chip is active — that's the entire point
+                            // of the chip (otherwise the user would see
+                            // unfiltered legacy clips mixed in).
+                            short != null && short in placeFilter
+                        }
+                        if (!placeOk) return@filter false
                         if (!hasSidecar) return@filter true
                         val classOk = actorClassFilter.isEmpty()
                                 || rec.actorClasses.any { it.lowercase() in actorClassFilter }
@@ -704,7 +743,7 @@ class RecordingLibraryFragment : Fragment() {
                     }
                 }
 
-                Log.d(TAG, "After filter (${currentFilter}, actor=$actorClassFilter, sev=$severityFilter): ${recordings.size} recordings")
+                Log.d(TAG, "After filter (${currentFilter}, actor=$actorClassFilter, sev=$severityFilter, place=$placeFilter): ${recordings.size} recordings")
 
                 activity?.runOnUiThread {
                     if (isAdded) {
@@ -840,6 +879,9 @@ class RecordingLibraryFragment : Fragment() {
         if (RecordingScanner.deleteRecording(recording)) {
             Toast.makeText(context, getString(R.string.toast_recording_deleted), Toast.LENGTH_SHORT).show()
             loadRecordingsForSelectedDate()
+            // Notify the parent so its chip-derivation scan re-runs and
+            // chip rows / segment counters reflect the deletion.
+            onContentChanged?.invoke()
         } else {
             Toast.makeText(context, getString(R.string.toast_recording_delete_failed), Toast.LENGTH_SHORT).show()
         }
@@ -885,6 +927,9 @@ class RecordingLibraryFragment : Fragment() {
                     Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
                     exitSelectMode()
                     loadRecordingsForSelectedDate()
+                    // Same notification as single-delete — keeps the
+                    // parent's chip set in sync after a multi-clip purge.
+                    onContentChanged?.invoke()
                 }
             }
         }

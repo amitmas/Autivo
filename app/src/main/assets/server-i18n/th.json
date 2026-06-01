@@ -11,7 +11,8 @@
     "charging_stopped": "หยุดชาร์จที่ {0}%",
     "charging_complete": "แบตเต็ม {0}% ถอดสายได้เลย",
     "recording_started": "เริ่มบันทึก",
-    "recording_ended": "หยุดบันทึก"
+    "recording_ended": "หยุดบันทึก",
+    "location_prefix": "สถานที่: {0}"
   },
   "errors": {
     "rate_limited_locked_for_seconds": "ลองบ่อยไป ล็อก {0} วิ",
@@ -35,6 +36,7 @@
     "models_invalid_json": "JSON ไม่ถูกต้อง",
     "models_unknown_id_with_id": "ไม่รู้จัก ID: {0}",
     "models_invalid_color": "สีไม่ถูกต้อง (ต้องเป็น #RRGGBB)",
+    "models_invalid_drive_side": "เลย์เอาต์ของรถไม่ถูกต้อง (ต้องเป็น «lhd» หรือ «rhd»)",
     "models_nothing_to_update": "ไม่มีอะไรให้อัปเดต",
     "models_persist_failed": "บันทึกข้อมูลไม่สำเร็จ",
     "models_id_required": "ต้องระบุ ID",
@@ -99,8 +101,7 @@
     "mqtt_not_initialized": "MQTT ยังไม่เริ่มทำงาน",
     "max_connections_reached": "เชื่อมต่อเต็มจำนวนแล้ว ({0})",
     "missing_connection_id": "ขาด ID เชื่อมต่อ",
-    "connection_not_found": "ไม่พบการเชื่อมต่อ: {0}",
-    "models_invalid_drive_side": "เลย์เอาต์ของรถไม่ถูกต้อง (ต้องเป็น «lhd» หรือ «rhd»)"
+    "connection_not_found": "ไม่พบการเชื่อมต่อ: {0}"
   },
   "notifications": {
     "charging_started": "เริ่มชาร์จ",
@@ -119,7 +120,9 @@
     "area_hood": "ฝากระโปรงหน้า",
     "area_trunk": "ฝากระโปรงท้าย",
     "area_fuel_cap": "ฝาชาร์จ",
-    "area_door_n": "ประตู {0}"
+    "area_door_n": "ประตู {0}",
+    "soh_frame_mismatch_title": "การตรวจสอบความต้องการความสามารถของแบตเตอรี่",
+    "soh_frame_mismatch_body": "รถรายงาน {0} kWh ในการชาร์จเต็ม แต่ความจุของบรรจุตั้งให้ {1} kWh เปิด Battery Health เพื่อติดตั้งใน 1 แท๊ป"
   },
   "telegram": {
     "recording_caption": "วิดีโอ ({0}) - {1} วิ",

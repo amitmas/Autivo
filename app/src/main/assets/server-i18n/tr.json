@@ -11,7 +11,8 @@
     "charging_stopped": "Şarj {0}%'de durduruldu",
     "charging_complete": "Batarya {0}%  bağlanmaya hazır",
     "recording_started": "Kayıt başladı .",
-    "recording_ended": "Kayıt bitti ."
+    "recording_ended": "Kayıt bitti .",
+    "location_prefix": "Yer: {0}"
   },
   "errors": {
     "rate_limited_locked_for_seconds": "{0}'ler için çok fazla girişim kilitlendi.",
@@ -35,6 +36,7 @@
     "models_invalid_json": "Geçersiz JSON",
     "models_unknown_id_with_id": "Bilinmeyen model kimliği: {0}",
     "models_invalid_color": "Geçersiz renk (ümkün olan #RRGGBB)",
+    "models_invalid_drive_side": "Geçersiz araç düzeni («lhd» veya «rhd» bekleniyordu)",
     "models_nothing_to_update": "Güncelleyecek bir şey yok.",
     "models_persist_failed": "Dayanamadım.",
     "models_id_required": "id gereklidir",
@@ -99,8 +101,7 @@
     "mqtt_not_initialized": "MQTT başlatılmamış",
     "max_connections_reached": "Maksimum bağlantılar ({0})",
     "missing_connection_id": "Kayıp bağlantı kimliği",
-    "connection_not_found": "Bağlantı bulunamadı: {0}",
-    "models_invalid_drive_side": "Geçersiz araç düzeni («lhd» veya «rhd» bekleniyordu)"
+    "connection_not_found": "Bağlantı bulunamadı: {0}"
   },
   "notifications": {
     "charging_started": "Şarj başladı .",
@@ -119,7 +120,9 @@
     "area_hood": "Kapuk",
     "area_trunk": "Çanta",
     "area_fuel_cap": "Yakıt kapağı",
-    "area_door_n": "Kapı {0}"
+    "area_door_n": "Kapı {0}",
+    "soh_frame_mismatch_title": "Batarya kapasitesi ihtiyaçlarının değerlendirilmesi",
+    "soh_frame_mismatch_body": "Araç {0} kWh'i tam şarj ile rapor ediyor ama paket kapasitesi {1} kWh'e ayarlanmıştır."
   },
   "telegram": {
     "recording_caption": " Kayıt ({0}) - {1}s",

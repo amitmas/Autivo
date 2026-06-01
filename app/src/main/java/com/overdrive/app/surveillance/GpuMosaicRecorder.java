@@ -52,8 +52,61 @@ public class GpuMosaicRecorder {
     private int programId;
     private int uCameraTexLocation;
     private int uApaModeLocation;
+    private int uTexMatrixLocation;
+    private int uApplyManualYFlipLocation;
+    private int uProducerForFrontLocation;
+    private int uProducerForRightLocation;
+    private int uProducerForRearLocation;
+    private int uProducerForLeftLocation;
+    private int uFlipForFrontLocation;
+    private int uFlipForRightLocation;
+    private int uFlipForRearLocation;
+    private int uFlipForLeftLocation;
+    private int uRedMaskStrengthLocation;
+    private int uApaCenterInsetLocation;
+    private volatile float apaCenterInset = 0.0f;
     private int aPositionLocation;
     private int aTexCoordLocation;
+
+    // Red-overlay mask toggle. Off by default; UI flips on for cars where
+    // the AVM HAL paints a red 'calibration failed' chrome. Volatile —
+    // UI thread writes via setRedMaskEnabled, GL thread reads in drawFrame.
+    private volatile boolean redMaskEnabled = false;
+
+    // Per-output-corner producer-corner mapping for dilink4 layout. Each
+    // 2-element pair is (cornerX, cornerY) of the producer 0.5×0.5
+    // sub-rect this output corner samples. Default = identity mapping
+    // (Front samples producer-TL, Right samples producer-TR, etc.).
+    // We use a single 8-float field + lock since the camera and GL
+    // threads can both touch this. Order matches uProducerFor{Front,
+    // Right, Rear, Left}.
+    private final float[] producerCornerMap = {
+        0.0f, 0.0f,  // Front  ← producer TL
+        0.5f, 0.0f,  // Right  ← producer TR
+        0.0f, 0.5f,  // Rear   ← producer BL
+        0.5f, 0.5f,  // Left   ← producer BR
+    };
+    // Per-role X/Y flip flags (xFlip, yFlip) for dilink4 layout. 1.0 =
+    // flip that axis within the role's 0.5×0.5 producer corner. Order
+    // matches producerCornerMap above. Default = no flips.
+    private final float[] flipFlags = {
+        0.0f, 0.0f,  // Front
+        0.0f, 0.0f,  // Right
+        0.0f, 0.0f,  // Rear
+        0.0f, 0.0f,  // Left
+    };
+    private final Object producerCornerMapLock = new Object();
+
+    // Last SurfaceTexture transform matrix published by the camera thread.
+    // Initialised to identity so non-esco paths keep working as before.
+    // Volatile because the camera thread writes via setTextureMatrix and
+    // the encoder GL thread reads in drawFrame.
+    private final float[] currentTexMatrix = {
+        1f, 0f, 0f, 0f,
+        0f, 1f, 0f, 0f,
+        0f, 0f, 1f, 0f,
+        0f, 0f, 0f, 1f,
+    };
     
     // Vertex data
     private FloatBuffer vertexBuffer;
@@ -72,7 +125,7 @@ public class GpuMosaicRecorder {
     private volatile boolean recording = false;
     private final Object recordingLock = new Object();
     private volatile boolean apaMode = false;  // APA mode: passthrough instead of mosaic split
-    private volatile int cameraLayout = 0;  // 0=4-cam, 1=APA passthrough, 2=3-cam
+    private volatile int cameraLayout = 0;  // 0=4-cam, 1=APA passthrough, 2=3-cam, 3=esco-parity passthrough
     // Set when setCameraLayout flips on a non-GL thread; consumed inside
     // drawFrame on the encoder GL thread to push the new uniform exactly
     // once. Per GLES2 spec, uniform values are part of the program object,
@@ -207,22 +260,48 @@ public class GpuMosaicRecorder {
          1.0f,  1.0f   // Top-right
     };
     
-    // Texture coordinates (flipped vertically for correct orientation)
+    // Texture coordinates — UN-flipped V. The vertex shader applies the
+    // appropriate Y-flip per layout:
+    //   - Legacy (uApaMode <= 0.5): vertex shader inverts V so the recorder
+    //     samples top-of-producer at top-of-screen, identical to pre-Phase-2
+    //     output.
+    //   - DiLink 4 (uApaMode > 2.5): uTexMatrix from SurfaceTexture already
+    //     contains the Android producer Y-flip, so we DON'T pre-flip — that
+    //     would double-flip and emit upside-down content.
+    // Both branches yield the producer's top-of-image at top-of-screen.
     private static final float[] TEX_COORDS = {
-        0.0f, 1.0f,  // Bottom-left (flipped to top-left)
-        1.0f, 1.0f,  // Bottom-right (flipped to top-right)
-        0.0f, 0.0f,  // Top-left (flipped to bottom-left)
-        1.0f, 0.0f   // Top-right (flipped to bottom-right)
+        0.0f, 0.0f,  // Bottom-left vertex → bottom of texture
+        1.0f, 0.0f,  // Bottom-right vertex → bottom of texture
+        0.0f, 1.0f,  // Top-left vertex → top of texture
+        1.0f, 1.0f   // Top-right vertex → top of texture
     };
     
-    // Vertex shader - simple passthrough
+    // Vertex shader. esco-parity: applies the SurfaceTexture transform
+    // matrix (uTexMatrix) so the consumer samples whatever sub-region the
+    // BYD HAL marked as "live frame" — without it we sample the whole
+    // producer surface including any HAL chrome (calibration text, letter-
+    // box, etc). The matrix is published per-frame via setTextureMatrix
+    // and defaults to identity, which is safe for HALs that don't set one.
+    //
+    // Y-flip handling. Input TEX_COORDS are un-flipped (V=0 at bottom of
+    // texture). Two cases for the shader:
+    //   - DiLink 4 (uTexMatrix non-identity): the SurfaceTexture's matrix
+    //     already includes the producer's Y-flip, so we apply it directly.
+    //   - Legacy (uTexMatrix == identity): we must Y-flip explicitly so the
+    //     producer's top-of-image lands at top-of-screen, matching the
+    //     pre-Phase-2 ImageReader output bit-for-bit.
+    // The shader uses uApplyManualYFlip (0 or 1) to switch between them.
     private static final String VERTEX_SHADER =
         "attribute vec4 aPosition;\n" +
         "attribute vec2 aTexCoord;\n" +
+        "uniform mat4 uTexMatrix;\n" +
+        "uniform float uApplyManualYFlip;\n" +
         "varying vec2 vTexCoord;\n" +
         "void main() {\n" +
         "    gl_Position = aPosition;\n" +
-        "    vTexCoord = aTexCoord;\n" +
+        "    vec2 src = aTexCoord;\n" +
+        "    if (uApplyManualYFlip > 0.5) src.y = 1.0 - src.y;\n" +
+        "    vTexCoord = (uTexMatrix * vec4(src, 0.0, 1.0)).xy;\n" +
         "}\n";
     
     // Fragment shader - supports 4-camera mosaic, 3-camera mosaic, and APA passthrough.
@@ -361,6 +440,18 @@ public class GpuMosaicRecorder {
         aTexCoordLocation = GLES20.glGetAttribLocation(programId, "aTexCoord");
         uCameraTexLocation = GLES20.glGetUniformLocation(programId, "uCameraTex");
         uApaModeLocation = GLES20.glGetUniformLocation(programId, "uApaMode");
+        uTexMatrixLocation = GLES20.glGetUniformLocation(programId, "uTexMatrix");
+        uApplyManualYFlipLocation = GLES20.glGetUniformLocation(programId, "uApplyManualYFlip");
+        uProducerForFrontLocation = GLES20.glGetUniformLocation(programId, "uProducerForFront");
+        uProducerForRightLocation = GLES20.glGetUniformLocation(programId, "uProducerForRight");
+        uProducerForRearLocation  = GLES20.glGetUniformLocation(programId, "uProducerForRear");
+        uProducerForLeftLocation  = GLES20.glGetUniformLocation(programId, "uProducerForLeft");
+        uFlipForFrontLocation = GLES20.glGetUniformLocation(programId, "uFlipForFront");
+        uFlipForRightLocation = GLES20.glGetUniformLocation(programId, "uFlipForRight");
+        uFlipForRearLocation  = GLES20.glGetUniformLocation(programId, "uFlipForRear");
+        uFlipForLeftLocation  = GLES20.glGetUniformLocation(programId, "uFlipForLeft");
+        uRedMaskStrengthLocation = GLES20.glGetUniformLocation(programId, "uRedMaskStrength");
+        uApaCenterInsetLocation = GLES20.glGetUniformLocation(programId, "uApaCenterInset");
         
         GlUtil.checkGlError("glGetLocation");
         
@@ -520,6 +611,48 @@ public class GpuMosaicRecorder {
         // racer published before flipping the dirty bit.
         if (apaModeUniformDirty.compareAndSet(true, false)) {
             GLES20.glUniform1f(uApaModeLocation, (float) cameraLayout);
+        }
+
+        // SurfaceTexture transform matrix. Published per-frame from
+        // PanoramicCameraGpu after updateTexImage(). Identity if the path
+        // never set one — that matches legacy ImageReader behaviour.
+        if (uTexMatrixLocation >= 0) {
+            GLES20.glUniformMatrix4fv(uTexMatrixLocation, 1, false, currentTexMatrix, 0);
+        }
+        if (uApplyManualYFlipLocation >= 0) {
+            // Legacy (cameraLayout != 3) → ImageReader output is canonical
+            // Y-up; we must manually flip V to put producer-top at screen-top.
+            // DiLink 4 (cameraLayout == 3) → SurfaceTexture matrix already
+            // contains the producer Y-flip; manual flip would double-flip.
+            GLES20.glUniform1f(uApplyManualYFlipLocation,
+                cameraLayout == 3 ? 0.0f : 1.0f);
+        }
+        // Per-output-corner producer mapping + per-role flip flags.
+        // Snapshot under lock; UI thread can race the GL upload here.
+        if (uProducerForFrontLocation >= 0) {
+            float[] m = new float[8];
+            float[] f = new float[8];
+            synchronized (producerCornerMapLock) {
+                System.arraycopy(producerCornerMap, 0, m, 0, 8);
+                System.arraycopy(flipFlags, 0, f, 0, 8);
+            }
+            GLES20.glUniform2f(uProducerForFrontLocation, m[0], m[1]);
+            GLES20.glUniform2f(uProducerForRightLocation, m[2], m[3]);
+            GLES20.glUniform2f(uProducerForRearLocation,  m[4], m[5]);
+            GLES20.glUniform2f(uProducerForLeftLocation,  m[6], m[7]);
+            if (uFlipForFrontLocation >= 0) {
+                GLES20.glUniform2f(uFlipForFrontLocation, f[0], f[1]);
+                GLES20.glUniform2f(uFlipForRightLocation, f[2], f[3]);
+                GLES20.glUniform2f(uFlipForRearLocation,  f[4], f[5]);
+                GLES20.glUniform2f(uFlipForLeftLocation,  f[6], f[7]);
+            }
+        }
+        if (uRedMaskStrengthLocation >= 0) {
+            GLES20.glUniform1f(uRedMaskStrengthLocation,
+                redMaskEnabled ? 1.0f : 0.0f);
+        }
+        if (uApaCenterInsetLocation >= 0) {
+            GLES20.glUniform1f(uApaCenterInsetLocation, apaCenterInset);
         }
 
         // Set up vertex attributes
@@ -936,6 +1069,8 @@ public class GpuMosaicRecorder {
      * 0 = 4-camera mosaic (Seal: pano_h/pano_l, surfaceMode=0)
      * 1 = APA passthrough (single pre-composited image, surfaceMode=1 with apa/byd_apa tag)
      * 2 = 3-camera mosaic (Atto 3 default: Rear, Side, Front)
+     * 3 = esco-parity passthrough — sample camera as-is, no rearrangement;
+     *     pairs with uTexMatrix from SurfaceTexture.getTransformMatrix().
      */
     public void setCameraLayout(int layout) {
         this.apaMode = (layout == 1);
@@ -943,8 +1078,119 @@ public class GpuMosaicRecorder {
         // Defer the actual glUniform1f to the next drawFrame on the
         // encoder GL thread; we don't own that context here.
         this.apaModeUniformDirty.set(true);
-        String[] names = {"4-camera mosaic", "APA passthrough", "3-camera mosaic"};
+        String[] names = {
+            "4-camera mosaic", "APA passthrough", "3-camera mosaic",
+            "esco-parity passthrough"
+        };
         logger.info("Camera layout: " + (layout < names.length ? names[layout] : "unknown(" + layout + ")"));
+    }
+
+    /**
+     * Publishes the SurfaceTexture transform matrix the shader will use on
+     * the next drawFrame. Called from the GL thread inside the camera's
+     * consume function — same thread as drawFrame, so a plain copy is safe
+     * (no synchronization needed). Identity is retained until the first
+     * call.
+     */
+    public void setTextureMatrix(float[] matrix4x4) {
+        if (matrix4x4 == null || matrix4x4.length < 16) return;
+        System.arraycopy(matrix4x4, 0, currentTexMatrix, 0, 16);
+    }
+
+    /**
+     * Per-role X/Y flip flags on the DiLink 4 passthrough path. Each
+     * float[] is {xFlip, yFlip}; values >= 0.5 flip that axis within the
+     * role's 0.5×0.5 producer corner. Pass null/short arrays to leave
+     * a role's flags unchanged.
+     */
+    public void setFlipFlags(float[] front, float[] right,
+                             float[] rear, float[] left) {
+        synchronized (producerCornerMapLock) {
+            if (front != null && front.length >= 2) {
+                flipFlags[0] = front[0]; flipFlags[1] = front[1];
+            }
+            if (right != null && right.length >= 2) {
+                flipFlags[2] = right[0]; flipFlags[3] = right[1];
+            }
+            if (rear != null && rear.length >= 2) {
+                flipFlags[4] = rear[0]; flipFlags[5] = rear[1];
+            }
+            if (left != null && left.length >= 2) {
+                flipFlags[6] = left[0]; flipFlags[7] = left[1];
+            }
+        }
+    }
+    public float[] getFlipFlags() {
+        synchronized (producerCornerMapLock) {
+            return flipFlags.clone();
+        }
+    }
+
+    /** Toggle the red-overlay mask filter. When enabled, the recorder's
+     *  fragment shader replaces saturated-red pixels (HAL 'calibration
+     *  failed' chrome) with a small-offset neighbour sample so they
+     *  don't appear in recordings. Cosmetic only — doesn't fix the
+     *  underlying calibration. Off by default. */
+    /**
+     * Sets the APA center inset (esco APACropFilter parity).
+     *
+     * <p>Inset is in producer-UV units, applied to each role's local
+     * {@code [0, 0.5]} sample window: {@code [0, 0.5] -> [inset, 0.5 - inset]}.
+     * The chrome lives at the producer center seams (where the four roles
+     * meet), so trimming each role inward eliminates the red bars.
+     *
+     * <p>Suggested value for the BYD byd_apa firmware (esco mirror):
+     * {@code 240 / (producer_width / 2) / 2 = 240 / W} where {@code W} is
+     * the FULL producer width (2560 typical). On Seal/Tang dilink4 cars
+     * this is {@code 240/2560 = 0.09375}.
+     *
+     * <p>Default 0 = no crop (legacy and unconfigured paths bit-exact).
+     * Clamped to [0, 0.20] so the visible window never collapses to zero.
+     */
+    public void setApaCenterInset(float inset) {
+        this.apaCenterInset = Math.max(0.0f, Math.min(0.20f, inset));
+    }
+
+    public void setRedMaskEnabled(boolean enabled) {
+        this.redMaskEnabled = enabled;
+    }
+    public boolean isRedMaskEnabled() { return redMaskEnabled; }
+
+    /**
+     * Per-output-corner producer-corner remap for the DiLink 4 passthrough
+     * path. Each role (Front, Right, Rear, Left) reads from one of four
+     * 0.5×0.5 producer corners: TL=(0,0), TR=(0.5,0), BL=(0,0.5),
+     * BR=(0.5,0.5). Pass identity values to disable the remap; pass a
+     * permutation to fix HAL layouts that paint roles in different
+     * corners than our default.
+     *
+     * Each parameter is a {x, y} pair; null/short arrays are ignored
+     * for that role only (other roles still update).
+     */
+    public void setProducerCornerMap(float[] front, float[] right,
+                                     float[] rear, float[] left) {
+        synchronized (producerCornerMapLock) {
+            if (front != null && front.length >= 2) {
+                producerCornerMap[0] = front[0]; producerCornerMap[1] = front[1];
+            }
+            if (right != null && right.length >= 2) {
+                producerCornerMap[2] = right[0]; producerCornerMap[3] = right[1];
+            }
+            if (rear != null && rear.length >= 2) {
+                producerCornerMap[4] = rear[0]; producerCornerMap[5] = rear[1];
+            }
+            if (left != null && left.length >= 2) {
+                producerCornerMap[6] = left[0]; producerCornerMap[7] = left[1];
+            }
+        }
+    }
+
+    /** Returns a copy of the current producer-corner map (8 floats:
+     *  fX,fY, rX,rY, bX,bY, lX,lY). */
+    public float[] getProducerCornerMap() {
+        synchronized (producerCornerMapLock) {
+            return producerCornerMap.clone();
+        }
     }
     
     public void setApaMode(boolean apa) {
@@ -1042,11 +1288,41 @@ public class GpuMosaicRecorder {
      * branches are layout-independent and stay as-is.
      */
     private static String buildFragmentShader(float[] offsets) {
+        // uApaMode branches:
+        //   0.0  4-camera mosaic: sample 4 quadrants of a 5120x960 horizontal
+        //        strip and rearrange into 2x2 corners (legacy Seal layout).
+        //   1.0  APA passthrough: sample camera surface as-is.
+        //   2.0  3-camera mosaic (Atto 3): rear=left half, front=top-right,
+        //        left+right=bottom-right.
+        //   3.0  esco-parity passthrough: HAL emits the final 2x2 layout
+        //        natively; we sample with uTexMatrix in the vertex shader.
+        //        Per-quadrant 180° rotation on TR (Right) and BL (Rear)
+        //        mirrors esco's APARotateFilter (C7610c quadrantAngles
+        //        {0, 180, 180, 0}). Toggle via uRotateNonZeroQuads:
+        //          1.0 → rotate TR+BL by 180°
+        //          0.0 → no rotation (debug / variant fallback)
         return String.format(Locale.US,
             "#extension GL_OES_EGL_image_external : require\n" +
             "precision mediump float;\n" +
             "uniform samplerExternalOES uCameraTex;\n" +
             "uniform float uApaMode;\n" +
+            "uniform vec2 uProducerForFront;\n" +
+            "uniform vec2 uProducerForRight;\n" +
+            "uniform vec2 uProducerForRear;\n" +
+            "uniform vec2 uProducerForLeft;\n" +
+            // Per-role flip flags (xFlip, yFlip). 1.0 = flip that axis
+            // within the role's local 0.5×0.5 producer corner. Used to
+            // un-mirror cameras whose HAL output is flipped relative to
+            // the canonical Y-down image convention.
+            "uniform vec2 uFlipForFront;\n" +
+            "uniform vec2 uFlipForRight;\n" +
+            "uniform vec2 uFlipForRear;\n" +
+            "uniform vec2 uFlipForLeft;\n" +
+            // Red-overlay mask strength. 0.0 = pass through, 1.0 = active.
+            // Used to suppress the AVM HAL's 'calibration failed' chrome
+            // on uncalibrated cars where the dealer hasn't calibrated yet.
+            "uniform float uRedMaskStrength;\n" +
+            "uniform float uApaCenterInset;\n" +
             "varying vec2 vTexCoord;\n" +
             "void main() {\n" +
             "    vec2 samplePos;\n" +
@@ -1054,7 +1330,36 @@ public class GpuMosaicRecorder {
             "    float rightOffset = %.5ff;\n" +
             "    float rearOffset  = %.5ff;\n" +
             "    float leftOffset  = %.5ff;\n" +
-            "    if (uApaMode > 1.5) {\n" +
+            "    if (uApaMode > 2.5) {\n" +
+            "        // DiLink 4 passthrough with per-output-corner producer\n" +
+            "        // remap + per-role X/Y flip. Each of the four output\n" +
+            "        // corners (Front=TL, Right=TR, Rear=BL, Left=BR) reads\n" +
+            "        // a configurable producer corner; X/Y flips are applied\n" +
+            "        // within the role's local 0.5×0.5 region to un-mirror\n" +
+            "        // HAL outputs that have inverted axes per camera.\n" +
+            "        bool inRight = (vTexCoord.x >= 0.5 && vTexCoord.y <  0.5);\n" +
+            "        bool inRear  = (vTexCoord.x <  0.5 && vTexCoord.y >= 0.5);\n" +
+            "        bool inLeft  = (vTexCoord.x >= 0.5 && vTexCoord.y >= 0.5);\n" +
+            "        // Local coord inside this output's 0.5×0.5 corner.\n" +
+            "        vec2 localOffset = vec2(0.0);\n" +
+            "        if (inRight) localOffset = vec2(0.5, 0.0);\n" +
+            "        else if (inRear) localOffset = vec2(0.0, 0.5);\n" +
+            "        else if (inLeft) localOffset = vec2(0.5, 0.5);\n" +
+            "        vec2 local = vTexCoord - localOffset;\n" +
+            "        // Pick the producer corner + flip flags for this role.\n" +
+            "        vec2 producerCorner = uProducerForFront;\n" +
+            "        vec2 flip = uFlipForFront;\n" +
+            "        if (inRight) { producerCorner = uProducerForRight; flip = uFlipForRight; }\n" +
+            "        else if (inRear)  { producerCorner = uProducerForRear;  flip = uFlipForRear;  }\n" +
+            "        else if (inLeft)  { producerCorner = uProducerForLeft;  flip = uFlipForLeft;  }\n" +
+            "        // Apply X/Y flip within the local 0.5-wide window. flip.x>0.5\n" +
+            "        // mirrors left-right; flip.y>0.5 mirrors top-bottom.\n" +
+            "        vec2 sampledLocal = local;\n" +
+            "        if (flip.x > 0.5) sampledLocal.x = 0.5 - sampledLocal.x;\n" +
+            "        if (flip.y > 0.5) sampledLocal.y = 0.5 - sampledLocal.y;\n" +
+            "        samplePos = producerCorner + sampledLocal;\n" +
+            com.overdrive.app.camera.GlUtil.APA_CENTER_INSET_GLSL +
+            "    } else if (uApaMode > 1.5) {\n" +
             "        if (vTexCoord.x < 0.5) {\n" +
             "            float lx = vTexCoord.x * 0.5;\n" +
             "            float ly = mod(vTexCoord.y, 0.5) * 2.0;\n" +
@@ -1078,7 +1383,10 @@ public class GpuMosaicRecorder {
             "        float localY = mod(vTexCoord.y, 0.5) * 2.0;\n" +
             "        samplePos = vec2(localX + stripOffsetX, localY);\n" +
             "    }\n" +
-            "    gl_FragColor = texture2D(uCameraTex, samplePos);\n" +
+            "    vec4 src = texture2D(uCameraTex, samplePos);\n" +
+            // Shared red-overlay suppression. See GlUtil.RED_MASK_GLSL.
+            com.overdrive.app.camera.GlUtil.RED_MASK_GLSL +
+            "    gl_FragColor = src;\n" +
             "}\n",
             offsets[0], offsets[1], offsets[2], offsets[3]);
     }

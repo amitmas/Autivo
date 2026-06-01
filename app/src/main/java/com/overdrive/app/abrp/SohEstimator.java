@@ -45,8 +45,16 @@ public class SohEstimator {
     private static final String PROP_CAPACITY_AH_TIMESTAMP = "capacity_ah_timestamp_ms";
     private static final String PROP_CAPACITY_AH_DISABLED = "capacity_ah_disabled";
     private static final String PROP_LIVE_HISTORY = "live_history";
+    private static final String PROP_PEAK_REMAIN_KWH = "peak_remain_kwh";
+    private static final String PROP_PEAK_REMAIN_KWH_SAMPLES = "peak_remain_kwh_samples";
+    private static final String PROP_PEAK_REMAIN_KWH_TS = "peak_remain_kwh_ts";
+    private static final String PROP_PEAK_REMAIN_KWH_NOTIFIED = "peak_remain_kwh_notified";
     private static final String PROP_SCHEMA_VERSION = "schema_version";
-    private static final int CURRENT_SCHEMA_VERSION = 2;
+    // v3: PHEV peak-charge frame anchor — empirically derives the BMS's
+    // full-charge usable kWh by tracking max remainKwh observed at SOC≥99%.
+    // Lets the dialog show frame mismatches when user-entered nominal is in a
+    // different unit system than the BMS's remainKwh (nameplate vs usable).
+    private static final int CURRENT_SCHEMA_VERSION = 3;
 
     private static final int LIVE_HISTORY_SIZE = 10;
     private final java.util.ArrayDeque<Double> liveHistory = new java.util.ArrayDeque<>(LIVE_HISTORY_SIZE);
@@ -94,10 +102,31 @@ public class SohEstimator {
     // remainKwh happens to be numerically close to SOC% by coincidence.
     private boolean fuelSignalsLookBev = false;
 
-    // Plausible BYD pack range. Smallest is Sealion 6 DM-i PHEV at 18.3 kWh;
-    // largest is Tang at 108.8 kWh.
+    // Plausible BYD pack range. Smallest BEV-side is Sealion 6 DM-i PHEV at
+    // 18.3 kWh; largest is Tang at 108.8 kWh. PHEV packs whose users want to
+    // enter a usable-frame value (e.g. Tang DM-i ~12.9 kWh out of 21.5 nominal)
+    // need a lower floor — the BMS-reported remainKwh + display SOC live in
+    // the usable frame on those models, and the live SOH formula only matches
+    // when nominalCapacityKwh is in the same frame.
     private static final double MIN_PLAUSIBLE_KWH = 15.0;
+    private static final double MIN_PLAUSIBLE_KWH_PHEV = 8.0;
     private static final double MAX_PLAUSIBLE_KWH = 120.0;
+
+    // PHEV-only peak-charge frame anchor. Tracks max remainKwh observed at
+    // SOC≥99% across N samples. peakRemainKwhAtFull / nominalCapacityKwh × 100
+    // yields a frame-aware SOH that survives the "user enters nameplate but
+    // BMS reports usable" mismatch — when ratio is < 0.85 the dialog shows
+    // a frame-mismatch warning so the user can correct the input.
+    private static final int PEAK_REMAIN_KWH_REQUIRED_SAMPLES = 3;
+    private static final double PEAK_REMAIN_KWH_FULL_SOC_THRESHOLD = 99.0;
+    private double peakRemainKwhAtFull = -1;
+    private int peakRemainKwhSamples = 0;
+    private long peakRemainKwhTimestampMs = 0;
+    // One-shot notified flag — flipped true the first time we publish the
+    // frame-mismatch notification, cleared on every event that wipes the
+    // anchor (reset / clearUserNominal / nominal change). Without this the
+    // notification would re-fire every daemon restart.
+    private boolean peakMismatchNotified = false;
 
     // BYD Blade LFP reference cell voltage. 3.22 V derived from BYD's
     // published kWh / Ah / cellCount specs.
@@ -127,12 +156,28 @@ public class SohEstimator {
      * User-driven override. Persists to UnifiedConfigManager so it survives
      * across daemon restarts AND across re-runs of autoDetectCarModel — only
      * clearUserNominal() can demote this back to "auto" / "unset".
+     *
+     * <p>The plausible floor is drivetrain-aware: BEV uses {@link #MIN_PLAUSIBLE_KWH}
+     * (15 kWh), PHEV uses {@link #MIN_PLAUSIBLE_KWH_PHEV} (8 kWh) so users on
+     * small Blade DM-i packs can enter usable-frame values like ~12.9 kWh.
+     * The drivetrain hint is read from {@code BydDataCollector.isPhevPublic()};
+     * if that probe fails the conservative BEV floor wins.
      */
     public void setNominalCapacityKwhFromUser(double capacityKwh) {
         synchronized (autoDetectLock) {
-            if (capacityKwh < MIN_PLAUSIBLE_KWH || capacityKwh > MAX_PLAUSIBLE_KWH) {
+            boolean isPhev = false;
+            try {
+                com.overdrive.app.byd.BydDataCollector col =
+                    com.overdrive.app.byd.BydDataCollector.getInstance();
+                if (col != null && col.isInitialized()) {
+                    isPhev = col.isPhevPublic();
+                }
+            } catch (Throwable ignored) { /* default isPhev=false → BEV floor */ }
+            double floor = isPhev ? MIN_PLAUSIBLE_KWH_PHEV : MIN_PLAUSIBLE_KWH;
+            if (capacityKwh < floor || capacityKwh > MAX_PLAUSIBLE_KWH) {
                 logger.warn("Rejecting user nominal " + capacityKwh + " kWh — outside "
-                    + MIN_PLAUSIBLE_KWH + "-" + MAX_PLAUSIBLE_KWH + " range");
+                    + floor + "-" + MAX_PLAUSIBLE_KWH + " range (drivetrain="
+                    + (isPhev ? "PHEV" : "BEV") + ")");
                 return;
             }
             double previous = this.nominalCapacityKwh;
@@ -210,6 +255,13 @@ public class SohEstimator {
             this.capacityAhSocCoupledCount = 0;
             this.liveHistory.clear();
             this.saturationStreak = 0;
+            // Peak frame anchor is an empirical BMS observation, independent
+            // of nominal — but clearUserNominal is a deliberate "start over"
+            // entrypoint, so wipe it too to match user expectation.
+            this.peakRemainKwhAtFull = -1;
+            this.peakRemainKwhSamples = 0;
+            this.peakRemainKwhTimestampMs = 0;
+            this.peakMismatchNotified = false;
             if (previous > 0) {
                 invalidateActiveTripKwhBaseline("user nominal cleared (was "
                     + String.format("%.1f", previous) + " kWh)");
@@ -894,11 +946,17 @@ public class SohEstimator {
     // ==================== LIFECYCLE ====================
 
     public void init() {
-        // 1. User override from UnifiedConfigManager.
+        // 1. User override from UnifiedConfigManager. Restore floor matches
+        //    setNominalCapacityKwhFromUser: PHEV-aware. We can't always probe
+        //    BydDataCollector here (init runs before drivetrain classification
+        //    has settled), so we accept the wider PHEV floor at restore-time
+        //    — the value already passed strict per-drivetrain validation when
+        //    it was originally set, and a stale value would still need
+        //    affirmative user action to persist.
         try {
             JSONObject vehicle = UnifiedConfigManager.getVehicle();
             double userKwh = vehicle.optDouble("nominalKwh", 0);
-            if (userKwh >= MIN_PLAUSIBLE_KWH && userKwh <= MAX_PLAUSIBLE_KWH) {
+            if (userKwh >= MIN_PLAUSIBLE_KWH_PHEV && userKwh <= MAX_PLAUSIBLE_KWH) {
                 nominalCapacityKwh = userKwh;
                 nominalSource = "user";
                 logger.info("Restored user nominal capacity: " + userKwh + " kWh");
@@ -924,7 +982,13 @@ public class SohEstimator {
                 persistedVersion = 0;
             }
 
-            if (persistedVersion < CURRENT_SCHEMA_VERSION) {
+            // Migration tiers:
+            //   < v2 → harsh migration: SOH semantics changed in v2, drop state.
+            //   v2 → soft upgrade to v3: peak frame anchor is a NEW additive
+            //        field, existing SOH/calibration semantics unchanged.
+            //        Just fall through to the normal load path; persistEstimate
+            //        will rewrite with schema_version=3 on the next update.
+            if (persistedVersion < 2) {
                 // Legacy file: preserve nominal so auto-detect doesn't restart cold,
                 // but drop SOH state — its semantics may have shifted across versions.
                 if (!"user".equals(nominalSource)) {
@@ -958,6 +1022,11 @@ public class SohEstimator {
                 // migration every boot. Stamp the new schema unconditionally.
                 writeSchemaStamp();
                 return;
+            }
+            if (persistedVersion == 2 && CURRENT_SCHEMA_VERSION >= 3) {
+                logger.info("SOH file soft-upgraded v2 → v" + CURRENT_SCHEMA_VERSION
+                    + " (peak frame anchor added, existing state preserved)");
+                // Fall through to the normal load path below.
             }
 
             String sohStr = props.getProperty(PROP_SOH_PERCENT);
@@ -1025,10 +1094,49 @@ public class SohEstimator {
                 }
             }
 
+            // Peak frame anchor restore (v3+). Missing on v2 files — fields stay -1/0
+            // and observePeakAtFullCharge will re-seed on the next SOC≥99% tick.
+            String peakStr = props.getProperty(PROP_PEAK_REMAIN_KWH);
+            if (peakStr != null) {
+                try {
+                    double peak = Double.parseDouble(peakStr);
+                    if (peak > 0 && peak <= MAX_PLAUSIBLE_KWH) {
+                        peakRemainKwhAtFull = peak;
+                    }
+                } catch (NumberFormatException ignored) {}
+            }
+            String peakSamplesStr = props.getProperty(PROP_PEAK_REMAIN_KWH_SAMPLES);
+            if (peakSamplesStr != null) {
+                try {
+                    peakRemainKwhSamples = Math.min(
+                        Integer.parseInt(peakSamplesStr), PEAK_REMAIN_KWH_REQUIRED_SAMPLES);
+                } catch (NumberFormatException ignored) {}
+            }
+            String peakTsStr = props.getProperty(PROP_PEAK_REMAIN_KWH_TS);
+            if (peakTsStr != null) {
+                try {
+                    peakRemainKwhTimestampMs = Long.parseLong(peakTsStr);
+                } catch (NumberFormatException ignored) {}
+            }
+            String peakNotifiedStr = props.getProperty(PROP_PEAK_REMAIN_KWH_NOTIFIED);
+            if ("true".equalsIgnoreCase(peakNotifiedStr)) {
+                peakMismatchNotified = true;
+            }
+            if (peakRemainKwhAtFull > 0) {
+                logger.info("Restored peak frame anchor: "
+                    + String.format("%.2f", peakRemainKwhAtFull) + " kWh ("
+                    + peakRemainKwhSamples + "/"
+                    + PEAK_REMAIN_KWH_REQUIRED_SAMPLES + " samples)"
+                    + (peakMismatchNotified ? " [mismatch already notified]" : ""));
+            }
+
             if (!"user".equals(nominalSource)) {
                 String capStr = props.getProperty(PROP_NOMINAL_CAPACITY);
                 if (capStr != null) {
                     double savedCap = Double.parseDouble(capStr);
+                    // Auto-detected nominal keeps the strict BEV floor — only
+                    // user-entered values are allowed below MIN_PLAUSIBLE_KWH
+                    // (gated separately in setNominalCapacityKwhFromUser).
                     if (savedCap >= MIN_PLAUSIBLE_KWH && savedCap <= MAX_PLAUSIBLE_KWH) {
                         nominalCapacityKwh = savedCap;
                         String savedSrc = props.getProperty(PROP_NOMINAL_SOURCE);
@@ -1262,6 +1370,138 @@ public class SohEstimator {
         }
     }
 
+    /**
+     * PHEV-only peak-charge frame anchor. Track the maximum {@code remainKwh}
+     * the BMS reports while SOC is at or above {@link #PEAK_REMAIN_KWH_FULL_SOC_THRESHOLD}.
+     *
+     * <p>Why: on Blade DM-i PHEVs the BMS reports {@code remainKwh} in the
+     * usable frame (e.g. ~12.9 kWh full on a Tang DM-i with 21.5 kWh nameplate)
+     * while users tend to enter the nameplate value as nominal. The live SOH
+     * formula {@code remainKwh / (SOC/100) / nominal × 100} then computes
+     * something like 12.9 / 21.5 × 100 ≈ 60% indistinguishable from a
+     * genuinely-degraded battery. The peak observed at full charge is exactly
+     * the BMS's view of "100% SOC" — comparing it to nominal lets us a) emit
+     * a frame-aware SOH that doesn't mistake unit-mismatch for degradation,
+     * and b) surface the mismatch in the UI so the user can correct nominal.
+     *
+     * <p>BEV calls early-return — BEV {@code remainKwh} is already in the
+     * nominal frame and the live formula is sufficient.
+     *
+     * <p>Anchor stabilizes after {@link #PEAK_REMAIN_KWH_REQUIRED_SAMPLES}
+     * observations to avoid pinning to a single tick of HAL noise. Each
+     * higher-than-current observation replaces the anchor (true peak); equal
+     * or lower observations only bump the sample counter.
+     */
+    public void observePeakAtFullCharge(double remainKwh, double socPercent, boolean isPhev) {
+        synchronized (autoDetectLock) {
+            if (!isPhev) return;
+            if (nominalCapacityKwh <= 0) return;
+            if (socPercent < PEAK_REMAIN_KWH_FULL_SOC_THRESHOLD) return;
+            if (remainKwh <= 0 || remainKwh > MAX_PLAUSIBLE_KWH) return;
+            // SOC-as-kWh PHEV firmware bug: HAL echoes SOC% (≈100) into the
+            // remainKwh field at full charge. Reject when remainKwh is suspiciously
+            // close to socPercent — that's the bug pattern, not a real reading.
+            if (Math.abs(remainKwh - socPercent) < 3.0) return;
+
+            boolean firstObservation = (peakRemainKwhAtFull <= 0);
+            if (remainKwh > peakRemainKwhAtFull) {
+                double prev = peakRemainKwhAtFull;
+                peakRemainKwhAtFull = remainKwh;
+                peakRemainKwhTimestampMs = System.currentTimeMillis();
+                peakRemainKwhSamples = Math.min(peakRemainKwhSamples + 1, PEAK_REMAIN_KWH_REQUIRED_SAMPLES);
+                if (firstObservation) {
+                    double ratio = remainKwh / nominalCapacityKwh;
+                    logger.info("Peak frame anchor seeded: " + String.format("%.2f", remainKwh)
+                        + " kWh at " + String.format("%.0f", socPercent) + "% SOC (nominal="
+                        + String.format("%.1f", nominalCapacityKwh) + " kWh, ratio="
+                        + String.format("%.2f", ratio) + ")");
+                    if (ratio < 0.85) {
+                        logger.warn("Frame mismatch: peak observed kWh ("
+                            + String.format("%.2f", remainKwh) + ") is "
+                            + String.format("%.0f", ratio * 100)
+                            + "% of user nominal (" + String.format("%.1f", nominalCapacityKwh)
+                            + ") — user may have entered nameplate vs usable. SOH dialog will flag.");
+                    }
+                } else {
+                    logger.debug("Peak frame anchor raised: " + String.format("%.2f", prev)
+                        + " → " + String.format("%.2f", remainKwh) + " kWh");
+                }
+                persistEstimate();
+            } else if (peakRemainKwhSamples < PEAK_REMAIN_KWH_REQUIRED_SAMPLES) {
+                peakRemainKwhSamples++;
+                if (peakRemainKwhSamples == PEAK_REMAIN_KWH_REQUIRED_SAMPLES) {
+                    logger.info("Peak frame anchor stabilized at " + String.format("%.2f", peakRemainKwhAtFull)
+                        + " kWh after " + peakRemainKwhSamples + " samples");
+                    persistEstimate();
+                }
+            }
+
+            // Notification gate. We only fire after the anchor has stabilized
+            // AND the ratio is below threshold AND we haven't already notified
+            // this anchor lifetime. The flag is wiped along with peak* fields
+            // on every reset / nominal change, so re-detection re-notifies.
+            maybeFireFrameMismatchNotification();
+        }
+    }
+
+    /**
+     * Publish the frame-mismatch notification once per anchor lifetime.
+     * Called from observePeakAtFullCharge after every state mutation; the
+     * persisted flag {@link #peakMismatchNotified} keeps it single-shot.
+     */
+    private void maybeFireFrameMismatchNotification() {
+        if (peakMismatchNotified) return;
+        if (peakRemainKwhSamples < PEAK_REMAIN_KWH_REQUIRED_SAMPLES) return;
+        if (peakRemainKwhAtFull <= 0 || nominalCapacityKwh <= 0) return;
+        double ratio = peakRemainKwhAtFull / nominalCapacityKwh;
+        if (ratio >= 0.85) return;
+        try {
+            JSONObject data = new JSONObject();
+            data.put("peakKwh", Math.round(peakRemainKwhAtFull * 100) / 100.0);
+            data.put("nominalKwh", Math.round(nominalCapacityKwh * 10) / 10.0);
+            data.put("ratio", Math.round(ratio * 100) / 100.0);
+            String peakStr = String.format(java.util.Locale.US, "%.1f", peakRemainKwhAtFull);
+            String nomStr = String.format(java.util.Locale.US, "%.1f", nominalCapacityKwh);
+            String title = com.overdrive.app.server.Messages.get(
+                "notifications.soh_frame_mismatch_title");
+            String body = com.overdrive.app.server.Messages.get(
+                "notifications.soh_frame_mismatch_body", peakStr, nomStr);
+            com.overdrive.app.notifications.NotificationBus.get().publish(
+                new com.overdrive.app.notifications.NotificationEvent(
+                    "vehicle.health.soh.frame_mismatch",
+                    com.overdrive.app.notifications.NotificationEvent.Severity.WARN,
+                    title,
+                    body,
+                    "soh-frame-mismatch",
+                    null,   // category default click URL
+                    data));
+            peakMismatchNotified = true;
+            persistEstimate();
+            logger.info("Published frame-mismatch notification (peak="
+                + peakStr + " kWh, nominal=" + nomStr + " kWh, ratio="
+                + String.format("%.2f", ratio) + ")");
+        } catch (Throwable t) {
+            // Bus failure must not break the SOH pipeline. Leave flag false
+            // so a later observation retries.
+            logger.debug("Frame-mismatch notification publish failed: " + t.getMessage());
+        }
+    }
+
+    /**
+     * SOH derived from the peak frame anchor. {@code -1} until the anchor has
+     * stabilized at {@link #PEAK_REMAIN_KWH_REQUIRED_SAMPLES} samples; this
+     * gate prevents a single noisy peak from displaying a misleading SOH
+     * before enough confirming observations exist.
+     */
+    public double getFrameAnchorSoh() {
+        if (peakRemainKwhAtFull <= 0 || nominalCapacityKwh <= 0) return -1;
+        if (peakRemainKwhSamples < PEAK_REMAIN_KWH_REQUIRED_SAMPLES) return -1;
+        double soh = (peakRemainKwhAtFull / nominalCapacityKwh) * 100.0;
+        if (soh < 60.0) return 60.0;
+        if (soh > 110.0) return 110.0;
+        return soh;
+    }
+
     // ==================== GETTERS ====================
 
     public double getCurrentSoh() { return currentSoh; }
@@ -1269,6 +1509,9 @@ public class SohEstimator {
     public long getCalibrationTimestampMs() { return calibrationTimestampMs; }
     public double getCapacityAhSoh() { return capacityAhSoh; }
     public long getCapacityAhTimestampMs() { return capacityAhTimestampMs; }
+    public double getPeakRemainKwhAtFull() { return peakRemainKwhAtFull; }
+    public long getPeakRemainKwhTimestampMs() { return peakRemainKwhTimestampMs; }
+    public int getPeakRemainKwhSamples() { return peakRemainKwhSamples; }
     public boolean hasEstimate() { return currentSoh > 0; }
 
     public double getEstimatedCapacityKwh() {
@@ -1296,6 +1539,11 @@ public class SohEstimator {
             nominalSource = "unset";
             liveHistory.clear();
             saturationStreak = 0;
+            // Peak frame anchor wiped on reset — see clearUserNominal note.
+            peakRemainKwhAtFull = -1;
+            peakRemainKwhSamples = 0;
+            peakRemainKwhTimestampMs = 0;
+            peakMismatchNotified = false;
             if (previous > 0) {
                 invalidateActiveTripKwhBaseline("SohEstimator.reset()");
             }
@@ -1314,7 +1562,8 @@ public class SohEstimator {
             try {
                 JSONObject vehicle = UnifiedConfigManager.getVehicle();
                 double userKwh = vehicle.optDouble("nominalKwh", 0);
-                if (userKwh >= MIN_PLAUSIBLE_KWH && userKwh <= MAX_PLAUSIBLE_KWH) {
+                // PHEV-aware floor on restore — see note in init().
+                if (userKwh >= MIN_PLAUSIBLE_KWH_PHEV && userKwh <= MAX_PLAUSIBLE_KWH) {
                     nominalCapacityKwh = userKwh;
                     nominalSource = "user";
                     logger.info("SOH estimation RESET — local data cleared, user nominal " +
@@ -1354,19 +1603,48 @@ public class SohEstimator {
             capAh.put("disabled", capacityAhDisabled);
             status.put("capacityAh", capAh);
 
+            // Frame anchor (PHEV-only). Empirically captures the BMS's view
+            // of "100% SOC" by tracking peak remainKwh observed at SOC≥99%.
+            // ratio = peakRemainKwhAtFull / nominalCapacityKwh tells us
+            // whether the user's nominal entry matches the BMS's frame
+            // (~1.0 = match) or differs (~0.6 on Tang DM-i nameplate vs usable).
+            org.json.JSONObject frameAnchor = new org.json.JSONObject();
+            double frameSoh = getFrameAnchorSoh();
+            frameAnchor.put("soh", frameSoh > 0 ? Math.round(frameSoh * 10) / 10.0 : -1);
+            frameAnchor.put("peakKwh", peakRemainKwhAtFull > 0
+                ? Math.round(peakRemainKwhAtFull * 100) / 100.0 : -1);
+            frameAnchor.put("samples", peakRemainKwhSamples);
+            frameAnchor.put("requiredSamples", PEAK_REMAIN_KWH_REQUIRED_SAMPLES);
+            frameAnchor.put("timestampMs", peakRemainKwhTimestampMs);
+            double frameRatio = (peakRemainKwhAtFull > 0 && nominalCapacityKwh > 0)
+                ? peakRemainKwhAtFull / nominalCapacityKwh : -1;
+            frameAnchor.put("ratio", frameRatio > 0 ? Math.round(frameRatio * 100) / 100.0 : -1);
+            // Frame mismatch threshold: < 0.85 means user nominal is ~17%+
+            // larger than BMS's full-charge reading. The most common cause is
+            // user-entered nameplate (e.g. 21.5 kWh Tang DM-i) vs BMS-reported
+            // usable (~12.9 kWh). Set when the anchor has stabilized.
+            frameAnchor.put("mismatch",
+                frameRatio > 0 && frameRatio < 0.85
+                    && peakRemainKwhSamples >= PEAK_REMAIN_KWH_REQUIRED_SAMPLES);
+            status.put("frameAnchor", frameAnchor);
+
             // Display fallback chain.
             //
-            // BEV: live > calibration > unavailable. capacity_ah is never
-            // computed for BEV (updateFromCapacityAh early-returns).
+            // BEV: live > calibration > unavailable. capacity_ah and
+            // frame_anchor are never computed for BEV (both early-return on
+            // !isPhev).
             //
-            // PHEV: capacity_ah > live > calibration > unavailable. The BMS
-            // Ah counter is the most accurate SOH source on small PHEV packs
-            // because the live `remainKwh / SOC` formula sees ±1.5% per-tick
-            // noise from 1-decimal kWh resolution over a 9-18 kWh range. The
-            // capacity-Ah anchor is independent of SOC range and not subject
-            // to that quantization. We only prefer it when it has a real
-            // value AND hasn't been disabled by the nameplate-stuck or
-            // SOC-coupled detectors.
+            // PHEV: frame_anchor > capacity_ah > live > calibration > unavailable.
+            // The frame anchor is the most accurate PHEV source because it's
+            // anchored at the BMS's own "100% SOC" boundary — independent of
+            // the per-tick noise in remainKwh / SOC and independent of the
+            // nameplate-vs-usable frame question that breaks the live formula.
+            // capacity_ah is the second choice (independent of SOC range too,
+            // but subject to nameplate-stuck and SOC-coupling failure modes).
+            // live is only the headline source on BEV; on PHEV it's the
+            // last-resort before falling back to calibration. We only prefer
+            // a source when it has a real value AND hasn't been disabled by
+            // its specific guard.
             boolean phev = false;
             try {
                 com.overdrive.app.byd.BydDataCollector col =
@@ -1376,8 +1654,12 @@ public class SohEstimator {
 
             double displaySoh;
             String displaySource;
+            boolean preferFrameAnchor = phev && frameSoh > 0;
             boolean preferCapacityAh = phev && capacityAhSoh > 0 && !capacityAhDisabled;
-            if (preferCapacityAh) {
+            if (preferFrameAnchor) {
+                displaySoh = frameSoh;
+                displaySource = "frame_anchor";
+            } else if (preferCapacityAh) {
                 displaySoh = capacityAhSoh;
                 displaySource = "capacity_ah";
             } else if (currentSoh > 0) {
@@ -1478,7 +1760,9 @@ public class SohEstimator {
             if (currentSoh <= 0 && nominalCapacityKwh <= 0
                     && calibrationSoh <= 0 && calibrationTimestampMs <= 0
                     && capacityAhSoh <= 0 && capacityAhTimestampMs <= 0
-                    && !capacityAhDisabled) {
+                    && !capacityAhDisabled
+                    && peakRemainKwhAtFull <= 0 && peakRemainKwhSamples == 0
+                    && !peakMismatchNotified) {
                 return;
             }
             try {
@@ -1516,6 +1800,14 @@ public class SohEstimator {
                         first = false;
                     }
                     props.setProperty(PROP_LIVE_HISTORY, sb.toString());
+                }
+                if (peakRemainKwhAtFull > 0) {
+                    props.setProperty(PROP_PEAK_REMAIN_KWH, String.valueOf(peakRemainKwhAtFull));
+                    props.setProperty(PROP_PEAK_REMAIN_KWH_SAMPLES, String.valueOf(peakRemainKwhSamples));
+                    props.setProperty(PROP_PEAK_REMAIN_KWH_TS, String.valueOf(peakRemainKwhTimestampMs));
+                }
+                if (peakMismatchNotified) {
+                    props.setProperty(PROP_PEAK_REMAIN_KWH_NOTIFIED, "true");
                 }
 
                 try (FileOutputStream fos = new FileOutputStream(SOH_FILE)) {

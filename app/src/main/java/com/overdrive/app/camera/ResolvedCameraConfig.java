@@ -187,6 +187,27 @@ public final class ResolvedCameraConfig {
         };
     }
 
+    /**
+     * Returns 8 floats: {frontX, frontY, rightX, rightY, rearX, rearY,
+     * leftX, leftY} — the top-left of each role's 0.5×0.5 corner in a
+     * 2x2-native HAL frame. Used by GpuStreamScaler / FoveatedCropper /
+     * HighResPreviewSampler when the camera is in DiLink 4 mode (HAL
+     * emits a stitched 2x2 mosaic, no horizontal-strip rearrangement).
+     */
+    public float[] getQuadrantCornerOffsetsXY() {
+        EnumMap<CameraRole, PanoramicSlice> slices = buildResolvedPanoramicSlices();
+        PanoramicSlice f = slices.get(CameraRole.PANO_FRONT);
+        PanoramicSlice r = slices.get(CameraRole.PANO_RIGHT);
+        PanoramicSlice b = slices.get(CameraRole.PANO_REAR);
+        PanoramicSlice l = slices.get(CameraRole.PANO_LEFT);
+        return new float[] {
+            f.getCornerX(), f.getCornerY(),
+            r.getCornerX(), r.getCornerY(),
+            b.getCornerX(), b.getCornerY(),
+            l.getCornerX(), l.getCornerY()
+        };
+    }
+
     public JSONObject panoramicSlicesToJson() {
         EnumMap<CameraRole, PanoramicSlice> slices = buildResolvedPanoramicSlices();
         JSONObject out = new JSONObject();

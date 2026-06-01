@@ -917,6 +917,39 @@ public class HardwareEventRecorderGpu {
         new java.util.concurrent.atomic.AtomicBoolean(false);
     private int segmentNumber = 0;
     private String segmentBasePath = null;  // Base path for segment rotation (without .mp4)
+
+    // ---- Geo-tagging snapshot (for v3 sidecar geo block) -----------------
+    // Captured at triggerEventRecording start, before MediaMuxer.start().
+    // Re-read on every rotation so each segment carries its own startLocation
+    // matching the time it actually began. Sentinel values (Double.NaN) mean
+    // "no GPS fix at trigger time" — the JSON writer skips emission rather
+    // than writing 0.0, 0.0 which would point at the Atlantic Ocean off
+    // West Africa and break "show on map" UX.
+    //
+    // `volatile` is correct here on Android: ART's memory model has always
+    // guaranteed atomic 64-bit reads/writes for `volatile long` and
+    // `volatile double`, even on 32-bit ARM. (JLS §17.7 only relaxes
+    // atomicity for non-volatile longs/doubles.)
+    private volatile double startGeoLat = Double.NaN;
+    private volatile double startGeoLng = Double.NaN;
+    private volatile float  startGeoAccuracy = 0f;
+    private volatile long   startGeoAgeMs = -1L;
+    private volatile long   startGeoCapturedAtMs = 0L;
+
+    // Snapshot of the JUST-CLOSED segment's start-geo, captured inside
+    // rotateSegmentLocked() before the active fields above are overwritten
+    // for the new segment. The engine's segment listener reads these via
+    // getClosedStartGeo*() so the closed segment's sidecar carries the GPS
+    // fix from the time IT began, not the time the next segment begins.
+    // Without this split, every rotated segment's geo.start would
+    // misattribute to the rotation moment instead of the segment-start
+    // moment — visible on a 30-min trip as segment 1 having segment 2's
+    // location.
+    private volatile double closedStartGeoLat = Double.NaN;
+    private volatile double closedStartGeoLng = Double.NaN;
+    private volatile float  closedStartGeoAccuracy = 0f;
+    private volatile long   closedStartGeoAgeMs = -1L;
+    private volatile long   closedStartGeoCapturedAtMs = 0L;
     
     // Timing
     private long startTimeNs = 0;
@@ -1880,6 +1913,11 @@ public class HardwareEventRecorderGpu {
             // with a one-time burst inside a single event.
             audioWriteFailureCount.set(0);
 
+            // Snapshot current GPS into volatile fields so the segment's
+            // sidecar writer can include startLocation. Captured BEFORE the
+            // muxer ctor so MediaMuxer.setLocation() can also use it.
+            captureStartLocationSnapshot();
+
             // Create muxer. Hold muxerLock so the disk writer never observes a
             // half-constructed muxer (e.g., started but trackIndex still -1).
             boolean muxerOk = false;
@@ -1887,6 +1925,21 @@ public class HardwareEventRecorderGpu {
                 try {
                     muxer = new MediaMuxer(tempFile.getAbsolutePath(),
                             MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
+
+                    // ISO 6709 location box in the moov atom. Apple Photos,
+                    // GoPro Quik, VLC and most map-aware libraries surface
+                    // it as the recording's geotag. Wrapped: a malformed
+                    // (NaN/0) coordinate must not break the recording.
+                    try {
+                        if (!Double.isNaN(startGeoLat) && !Double.isNaN(startGeoLng)) {
+                            // MediaMuxer requires |lat| <= 90 and |lng| <= 180.
+                            float lat = (float) Math.max(-90.0, Math.min(90.0, startGeoLat));
+                            float lng = (float) Math.max(-180.0, Math.min(180.0, startGeoLng));
+                            muxer.setLocation(lat, lng);
+                        }
+                    } catch (Throwable geoErr) {
+                        logger.warn("MediaMuxer.setLocation failed: " + geoErr.getMessage());
+                    }
 
                     // If we have a saved format, use it immediately
                     if (savedFormat != null) {
@@ -2124,6 +2177,97 @@ public class HardwareEventRecorderGpu {
     public boolean startRecording(String outputPath) {
         return triggerEventRecording(outputPath, 5000);  // Default 5 sec post-record
     }
+
+    /**
+     * Snapshot the current GPS fix into the {@code startGeo*} fields. Called
+     * once per recording (and once per rotated segment via the rotation
+     * path). Wrapped in a wide catch — GPS lookup must never break recording.
+     *
+     * <p>Skipped entirely when geocoding is disabled for the relevant flow
+     * (recording vs surveillance — derived from the output filename prefix).
+     * The unified config check is cheap (cached map lookup) so we read it
+     * on every start, which means a mid-recording toggle takes effect at
+     * the next rotation boundary without any explicit invalidation.
+     */
+    private void captureStartLocationSnapshot() {
+        startGeoLat = Double.NaN;
+        startGeoLng = Double.NaN;
+        startGeoAccuracy = 0f;
+        startGeoAgeMs = -1L;
+        startGeoCapturedAtMs = 0L;
+        try {
+            String flow = inferGeocodingFlow(outputPath);
+            if (!com.overdrive.app.config.UnifiedConfigManager
+                    .isGeocodingEnabledForFlow(flow)) {
+                return;
+            }
+            com.overdrive.app.monitor.GpsMonitor gps =
+                com.overdrive.app.monitor.GpsMonitor.getInstance();
+            if (!gps.hasLocation()) return;
+            startGeoLat = gps.getLatitude();
+            startGeoLng = gps.getLongitude();
+            startGeoAccuracy = gps.getAccuracy();
+            long lastUpdate = gps.getLastUpdate();
+            long nowMs = System.currentTimeMillis();
+            startGeoAgeMs = lastUpdate > 0 ? Math.max(0L, nowMs - lastUpdate) : -1L;
+            startGeoCapturedAtMs = nowMs;
+        } catch (Throwable t) {
+            // Reset defensively so a partial snapshot never lands in a sidecar.
+            startGeoLat = Double.NaN;
+            startGeoLng = Double.NaN;
+            logger.warn("captureStartLocationSnapshot failed: " + t.getMessage());
+        }
+    }
+
+    /**
+     * Map a recording's output path to the geocoding config flow that
+     * gates it.
+     * <ul>
+     *   <li>{@code event_*.mp4} (sentry / surveillance pipeline) →
+     *       {@code "surveillance"}</li>
+     *   <li>{@code cam_*.mp4}, {@code proximity_*.mp4} or anything else
+     *       (dashcam, proximity guard, manual) → {@code "recording"}</li>
+     * </ul>
+     *
+     * <p>Filename-based dispatch is deliberate: this class is mode-agnostic
+     * and its callers (RecordingModeManager, GpuSurveillancePipeline,
+     * SurveillanceEngineGpu) all encode the flow into the path they pass
+     * us. Threading a separate enum would force every call site to be
+     * touched; the prefix is already an authoritative classifier.
+     */
+    private static String inferGeocodingFlow(String outPath) {
+        if (outPath == null) return "recording";
+        String name = outPath;
+        int slash = name.lastIndexOf('/');
+        if (slash >= 0 && slash + 1 < name.length()) name = name.substring(slash + 1);
+        return name.startsWith("event_") ? "surveillance" : "recording";
+    }
+
+    // ---- Public geo accessors (used by SurveillanceEngineGpu when it
+    //      writes the segment metadata sidecar). All return sentinel values
+    //      / -1 / 0 when no fix was captured; the writer omits the geo block
+    //      in that case rather than emitting (0,0). -----------------------
+
+    public double getStartGeoLat() { return startGeoLat; }
+    public double getStartGeoLng() { return startGeoLng; }
+    public float  getStartGeoAccuracy() { return startGeoAccuracy; }
+    public long   getStartGeoAgeMs() { return startGeoAgeMs; }
+    public long   getStartGeoCapturedAtMs() { return startGeoCapturedAtMs; }
+    public boolean hasStartGeo() {
+        return !Double.isNaN(startGeoLat) && !Double.isNaN(startGeoLng);
+    }
+
+    // Closed-segment geo (set by rotateSegmentLocked just before the active
+    // fields are refreshed). The engine's segment listener reads these to
+    // populate the OUTGOING segment's sidecar.
+    public double getClosedStartGeoLat() { return closedStartGeoLat; }
+    public double getClosedStartGeoLng() { return closedStartGeoLng; }
+    public float  getClosedStartGeoAccuracy() { return closedStartGeoAccuracy; }
+    public long   getClosedStartGeoAgeMs() { return closedStartGeoAgeMs; }
+    public long   getClosedStartGeoCapturedAtMs() { return closedStartGeoCapturedAtMs; }
+    public boolean hasClosedStartGeo() {
+        return !Double.isNaN(closedStartGeoLat) && !Double.isNaN(closedStartGeoLng);
+    }
     
     /**
      * Stops recording immediately or schedules post-record stop.
@@ -2324,6 +2468,36 @@ public class HardwareEventRecorderGpu {
                                 finalFile.getAbsolutePath(), null, (int) durationSec);
                     } catch (Exception e) {
                         logger.warn("Failed to emit video notification: " + e.getMessage());
+                    }
+
+                    // Geo sidecar for non-sentry flows (cam_*, proximity_*).
+                    // Sentry events (event_*.mp4) use the richer path
+                    // through SurveillanceEngineGpu.scheduleSegmentMetadataFlush
+                    // which produces the v3 sidecar with actors/hero +
+                    // geo. Dashcam + proximity recordings have no actor
+                    // tracking, so they get a lighter sidecar covering
+                    // only the geo block + SRT location prefix. Same
+                    // submission discipline (off-thread executor inside
+                    // LocationSidecarWriter), so this never blocks the
+                    // recorder hot path.
+                    try {
+                        String flow = inferGeocodingFlow(finalFile.getName());
+                        if (!"surveillance".equals(flow)) {
+                            com.overdrive.app.geo.GeoSnapshot startGeo;
+                            if (hasStartGeo()) {
+                                startGeo = new com.overdrive.app.geo.GeoSnapshot(
+                                        startGeoLat, startGeoLng,
+                                        startGeoAccuracy, startGeoAgeMs,
+                                        startGeoCapturedAtMs, 0L);
+                            } else {
+                                startGeo = com.overdrive.app.geo.GeoSnapshot.empty();
+                            }
+                            com.overdrive.app.geo.LocationSidecarWriter
+                                    .getInstance()
+                                    .submit(finalFile, flow, startGeo);
+                        }
+                    } catch (Throwable e) {
+                        logger.warn("Geo sidecar submit failed: " + e.getMessage());
                     }
                 } else {
                     logger.error("Failed to rename temp file — deleting orphan");
@@ -3329,9 +3503,42 @@ public class HardwareEventRecorderGpu {
         MediaMuxer newMuxer;
         int newTrackIndex = -1;
         int newAudioTrackIndex = -1;
+
+        // Stash the OUTGOING segment's start-geo before we overwrite the
+        // active fields with the new segment's GPS. The engine's segment
+        // listener (which fires AFTER this method returns, on the same
+        // finalizer thread) will read these via getClosedStartGeo*() to
+        // populate the closed segment's sidecar. Without this stash, the
+        // closed segment's geo.start would carry the new segment's GPS,
+        // misattributing location on every multi-segment recording.
+        closedStartGeoLat         = startGeoLat;
+        closedStartGeoLng         = startGeoLng;
+        closedStartGeoAccuracy    = startGeoAccuracy;
+        closedStartGeoAgeMs       = startGeoAgeMs;
+        closedStartGeoCapturedAtMs = startGeoCapturedAtMs;
+
+        // Refresh the start-location snapshot for the new segment so each
+        // rotated .mp4 carries a geo block matching the time it actually
+        // began (a 30-min trip can move several km between segment 1 and
+        // segment 15). Failures are non-fatal — the segment just won't have
+        // a geo block.
+        captureStartLocationSnapshot();
+
         try {
             newMuxer = new MediaMuxer(newTempFile.getAbsolutePath(),
                     MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
+            // ISO 6709 geotag for the new segment (separate moov from the
+            // outgoing one). Same coordinate-clamping discipline as the
+            // start path — never let a malformed coord break rotation.
+            try {
+                if (!Double.isNaN(startGeoLat) && !Double.isNaN(startGeoLng)) {
+                    float lat = (float) Math.max(-90.0, Math.min(90.0, startGeoLat));
+                    float lng = (float) Math.max(-180.0, Math.min(180.0, startGeoLng));
+                    newMuxer.setLocation(lat, lng);
+                }
+            } catch (Throwable geoErr) {
+                logger.warn("Rotation MediaMuxer.setLocation failed: " + geoErr.getMessage());
+            }
             if (savedFormat != null) {
                 newTrackIndex = newMuxer.addTrack(savedFormat);
                 // Re-evaluate audio for the new segment so a mid-recording
@@ -3522,6 +3729,35 @@ public class HardwareEventRecorderGpu {
                             com.overdrive.app.storage.StorageManager.getInstance().onFileSaved(finalFile);
                         } catch (Exception e) {
                             logger.warn("onFileSaved error: " + e.getMessage());
+                        }
+
+                        // Geo sidecar for non-sentry rotated segments
+                        // (cam_*, proximity_*). Sentry segments go via
+                        // SurveillanceEngineGpu's listener which writes
+                        // the richer v3 sidecar. The CLOSED-segment geo
+                        // is in closedStartGeo* (stashed at the top of
+                        // rotateSegmentLocked before we refreshed the
+                        // active fields for the new segment). Off-thread
+                        // executor inside LocationSidecarWriter.
+                        try {
+                            String flow = inferGeocodingFlow(finalFile.getName());
+                            if (!"surveillance".equals(flow)) {
+                                com.overdrive.app.geo.GeoSnapshot startGeo;
+                                if (hasClosedStartGeo()) {
+                                    startGeo = new com.overdrive.app.geo.GeoSnapshot(
+                                            closedStartGeoLat, closedStartGeoLng,
+                                            closedStartGeoAccuracy, closedStartGeoAgeMs,
+                                            closedStartGeoCapturedAtMs, 0L);
+                                } else {
+                                    startGeo = com.overdrive.app.geo.GeoSnapshot.empty();
+                                }
+                                com.overdrive.app.geo.LocationSidecarWriter
+                                        .getInstance()
+                                        .submit(finalFile, flow, startGeo);
+                            }
+                        } catch (Throwable e) {
+                            logger.warn("Rotation geo sidecar submit failed: "
+                                    + e.getMessage());
                         }
                     } else {
                         logger.error("Failed to rename segment " + oldSegmentNumber + " — deleting orphan");

@@ -11,7 +11,8 @@
     "charging_stopped": "Зарядка прекращена на {0}%",
     "charging_complete": "Аккумулятор на уровне {0}%  готов к отключению",
     "recording_started": "Запись началась.",
-    "recording_ended": "Запись завершена"
+    "recording_ended": "Запись завершена",
+    "location_prefix": "Местонахождение: {0}"
   },
   "errors": {
     "rate_limited_locked_for_seconds": "Слишком много попыток  заперты для {0}s",
@@ -35,6 +36,7 @@
     "models_invalid_json": "Недействительный JSON",
     "models_unknown_id_with_id": "Неизвестный идентификатор модели: {0}",
     "models_invalid_color": "Недействительный цвет (ожидается #RRGGBB)",
+    "models_invalid_drive_side": "Недопустимая компоновка автомобиля (ожидается «lhd» или «rhd»)",
     "models_nothing_to_update": "Ничего обновлять .",
     "models_persist_failed": "Не смогла выдержать",
     "models_id_required": "требуется идентификационный номер",
@@ -99,8 +101,7 @@
     "mqtt_not_initialized": "MQTT не инициирован",
     "max_connections_reached": "Максимальные соединения достигнуты ({0})",
     "missing_connection_id": "Отсутствие идентификатора подключения",
-    "connection_not_found": "Соединение не найдено: {0}",
-    "models_invalid_drive_side": "Недопустимая компоновка автомобиля (ожидается «lhd» или «rhd»)"
+    "connection_not_found": "Соединение не найдено: {0}"
   },
   "notifications": {
     "charging_started": "Начало зарядки",
@@ -119,7 +120,9 @@
     "area_hood": "Капуста",
     "area_trunk": "Трубопровод",
     "area_fuel_cap": "Топливная крышка",
-    "area_door_n": "Дверь {0}"
+    "area_door_n": "Дверь {0}",
+    "soh_frame_mismatch_title": "Пересмотр потребностей в емкости батареи",
+    "soh_frame_mismatch_body": "Автомобиль сообщает {0} kWh на полную зарядку, но емкость упаковки установлена на {1} kWh."
   },
   "telegram": {
     "recording_caption": " Запись ({0}) - {1}",

@@ -450,6 +450,23 @@ public class SocHistoryDatabase {
                             boolean atRest = isVehicleAtRest();
                             sohEst.updateFromEnergy(rawRemainKwh, soc, highCellV, atRest);
                         }
+
+                        // PHEV-only: feed the peak-charge frame anchor. The
+                        // estimator gates on isPhev internally and on
+                        // SOC≥99%, so we can call unconditionally. We feed
+                        // the raw BMS reading even when it failed the
+                        // 50-150% nominal-ratio gate above — the whole
+                        // point of the frame anchor is to catch the case
+                        // where the user-entered nominal is in a different
+                        // unit frame than remainKwh, which inherently
+                        // produces a low ratio. observePeakAtFullCharge has
+                        // its own SOC-as-kWh-bug guard.
+                        try {
+                            com.overdrive.app.byd.BydDataCollector pcol =
+                                com.overdrive.app.byd.BydDataCollector.getInstance();
+                            boolean isPhev = pcol != null && pcol.isInitialized() && pcol.isPhevPublic();
+                            sohEst.observePeakAtFullCharge(rawRemainKwh, soc, isPhev);
+                        } catch (Throwable ignored) { /* best-effort */ }
                     }
 
                     // PHEV-only secondary anchor from the BMS Ah counter.

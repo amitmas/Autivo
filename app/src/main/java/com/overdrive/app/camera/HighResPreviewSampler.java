@@ -48,50 +48,98 @@ public final class HighResPreviewSampler {
     private static final DaemonLogger logger =
             DaemonLogger.getInstance("HighResPreviewSampler");
 
+    // esco-parity: uTexMatrix from SurfaceTexture.getTransformMatrix()
+    // crops to the HAL's live region. Identity by default.
+    //
+    // TEX_COORDS below are pre-flipped V (legacy convention). On DiLink 4
+    // uTexMatrix already includes Android's producer Y-flip — combined,
+    // we'd double-flip and the dialog preview would be upside-down.
+    // Counter-flip via uApplyInverseFlip when on dilink4 (uApaMode > 2.5).
     private static final String VERTEX_SHADER =
             "attribute vec4 aPosition;\n" +
             "attribute vec2 aTexCoord;\n" +
+            "uniform mat4 uTexMatrix;\n" +
+            "uniform float uApplyInverseYFlip;\n" +
             "varying vec2 vTexCoord;\n" +
             "void main() {\n" +
             "    gl_Position = aPosition;\n" +
-            "    vTexCoord = aTexCoord;\n" +
+            "    vec2 src = aTexCoord;\n" +
+            "    if (uApplyInverseYFlip > 0.5) src.y = 1.0 - src.y;\n" +
+            "    vTexCoord = (uTexMatrix * vec4(src, 0.0, 1.0)).xy;\n" +
             "}\n";
 
     private static String buildMosaicShader(float[] offsets) {
+        // uApaMode > 2.5 = esco-parity passthrough (HAL emits final 2x2
+        // mosaic natively). Default 0 = legacy 4-strip → 2x2 rearrangement.
         return String.format(Locale.US,
                 "#extension GL_OES_EGL_image_external : require\n" +
                 "precision mediump float;\n" +
                 "uniform samplerExternalOES uCameraTex;\n" +
+                "uniform float uApaMode;\n" +
+                "uniform float uRedMaskStrength;\n" +
+                "uniform float uApaCenterInset;\n" +
                 "varying vec2 vTexCoord;\n" +
                 "void main() {\n" +
-                "    vec2 gridPos = step(0.5, vTexCoord);\n" +
-                "    float frontOffset = %.5ff;\n" +
-                "    float rightOffset = %.5ff;\n" +
-                "    float rearOffset  = %.5ff;\n" +
-                "    float leftOffset  = %.5ff;\n" +
-                "    float stripOffsetX;\n" +
-                "    if (gridPos.x < 0.5) {\n" +
-                "        stripOffsetX = gridPos.y < 0.5 ? frontOffset : rearOffset;\n" +
+                "    vec2 samplePos;\n" +
+                "    if (uApaMode > 2.5) {\n" +
+                "        samplePos = vTexCoord;\n" +
+                com.overdrive.app.camera.GlUtil.APA_CENTER_INSET_GLSL +
                 "    } else {\n" +
-                "        stripOffsetX = gridPos.y < 0.5 ? rightOffset : leftOffset;\n" +
+                "        vec2 gridPos = step(0.5, vTexCoord);\n" +
+                "        float frontOffset = %.5ff;\n" +
+                "        float rightOffset = %.5ff;\n" +
+                "        float rearOffset  = %.5ff;\n" +
+                "        float leftOffset  = %.5ff;\n" +
+                "        float stripOffsetX;\n" +
+                "        if (gridPos.x < 0.5) {\n" +
+                "            stripOffsetX = gridPos.y < 0.5 ? frontOffset : rearOffset;\n" +
+                "        } else {\n" +
+                "            stripOffsetX = gridPos.y < 0.5 ? rightOffset : leftOffset;\n" +
+                "        }\n" +
+                "        float localX = mod(vTexCoord.x, 0.5) * 0.5;\n" +
+                "        float localY = mod(vTexCoord.y, 0.5) * 2.0;\n" +
+                "        samplePos = vec2(localX + stripOffsetX, localY);\n" +
                 "    }\n" +
-                "    float localX = mod(vTexCoord.x, 0.5) * 0.5;\n" +
-                "    float localY = mod(vTexCoord.y, 0.5) * 2.0;\n" +
-                "    vec2 samplePos = vec2(localX + stripOffsetX, localY);\n" +
-                "    gl_FragColor = texture2D(uCameraTex, samplePos);\n" +
+                "    vec4 src = texture2D(uCameraTex, samplePos);\n" +
+                com.overdrive.app.camera.GlUtil.RED_MASK_GLSL +
+                "    gl_FragColor = src;\n" +
                 "}\n",
                 offsets[0], offsets[1], offsets[2], offsets[3]);
     }
 
+    // Layout-aware single-quadrant sampler.
+    //   uApaMode <= 2.5 → legacy 4-strip: 0.25-wide vertical strip at uStripOffsetX.
+    //   uApaMode >  2.5 → DiLink 4 2x2: 0.5×0.5 corner at uCorner.
+    // uTexMatrix in the vertex shader is applied to the sampled UV
+    // regardless, so the HAL's transform matrix still crops out chrome.
     private static final String QUADRANT_SHADER =
             "#extension GL_OES_EGL_image_external : require\n" +
             "precision mediump float;\n" +
             "uniform samplerExternalOES uCameraTex;\n" +
             "uniform float uStripOffsetX;\n" +
+            "uniform vec2 uCorner;\n" +
+            "uniform vec2 uFlip;\n" +
+            "uniform float uApaMode;\n" +
+            "uniform float uRedMaskStrength;\n" +
+            "uniform float uApaCenterInset;\n" +
             "varying vec2 vTexCoord;\n" +
             "void main() {\n" +
-            "    vec2 samplePos = vec2(uStripOffsetX + vTexCoord.x * 0.25, vTexCoord.y);\n" +
-            "    gl_FragColor = texture2D(uCameraTex, samplePos);\n" +
+            "    vec2 samplePos;\n" +
+            "    if (uApaMode > 2.5) {\n" +
+            "        // DiLink 4 2x2: sample inside the role's 0.5×0.5\n" +
+            "        // producer corner. uFlip mirrors the local axes when\n" +
+            "        // the HAL emits that role's tile flipped.\n" +
+            "        vec2 sampledLocal = vec2(vTexCoord.x * 0.5, vTexCoord.y * 0.5);\n" +
+            "        if (uFlip.x > 0.5) sampledLocal.x = 0.5 - sampledLocal.x;\n" +
+            "        if (uFlip.y > 0.5) sampledLocal.y = 0.5 - sampledLocal.y;\n" +
+            "        samplePos = uCorner + sampledLocal;\n" +
+            com.overdrive.app.camera.GlUtil.APA_CENTER_INSET_GLSL +
+            "    } else {\n" +
+            "        samplePos = vec2(uStripOffsetX + vTexCoord.x * 0.25, vTexCoord.y);\n" +
+            "    }\n" +
+            "    vec4 src = texture2D(uCameraTex, samplePos);\n" +
+            com.overdrive.app.camera.GlUtil.RED_MASK_GLSL +
+            "    gl_FragColor = src;\n" +
             "}\n";
 
     private static final float[] VERTEX_COORDS = {
@@ -119,10 +167,36 @@ public final class HighResPreviewSampler {
 
     private int mosaicProgram = 0;
     private int mosaicAPos = -1, mosaicATex = -1, mosaicUTex = -1;
+    private int mosaicUTexMatrix = -1, mosaicUApaMode = -1;
+    private int mosaicURedMaskStrength = -1;
+    private int mosaicUApaCenterInset = -1;
+    private int mosaicUApplyInverseYFlip = -1;
     private float[] cachedOffsets = null;
 
     private int quadProgram = 0;
     private int quadAPos = -1, quadATex = -1, quadUTex = -1, quadUOffset = -1;
+    private int quadUTexMatrix = -1;
+    private int quadUCorner = -1;
+    private int quadUFlip = -1;
+    private int quadURedMaskStrength = -1;
+    private int quadUApaCenterInset = -1;
+    private volatile float apaCenterInset = 0.0f;
+    private volatile boolean redMaskEnabled = false;
+    private int quadUApaMode = -1;
+    private int quadUApplyInverseYFlip = -1;
+
+    // SurfaceTexture transform matrix + layout selector. Cross-thread
+    // (HTTP worker writes via setTextureMatrix → sampler thread reads
+    // inside renderAndEncode), so the writer holds the lock and the
+    // reader snapshots into a local before uploading.
+    private final float[] currentTexMatrix = {
+        1f, 0f, 0f, 0f,
+        0f, 1f, 0f, 0f,
+        0f, 0f, 1f, 0f,
+        0f, 0f, 0f, 1f,
+    };
+    private final Object texMatrixLock = new Object();
+    private volatile int cameraLayout = 0;  // 0=4-strip rearrange, 3=passthrough
 
     private int fbo = -1;
     private int fboTexture = -1;
@@ -267,6 +341,11 @@ public final class HighResPreviewSampler {
         mosaicAPos = GLES20.glGetAttribLocation(mosaicProgram, "aPosition");
         mosaicATex = GLES20.glGetAttribLocation(mosaicProgram, "aTexCoord");
         mosaicUTex = GLES20.glGetUniformLocation(mosaicProgram, "uCameraTex");
+        mosaicUTexMatrix = GLES20.glGetUniformLocation(mosaicProgram, "uTexMatrix");
+        mosaicUApaMode = GLES20.glGetUniformLocation(mosaicProgram, "uApaMode");
+        mosaicUApplyInverseYFlip = GLES20.glGetUniformLocation(mosaicProgram, "uApplyInverseYFlip");
+        mosaicURedMaskStrength = GLES20.glGetUniformLocation(mosaicProgram, "uRedMaskStrength");
+        mosaicUApaCenterInset = GLES20.glGetUniformLocation(mosaicProgram, "uApaCenterInset");
         cachedOffsets = offsets.clone();
         return true;
     }
@@ -279,6 +358,13 @@ public final class HighResPreviewSampler {
         quadATex = GLES20.glGetAttribLocation(quadProgram, "aTexCoord");
         quadUTex = GLES20.glGetUniformLocation(quadProgram, "uCameraTex");
         quadUOffset = GLES20.glGetUniformLocation(quadProgram, "uStripOffsetX");
+        quadUTexMatrix = GLES20.glGetUniformLocation(quadProgram, "uTexMatrix");
+        quadUCorner = GLES20.glGetUniformLocation(quadProgram, "uCorner");
+        quadUFlip = GLES20.glGetUniformLocation(quadProgram, "uFlip");
+        quadUApaMode = GLES20.glGetUniformLocation(quadProgram, "uApaMode");
+        quadUApplyInverseYFlip = GLES20.glGetUniformLocation(quadProgram, "uApplyInverseYFlip");
+        quadURedMaskStrength = GLES20.glGetUniformLocation(quadProgram, "uRedMaskStrength");
+        quadUApaCenterInset = GLES20.glGetUniformLocation(quadProgram, "uApaCenterInset");
         return true;
     }
 
@@ -295,20 +381,81 @@ public final class HighResPreviewSampler {
             ensureFbo(outW, outH);
             if (fbo < 0 || !ensureMosaicProgram(offsets)) return null;
             return renderAndEncode(textureId, mosaicProgram, mosaicAPos, mosaicATex, mosaicUTex,
-                    -1, 0f, outW, outH);
+                    -1, 0f, mosaicUTexMatrix, mosaicUApaMode, outW, outH);
         });
     }
 
     public byte[] samplePerQuadrantJpeg(int textureId, int stripWidth, int stripHeight,
                                         float stripOffsetX) {
+        // Legacy entry-point: 4-strip layout (cameraLayout=0 path).
+        return samplePerQuadrantJpeg(textureId, stripWidth, stripHeight,
+                                     stripOffsetX, Float.NaN, Float.NaN);
+    }
+
+    /**
+     * Layout-aware per-quadrant sampler. Pass Float.NaN for cornerX/cornerY
+     * to force legacy 4-strip mode (uApaMode=0); pass real values to enable
+     * 2x2 corner sampling (uApaMode=3, DiLink 4 path).
+     *
+     * Output dims are layout-derived: 4-strip → stripWidth/4 × stripHeight,
+     * 2x2 → producerW/2 × producerH/2 where producerW/H = stripWidth/2 ×
+     * stripHeight*2. Both produce ~per-camera resolution (Seal: 1280×960).
+     */
+    public byte[] samplePerQuadrantJpeg(int textureId, int stripWidth, int stripHeight,
+                                        float stripOffsetX,
+                                        float cornerX, float cornerY) {
+        return samplePerQuadrantJpeg(textureId, stripWidth, stripHeight,
+                stripOffsetX, cornerX, cornerY, 0f, 0f);
+    }
+
+    /**
+     * Layout-aware sampler with explicit per-role flip flags. xFlip / yFlip
+     * mirror the local 0.5×0.5 sample window when DiLink 4's HAL emits a
+     * flipped tile for that role.
+     */
+    public byte[] samplePerQuadrantJpeg(int textureId, int stripWidth, int stripHeight,
+                                        float stripOffsetX,
+                                        float cornerX, float cornerY,
+                                        float xFlip, float yFlip) {
         if (textureId == 0) return null;
-        int outW = Math.max(1, stripWidth / 4);
-        int outH = Math.max(1, stripHeight);
+        boolean useCorner = !Float.isNaN(cornerX) && !Float.isNaN(cornerY);
+        int outW;
+        int outH;
+        if (useCorner) {
+            // 2x2-native HAL: producer surface is stripWidth/2 × stripHeight*2,
+            // each quadrant is half on each axis → producerW/2 × producerH/2
+            // = stripWidth/4 × stripHeight, identical per-camera resolution
+            // to the legacy path.
+            outW = Math.max(1, stripWidth / 4);
+            outH = Math.max(1, stripHeight);
+        } else {
+            outW = Math.max(1, stripWidth / 4);
+            outH = Math.max(1, stripHeight);
+        }
+        final int finalW = outW;
+        final int finalH = outH;
+        final int apaMode = useCorner ? 3 : 0;
+        final float cx = useCorner ? cornerX : 0f;
+        final float cy = useCorner ? cornerY : 0f;
+        final float fx = useCorner ? xFlip : 0f;
+        final float fy = useCorner ? yFlip : 0f;
         return runOnSamplerThread(() -> {
-            ensureFbo(outW, outH);
+            ensureFbo(finalW, finalH);
             if (fbo < 0 || !ensureQuadrantProgram()) return null;
+            // Upload corner + flip uniforms if the program has them (silent
+            // no-op otherwise). uApaMode picks which branch the shader takes.
+            if (quadUCorner >= 0) {
+                GLES20.glUseProgram(quadProgram);
+                GLES20.glUniform2f(quadUCorner, cx, cy);
+            }
+            if (quadUFlip >= 0) {
+                GLES20.glUseProgram(quadProgram);
+                GLES20.glUniform2f(quadUFlip, fx, fy);
+            }
+            // renderAndEncode handles uApaMode upload via the location arg.
             return renderAndEncode(textureId, quadProgram, quadAPos, quadATex, quadUTex,
-                    quadUOffset, stripOffsetX, outW, outH);
+                    quadUOffset, stripOffsetX, quadUTexMatrix,
+                    quadUApaMode, finalW, finalH, apaMode);
         });
     }
 
@@ -353,7 +500,22 @@ public final class HighResPreviewSampler {
     private byte[] renderAndEncode(int textureId, int program,
                                    int aPosLoc, int aTexLoc, int uTexLoc,
                                    int uOffsetLoc, float offsetValue,
+                                   int uTexMatrixLoc, int uApaModeLoc,
                                    int width, int height) {
+        // Default apaMode = persisted cameraLayout (used by mosaic sampler).
+        return renderAndEncode(textureId, program, aPosLoc, aTexLoc, uTexLoc,
+            uOffsetLoc, offsetValue, uTexMatrixLoc, uApaModeLoc,
+            width, height, cameraLayout);
+    }
+
+    /** Variant that accepts an explicit apaMode override (per-call, e.g.
+     *  per-quadrant sampler decides 0 vs 3 based on whether corner offsets
+     *  were supplied, regardless of the persisted layout). */
+    private byte[] renderAndEncode(int textureId, int program,
+                                   int aPosLoc, int aTexLoc, int uTexLoc,
+                                   int uOffsetLoc, float offsetValue,
+                                   int uTexMatrixLoc, int uApaModeLoc,
+                                   int width, int height, int apaModeOverride) {
         try {
             GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fbo);
             GLES20.glViewport(0, 0, width, height);
@@ -366,6 +528,44 @@ public final class HighResPreviewSampler {
             GLES20.glUniform1i(uTexLoc, 0);
             if (uOffsetLoc >= 0) {
                 GLES20.glUniform1f(uOffsetLoc, offsetValue);
+            }
+            if (uTexMatrixLoc >= 0) {
+                float[] m = new float[16];
+                synchronized (texMatrixLock) {
+                    System.arraycopy(currentTexMatrix, 0, m, 0, 16);
+                }
+                GLES20.glUniformMatrix4fv(uTexMatrixLoc, 1, false, m, 0);
+            }
+            if (uApaModeLoc >= 0) {
+                GLES20.glUniform1f(uApaModeLoc, (float) apaModeOverride);
+            }
+            // On dilink4 the SurfaceTexture matrix already Y-flips; combined
+            // with the legacy pre-flipped TEX_COORDS we'd double-flip.
+            // Counter-flip in the vertex shader so the dialog preview comes
+            // out the right way up.
+            int inverseFlipLoc = (program == mosaicProgram)
+                ? mosaicUApplyInverseYFlip
+                : (program == quadProgram ? quadUApplyInverseYFlip : -1);
+            if (inverseFlipLoc >= 0) {
+                GLES20.glUniform1f(inverseFlipLoc,
+                    apaModeOverride > 2.5f ? 1.0f : 0.0f);
+            }
+            int redMaskLoc = (program == mosaicProgram)
+                ? mosaicURedMaskStrength
+                : (program == quadProgram ? quadURedMaskStrength : -1);
+            if (redMaskLoc >= 0) {
+                GLES20.glUniform1f(redMaskLoc, redMaskEnabled ? 1.0f : 0.0f);
+            }
+            // APA center inset is applied to BOTH the quadrant per-role
+            // sampler AND the mosaic passthrough — the mosaic JPEG would
+            // otherwise show the producer center seam where the BYD AVC
+            // chrome lives. Mirrors the snapshot endpoint output to the
+            // recorder/stream/downscaler chain on dilink4.
+            int insetLoc = (program == mosaicProgram)
+                ? mosaicUApaCenterInset
+                : (program == quadProgram ? quadUApaCenterInset : -1);
+            if (insetLoc >= 0) {
+                GLES20.glUniform1f(insetLoc, apaCenterInset);
             }
 
             GLES20.glEnableVertexAttribArray(aPosLoc);
@@ -447,6 +647,33 @@ public final class HighResPreviewSampler {
      * destruction and possibly hit EGL_BAD_DISPLAY in the sampler's
      * eglDestroyContext.
      */
+    /**
+     * Publishes the SurfaceTexture transform matrix subsequent samples
+     * will apply. Caller is the camera GL thread (publishes per frame);
+     * actual sample renders happen on the sampler thread, so we lock
+     * around the float[16] copy to avoid tearing.
+     */
+    public void setTextureMatrix(float[] matrix4x4) {
+        if (matrix4x4 == null || matrix4x4.length < 16) return;
+        synchronized (texMatrixLock) {
+            System.arraycopy(matrix4x4, 0, currentTexMatrix, 0, 16);
+        }
+    }
+
+    /** 0 = legacy 4-strip → 2x2 rearrangement; 3 = esco-parity passthrough. */
+    public void setCameraLayout(int layout) { this.cameraLayout = layout; }
+
+    /** Enables the GL red-overlay suppression on dialog preview JPEGs. */
+    /** APA center inset (esco APACropFilter parity). See {@link
+     *  com.overdrive.app.surveillance.GpuMosaicRecorder#setApaCenterInset}. */
+    public void setApaCenterInset(float inset) {
+        this.apaCenterInset = Math.max(0.0f, Math.min(0.20f, inset));
+    }
+
+    public void setRedMaskEnabled(boolean enabled) {
+        this.redMaskEnabled = enabled;
+    }
+
     public void release() {
         if (thread == null || !thread.isAlive()) return;
         final Object lock = new Object();

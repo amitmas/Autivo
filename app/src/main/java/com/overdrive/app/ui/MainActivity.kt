@@ -1157,7 +1157,14 @@ class MainActivity : AppCompatActivity() {
         // Currently-saved manual camera ID, or null when auto / unset.
         // Drives the manual-camera-ID radio group's initial selection.
         val manualCameraId: Int?,
-        val isManualOverride: Boolean
+        val isManualOverride: Boolean,
+        // Persisted ingestion mode. "default" = legacy ImageReader + 4-strip
+        // → 2x2 rearrangement. "dilink4" = esco SurfaceTexture passthrough.
+        // Absent in older config → "default".
+        val cameraMode: String,
+        // GL fragment-shader red-pixel suppression for the HAL "calibration
+        // failed" overlay. Cosmetic mitigation only.
+        val dilink4RedMask: Boolean
     )
 
     /**
@@ -1256,13 +1263,19 @@ class MainActivity : AppCompatActivity() {
             val manualOverride = config.optBoolean("cameraManualOverride", false)
             val manualCameraId = if (manualOverride && rawManualId in 0..5) rawManualId else null
 
+            val cameraMode = config.optString("cameraMode", "default")
+                .lowercase(java.util.Locale.US)
+                .let { if (it == "dilink4") "dilink4" else "default" }
+
             CameraMappingState(
                 summary = summary,
                 roles = roles,
                 candidates = candidates,
                 currentMappings = mappings,
                 manualCameraId = manualCameraId,
-                isManualOverride = manualOverride
+                isManualOverride = manualOverride,
+                cameraMode = cameraMode,
+                dilink4RedMask = config.optBoolean("dilink4RedMask", false)
             )
         } catch (e: Exception) {
             logsViewModel.error("Camera", "Failed to load camera mapping state: ${e.message}")
@@ -1287,7 +1300,11 @@ class MainActivity : AppCompatActivity() {
         val manualCameraGroup = dialogView.findViewById<android.widget.RadioGroup>(R.id.rgManualCameraId)
         val currentManualCameraView = dialogView.findViewById<TextView>(R.id.tvCurrentManualCamera)
         val saveManualCameraButton = dialogView.findViewById<View>(R.id.btnSaveManualCameraId)
-
+        val cameraModeGroup = dialogView.findViewById<android.widget.RadioGroup>(R.id.rgCameraMode)
+        val currentCameraModeView = dialogView.findViewById<TextView>(R.id.tvCurrentCameraMode)
+        val saveCameraModeButton = dialogView.findViewById<View>(R.id.btnSaveCameraMode)
+        val saveDilink4TweaksButton = dialogView.findViewById<View>(R.id.btnSaveCameraDilink4Tweaks)
+        val dilink4RedMaskSwitch = dialogView.findViewById<com.google.android.material.materialswitch.MaterialSwitch>(R.id.swCameraDilink4RedMask)
         summaryView.text = state.summary
 
         val roleAdapter = android.widget.ArrayAdapter(
@@ -1649,6 +1666,97 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        // Camera ingestion mode (Default vs DiLink 4). Pre-select from
+        // saved config; if no value present the data class default is
+        // "default" so the radio group defaults match the daemon's
+        // resolveCameraModeFromConfig fallback.
+        val initialModeRadioId = if (state.cameraMode == "dilink4") {
+            R.id.rbCameraModeDilink4
+        } else {
+            R.id.rbCameraModeDefault
+        }
+        cameraModeGroup.check(initialModeRadioId)
+        currentCameraModeView.text = if (state.cameraMode == "dilink4") {
+            getString(R.string.camera_mode_current_dilink4)
+        } else {
+            getString(R.string.camera_mode_current_default)
+        }
+
+        saveCameraModeButton.setOnClickListener {
+            val selectedMode = when (cameraModeGroup.checkedRadioButtonId) {
+                R.id.rbCameraModeDilink4 -> "dilink4"
+                else -> "default"
+            }
+            // No-op when the user re-applies the already-saved mode — saves a
+            // daemon restart and a "settings unchanged" toast.
+            if (selectedMode == state.cameraMode) {
+                Toast.makeText(
+                    this,
+                    getString(R.string.camera_mode_save),
+                    Toast.LENGTH_SHORT
+                ).show()
+                return@setOnClickListener
+            }
+            val payload = org.json.JSONObject().apply {
+                put("cameraMode", selectedMode)
+            }.toString()
+            saveCameraModeButton.isEnabled = false
+            postSurveillanceConfig(payload) { success, message ->
+                if (success) {
+                    currentCameraModeView.text = if (selectedMode == "dilink4") {
+                        getString(R.string.camera_mode_current_dilink4)
+                    } else {
+                        getString(R.string.camera_mode_current_default)
+                    }
+                    Toast.makeText(
+                        this,
+                        getString(R.string.camera_mapping_saved),
+                        Toast.LENGTH_SHORT
+                    ).show()
+                    // Mode changes are read at PanoramicCameraGpu construction
+                    // — only a daemon restart picks up the new path. Reuse the
+                    // existing prepare-restart flow used by role-mapping saves.
+                    restartCameraDaemonForCameraSettings()
+                    dialog.dismiss()
+                } else {
+                    saveCameraModeButton.isEnabled = true
+                    Toast.makeText(
+                        this,
+                        message ?: getString(R.string.toast_failed_to_save_short),
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+            }
+        }
+
+        // DiLink 4 quadrant tweaks. The 2x2 layout is hardcoded; only the
+        // red-overlay mitigation switches are user-controllable.
+        dilink4RedMaskSwitch.isChecked = state.dilink4RedMask
+        saveDilink4TweaksButton.setOnClickListener {
+            val payload = org.json.JSONObject().apply {
+                put("dilink4RedMask", dilink4RedMaskSwitch.isChecked)
+            }.toString()
+            saveDilink4TweaksButton.isEnabled = false
+            postSurveillanceConfig(payload) { success, message ->
+                if (success) {
+                    Toast.makeText(
+                        this,
+                        getString(R.string.camera_mapping_saved),
+                        Toast.LENGTH_SHORT
+                    ).show()
+                    restartCameraDaemonForCameraSettings()
+                    dialog.dismiss()
+                } else {
+                    saveDilink4TweaksButton.isEnabled = true
+                    Toast.makeText(
+                        this,
+                        message ?: getString(R.string.toast_failed_to_save_short),
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+            }
+        }
+
         updateCurrentMappingText()
         selectCandidate(mappedCandidateIndexForRole(
             state.roles.getOrNull(currentRoleIndex)?.key ?: ""))
@@ -1930,6 +2038,11 @@ class MainActivity : AppCompatActivity() {
             var estimatedKwhValue = 0.0
             var calibrationSoh = 0.0
             var calibrationTs = 0L
+            // Frame anchor state (PHEV-only, hidden on BEV).
+            var framePeakKwh = -1.0
+            var frameSamples = 0
+            var frameRequiredSamples = 3
+            var frameMismatch = false
 
             try {
                 val sohFile = java.io.File("/data/local/tmp/abrp_soh_estimate.properties")
@@ -1986,6 +2099,13 @@ class MainActivity : AppCompatActivity() {
                         calibrationSoh = calObj.optDouble("soh", -1.0)
                         calibrationTs = calObj.optLong("timestampMs", 0L)
                     }
+                    val frameObj = json.optJSONObject("frameAnchor")
+                    if (frameObj != null) {
+                        framePeakKwh = frameObj.optDouble("peakKwh", -1.0)
+                        frameSamples = frameObj.optInt("samples", 0)
+                        frameRequiredSamples = frameObj.optInt("requiredSamples", 3)
+                        frameMismatch = frameObj.optBoolean("mismatch", false)
+                    }
                 }
                 conn.disconnect()
             } catch (_: Throwable) { /* keep legacy file fallback values */ }
@@ -2003,6 +2123,10 @@ class MainActivity : AppCompatActivity() {
             val finalEstimatedKwh = estimatedKwhValue
             val finalCalSoh = calibrationSoh
             val finalCalTs = calibrationTs
+            val finalFramePeakKwh = framePeakKwh
+            val finalFrameSamples = frameSamples
+            val finalFrameRequiredSamples = frameRequiredSamples
+            val finalFrameMismatch = frameMismatch
 
             runOnUiThread {
                 val dialogView = layoutInflater.inflate(R.layout.dialog_battery_health, null)
@@ -2060,6 +2184,33 @@ class MainActivity : AppCompatActivity() {
                     rowCal.visibility = View.GONE
                 }
 
+                // Frame anchor row: shown on PHEV once any peak observation
+                // exists. Pending vs stable wording driven by samples<required.
+                val rowFrame = dialogView.findViewById<View>(R.id.rowSohFrameAnchor)
+                if (finalFramePeakKwh > 0) {
+                    val pending = finalFrameSamples < finalFrameRequiredSamples
+                    dialogView.findViewById<TextView>(R.id.tvSohFrameAnchor).text =
+                        if (pending) getString(R.string.soh_dialog_frame_anchor_pending_format,
+                            finalFramePeakKwh, finalFrameSamples, finalFrameRequiredSamples)
+                        else getString(R.string.soh_dialog_frame_anchor_format,
+                            finalFramePeakKwh, finalFrameSamples, finalFrameRequiredSamples)
+                    rowFrame.visibility = View.VISIBLE
+                } else {
+                    rowFrame.visibility = View.GONE
+                }
+
+                // Frame mismatch warning card — only when the anchor has
+                // stabilized AND the ratio is < 0.85. Daemon sets the boolean.
+                val cardMismatch = dialogView.findViewById<View>(R.id.cardSohFrameMismatch)
+                if (finalFrameMismatch && finalFramePeakKwh > 0 && finalNominalKwh > 0) {
+                    dialogView.findViewById<TextView>(R.id.tvSohFrameMismatch).text =
+                        getString(R.string.soh_dialog_frame_mismatch_format,
+                            finalFramePeakKwh, finalNominalKwh)
+                    cardMismatch.visibility = View.VISIBLE
+                } else {
+                    cardMismatch.visibility = View.GONE
+                }
+
                 // Status text
                 val statusView = dialogView.findViewById<TextView>(R.id.tvSohStatus)
                 if (finalHasEstimate) {
@@ -2093,7 +2244,73 @@ class MainActivity : AppCompatActivity() {
                     confirmSohReset()
                 }
 
+                // One-tap "Use observed value" — POSTs the observed peak as
+                // the new user nominal so the headline SOH updates without
+                // the user navigating back to the input UI. Disable the
+                // button while in flight to avoid double-submits, then close
+                // the dialog so the next open shows the recomputed state.
+                if (finalFrameMismatch && finalFramePeakKwh > 0) {
+                    val btn = dialogView.findViewById<com.google.android.material.button.MaterialButton>(
+                        R.id.btnSohUseObservedValue)
+                    btn.setOnClickListener {
+                        btn.isEnabled = false
+                        btn.text = getString(R.string.soh_dialog_use_observed_value_pending)
+                        applyObservedNominal(finalFramePeakKwh) { dialog.dismiss() }
+                    }
+                }
+
                 dialog.show()
+            }
+        }
+    }
+
+    /**
+     * POSTs the peak-anchor kWh value as the new user nominal so the SOH
+     * headline reflects the BMS's full-charge frame. The daemon does the
+     * floor / range validation; we just surface success/failure to a toast
+     * and dismiss the dialog so a re-open paints the corrected numbers.
+     */
+    private fun applyObservedNominal(observedKwh: Double, onComplete: () -> Unit) {
+        val executor = java.util.concurrent.Executors.newSingleThreadExecutor()
+        executor.execute {
+            var ok = false
+            var errMsg: String? = null
+            try {
+                val conn = com.overdrive.app.util.DaemonHttpClient.open(
+                    "/api/performance/soh/nominal", "POST", 3000, 5000)
+                conn.doOutput = true
+                conn.setRequestProperty("Content-Type", "application/json")
+                // Round to 1 decimal so the persisted value matches the UI's
+                // own precision; the API accepts arbitrary doubles but the
+                // user-visible suggestion is one decimal.
+                val payload = "{\"nominalKwh\":${"%.1f".format(observedKwh)}}"
+                conn.outputStream.use { it.write(payload.toByteArray()) }
+                if (conn.responseCode in 200..299) {
+                    val body = conn.inputStream.bufferedReader().use { it.readText() }
+                    val json = org.json.JSONObject(body)
+                    ok = json.optBoolean("success", true)
+                    if (!ok) errMsg = json.optString("error", "")
+                } else {
+                    errMsg = "HTTP ${conn.responseCode}"
+                }
+                conn.disconnect()
+            } catch (e: Throwable) {
+                errMsg = e.message ?: e.javaClass.simpleName
+            }
+
+            runOnUiThread {
+                if (ok) {
+                    Toast.makeText(this,
+                        getString(R.string.toast_soh_observed_value_saved, observedKwh),
+                        Toast.LENGTH_LONG).show()
+                    logsViewModel.info("SOH",
+                        "Pack capacity updated to ${"%.1f".format(observedKwh)} kWh from observed peak")
+                } else {
+                    Toast.makeText(this,
+                        getString(R.string.toast_soh_observed_value_failed, errMsg ?: ""),
+                        Toast.LENGTH_LONG).show()
+                }
+                onComplete()
             }
         }
     }

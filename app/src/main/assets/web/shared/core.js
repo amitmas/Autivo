@@ -84,6 +84,11 @@ BYD.i18n = (function () {
     var state = {
         lang: DEFAULT_LANG,
         catalog: {},          // flat key → string OR { one, other, ... }
+        // English fallback catalog — populated once on first non-en load
+        // so t() can fall back when a key is missing from the active
+        // locale. Keeps the UI legible between feature ship and NLLB
+        // translation pass landing.
+        enCatalog: null,
         loaded: false,
         loadingPromise: null,
         listeners: []
@@ -165,12 +170,27 @@ BYD.i18n = (function () {
     function t(key, vars) {
         var val = lookup(state.catalog, key);
         if (val == null) {
-            // No translation available. Two cases:
-            //   1. Catalog hasn't loaded yet — return null so hydrate keeps
-            //      the existing default text rather than writing the raw key.
-            //   2. Catalog IS loaded but the key is missing — return the key
-            //      as a dev-visible miss indicator.
-            return state.loaded ? key : null;
+            // No translation available in the active locale. Try the en
+            // catalog as a fallback — without this, a key newly added to
+            // en.json (e.g. a feature added between translation passes)
+            // would render as the raw key string in every non-English
+            // locale until the NLLB run lands. The en catalog is the only
+            // one guaranteed to have every key by convention.
+            //
+            // Distinct sentinel returns:
+            //   - null  : nothing yet (catalog still loading) → hydrate
+            //             keeps the existing default text in the DOM.
+            //   - key   : catalog loaded, key missing in BOTH active and
+            //             en catalogs → dev-visible miss indicator.
+            if (!state.loaded) return null;
+            if (state.lang !== 'en' && state.enCatalog) {
+                var enVal = lookup(state.enCatalog, key);
+                if (enVal != null) {
+                    if (typeof enVal === 'object' && enVal.other) enVal = enVal.other;
+                    return interpolate(enVal, vars);
+                }
+            }
+            return key;
         }
         if (typeof val === 'object' && val.other) val = val.other;
         return interpolate(val, vars);
@@ -304,6 +324,20 @@ BYD.i18n = (function () {
         return fetchCatalog(resolved).then(function (cat) {
             state.catalog = cat || {};
             state.loaded = true;
+            // Same en-fallback hydration as init(): fire-and-forget so the
+            // active locale renders immediately and any unresolved keys
+            // pick up an en string on the next t() call.
+            if (state.lang !== 'en' && state.enCatalog == null) {
+                fetchCatalog('en').then(function (enCat) {
+                    state.enCatalog = enCat || {};
+                    // Re-hydrate so any first-paint elements that fell
+                    // through to the raw key (because en wasn't loaded
+                    // yet) pick up the English string. notify() also
+                    // wakes any consumer subscribed via onChange().
+                    hydrate(document);
+                    notify();
+                }).catch(function () { /* best-effort */ });
+            }
             hydrate(document);
             notify();
         });
@@ -357,6 +391,21 @@ BYD.i18n = (function () {
         state.loadingPromise = fetchCatalog(state.lang).then(function (cat) {
             state.catalog = cat || {};
             state.loaded = true;
+            // Load en as a side-channel fallback when the active locale
+            // is non-en. Fire-and-forget — the visible hydrate already
+            // ran and any subsequent t() call that misses on the active
+            // catalog will check enCatalog before returning the raw key.
+            if (state.lang !== 'en' && state.enCatalog == null) {
+                fetchCatalog('en').then(function (enCat) {
+                    state.enCatalog = enCat || {};
+                    // Re-hydrate so any first-paint elements that fell
+                    // through to the raw key (because en wasn't loaded
+                    // yet) pick up the English string. notify() also
+                    // wakes any consumer subscribed via onChange().
+                    hydrate(document);
+                    notify();
+                }).catch(function () { /* best-effort */ });
+            }
             hydrate(document);
             notify();
             // External mode: pull the server-stored web locale to handle

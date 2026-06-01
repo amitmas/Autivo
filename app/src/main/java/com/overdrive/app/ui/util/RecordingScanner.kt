@@ -175,6 +175,36 @@ object RecordingScanner {
                     classes.add(c)
                 }
             }
+
+            // v3 geo block — populated by EventTimelineCollector at sidecar
+            // write time + asynchronously by SidecarGeoUpdater when the place
+            // resolver completes. All fields are optional so legacy clips,
+            // clips with no GPS fix, and clips written before geocoding was
+            // enabled all read as nulls.
+            val geo = root.optJSONObject("geo")
+            val place = geo?.optJSONObject("place")
+            val placeShort = place?.optString("district")?.takeIf { it.isNotEmpty() }
+                ?: place?.optString("city")?.takeIf { it.isNotEmpty() }
+                ?: place?.optString("displayName")?.takeIf { it.isNotEmpty() }
+            val placeMedium = run {
+                val d = place?.optString("district")?.takeIf { it.isNotEmpty() }
+                val c = place?.optString("city")?.takeIf { it.isNotEmpty() }
+                when {
+                    d != null && c != null && d != c -> "$d, $c"
+                    else -> placeShort
+                }
+            }
+            val placeDisplay = place?.optString("displayName")?.takeIf { it.isNotEmpty() }
+            val placeCC = place?.optString("countryCode")?.takeIf { it.isNotEmpty() }?.lowercase()
+            val placeSrc = place?.optString("source")?.takeIf { it.isNotEmpty() }
+            val startObj = geo?.optJSONObject("start")
+            val startLat = startObj?.let {
+                if (it.has("lat")) it.optDouble("lat") else null
+            }
+            val startLng = startObj?.let {
+                if (it.has("lng")) it.optDouble("lng") else null
+            }
+
             rec.copy(
                 peakSeverity = sev,
                 peakProximity = prox,
@@ -183,7 +213,14 @@ object RecordingScanner {
                 bikeCount = bike,
                 animalCount = animal,
                 heroThumbnailFile = heroFile,
-                actorClasses = classes
+                actorClasses = classes,
+                placeShortLabel = placeShort,
+                placeMediumLabel = placeMedium,
+                placeDisplayName = placeDisplay,
+                placeCountryCode = placeCC,
+                placeSource = placeSrc,
+                startLat = startLat,
+                startLng = startLng
             )
         } catch (e: Exception) {
             rec
@@ -212,10 +249,11 @@ object RecordingScanner {
 
         val deleted = recording.file.delete()
         if (deleted) {
-            // Also delete JSON sidecar (event timeline) if it exists
-            val jsonFile = File(recording.file.absolutePath.replace(".mp4", ".json"))
-            if (jsonFile.exists()) {
-                jsonFile.delete()
+            // Also delete JSON + SRT sidecars (event timeline + subtitles)
+            val basePath = recording.file.absolutePath.removeSuffix(".mp4")
+            for (ext in listOf(".json", ".srt")) {
+                val sidecar = File(basePath + ext)
+                if (sidecar.exists()) sidecar.delete()
             }
 
             // Delete cached thumbnail from the thumbs directory

@@ -11,7 +11,8 @@
     "charging_stopped": "Charging stopped at {0}%",
     "charging_complete": "Battery at {0}% — ready to unplug",
     "recording_started": "Recording started",
-    "recording_ended": "Recording ended"
+    "recording_ended": "Recording ended",
+    "location_prefix": "Location: {0}"
   },
   "errors": {
     "rate_limited_locked_for_seconds": "Too many attempts — locked for {0}s",
@@ -119,7 +120,9 @@
     "area_hood": "Hood",
     "area_trunk": "Trunk",
     "area_fuel_cap": "Fuel cap",
-    "area_door_n": "Door {0}"
+    "area_door_n": "Door {0}",
+    "soh_frame_mismatch_title": "Battery capacity needs review",
+    "soh_frame_mismatch_body": "Vehicle reports {0} kWh at full charge but pack capacity is set to {1} kWh. Open Battery Health to fix in one tap."
   },
   "telegram": {
     "recording_caption": "📹 Recording ({0}) - {1}s",

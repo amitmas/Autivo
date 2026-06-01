@@ -93,16 +93,272 @@ public class RecordingsApiHandler {
     private static final java.util.concurrent.ConcurrentHashMap<String, CachedRecording> RECORDING_CACHE =
             new java.util.concurrent.ConcurrentHashMap<>();
 
+    // ==================================================================
+    // Inverted index — lazy, in-memory, populated alongside RECORDING_CACHE
+    // ==================================================================
+    //
+    // For per-filter listing/places endpoints we'd otherwise iterate every
+    // RECORDING_CACHE entry on every request. The index has two halves:
+    //
+    //   filenameMeta   : filename → IndexEntry (timestamp + reverse keys
+    //                    so we can clean up the inverted maps on remove)
+    //                    USED on read by listPlaces — skips the JSON walk
+    //                    by reading placeKey/placeLabel directly.
+    //
+    //   placeIdx       : place-short-key (lower) → Set<filename>
+    //   severityIdx    : "ALERT"|"CRITICAL"|... → Set<filename>
+    //   proximityIdx   : "VERY_CLOSE"|...       → Set<filename>
+    //   classIdx       : "person"|"vehicle"|... → Set<filename>
+    //   typeIdx        : "normal"|"sentry"|"proximity" → Set<filename>
+    //                    Maintained for future use — once recording
+    //                    libraries grow past the ≤2K typical, scanAndFilter
+    //                    can intersect bucket sets to skip directory walks
+    //                    for filtered queries. Today the cost is one
+    //                    Set add/remove per put/remove (~µs); we keep the
+    //                    structures populated so the future switch is a
+    //                    diff in `scanAndFilter` rather than a rebuild.
+    //
+    // Memory bound: HARD cap of INDEX_MAX_ENTRIES filenames. Per-entry
+    // realistic worst case ≈ 800 B (IndexEntry + 5 bucket Node overheads
+    // + filenameMeta Node). At 20K cap that's ~16 MB heap ceiling —
+    // within budget on a 256 MB-max daemon process, but if the device
+    // sees larger libraries this should be re-tuned. When the cap is
+    // hit, the oldest entries (lowest timestamp) are evicted from BOTH
+    // the index AND RECORDING_CACHE together so the next /api/recordings
+    // request rebuilds them on-demand from disk.
+    //
+    // Race: every mutation acquires `INDEX_LOCK`. Reads use the maps'
+    // own concurrent-collection visibility guarantees — bucket Sets are
+    // newSetFromMap(ConcurrentHashMap) values, so concurrent
+    // Set.add/remove/contains are safe.
+
+    private static final int INDEX_MAX_ENTRIES = 20_000;
+
+    private static final Object INDEX_LOCK = new Object();
+
+    /** filename → bucket keys. Used to dismantle the inverted maps on remove. */
+    private static final java.util.concurrent.ConcurrentHashMap<String, IndexEntry> filenameMeta =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    private static final java.util.concurrent.ConcurrentHashMap<String, java.util.Set<String>> placeIdx =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private static final java.util.concurrent.ConcurrentHashMap<String, java.util.Set<String>> severityIdx =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private static final java.util.concurrent.ConcurrentHashMap<String, java.util.Set<String>> proximityIdx =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private static final java.util.concurrent.ConcurrentHashMap<String, java.util.Set<String>> classIdx =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private static final java.util.concurrent.ConcurrentHashMap<String, java.util.Set<String>> typeIdx =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    private static final class IndexEntry {
+        final String filename;
+        final long timestamp;
+        final String type;            // "normal" | "sentry" | "proximity"
+        final String placeKey;        // lowercase short label, "" when no place
+        final String placeLabel;      // canonical mixed-case form; used by
+                                      // the chip-row endpoint so the index
+                                      // is self-sufficient and listPlaces
+                                      // doesn't re-read JSON for the label.
+        final String severity;        // "" when none
+        final String proximity;       // "" when none
+        final java.util.Set<String> classes; // lowercase class group names
+
+        IndexEntry(String filename, long timestamp, String type,
+                   String placeKey, String placeLabel,
+                   String severity, String proximity,
+                   java.util.Set<String> classes) {
+            this.filename = filename;
+            this.timestamp = timestamp;
+            this.type = type == null ? "" : type;
+            this.placeKey = placeKey == null ? "" : placeKey;
+            this.placeLabel = placeLabel == null ? "" : placeLabel;
+            this.severity = severity == null ? "" : severity;
+            this.proximity = proximity == null ? "" : proximity;
+            this.classes = classes == null
+                    ? java.util.Collections.<String>emptySet()
+                    : classes;
+        }
+    }
+
+    /**
+     * Insert or update the index for a parsed recording. Mirrors the
+     * `RECORDING_CACHE.put` lifecycle: every successful parse calls this
+     * with the current parse result. Re-indexes existing entries by
+     * removing the old bucket memberships first (read from filenameMeta
+     * snapshot) — without this step a sidecar update that changes a
+     * recording's place would leave it indexed under both old and new
+     * place keys.
+     */
+    private static void indexPut(JSONObject rec) {
+        if (rec == null) return;
+        String filename = rec.optString("filename", "");
+        if (filename.isEmpty()) return;
+        synchronized (INDEX_LOCK) {
+            // Remove the OLD entry's bucket memberships before inserting
+            // the new one. Without this, a re-parse that changes any
+            // bucket key (e.g. place resolved async after first parse)
+            // would leave the file indexed under both old + new buckets.
+            IndexEntry old = filenameMeta.get(filename);
+            if (old != null) {
+                indexRemoveFromBuckets(old);
+            }
+
+            long timestamp = rec.optLong("timestamp", 0L);
+            String type = rec.optString("type", "");
+            String severity = rec.optString("peakSeverity", "");
+            String proximity = rec.optString("peakProximity", "");
+            String placeKey = "";
+            String placeLabel = "";
+            JSONObject placeObj = rec.optJSONObject("place");
+            if (placeObj != null) {
+                String shortLabel = placeObj.optString("short", "");
+                if (!shortLabel.isEmpty()) {
+                    placeKey = shortLabel.toLowerCase(Locale.US);
+                    placeLabel = shortLabel;
+                }
+            }
+            java.util.Set<String> classes = new java.util.HashSet<>(4);
+            org.json.JSONArray actors = rec.optJSONArray("actors");
+            if (actors != null) {
+                for (int i = 0; i < actors.length(); i++) {
+                    JSONObject a = actors.optJSONObject(i);
+                    if (a == null) continue;
+                    String c = a.optString("class", "");
+                    if (!c.isEmpty()) classes.add(c.toLowerCase(Locale.US));
+                }
+            }
+
+            IndexEntry entry = new IndexEntry(filename, timestamp, type,
+                    placeKey, placeLabel, severity, proximity, classes);
+            filenameMeta.put(filename, entry);
+            indexAddToBuckets(entry);
+
+            // Memory cap enforcement. Eviction is amortised: we only do a
+            // sweep when the size exceeds the cap by 5% so the cost
+            // doesn't fire on every put once we're near the boundary.
+            if (filenameMeta.size() > INDEX_MAX_ENTRIES * 21 / 20) {
+                indexEvictOldest(filenameMeta.size() - INDEX_MAX_ENTRIES);
+            }
+        }
+    }
+
+    /** Remove `filename` from both the parse cache AND the inverted index. */
+    private static void indexRemove(String filename) {
+        if (filename == null || filename.isEmpty()) return;
+        synchronized (INDEX_LOCK) {
+            IndexEntry e = filenameMeta.remove(filename);
+            if (e != null) indexRemoveFromBuckets(e);
+        }
+    }
+
+    /** Remove `entry` from every inverted map. Caller holds INDEX_LOCK. */
+    private static void indexRemoveFromBuckets(IndexEntry entry) {
+        unbucket(typeIdx,      entry.type,     entry.filename);
+        if (!entry.placeKey.isEmpty())  unbucket(placeIdx,     entry.placeKey, entry.filename);
+        if (!entry.severity.isEmpty())  unbucket(severityIdx,  entry.severity, entry.filename);
+        if (!entry.proximity.isEmpty()) unbucket(proximityIdx, entry.proximity, entry.filename);
+        for (String cls : entry.classes) unbucket(classIdx, cls, entry.filename);
+    }
+
+    /** Insert `entry` into every inverted map. Caller holds INDEX_LOCK. */
+    private static void indexAddToBuckets(IndexEntry entry) {
+        if (!entry.type.isEmpty())      bucket(typeIdx,      entry.type,     entry.filename);
+        if (!entry.placeKey.isEmpty())  bucket(placeIdx,     entry.placeKey, entry.filename);
+        if (!entry.severity.isEmpty())  bucket(severityIdx,  entry.severity, entry.filename);
+        if (!entry.proximity.isEmpty()) bucket(proximityIdx, entry.proximity, entry.filename);
+        for (String cls : entry.classes) bucket(classIdx, cls, entry.filename);
+    }
+
+    private static void bucket(java.util.concurrent.ConcurrentHashMap<String, java.util.Set<String>> map,
+                               String key, String filename) {
+        java.util.Set<String> set = map.get(key);
+        if (set == null) {
+            set = java.util.Collections.newSetFromMap(
+                    new java.util.concurrent.ConcurrentHashMap<String, Boolean>());
+            java.util.Set<String> prev = map.putIfAbsent(key, set);
+            if (prev != null) set = prev;
+        }
+        set.add(filename);
+    }
+
+    private static void unbucket(java.util.concurrent.ConcurrentHashMap<String, java.util.Set<String>> map,
+                                 String key, String filename) {
+        java.util.Set<String> set = map.get(key);
+        if (set == null) return;
+        set.remove(filename);
+        // Don't remove the empty bucket from the map — we'd race with a
+        // concurrent bucket() that just got the same Set ref. The empty
+        // bucket is cheap (HashMap entry); periodic prune cleans these.
+    }
+
+    /**
+     * Evict the {@code count} oldest entries (by recording timestamp).
+     * Caller holds INDEX_LOCK. Drops both filenameMeta + inverted-map
+     * memberships AND removes them from RECORDING_CACHE so the parse
+     * cache stays in sync. The next list request rebuilds these from
+     * disk on-demand.
+     *
+     * Cache scrub is O(cache.size) total — we build the evicted-filename
+     * Set first, then make a single pass over RECORDING_CACHE removing
+     * any entry whose path ends with `/<evicted-filename>`. Previous
+     * implementation had an inner loop per evicted entry which was
+     * O(cache.size * count) — at 20K cache + 1K evictions that's ~20M
+     * comparisons inside the lock.
+     */
+    private static void indexEvictOldest(int count) {
+        if (count <= 0 || filenameMeta.isEmpty()) return;
+        java.util.List<IndexEntry> all = new java.util.ArrayList<>(filenameMeta.values());
+        all.sort((a, b) -> Long.compare(a.timestamp, b.timestamp));
+        int actual = Math.min(count, all.size());
+
+        // Pre-collect filenames-to-evict so the single cache pass below
+        // can match in O(1) per cache entry. Add the leading slash here
+        // so the suffix match below is one substring check.
+        java.util.Set<String> evictedSuffixes = new java.util.HashSet<>(actual * 2);
+        for (int i = 0; i < actual; i++) {
+            IndexEntry e = all.get(i);
+            filenameMeta.remove(e.filename);
+            indexRemoveFromBuckets(e);
+            evictedSuffixes.add("/" + e.filename);
+        }
+
+        // Single pass over the parse cache. Each entry's key is checked
+        // once against the Set instead of looped against every evicted
+        // filename.
+        java.util.Iterator<java.util.Map.Entry<String, CachedRecording>> it =
+                RECORDING_CACHE.entrySet().iterator();
+        while (it.hasNext()) {
+            java.util.Map.Entry<String, CachedRecording> ce = it.next();
+            String key = ce.getKey();
+            int slash = key.lastIndexOf('/');
+            String suffix = (slash >= 0) ? key.substring(slash) : "/" + key;
+            if (evictedSuffixes.contains(suffix)) {
+                it.remove();
+            }
+        }
+        CameraDaemon.log("RecordingsApiHandler index evicted " + actual + " oldest entries");
+    }
+
     /**
      * Drop a cache entry for the given mp4 absolute path. Callers outside
      * this class (loop rotation in HardwareEventRecorderGpu, the Kotlin
      * RecordingScanner, manual SD-card maintenance) should call this when
      * they delete an .mp4 so the API cache doesn't return phantom entries.
-     * No-op when the key isn't present.
+     * No-op when the key isn't present. Also tears down the inverted
+     * index entry — both stay in lockstep.
      */
     public static void invalidateRecordingCache(String absMp4Path) {
         if (absMp4Path == null) return;
         RECORDING_CACHE.remove(absMp4Path);
+        // Strip the trailing filename so the index can drop its entry.
+        // Index is keyed on filename; absolute paths from the same .mp4
+        // map to one filename across SD/internal mirrors.
+        int slash = absMp4Path.lastIndexOf('/');
+        String filename = (slash >= 0 && slash + 1 < absMp4Path.length())
+                ? absMp4Path.substring(slash + 1)
+                : absMp4Path;
+        indexRemove(filename);
     }
 
     /**
@@ -110,19 +366,87 @@ public class RecordingsApiHandler {
      * Call from a long-running daemon's hourly maintenance pass to keep the
      * cache from growing unbounded across months of uptime.
      */
+    /**
+     * Pre-populate the parse cache + inverted index without serving a
+     * request. Called from the daemon's post-startup background thread
+     * so the first user-visible /api/recordings call doesn't pay the
+     * full directory-walk + sidecar-parse cost inline.
+     *
+     * Safe to call from any thread; the underlying scanAndFilter walks
+     * are idempotent and the cache mutations are concurrent-collection
+     * + INDEX_LOCK protected. Returns silently on any error.
+     */
+    public static void warmupCache() {
+        try {
+            // No filters — populate the cache for everything on disk.
+            // The pre-existing scanAndFilter is the canonical entry
+            // point so the warmup matches what the API would do
+            // exactly (same dedup, same sort, same parse-then-cache
+            // discipline).
+            scanAndFilter(null, null, null, null, null, null);
+            CameraDaemon.log("RecordingsApiHandler warmup: "
+                    + RECORDING_CACHE.size() + " recordings cached, "
+                    + filenameMeta.size() + " indexed");
+        } catch (Throwable t) {
+            CameraDaemon.log("RecordingsApiHandler warmup failed: " + t.getMessage());
+        }
+    }
+
     public static void pruneRecordingCache() {
         java.util.Iterator<java.util.Map.Entry<String, CachedRecording>> it =
                 RECORDING_CACHE.entrySet().iterator();
         int removed = 0;
         while (it.hasNext()) {
             java.util.Map.Entry<String, CachedRecording> e = it.next();
-            if (!new File(e.getKey()).exists()) {
+            String absPath = e.getKey();
+            if (!new File(absPath).exists()) {
                 it.remove();
+                // Drop the matching index entry too — pruneRecordingCache
+                // is the daemon's hourly garbage-collect path; without
+                // this, an SD-card-mounted file deleted out-of-band would
+                // leave a stale place chip indefinitely.
+                int slash = absPath.lastIndexOf('/');
+                String filename = (slash >= 0 && slash + 1 < absPath.length())
+                        ? absPath.substring(slash + 1)
+                        : absPath;
+                indexRemove(filename);
                 removed++;
             }
         }
         if (removed > 0) {
             CameraDaemon.log("RECORDING_CACHE pruned " + removed + " stale entries");
+        }
+
+        // Empty inverted-bucket cleanup. Over months of churn, transient
+        // place keys (a one-clip side-trip district) accumulate empty
+        // Sets in the bucket maps. Cheap (~64 B each) but unbounded
+        // without this sweep. Per-entry cost is one Set.isEmpty() call,
+        // so the cleanup itself is O(distinct-keys-ever-seen) on each
+        // prune cycle — bounded by the index's own lifetime entry count.
+        //
+        // Sharded sweep: take + release INDEX_LOCK between each map so
+        // a long key-cardinality across all five maps doesn't block
+        // concurrent indexPut/indexRemove for the entire walk. A
+        // single sweep can still have a long lock-hold for one map,
+        // but the worst case is now bounded by the SLOWEST map's
+        // size rather than the SUM. With 5K distinct keys per map,
+        // hold time per shard is ~1-5 ms vs ~25 ms for the unsharded
+        // version. Concurrent puts can interleave between shards.
+        synchronized (INDEX_LOCK) { pruneEmptyBuckets(placeIdx); }
+        synchronized (INDEX_LOCK) { pruneEmptyBuckets(severityIdx); }
+        synchronized (INDEX_LOCK) { pruneEmptyBuckets(proximityIdx); }
+        synchronized (INDEX_LOCK) { pruneEmptyBuckets(classIdx); }
+        synchronized (INDEX_LOCK) { pruneEmptyBuckets(typeIdx); }
+    }
+
+    /** Caller holds INDEX_LOCK. Drops bucket entries whose Set is empty. */
+    private static void pruneEmptyBuckets(
+            java.util.concurrent.ConcurrentHashMap<String, java.util.Set<String>> map) {
+        java.util.Iterator<java.util.Map.Entry<String, java.util.Set<String>>> it =
+                map.entrySet().iterator();
+        while (it.hasNext()) {
+            java.util.Map.Entry<String, java.util.Set<String>> e = it.next();
+            if (e.getValue().isEmpty()) it.remove();
         }
     }
 
@@ -159,10 +483,35 @@ public class RecordingsApiHandler {
             String classes = params.get("class");        // e.g. "person,vehicle"
             String severities = params.get("severity");  // e.g. "ALERT,CRITICAL"
             String proximities = params.get("proximity"); // e.g. "VERY_CLOSE,CLOSE"
-            listRecordings(out, type, date, page, pageSize, classes, severities, proximities);
+            // Place filter (item 7): single short label, case-insensitive.
+            // Server-side so pagination + totalCount stay honest under the
+            // filter — client-side filtering would let "page 2 of 5" hide
+            // matching clips on later pages.
+            String place = params.get("place");
+            listRecordings(out, type, date, page, pageSize,
+                    classes, severities, proximities, place);
             return true;
         }
-        
+
+        // Distinct places list (top-N by count) — drives the dynamic
+        // Place chip row in events.html. Scoped by the SAME filter
+        // context as /api/recordings (minus the place filter itself),
+        // so e.g. switching to the Sentry tab refreshes the chip set
+        // to "places where sentry events happened" instead of every
+        // place across every type.
+        if ((path.equals("/api/recordings/places") || path.startsWith("/api/recordings/places?"))
+                && method.equals("GET")) {
+            String query = path.contains("?") ? path.substring(path.indexOf('?') + 1) : "";
+            Map<String, String> params = parseQuery(query);
+            String type = params.get("type");
+            String date = params.get("date");
+            String classes = params.get("class");
+            String severities = params.get("severity");
+            String proximities = params.get("proximity");
+            listPlaces(out, type, date, classes, severities, proximities);
+            return true;
+        }
+
         // Get dates with recordings
         if (path.equals("/api/recordings/dates") && method.equals("GET")) {
             getDatesWithRecordings(out);
@@ -574,11 +923,34 @@ public class RecordingsApiHandler {
     private static Map<String, String> parseQuery(String query) {
         Map<String, String> params = new HashMap<>();
         if (query == null || query.isEmpty()) return params;
-        
+
         for (String param : query.split("&")) {
             String[] kv = param.split("=", 2);
             if (kv.length == 2) {
-                params.put(kv[0], kv[1]);
+                // URL-decode both halves so values with spaces or
+                // unicode (e.g. place="Petaling Jaya" → "Petaling%20Jaya"
+                // or "Cheras" → "Cheras") survive the round-trip.
+                //
+                // Important: java.net.URLDecoder.decode honours form-
+                // urlencoded semantics where `+` decodes to space. Our
+                // web client uses encodeURIComponent which emits `%20`
+                // for spaces and passes literal `+` through unchanged.
+                // Pre-escape `+` to `%2B` BEFORE decoding so a real-world
+                // place name like "Marina Bay+" keeps its plus sign
+                // instead of becoming "Marina Bay " (trailing space).
+                // Pre-feature filters (class/severity/proximity) used a
+                // fixed vocab without `+`; place names are user / OSM
+                // strings and may contain it.
+                //
+                // Decode failure falls back to the raw value so a
+                // malformed param can't break the request.
+                String key = kv[0];
+                String val = kv[1];
+                try {
+                    key = java.net.URLDecoder.decode(key.replace("+", "%2B"), "UTF-8");
+                    val = java.net.URLDecoder.decode(val.replace("+", "%2B"), "UTF-8");
+                } catch (Exception ignored) {}
+                params.put(key, val);
             }
         }
         return params;
@@ -589,55 +961,200 @@ public class RecordingsApiHandler {
      */
     private static void listRecordings(OutputStream out, String typeFilter, String dateFilter,
                                        int page, int pageSize) throws Exception {
-        listRecordings(out, typeFilter, dateFilter, page, pageSize, null, null, null);
+        listRecordings(out, typeFilter, dateFilter, page, pageSize, null, null, null, null);
     }
 
     private static void listRecordings(OutputStream out, String typeFilter, String dateFilter,
                                        int page, int pageSize,
                                        String classFilter, String severityFilter,
-                                       String proximityFilter) throws Exception {
+                                       String proximityFilter,
+                                       String placeFilter) throws Exception {
+        List<JSONObject> recordings = scanAndFilter(typeFilter, dateFilter,
+                classFilter, severityFilter, proximityFilter, placeFilter);
+
+        // Pagination
+        int totalCount = recordings.size();
+        int totalPages = (int) Math.ceil((double) totalCount / pageSize);
+        if (totalPages == 0) totalPages = 1;
+
+        // Clamp page to valid range
+        page = Math.max(1, Math.min(page, totalPages));
+
+        int startIndex = (page - 1) * pageSize;
+        int endIndex = Math.min(startIndex + pageSize, totalCount);
+
+        List<JSONObject> pageRecordings = startIndex < totalCount
+            ? recordings.subList(startIndex, endIndex)
+            : new ArrayList<>();
+
+        JSONObject response = new JSONObject();
+        response.put("success", true);
+        response.put("recordings", new JSONArray(pageRecordings));
+        response.put("totalCount", totalCount);
+        response.put("totalPages", totalPages);
+        response.put("page", page);
+        response.put("pageSize", pageSize);
+
+        HttpResponse.sendJson(out, response.toString());
+    }
+
+    /**
+     * Distinct places across the filtered set. Same filter inputs as
+     * {@link #listRecordings} except the place filter itself — chips
+     * are derived from "places that are reachable under the current
+     * type/date/class/severity/proximity context," NOT from the
+     * already-narrowed-by-place subset (that would always return only
+     * the active chip).
+     *
+     * <p>Returns top {@link #PLACES_LIMIT} entries by count, alpha
+     * tiebreak, with bucketed display label = canonical mixed-case
+     * picked from the most recent clip in each bucket.
+     */
+    private static void listPlaces(OutputStream out, String typeFilter, String dateFilter,
+                                   String classFilter, String severityFilter,
+                                   String proximityFilter) throws Exception {
+        List<JSONObject> recordings = scanAndFilter(typeFilter, dateFilter,
+                classFilter, severityFilter, proximityFilter, /* placeFilter */ null);
+
+        // Index fast path: scanAndFilter has already populated
+        // filenameMeta during its parseRecording loop (every successful
+        // parse calls indexPut). For each recording in the filtered set,
+        // we read the placeKey from the index INSTEAD of re-walking the
+        // recording's JSON. The full canonical-mixed-case label still
+        // needs to come from the JSON (the index stores only the
+        // lowercase key), but only for the bucket-leader (newest clip).
+        //
+        // Net effect: cache-hit case is O(N) Set lookups vs. O(N) JSON
+        // walks. ~5-10x faster on the hot path. Cold cache falls back
+        // naturally because filenameMeta.get returns null and we just
+        // re-derive from the JSON like before.
+        java.util.Map<String, long[]> counts = new java.util.LinkedHashMap<>();
+        java.util.Map<String, String> labels = new java.util.HashMap<>();
+
+        for (JSONObject rec : recordings) {
+            String filename = rec.optString("filename", "");
+            String key = "";
+            String shortLabel = "";
+            // Index fast path: read placeKey + placeLabel directly from
+            // the index — no JSON walk needed. Index is populated by
+            // parseRecording on cache miss. Cache hit means the entry
+            // was already indexed by an earlier miss, so filenameMeta
+            // is in sync with the cache by construction. Only miss path
+            // is index eviction (in-flight), which falls through to the
+            // JSON fallback below.
+            if (!filename.isEmpty()) {
+                IndexEntry entry = filenameMeta.get(filename);
+                if (entry != null && !entry.placeKey.isEmpty()) {
+                    key = entry.placeKey;
+                    shortLabel = entry.placeLabel;
+                }
+            }
+            if (key.isEmpty()) {
+                // Fallback: index doesn't have this filename yet (cold
+                // start, race with eviction). Walk the JSON like the
+                // pre-index path did.
+                JSONObject place = rec.optJSONObject("place");
+                if (place == null) continue;
+                shortLabel = place.optString("short", "");
+                if (shortLabel.isEmpty()) continue;
+                key = shortLabel.toLowerCase(Locale.US);
+            }
+            long ts = rec.optLong("timestamp", 0L);
+            long[] entry = counts.get(key);
+            if (entry == null) {
+                counts.put(key, new long[] { 1L, ts });
+                labels.put(key, shortLabel);
+            } else {
+                entry[0]++;
+                if (ts > entry[1]) {
+                    entry[1] = ts;
+                    labels.put(key, shortLabel);
+                }
+            }
+        }
+
+        // Sort: count desc, then lowercase key alpha asc — stable across
+        // calls so the chip row doesn't reshuffle on every refresh.
+        java.util.List<java.util.Map.Entry<String, long[]>> sorted =
+                new java.util.ArrayList<>(counts.entrySet());
+        sorted.sort((a, b) -> {
+            long ca = a.getValue()[0], cb = b.getValue()[0];
+            if (ca != cb) return Long.compare(cb, ca);
+            return a.getKey().compareTo(b.getKey());
+        });
+
+        JSONArray places = new JSONArray();
+        int emitted = 0;
+        for (java.util.Map.Entry<String, long[]> e : sorted) {
+            if (emitted >= PLACES_LIMIT) break;
+            JSONObject row = new JSONObject();
+            row.put("key", e.getKey());            // matches what /api/recordings?place= expects
+            row.put("label", labels.get(e.getKey()));
+            row.put("count", e.getValue()[0]);
+            places.put(row);
+            emitted++;
+        }
+
+        JSONObject response = new JSONObject();
+        response.put("success", true);
+        response.put("places", places);
+        response.put("totalDistinct", counts.size());
+        HttpResponse.sendJson(out, response.toString());
+    }
+
+    /** Cap mirrored across native + web. */
+    private static final int PLACES_LIMIT = 8;
+
+    /**
+     * Scan + sort + dedupe + filter helper shared by listRecordings and
+     * listPlaces. Pulled out so server-side place filtering can reuse
+     * the same actor/severity/proximity gates and produce a consistent
+     * universe for the chip-derivation endpoint.
+     */
+    private static List<JSONObject> scanAndFilter(String typeFilter, String dateFilter,
+                                                  String classFilter, String severityFilter,
+                                                  String proximityFilter,
+                                                  String placeFilter) {
         List<JSONObject> recordings = new ArrayList<>();
         StorageManager sm = StorageManager.getInstance();
-        
+
         // Scan normal recordings from ALL locations (active + alternate + legacy)
         if (typeFilter == null || typeFilter.equals("normal")) {
             for (File dir : sm.getAllRecordingsDirs()) {
                 scanDirectory(dir, "normal", recordings, dateFilter);
             }
-            // Also scan legacy location for backward compatibility
             File legacyDir = new File(LEGACY_RECORDINGS_DIR);
             if (legacyDir.exists()) {
                 scanDirectory(legacyDir, "normal", recordings, dateFilter);
             }
         }
-        
+
         // Scan sentry events from ALL locations (active + alternate + legacy)
         if (typeFilter == null || typeFilter.equals("sentry")) {
             for (File dir : sm.getAllSurveillanceDirs()) {
                 scanDirectory(dir, "sentry", recordings, dateFilter);
             }
-            // Also scan legacy location for backward compatibility
             File legacySentryDir = new File(LEGACY_SENTRY_DIR);
             if (legacySentryDir.exists()) {
                 scanDirectory(legacySentryDir, "sentry", recordings, dateFilter);
             }
         }
-        
+
         // Scan proximity events from ALL locations (active + alternate)
         if (typeFilter == null || typeFilter.equals("proximity")) {
             for (File dir : sm.getAllProximityDirs()) {
                 scanDirectory(dir, "proximity", recordings, dateFilter);
             }
         }
-        
+
         // Sort by timestamp descending (newest first)
         recordings.sort((a, b) -> Long.compare(
-            b.optLong("timestamp", 0), 
+            b.optLong("timestamp", 0),
             a.optLong("timestamp", 0)
         ));
-        
+
         // Deduplicate by filename — same file may appear from multiple scan locations
-        // (e.g., SD card + internal storage fallback). Keep the first occurrence (largest/newest).
+        // (e.g., SD card + internal storage fallback). Keep the first occurrence.
         Set<String> seenFilenames = new HashSet<>();
         recordings.removeIf(rec -> {
             String name = rec.optString("filename", "");
@@ -653,7 +1170,14 @@ public class RecordingsApiHandler {
         Set<String> classSet = splitCsvLower(classFilter);
         Set<String> sevSet   = splitCsvUpper(severityFilter);
         Set<String> proxSet  = splitCsvUpper(proximityFilter);
-        if (!classSet.isEmpty() || !sevSet.isEmpty() || !proxSet.isEmpty()) {
+        // Place filter (item 7): single short label, lowercase. Untagged
+        // clips (no place block) are EXCLUDED when active — same UX as
+        // the actor/severity rule. Match is case-insensitive.
+        final String placeKey = (placeFilter == null || placeFilter.isEmpty())
+                ? null
+                : placeFilter.trim().toLowerCase(Locale.US);
+
+        if (!classSet.isEmpty() || !sevSet.isEmpty() || !proxSet.isEmpty() || placeKey != null) {
             recordings.removeIf(rec -> {
                 if (!sevSet.isEmpty()) {
                     String sev = rec.optString("peakSeverity", "");
@@ -676,34 +1200,18 @@ public class RecordingsApiHandler {
                     }
                     if (!any) return true;
                 }
+                if (placeKey != null) {
+                    JSONObject place = rec.optJSONObject("place");
+                    if (place == null) return true;
+                    String shortLabel = place.optString("short", "");
+                    if (shortLabel.isEmpty()) return true;
+                    if (!shortLabel.toLowerCase(Locale.US).equals(placeKey)) return true;
+                }
                 return false;
             });
         }
 
-        // Pagination
-        int totalCount = recordings.size();
-        int totalPages = (int) Math.ceil((double) totalCount / pageSize);
-        if (totalPages == 0) totalPages = 1;
-        
-        // Clamp page to valid range
-        page = Math.max(1, Math.min(page, totalPages));
-        
-        int startIndex = (page - 1) * pageSize;
-        int endIndex = Math.min(startIndex + pageSize, totalCount);
-        
-        List<JSONObject> pageRecordings = startIndex < totalCount 
-            ? recordings.subList(startIndex, endIndex) 
-            : new ArrayList<>();
-        
-        JSONObject response = new JSONObject();
-        response.put("success", true);
-        response.put("recordings", new JSONArray(pageRecordings));
-        response.put("totalCount", totalCount);
-        response.put("totalPages", totalPages);
-        response.put("page", page);
-        response.put("pageSize", pageSize);
-        
-        HttpResponse.sendJson(out, response.toString());
+        return recordings;
     }
     
     private static void scanDirectory(File dir, String type, List<JSONObject> recordings, String dateFilter) {
@@ -777,9 +1285,60 @@ public class RecordingsApiHandler {
             try {
                 RECORDING_CACHE.put(cacheKey,
                         new CachedRecording(mp4Length, mp4Mtime, sidecarMtime, parsed.toString()));
+                // Keep the inverted index aligned with every parse so a
+                // sidecar that gets a place merged in async (via
+                // SidecarGeoUpdater) lands in the place bucket on the
+                // very next list request — sidecar mtime change → re-
+                // parse → indexPut → place bucket updated.
+                indexPut(parsed);
+
+                // Cold-boot place backfill. If the sidecar has
+                // geo.start but no geo.place, the resolver was killed
+                // before it could merge — typical case is SIGKILL /
+                // OOM mid-write or a SIGKILL that happened during the
+                // ~800 ms async resolve window. Schedule a resolve
+                // here so the place name appears on the NEXT request.
+                // No-op when the per-flow geocoding toggle is off
+                // (the resolver itself gates), so disabled installs
+                // pay nothing. Cache hit means already-resolved or
+                // already-scheduled, so the post-fetch merge fires
+                // at most once per backfill instance.
+                maybeBackfillPlace(file, parsed);
             } catch (Exception ignored) {}
         }
         return parsed;
+    }
+
+    /**
+     * If the parsed sidecar has start coords but no resolved place
+     * name, dispatch an async resolve. Used to recover from SIGKILL'd
+     * recordings whose async resolver never completed before process
+     * death — the sidecar is on disk with `geo.start` but no
+     * `geo.place`. Resolver short-circuits when the per-flow toggle
+     * is off, so this is a no-op for users who haven't opted in.
+     */
+    private static void maybeBackfillPlace(File mp4File, JSONObject parsed) {
+        try {
+            // Already has a place? Nothing to do.
+            JSONObject place = parsed.optJSONObject("place");
+            if (place != null && !place.optString("short", "").isEmpty()) return;
+            Double startLat = parsed.has("startLat") ? parsed.optDouble("startLat", Double.NaN) : null;
+            Double startLng = parsed.has("startLng") ? parsed.optDouble("startLng", Double.NaN) : null;
+            if (startLat == null || startLng == null
+                    || Double.isNaN(startLat) || Double.isNaN(startLng)) return;
+            String filename = mp4File.getName();
+            String flow = filename.startsWith("event_") ? "surveillance" : "recording";
+            final File mp4 = mp4File;
+            com.overdrive.app.geo.GeocodingResolver.getInstance()
+                    .resolveAsync(startLat, startLng, flow, resolved -> {
+                        if (resolved == null) return;
+                        com.overdrive.app.geo.SidecarGeoUpdater
+                                .mergePlaceForMp4(mp4, resolved);
+                    });
+        } catch (Throwable ignored) {
+            // Backfill is best-effort; failure here must not corrupt
+            // the parse result we're about to return.
+        }
     }
 
     private static JSONObject parseRecordingUncached(File file, String type) {
@@ -869,6 +1428,47 @@ public class RecordingsApiHandler {
                             if (heroFile.exists()) {
                                 rec.put("heroThumbnailUrl", "/thumb/" + heroName);
                             }
+                        }
+                    }
+                    // v3 geo block — populated by EventTimelineCollector at sidecar
+                    // write time and asynchronously by SidecarGeoUpdater when the
+                    // place resolver completes. All fields are optional; legacy
+                    // clips and clips with no GPS fix simply omit them.
+                    JSONObject geo = side.optJSONObject("geo");
+                    if (geo != null) {
+                        JSONObject startObj = geo.optJSONObject("start");
+                        if (startObj != null) {
+                            if (startObj.has("lat")) rec.put("startLat", startObj.optDouble("lat"));
+                            if (startObj.has("lng")) rec.put("startLng", startObj.optDouble("lng"));
+                        }
+                        JSONObject placeObj = geo.optJSONObject("place");
+                        if (placeObj != null) {
+                            String dn = placeObj.optString("displayName", "");
+                            String dist = placeObj.optString("district", "");
+                            String city = placeObj.optString("city", "");
+                            String country = placeObj.optString("country", "");
+                            String cc = placeObj.optString("countryCode", "");
+                            String src = placeObj.optString("source", "");
+                            String shortLabel = !dist.isEmpty() ? dist
+                                    : !city.isEmpty() ? city
+                                    : dn;
+                            String mediumLabel = (!dist.isEmpty() && !city.isEmpty() && !dist.equals(city))
+                                    ? (dist + ", " + city)
+                                    : shortLabel;
+                            JSONObject placeOut = new JSONObject();
+                            if (!dn.isEmpty()) placeOut.put("displayName", dn);
+                            if (!dist.isEmpty()) placeOut.put("district", dist);
+                            if (!city.isEmpty()) placeOut.put("city", city);
+                            if (!country.isEmpty()) placeOut.put("country", country);
+                            if (!cc.isEmpty()) placeOut.put("countryCode", cc);
+                            if (!src.isEmpty()) placeOut.put("source", src);
+                            if (shortLabel != null && !shortLabel.isEmpty()) {
+                                placeOut.put("short", shortLabel);
+                            }
+                            if (mediumLabel != null && !mediumLabel.isEmpty()) {
+                                placeOut.put("medium", mediumLabel);
+                            }
+                            rec.put("place", placeOut);
                         }
                     }
                     // Compact actors[] for filter chips. Strip the heavy fields,
@@ -1304,7 +1904,11 @@ public class RecordingsApiHandler {
     private static void deleteSidecars(File mp4File, String filename) {
         // Invalidate the in-memory parse cache so the next /api/recordings
         // call doesn't return a phantom entry for the just-deleted file.
+        // Tearing down the inverted-index entry happens here too so a
+        // place chip pointing at this file's place key vanishes the
+        // moment the delete completes.
         RECORDING_CACHE.remove(mp4File.getAbsolutePath());
+        indexRemove(filename);
 
         // JSON event timeline
         String jsonName = filename.replace(".mp4", ".json");

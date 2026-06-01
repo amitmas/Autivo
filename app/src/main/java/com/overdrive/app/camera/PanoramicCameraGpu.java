@@ -1,6 +1,7 @@
 package com.overdrive.app.camera;
 
 import android.graphics.ImageFormat;
+import android.graphics.SurfaceTexture;
 import android.hardware.HardwareBuffer;
 import android.media.Image;
 import android.media.ImageReader;
@@ -42,8 +43,40 @@ public class PanoramicCameraGpu {
     private static final int MAX_CAMERA_ID = 5;     // Probe camera IDs 0-5
     
     // AVMCamera surface mode — 0 works on Seal, Atto 1 may need different value
-    // Set via setCameraSurfaceMode() before start() for per-model override
+    // Set via setCameraSurfaceMode() before start() for per-model override.
+    // On the esco SurfaceTexture path this same value is the previewIndex
+    // passed to addTexture/setTexture/rmTexture — 0=mosaic, 1-4=quadrants.
     private int cameraSurfaceMode = 0;
+
+    // Frame-ingestion path selector. Two modes, persisted in unified
+    // config under camera.cameraMode:
+    //   "default" → legacy ImageReader + 4-strip → 2x2 rearrangement.
+    //   "dilink4" → esco SurfaceTexture (addTexture + setTexture +
+    //               previewIndex) + cameraLayout=3 (passthrough). The
+    //               HAL emits its final 2x2 mosaic into the producer
+    //               surface natively on byd_apa firmware variants.
+    //
+    // Resolved at construction. Default when key is missing → legacy.
+    private final boolean USE_ESCO_SURFACE_TEXTURE_PATH = resolveCameraModeFromConfig();
+
+    private static boolean resolveCameraModeFromConfig() {
+        try {
+            org.json.JSONObject cam = com.overdrive.app.config.UnifiedConfigManager
+                .loadConfig().optJSONObject("camera");
+            if (cam == null) return false;
+            String mode = cam.optString("cameraMode", "default");
+            return "dilink4".equalsIgnoreCase(mode);
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /** Effective camera-layout mode for downstream consumers.
+     *  0 = 4-strip → 2x2 rearrangement (legacy);
+     *  3 = passthrough (dilink4 — HAL emits 2x2 natively). */
+    public int getCameraLayoutMode() {
+        return USE_ESCO_SURFACE_TEXTURE_PATH ? 3 : 0;
+    }
     
     // Camera ID override — set via setCameraId() before start()
     private int cameraIdOverride = -1;  // -1 = use default PHYSICAL_CAMERA_ID
@@ -89,6 +122,11 @@ public class PanoramicCameraGpu {
     // minSdk=28 enforces Image.getHardwareBuffer availability.
     private ImageReader cameraImageReader;
     private Surface cameraSurface;
+    // SurfaceTexture-backed consumer for the esco-style path (addTexture /
+    // setTexture / rmTexture). Lifetime mirrors cameraImageReader: created
+    // by createCameraSurfaceTexture(), freed by releaseCameraConsumer().
+    // Bound directly to cameraTextureId — no separate gralloc handoff.
+    private SurfaceTexture cameraSurfaceTexture;
     // Dedicated handler for ImageReader.OnImageAvailableListener. MUST be
     // separate from glHandler — renderLoop blocks the GL thread on
     // frameSync.wait(), which would starve the listener if it ran on the
@@ -156,6 +194,13 @@ public class PanoramicCameraGpu {
     private volatile float measuredFps = 0f;
     private long lastFrameTime = 0;
     private volatile long lastCameraStartTime = 0;
+    // DiLink 4: track last error-restart so we can throttle tight reopen
+    // loops when the HAL keeps emitting event=8 within 30 s. Without this,
+    // a stuck preview-surface state burns the CAN bus and battery for
+    // nothing. Only consulted on USE_ESCO_SURFACE_TEXTURE_PATH; legacy
+    // cars hit the existing immediate-restart branch unchanged.
+    private volatile long lastErrorRestartTime = 0;
+    private static final long DILINK4_ERROR_RESTART_MIN_INTERVAL_MS = 30_000L;
     private long startTime = 0;
     
     // Watchdog for GL thread hang detection
@@ -231,12 +276,39 @@ public class PanoramicCameraGpu {
 
     private int targetFps = 15;  // Desired frame rate for camera
     private final float[] quadrantStripOffsetX;
+    private final float[] quadrantCornerOffsetsXY;
 
     // One-shot mismatch warning for HAL-emitted dims vs. configured strip.
     // The HAL silently delivers whatever it wants; we want to know if Tang
     // returns 720 against a Seal-configured 960 ImageReader (mosaic geometry
     // would be wrong). volatile because the GL thread sets it on first frame.
     private volatile boolean emittedDimsLogged = false;
+
+    // Sticky flag for the SurfaceTexture path: true once SurfaceTexture has
+    // signalled at least one onFrameAvailable. Drives the renderLoop bind
+    // instead of imagePending (which is for the ImageReader path).
+    private volatile boolean stFramePending = false;
+
+    // One-shot first-frame transform-matrix dump on the SurfaceTexture path.
+    // Cleared by attachSurfaceTextureToCamera so we re-emit on every
+    // (re)attach, not just the cold-start session. The transform matrix
+    // tells us the HAL's actual framing — diagonal sx/sy give us "what
+    // fraction of the surface holds real pixels", which exposes 5120x960
+    // strip-vs-2x2-mosaic and similar. Cheap (single 16-float read).
+    private boolean firstFrameDimsLogged = false;
+
+    // Per-frame SurfaceTexture transform matrix, captured from
+    // SurfaceTexture.getTransformMatrix() inside consumeSurfaceTextureFrame
+    // and forwarded to GpuMosaicRecorder + GpuStreamScaler via
+    // setTextureMatrix. esco-parity: same matrix esco's pipeline applies as
+    // uTexMatrix in the vertex shader. Only used when the esco SurfaceTexture
+    // path is active; legacy ImageReader path leaves it at identity.
+    private final float[] currentTexMatrix = {
+        1f, 0f, 0f, 0f,
+        0f, 1f, 0f, 0f,
+        0f, 0f, 1f, 0f,
+        0f, 0f, 0f, 1f,
+    };
 
     /**
      * Creates a GPU-based panoramic camera.
@@ -254,11 +326,29 @@ public class PanoramicCameraGpu {
      *     {@code centerX} math picks the slice the user mapped to each role.
      */
     public PanoramicCameraGpu(int width, int height, float[] quadrantStripOffsetX) {
+        this(width, height, quadrantStripOffsetX, null);
+    }
+
+    /**
+     * @param quadrantStripOffsetX Per-role X offsets for legacy 4-strip HAL.
+     *     {Front, Right, Rear, Left}. Null → legacy default.
+     * @param quadrantCornerOffsetsXY Per-role (cornerX, cornerY) for the
+     *     0.5×0.5 corner in a 2x2-native HAL frame. {fX,fY, rX,rY, bX,bY,
+     *     lX,lY}. Null → mirrors recorder's default (Front=TL, Right=TR,
+     *     Rear=BL, Left=BR). Used when DiLink 4 mode is active.
+     */
+    public PanoramicCameraGpu(int width, int height,
+                              float[] quadrantStripOffsetX,
+                              float[] quadrantCornerOffsetsXY) {
         this.width = width;
         this.height = height;
         this.quadrantStripOffsetX = (quadrantStripOffsetX != null && quadrantStripOffsetX.length == 4)
             ? quadrantStripOffsetX.clone()
             : null;
+        this.quadrantCornerOffsetsXY =
+            (quadrantCornerOffsetsXY != null && quadrantCornerOffsetsXY.length == 8)
+                ? quadrantCornerOffsetsXY.clone()
+                : null;
     }
     
     /**
@@ -305,6 +395,12 @@ public class PanoramicCameraGpu {
      */
     public void start() throws Exception {
         logger.info( "Starting GPU camera pipeline...");
+        // Surface the resolved ingestion mode in every camera open log so
+        // field debugging can correlate "what does the recording look like"
+        // with "which path the daemon took".
+        logger.info("Camera ingestion mode: "
+            + (USE_ESCO_SURFACE_TEXTURE_PATH ? "DiLink 4 (SurfaceTexture passthrough)"
+                                              : "Default (ImageReader + 2x2 rearrangement)"));
         startTime = System.currentTimeMillis();
         
         // SOTA: Initialize BYD camera coordinator for cooperative sharing
@@ -370,9 +466,31 @@ public class PanoramicCameraGpu {
                     // settling. If it's a real error, the frame stall watchdog will catch it.
                     long timeSinceStart = System.currentTimeMillis() - lastCameraStartTime;
                     if (timeSinceStart < 3000) {
-                        logger.warn("CAMERA ERROR: event=" + eventType + " — IGNORED (camera started " + 
+                        logger.warn("CAMERA ERROR: event=" + eventType + " — IGNORED (camera started " +
                             timeSinceStart + "ms ago, waiting for frame stall watchdog)");
                         return;
+                    }
+                    // DiLink 4 backoff: byd_apa firmware can emit event=8
+                    // every 10 s when the AVMCamera preview surface is being
+                    // torn down by another consumer (com.byd.avc, backlight
+                    // sleep, etc.). Restarting that fast just churns the
+                    // CAN bus and battery without ever stabilising. Skip
+                    // restarts that fire within 30 s of the last error; the
+                    // frame-stall watchdog will catch a genuine permanent
+                    // failure later. Legacy fleet (USE_ESCO_SURFACE_TEXTURE_PATH
+                    // == false) keeps the prior immediate-restart behaviour.
+                    if (USE_ESCO_SURFACE_TEXTURE_PATH) {
+                        long now = System.currentTimeMillis();
+                        long timeSinceLastError = now - lastErrorRestartTime;
+                        if (lastErrorRestartTime != 0
+                                && timeSinceLastError < DILINK4_ERROR_RESTART_MIN_INTERVAL_MS) {
+                            logger.warn("CAMERA ERROR: event=" + eventType
+                                + " — THROTTLED (dilink4, last restart "
+                                + timeSinceLastError + "ms ago, min interval "
+                                + DILINK4_ERROR_RESTART_MIN_INTERVAL_MS + "ms)");
+                            return;
+                        }
+                        lastErrorRestartTime = now;
                     }
                     logger.error("CAMERA ERROR: event=" + eventType + " — restarting camera");
                     if (glHandler != null) {
@@ -463,10 +581,17 @@ public class PanoramicCameraGpu {
         // Create camera texture (OES type for external camera)
         cameraTextureId = GlUtil.createExternalTexture();
 
-        // Create the ImageReader-backed camera consumer. Bypasses
-        // SurfaceFlinger throttling that clamps the SurfaceTexture consumer
-        // to ~8.5 fps on this device (verified by AvmImageReaderFpsProbe).
-        createCameraImageReader();
+        // Build the camera consumer. Default = esco-style SurfaceTexture
+        // path (addTexture/setTexture/rmTexture + previewIndex). Falls back
+        // to the ImageReader path only when USE_ESCO_SURFACE_TEXTURE_PATH is
+        // disabled — kept around for FPS-ceiling investigations on Seal
+        // (verified ~26 fps by AvmImageReaderFpsProbe vs SurfaceFlinger's
+        // ~8.5 fps clamp on legacy SurfaceTexture wiring).
+        if (USE_ESCO_SURFACE_TEXTURE_PATH) {
+            createCameraSurfaceTexture();
+        } else {
+            createCameraImageReader();
+        }
         
         // Initialize GPU components now that EGL context exists
         if (recorder != null) {
@@ -491,6 +616,47 @@ public class PanoramicCameraGpu {
             // GpuDownscaler.releaseDirectResources() to free them on the
             // matching context (see T1-H1 fix).
             downscaler.init();
+            // Layout 3 = DiLink 4 / 2x2-native HAL. The fragment shader
+            // rearranges the producer's 2x2 into canonical Front=TL,
+            // Right=TR, Rear=BL, Left=BR upright via the per-role corner+
+            // flip uniforms set just below. Layout 0 = legacy 4-strip on
+            // every other car (Seal, Atto, Dolphin, Tang).
+            downscaler.setCameraLayout(getCameraLayoutMode());
+
+            // DiLink 4: same Variant A producer-corner remap + per-role
+            // flip the recorder/stream use, so the AI-lane downscaled
+            // mosaic is canonically arranged (Front=TL, Right=TR, Rear=BL,
+            // Left=BR upright). V2 motion's hardcoded quadrant-index→role
+            // mapping (Q0=Front..Q3=Left) only holds when the downscaler
+            // emits canonical layout — without this the cropper's centroid
+            // and the engine's quadrant grid disagree.
+            if (USE_ESCO_SURFACE_TEXTURE_PATH) {
+                downscaler.setProducerCornerMap(
+                    new float[] { 0.0f, 0.0f },  // Front  → producer TL
+                    new float[] { 0.5f, 0.5f },  // Right  → producer BR
+                    new float[] { 0.5f, 0.0f },  // Rear   → producer TR
+                    new float[] { 0.0f, 0.5f }); // Left   → producer BL
+                downscaler.setFlipFlags(
+                    new float[] { 1.0f, 1.0f },  // Front  X+Y-flip
+                    new float[] { 0.0f, 1.0f },  // Right  Y-flip
+                    new float[] { 0.0f, 0.0f },  // Rear   no flip
+                    new float[] { 0.0f, 0.0f }); // Left   no flip
+                // Red-overlay suppression on the AI lane. Same dilink4RedMask
+                // unified-config flag the recorder reads — keeps motion
+                // thumbnails clean of the HAL "calibration failed" chrome.
+                try {
+                    org.json.JSONObject camCfgDs = com.overdrive.app.config
+                        .UnifiedConfigManager.loadConfig().optJSONObject("camera");
+                    if (camCfgDs != null) {
+                        downscaler.setRedMaskEnabled(
+                            camCfgDs.optBoolean("dilink4RedMask", false));
+                        downscaler.setApaCenterInset(
+                            (float) camCfgDs.optDouble("dilink4ApaCenterInset", 0.09375));
+                    }
+                } catch (Throwable t) {
+                    logger.warn("Downscaler red-mask flag read failed: " + t.getMessage());
+                }
+            }
             logger.debug("Downscaler initialized (probe path on its own thread)");
         }
 
@@ -500,7 +666,43 @@ public class PanoramicCameraGpu {
         // context's command stream, which defeats the whole point of
         // Tier 1 — the readback in crop() would still serialize against
         // the encoder thread's eglSwapBuffers.
-        foveatedCropper = new FoveatedCropper(width, height, quadrantStripOffsetX);
+        foveatedCropper = new FoveatedCropper(width, height,
+            quadrantStripOffsetX, quadrantCornerOffsetsXY);
+        // Cropper picks 4-strip vs 2x2 corner geometry from the active
+        // layout mode. Layout 0 = legacy 4-strip; layout 3 = DiLink 4 /
+        // 2x2-native HAL with Variant A producer-corner remap pushed below.
+        foveatedCropper.setCameraLayout(getCameraLayoutMode());
+
+        // DiLink 4: override the canonical corner map with the only
+        // known-good Variant A layout (Front=TL X-flip, Right=BR no-flip,
+        // Rear=TR Y-flip, Left=BL Y-flip). Mirrors GpuMosaicRecorder so
+        // V2 motion crops align with the recorder's mosaic.
+        if (USE_ESCO_SURFACE_TEXTURE_PATH) {
+            foveatedCropper.setProducerCornerMap(
+                new float[] { 0.0f, 0.0f },  // Front  → producer TL
+                new float[] { 0.5f, 0.5f },  // Right  → producer BR
+                new float[] { 0.5f, 0.0f },  // Rear   → producer TR
+                new float[] { 0.0f, 0.5f }); // Left   → producer BL
+            foveatedCropper.setFlipFlags(
+                new float[] { 1.0f, 0.0f },  // Front  X-flip
+                new float[] { 0.0f, 0.0f },  // Right  no flip
+                new float[] { 0.0f, 1.0f },  // Rear   Y-flip
+                new float[] { 0.0f, 1.0f }); // Left   Y-flip
+            // Red-overlay suppression on AI thumbnails too — same flag the
+            // recorder/stream/downscaler read.
+            try {
+                org.json.JSONObject camCfgFc = com.overdrive.app.config
+                    .UnifiedConfigManager.loadConfig().optJSONObject("camera");
+                if (camCfgFc != null) {
+                    foveatedCropper.setRedMaskEnabled(
+                        camCfgFc.optBoolean("dilink4RedMask", false));
+                    foveatedCropper.setApaCenterInset(
+                        (float) camCfgFc.optDouble("dilink4ApaCenterInset", 0.09375));
+                }
+            } catch (Throwable t) {
+                logger.warn("Cropper red-mask flag read failed: " + t.getMessage());
+            }
+        }
 
         logger.info("OpenGL initialized (texture=" + cameraTextureId + ")");
     }
@@ -599,10 +801,307 @@ public class PanoramicCameraGpu {
      * Recreating the SurfaceTexture forces a clean connection to the new camera.
      */
     private void recreateCameraSurface() {
-        logger.info("Recreating ImageReader consumer for camera switch...");
+        logger.info("Recreating "
+            + (USE_ESCO_SURFACE_TEXTURE_PATH ? "SurfaceTexture" : "ImageReader")
+            + " consumer for camera switch...");
         releaseCameraConsumer();
-        createCameraImageReader();
+        if (USE_ESCO_SURFACE_TEXTURE_PATH) {
+            createCameraSurfaceTexture();
+        } else {
+            createCameraImageReader();
+        }
         logger.info("Camera consumer recreated for camera switch");
+    }
+
+    /** Build a SurfaceTexture-backed consumer (esco path).
+     *  Frame handling:
+     *    HAL → SurfaceTexture producer (BufferQueue)
+     *      → setOnFrameAvailableListener fires on glHandler
+     *        → renderLoop sees stFramePending, calls updateTexImage()
+     *  Mirrors esco's gl.C5920a path: addTexture/setTexture/rmTexture.
+     *  cameraTextureId is created in initializeGl() and is the EXTERNAL_OES
+     *  texture the SurfaceTexture writes into. We attach the listener on
+     *  glHandler so the renderLoop wakeup happens on the same thread that
+     *  later calls updateTexImage — the HAL ping/notify race that motivates
+     *  imagePending on the ImageReader path applies the same way here.
+     *
+     *  We do NOT call attachToGLContext / detachFromGLContext on this
+     *  SurfaceTexture: the SurfaceTexture(int) ctor already attaches it to
+     *  the current EGL context's cameraTextureId, and updateTexImage runs
+     *  on the GL thread where that context is current.  */
+    private void createCameraSurfaceTexture() {
+        if (cameraTextureId == 0) {
+            logger.warn("createCameraSurfaceTexture called before GL texture exists");
+            return;
+        }
+        cameraSurfaceTexture = new SurfaceTexture(cameraTextureId);
+        // esco-parity: do NOT call setDefaultBufferSize. esco's GL pipeline
+        // wraps SurfaceTexture without setting a default size; the BYD HAL
+        // drives the BufferQueue dims for the active previewIndex (mosaic
+        // strip = 5120x960 on Seal/Tang, etc.) and the consumer adapts via
+        // updateTexImage's transform matrix. Forcing dims here can make the
+        // HAL silently scale/crop or stall on byd_apa boards.
+        cameraSurfaceTexture.setOnFrameAvailableListener(st -> {
+            // Cheap signalling — the actual updateTexImage happens on the GL
+            // thread inside renderLoop. Ride frameSync so the wait/notify
+            // protocol matches the ImageReader path.
+            synchronized (frameSync) {
+                stFramePending = true;
+                frameSync.notify();
+            }
+        }, glHandler);
+        // Build the Surface that AVMCamera doesn't actually receive — the
+        // esco path uses addTexture(SurfaceTexture, ...) directly. We keep
+        // the cameraSurface reference null on this path so any stray
+        // addPreviewSurface code can't accidentally re-attach.
+        cameraSurface = null;
+    }
+
+    /** Bind the active SurfaceTexture to the AVMCamera via reflection,
+     *  mirroring esco's startPreview block:
+     *      addTexture(st, previewIndex)
+     *      setTexture(st, previewIndex)
+     *      startPreview()
+     *  previewIndex comes from cameraSurfaceMode (0=mosaic, 1-4=quadrant).
+     *  Caller must have just opened the camera (cameraObj != null). */
+    private void attachSurfaceTextureToCamera(int cameraId) throws Exception {
+        if (cameraObj == null) {
+            throw new IllegalStateException("attachSurfaceTextureToCamera with null cameraObj");
+        }
+        if (cameraSurfaceTexture == null) {
+            throw new IllegalStateException("attachSurfaceTextureToCamera before createCameraSurfaceTexture");
+        }
+        Class<?> avmClass = Class.forName("android.hardware.AVMCamera");
+        int previewIndex = cameraSurfaceMode;
+
+        // BmmCameraInfo dim probe — what the HAL claims it'll emit for this
+        // camera id BEFORE we attach. Mirrors esco's C6500c.m28945a path.
+        // Output is purely diagnostic; the BYD HAL ignores anything we do
+        // with these numbers, but logging them lets us correlate the
+        // "configured strip" (pipeline expects 5120x960) against the slot
+        // we're actually opening (id=1 might be 1280x720, etc.). On variants
+        // where BmmCameraInfo is empty (vehicle.config.cam_sort unset) both
+        // calls return 0 — note that explicitly.
+        logHalDeclaredDims(cameraId);
+
+        // AVM factory-calibration probe. esco reads these at app init:
+        //   - persist.vendor.camera.autostudy.avm  (calibration coefficients)
+        //   - vehicle.config.camInfo.avm           (physical module info)
+        //   - vehicle.config.cam_sort / pano_cam / pano_l_cam (id mapping)
+        // When `autostudy.avm` is empty / absent, the BYD AVM HAL itself
+        // refuses to stream the stitched mosaic and returns a red "no
+        // calibration" frame (or similar) — esco doesn't post-process this
+        // away because on properly-calibrated cars it never appears. If you
+        // see a red feed on this car, check this log: if all four props are
+        // empty, the AVM was never calibrated by the dealer.
+        logAvmCalibrationProps();
+
+        Method mAddTexture = avmClass.getDeclaredMethod(
+            "addTexture", SurfaceTexture.class, int.class);
+        mAddTexture.setAccessible(true);
+        mAddTexture.invoke(cameraObj, cameraSurfaceTexture, previewIndex);
+
+        Method mSetTexture = avmClass.getDeclaredMethod(
+            "setTexture", SurfaceTexture.class, int.class);
+        mSetTexture.setAccessible(true);
+        mSetTexture.invoke(cameraObj, cameraSurfaceTexture, previewIndex);
+
+        Method mStart = avmClass.getDeclaredMethod("startPreview");
+        mStart.setAccessible(true);
+        Object startResult = mStart.invoke(cameraObj);
+        logger.info("Esco-path attached: addTexture+setTexture(idx=" + previewIndex
+            + ") + startPreview → " + startResult
+            + " (cameraId=" + cameraId + ")");
+
+        // Re-arm the first-frame transform-matrix log so we print it on the
+        // next frame after every (re)attach, not just the very first
+        // session. SurfaceTexture stays the same instance across recreate
+        // so we'd otherwise miss the dim probe on probe-driven re-opens.
+        firstFrameDimsLogged = false;
+    }
+
+    /** Probe BmmCameraInfo for the HAL's declared preview size for this
+     *  cameraId. Pure logging — we never trust these numbers, but they're
+     *  the cheapest signal of "the slot you opened streams something
+     *  utterly different from the configured strip". */
+    private void logHalDeclaredDims(int cameraId) {
+        try {
+            Class<?> bmm = Class.forName("android.hardware.BmmCameraInfo");
+            Method gw = bmm.getDeclaredMethod("getDefaultPreviewWidth", int.class);
+            Method gh = bmm.getDeclaredMethod("getDefaultPreviewHeight", int.class);
+            gw.setAccessible(true);
+            gh.setAccessible(true);
+            Object w = gw.invoke(null, cameraId);
+            Object h = gh.invoke(null, cameraId);
+            int wInt = (w instanceof Integer) ? (Integer) w : 0;
+            int hInt = (h instanceof Integer) ? (Integer) h : 0;
+            logger.info("BmmCameraInfo declared dims for cam=" + cameraId
+                + ": " + wInt + "x" + hInt
+                + (wInt == 0 || hInt == 0
+                    ? "  (HAL has no entry — vehicle.config.cam_sort empty)"
+                    : "")
+                + "; pipeline configured " + width + "x" + height);
+            // BmmCameraInfo's "single preview" reports per-quadrant; the
+            // mosaic-doubled dims that AVMCamera emits for previewIndex=0
+            // are 2*W x 2*H per esco's C6500c.m28945a:88. Spell that out.
+            if (wInt > 0 && hInt > 0) {
+                int mosaicW = wInt * 2;
+                int mosaicH = hInt * 2;
+                logger.info("  → mosaic-doubled would be " + mosaicW + "x" + mosaicH
+                    + " (esco AVMCamera 2x scale rule)");
+            }
+        } catch (ClassNotFoundException e) {
+            logger.info("BmmCameraInfo class not present — skipping dim probe");
+        } catch (NoSuchMethodException e) {
+            logger.info("BmmCameraInfo.getDefaultPreviewWidth/Height not found — skipping dim probe");
+        } catch (Throwable t) {
+            logger.warn("BmmCameraInfo dim probe failed: " + t.getMessage());
+        }
+    }
+
+    /** Dump the four AVM-related SystemProperties so we can tell at a glance
+     *  whether the car has been factory-calibrated. Empty `autostudy.avm` +
+     *  empty `camInfo.avm` is the classic "AVM HAL renders red 'calibration
+     *  failed' frame" symptom — esco never sees it because it ships on cars
+     *  where these are populated by the dealer-side calibration procedure. */
+    private void logAvmCalibrationProps() {
+        try {
+            Class<?> sp = Class.forName("android.os.SystemProperties");
+            java.lang.reflect.Method get = sp.getMethod("get", String.class);
+            String autostudy = safeGetProp(get, "persist.vendor.camera.autostudy.avm");
+            String camInfo   = safeGetProp(get, "vehicle.config.camInfo.avm");
+            String camSort   = safeGetProp(get, "vehicle.config.cam_sort");
+            String panoCam   = safeGetProp(get, "vehicle.config.pano_cam");
+            String panoLCam  = safeGetProp(get, "vehicle.config.pano_l_cam");
+            logger.info("AVM calibration props:"
+                + " autostudy.avm=" + describeProp(autostudy)
+                + " camInfo.avm=" + describeProp(camInfo)
+                + " cam_sort=" + describeProp(camSort)
+                + " pano_cam=" + describeProp(panoCam)
+                + " pano_l_cam=" + describeProp(panoLCam));
+            if (isBlank(autostudy) && isBlank(camInfo)) {
+                // Information only. The HAL gates the red 'calibration failed'
+                // overlay on this property being non-empty; nothing in
+                // user-space (not us, not esco) can write
+                // persist.vendor.camera.autostudy.avm — it's owned by the
+                // dealer-run autostudy procedure and SELinux denies app/shell
+                // writes (verified rc=1 in the field). When this fires the
+                // user's only software remedy is the GL red-mask filter.
+                logger.info("AVM is UNCALIBRATED on this vehicle (autostudy "
+                    + "and camInfo properties are empty). The HAL will paint "
+                    + "a red banner into the producer surface; enable "
+                    + "dilink4RedMask to mask it cosmetically.");
+            }
+        } catch (Throwable t) {
+            logger.warn("AVM calibration prop probe failed: " + t.getMessage());
+        }
+    }
+
+    private static String safeGetProp(java.lang.reflect.Method get, String name) {
+        try {
+            Object v = get.invoke(null, name);
+            return v instanceof String ? (String) v : "";
+        } catch (Throwable t) {
+            return "";
+        }
+    }
+
+    private static String describeProp(String v) {
+        if (v == null || v.isEmpty()) return "(empty)";
+        // Truncate ridiculously long values (autostudy can be hundreds of bytes
+        // of binary-as-hex). Just show length + first 40 chars so logs stay
+        // legible while still preserving "is it actually populated?".
+        if (v.length() <= 60) return "'" + v + "'";
+        return "len=" + v.length() + " head='" + v.substring(0, 40) + "…'";
+    }
+
+    private static boolean isBlank(String v) {
+        return v == null || v.isEmpty();
+    }
+
+    /** Detach the SurfaceTexture from the camera before close.
+     *  Mirrors esco gl.C5920a.m26746l: rmTexture(st, previewIndex).
+     *  Quiet on errors — close() right after is the canonical teardown. */
+    private void detachSurfaceTextureFromCamera(Object cam) {
+        SurfaceTexture st = cameraSurfaceTexture;
+        if (cam == null || st == null) return;
+        try {
+            Class<?> avmClass = Class.forName("android.hardware.AVMCamera");
+            Method mRmTexture = avmClass.getDeclaredMethod(
+                "rmTexture", SurfaceTexture.class, int.class);
+            mRmTexture.setAccessible(true);
+            mRmTexture.invoke(cam, st, cameraSurfaceMode);
+        } catch (NoSuchMethodException ignored) {
+            // older HAL builds without rmTexture — close() handles it
+        } catch (Throwable t) {
+            logger.warn("rmTexture failed: " + t.getMessage());
+        }
+    }
+
+    /** Close the camera in the order esco uses (gl.C5920a.m26747m:318-356):
+     *    1. BYDApaHelper unregister + vp reset       (esco line 325)
+     *    2. rmTexture(SurfaceTexture, previewIndex)  (esco line 328)
+     *    3. setPreviewCallback(null)                 (esco line 333)
+     *    4. setEventCallback(null)                   (esco line 339)
+     *    5. stopPreview                              (esco line 342)
+     *    6. close                                    (esco line 345)
+     *  BydCameraCoordinator.closeCamera bundles steps 5+6 (and a redundant
+     *  disablePreviewCallback before stopPreview, which is benign).
+     *
+     *  Legacy path: only steps 5+6 — BydCameraCoordinator.closeCamera. */
+    private void closeCameraForPath(Object cam) {
+        if (cam == null) return;
+        if (USE_ESCO_SURFACE_TEXTURE_PATH) {
+            // Step 1 — must run BEFORE camera tear-down so the native AVM app
+            // can reclaim viewpoint ownership cleanly (matches esco order).
+            BydApaViewpointHelper.disable();
+            // Step 2 — remove our texture binding from the HAL.
+            detachSurfaceTextureFromCamera(cam);
+            // Steps 3+4 — null callback proxies on the AVMCamera.
+            clearAvmCameraCallbacks(cam);
+        }
+        // Steps 5+6 (and disablePreviewCallback in legacy compat).
+        BydCameraCoordinator.closeCamera(cam, cameraSurfaceMode);
+    }
+
+    /** Null out the AVMCamera-side preview + event callback proxies before
+     *  the HAL stopPreview/close. esco does this in m26747m at C5920a:333,339;
+     *  some HAL builds keep stale refs alive otherwise. Quiet on errors. */
+    private void clearAvmCameraCallbacks(Object cam) {
+        if (cam == null) return;
+        try {
+            Class<?> avmClass = Class.forName("android.hardware.AVMCamera");
+            Class<?> previewCb = null;
+            Class<?> eventCb = null;
+            try {
+                previewCb = Class.forName("android.hardware.AVMCamera$IPreviewCallback");
+            } catch (ClassNotFoundException ignored) {}
+            try {
+                eventCb = Class.forName("android.hardware.AVMCamera$IEventCallback");
+            } catch (ClassNotFoundException ignored) {}
+            if (previewCb != null) {
+                try {
+                    Method m = avmClass.getDeclaredMethod("setPreviewCallback", previewCb);
+                    m.setAccessible(true);
+                    m.invoke(cam, new Object[]{null});
+                } catch (NoSuchMethodException ignored) {
+                } catch (Throwable t) {
+                    logger.warn("setPreviewCallback(null) failed: " + t.getMessage());
+                }
+            }
+            if (eventCb != null) {
+                try {
+                    Method m = avmClass.getDeclaredMethod("setEventCallback", eventCb);
+                    m.setAccessible(true);
+                    m.invoke(cam, new Object[]{null});
+                } catch (NoSuchMethodException ignored) {
+                } catch (Throwable t) {
+                    logger.warn("setEventCallback(null) failed: " + t.getMessage());
+                }
+            }
+        } catch (ClassNotFoundException e) {
+            // AVMCamera class not present — fatal everywhere else, ignore here.
+        }
     }
 
     /** Build an ImageReader-backed consumer (zero-copy path).
@@ -666,6 +1165,30 @@ public class PanoramicCameraGpu {
             try { cameraImageReader.close(); } catch (Throwable ignored) {}
             cameraImageReader = null;
         }
+        if (cameraSurfaceTexture != null) {
+            try { cameraSurfaceTexture.setOnFrameAvailableListener(null); } catch (Throwable ignored) {}
+            try { cameraSurfaceTexture.release(); } catch (Throwable ignored) {}
+            cameraSurfaceTexture = null;
+        }
+        stFramePending = false;
+        // Reset to identity so a stale matrix from the previous camera
+        // can't leak into the first draw against a freshly-attached
+        // SurfaceTexture if its first consumeSurfaceTextureFrame returns
+        // false (e.g., spurious wakeup before HAL emits its first frame).
+        // Identity is safe — it samples the whole producer surface, same
+        // as legacy ImageReader behaviour.
+        resetCurrentTexMatrixToIdentity();
+    }
+
+    private void resetCurrentTexMatrixToIdentity() {
+        currentTexMatrix[0]  = 1f; currentTexMatrix[1]  = 0f;
+        currentTexMatrix[2]  = 0f; currentTexMatrix[3]  = 0f;
+        currentTexMatrix[4]  = 0f; currentTexMatrix[5]  = 1f;
+        currentTexMatrix[6]  = 0f; currentTexMatrix[7]  = 0f;
+        currentTexMatrix[8]  = 0f; currentTexMatrix[9]  = 0f;
+        currentTexMatrix[10] = 1f; currentTexMatrix[11] = 0f;
+        currentTexMatrix[12] = 0f; currentTexMatrix[13] = 0f;
+        currentTexMatrix[14] = 0f; currentTexMatrix[15] = 1f;
     }
     
     /**
@@ -720,6 +1243,21 @@ public class PanoramicCameraGpu {
             cameraCoordinator.notifyPreOpenCamera();
         }
 
+        // esco-parity: tell the BYDAutoManager Panorama device (1031) to switch
+        // its viewpoint to mosaic-output BEFORE opening AVMCamera. On byd_apa /
+        // apa firmware variants the HAL boots in single-camera (dashcam) mode
+        // and stays there until this setIntArray write flips it. Mirrors esco
+        // gl.C5920a.mo26750v:386-388.
+        //
+        // Gated on the DiLink 4 path: on legacy pano_h/pano_l boards the
+        // disable counterpart in closeCameraForPath is also gated, so we
+        // keep the pair symmetric. The helper would warn-log on legacy
+        // anyway (no panorama device exposed), but skipping the call also
+        // skips a binder round-trip per camera open.
+        if (USE_ESCO_SURFACE_TEXTURE_PATH) {
+            BydApaViewpointHelper.enableForPanoramic();
+        }
+
         Class<?> avmClass = Class.forName("android.hardware.AVMCamera");
 
         // === ATTEMPT 1: Constructor new AVMCamera(int) + .open() ===
@@ -770,25 +1308,45 @@ public class PanoramicCameraGpu {
             }
         }
         
-        // Set FPS BEFORE addPreviewSurface. On DiLink 3.x firmware the HAL
-        // rejects setCameraFps once a preview surface is attached — even before
-        // startPreview. Order must be open → setCameraFps → addPreviewSurface →
-        // startPreview to match the BYD HAL state machine.
+        // Set FPS BEFORE attaching any consumer. On DiLink 3.x firmware the
+        // HAL rejects setCameraFps once a consumer is bound — even before
+        // startPreview. Order matches both esco's AVMCameraRecorder and the
+        // legacy ImageReader path: open → setCameraFps → attach → start.
         AvmCameraHelper.setCameraFps(cameraObj, targetFps);
 
-        // Connect surface — mode 0 works on Seal, other models may need different mode
-        Method mAddSurface = avmClass.getDeclaredMethod("addPreviewSurface", Surface.class, int.class);
-        mAddSurface.setAccessible(true);
-        mAddSurface.invoke(cameraObj, cameraSurface, cameraSurfaceMode);
+        // esco-parity: register the AVMCamera IEventCallback BEFORE the
+        // consumer attach so the 1003 first-frame event and any pre-frame
+        // 8/1000/1002 fatal events emitted during HAL warmup are observable.
+        // Mirrors esco gl.C5920a.mo26750v:418 (after setCameraFps, before
+        // addTexture). The previous wiring registered the callback after
+        // start() returned; on byd_apa boards that fire the death event
+        // inside the warmup window, the coordinator's onCameraError never
+        // fired.
+        if (cameraCoordinator != null) {
+            cameraCoordinator.setupEventCallback(cameraObj);
+        }
 
-        // Start preview — required for real frame data on BYD Seal HAL.
-        // The HAL supports multiple consumers calling startPreview simultaneously.
-        // The AVC warmup (com.byd.avc launch + 4s delay) ensures the native DVR
-        // has already initialized before we reach here, preventing race conditions.
-        Method mStart = avmClass.getDeclaredMethod("startPreview");
-        mStart.setAccessible(true);
-        mStart.invoke(cameraObj);
-        logger.info("Camera started (id=" + cameraId + ", targetFps=" + targetFps + ")");
+        if (USE_ESCO_SURFACE_TEXTURE_PATH) {
+            // esco path: addTexture(st, idx) + setTexture(st, idx) + startPreview.
+            // attachSurfaceTextureToCamera does all three; cameraSurfaceMode is
+            // the previewIndex (0=mosaic on byd_apa/apa HAL).
+            attachSurfaceTextureToCamera(cameraId);
+        } else {
+            // Legacy path: addPreviewSurface(Surface, surfaceMode) + startPreview.
+            // mode 0 works on Seal; other models may need different mode.
+            Method mAddSurface = avmClass.getDeclaredMethod("addPreviewSurface", Surface.class, int.class);
+            mAddSurface.setAccessible(true);
+            mAddSurface.invoke(cameraObj, cameraSurface, cameraSurfaceMode);
+
+            // Start preview — required for real frame data on BYD Seal HAL.
+            // The HAL supports multiple consumers calling startPreview simultaneously.
+            // The AVC warmup (com.byd.avc launch + 4s delay) ensures the native DVR
+            // has already initialized before we reach here, preventing race conditions.
+            Method mStart = avmClass.getDeclaredMethod("startPreview");
+            mStart.setAccessible(true);
+            mStart.invoke(cameraObj);
+            logger.info("Camera started (id=" + cameraId + ", targetFps=" + targetFps + ")");
+        }
     }
     
     // Diagnostic counters for the ImageReader frame flow. Kept in place as
@@ -974,6 +1532,168 @@ public class PanoramicCameraGpu {
     }
 
     /**
+     * SurfaceTexture-path equivalent of consumeLatestImageAndBind.
+     * Pulls the freshest BufferQueue slot into cameraTextureId via
+     * updateTexImage() and captures the SurfaceTexture timestamp for PTS.
+     *
+     * Mirrors esco's gl.C5920a / GL pipeline: the BYD HAL writes into the
+     * SurfaceTexture-backed Surface, and updateTexImage rebinds the latest
+     * frame to the EXTERNAL_OES texture. No gralloc handoff, so there's no
+     * separate Image/HardwareBuffer ref to hold across GL cycles.
+     *
+     * Must be called on the GL thread.
+     */
+    private boolean consumeSurfaceTextureFrame() {
+        SurfaceTexture st = cameraSurfaceTexture;
+        if (st == null) return false;
+        try {
+            st.updateTexImage();
+        } catch (Throwable t) {
+            // BufferQueue can be in disconnected state during reopen — log and skip.
+            logger.warn("updateTexImage failed: " + t.getMessage());
+            return false;
+        }
+        // esco-parity: capture the producer's transform matrix. Forwarded
+        // to the recorder + stream scaler + AI-lane downscaler so each
+        // shader's uTexMatrix crops to the HAL's "live" sub-region. Without
+        // this we sample any letterbox / chrome the HAL drew into the
+        // producer surface.
+        try {
+            st.getTransformMatrix(currentTexMatrix);
+        } catch (Throwable t) {
+            // Fall back to identity — already initialised in the field.
+            logger.warn("getTransformMatrix failed: " + t.getMessage());
+        }
+        // The HAL on this firmware publishes an identity matrix
+        // (sx=1, sy=1, tx=0, ty=0). Our vertex layout maps NDC-bottom to
+        // aTexCoord.y=0 and NDC-top to aTexCoord.y=1, while every
+        // rearrangement shader treats `vTexCoord.y < 0.5` as "top half of
+        // output". With identity texMatrix that conflict produces a
+        // top-down flipped image on every consumer. When the matrix is
+        // already a Y-flip (Android producer canonical, m[5]<0, m[13]=1),
+        // the conventions line up. So: when m[5] >= 0, post-multiply a
+        // Y-flip into the matrix so every shader sees the same Y-down
+        // convention regardless of HAL build. (Esco hits the canonical
+        // m[5]=-1 case so it doesn't need this; we have to.)
+        if (currentTexMatrix[5] >= 0.0f) {
+            currentTexMatrix[1]  = -currentTexMatrix[1];
+            currentTexMatrix[5]  = -currentTexMatrix[5];
+            currentTexMatrix[9]  = -currentTexMatrix[9];
+            currentTexMatrix[13] =  1.0f - currentTexMatrix[13];
+        }
+        // Publish to the downscaler too. The probe shader runs on a
+        // separate thread (AI-lane GL or probe GL), but the downscaler
+        // instance is shared and copies the matrix internally.
+        if (USE_ESCO_SURFACE_TEXTURE_PATH) {
+            GpuDownscaler ds = downscaler;
+            if (ds != null) ds.setTextureMatrix(currentTexMatrix);
+            // FoveatedCropper does not consume the matrix — its samples are
+            // already in producer-space UV via the role's corner+flip remap.
+            // HighResPreviewSampler is lazy-allocated; only push when present.
+            // The dialog endpoint is rare so freshness within a few frames
+            // is fine, but per-frame upload is cheap (memcpy under lock).
+            HighResPreviewSampler hr = highResSampler;
+            if (hr != null) hr.setTextureMatrix(currentTexMatrix);
+        }
+        if (!firstFrameDimsLogged) {
+            firstFrameDimsLogged = true;
+            logFirstFrameDims(st);
+        }
+        // esco-parity: PTS comes from System.nanoTime() unconditionally.
+        // esco's GL pipeline (C7411k) never trusts SurfaceTexture.getTimestamp;
+        // it stamps frames at the moment of capture on the consumer thread.
+        // The hwTs/latch state machine on the legacy ImageReader path exists
+        // because gralloc's Image.getTimestamp returns a stuck value on this
+        // HAL — same trap exists on SurfaceTexture, but esco proves nanoTime
+        // is the right answer either way. Apply the same monotonic +1us
+        // guard to satisfy MediaCodec's strictly-increasing PTS contract.
+        long candidate = System.nanoTime();
+        if (candidate <= lastAcceptedPtsNs) {
+            candidate = lastAcceptedPtsNs + 1_000L;
+        }
+        lastAcceptedPtsNs = candidate;
+        currentFrameTimestampNs = candidate;
+        cameraFrameSeq.incrementAndGet();
+        return true;
+    }
+
+    /** First-frame diagnostic on the SurfaceTexture path. SurfaceTexture
+     *  itself doesn't expose the producer-side W×H, but the transform
+     *  matrix encodes the U/V scale the GL shader has to apply to sample
+     *  the live region. With BYD HAL emitting the full configured strip,
+     *  the diagonal entries (sx, sy) are very close to 1.0; if the HAL is
+     *  cropping (e.g., delivering a 2x2 mosaic into a 5120x960 surface),
+     *  the scale will be < 1.0 on one or both axes and that surfaces here
+     *  before we waste cycles wondering why the recorded mosaic looks
+     *  squashed. Cheap — one float[16] read per cold attach. */
+    /** Effective HAL-emit dims derived from the SurfaceTexture transform
+     *  matrix on the first frame after each (re)attach. {@code -1} until
+     *  the first frame arrives. Volatile because the GL thread writes and
+     *  HTTP / pipeline threads can read for diagnostics. */
+    private volatile int halEffectiveWidth = -1;
+    private volatile int halEffectiveHeight = -1;
+    public int getHalEffectiveWidth() { return halEffectiveWidth; }
+    public int getHalEffectiveHeight() { return halEffectiveHeight; }
+
+    private void logFirstFrameDims(SurfaceTexture st) {
+        try {
+            float[] m = new float[16];
+            st.getTransformMatrix(m);
+            // Standard SurfaceTexture matrix: row-major OpenGL form, where
+            // the diagonal m[0]/m[5] are X/Y scale and m[12]/m[13] are
+            // X/Y translation. Sign of sy is usually negative (Y flip).
+            float sx = m[0];
+            float sy = m[5];
+            float tx = m[12];
+            float ty = m[13];
+            // Effective sampled region in producer coords: |sx|×|sy| of
+            // the surface, offset by (tx, ty). Scale 1.0 = full surface.
+            float effW = Math.abs(sx) * (float) width;
+            float effH = Math.abs(sy) * (float) height;
+            halEffectiveWidth = Math.round(effW);
+            halEffectiveHeight = Math.round(effH);
+            logger.info(String.format(java.util.Locale.US,
+                "First frame transform: sx=%.4f sy=%.4f tx=%.4f ty=%.4f → "
+                + "effective sampled region ≈ %.0fx%.0f (configured %dx%d)",
+                sx, sy, tx, ty, effW, effH, width, height));
+            // Cross-correlate effective dims with the configured pipeline
+            // viewport. esco's encoder adapts to whatever the HAL emits;
+            // we instead pin a fixed encoder viewport (Seal: 2560×1920),
+            // so a delta > 5% on either axis means the recorder is going
+            // to stretch/squish content to fill the encoder. Surface the
+            // warning loudly so the operator picks the right cameraMode
+            // / camera profile rather than wondering why the recording
+            // looks squashed.
+            float wRatio = effW / (float) Math.max(1, width);
+            float hRatio = effH / (float) Math.max(1, height);
+            float wDeviation = Math.abs(wRatio - 1.0f);
+            float hDeviation = Math.abs(hRatio - 1.0f);
+            if (wDeviation > 0.05f || hDeviation > 0.05f) {
+                logger.warn(String.format(java.util.Locale.US,
+                    "ENCODER DIM MISMATCH: HAL effective %.0fx%.0f vs configured "
+                    + "%dx%d (deviation: %.1f%% width, %.1f%% height). The "
+                    + "recorder/streamer/AI lane will rescale content into the "
+                    + "fixed viewport, which may stretch or squish the output. "
+                    + "If this car ships a different mosaic shape, switch "
+                    + "cameraMode (Default vs DiLink 4) or update the camera "
+                    + "profile's panoWidth/panoHeight to match.",
+                    effW, effH, width, height,
+                    wDeviation * 100f, hDeviation * 100f));
+            }
+            if (Math.abs(Math.abs(sx) - 1.0f) > 0.01f
+                    || Math.abs(Math.abs(sy) - 1.0f) > 0.01f) {
+                logger.warn("HAL is delivering a CROPPED region of the surface — "
+                    + "if you expected a 4-quadrant 5120x960 strip and effective "
+                    + "is closer to half on either axis, the HAL is in 2x2 "
+                    + "mosaic mode (or some non-strip layout). Consider trying "
+                    + "a different previewIndex (cameraSurfaceMode) or cameraId.");
+            }
+        } catch (Throwable t) {
+            logger.warn("First-frame transform-matrix probe failed: " + t.getMessage());
+        }
+    }
+
+    /**
      * Resolve the per-frame PTS source. Trusts Image.getTimestamp() only as
      * long as it advances by at least MIN_PER_FRAME_HW_ADVANCE_NS per frame;
      * micro-advance (BYD HAL behavior) and constant values both count as
@@ -1096,12 +1816,15 @@ public class PanoramicCameraGpu {
         }
 
         try {
-            // Wait for new frame (hardware sync). Skip the wait if the HAL
-            // already signaled while we were processing the previous frame —
-            // otherwise the unconditional wait() would miss that notify and
-            // park us until the NEXT HAL fire, capping effective FPS.
+            // Wait for new frame (hardware sync). Skip the wait if either
+            // path already signaled while we were processing the previous
+            // frame — otherwise the unconditional wait() would miss that
+            // notify and park us until the NEXT HAL fire, capping FPS.
+            // imagePending is set by the ImageReader OnImageAvailable cb;
+            // stFramePending is set by SurfaceTexture.onFrameAvailable. The
+            // path that's inactive simply never sets its flag.
             synchronized (frameSync) {
-                if (!imagePending) {
+                if (!imagePending && !stFramePending) {
                     try {
                         frameSync.wait(100);  // Timeout to check running flag
                     } catch (InterruptedException e) {
@@ -1109,6 +1832,7 @@ public class PanoramicCameraGpu {
                     }
                 }
                 imagePending = false;
+                stFramePending = false;
             }
 
             if (!running) {
@@ -1131,20 +1855,30 @@ public class PanoramicCameraGpu {
                 return;
             }
 
-            // ImageReader path: acquireLatestImage + getHardwareBuffer +
-            // glEGLImageTargetTexture2DOES binds the freshest gralloc buffer
-            // to cameraTextureId. Runs on the GL thread (current EGL
-            // context). If no new frame is ready (spurious wakeup or notify
-            // race), return — the finally re-posts the loop and we wait again.
-            if (cameraImageReader == null) {
-                return;
-            }
-            // Per-stage timing — measure each phase of the GL frame so we can
-            // attribute backpressure (logged at most once per 2 s, worst-case
-            // frame only). nanoTime() is a monotonic call, ~50ns each.
+            // Bind the latest camera frame to cameraTextureId. Two paths:
+            //   - esco SurfaceTexture: updateTexImage() pulls the most recent
+            //     BufferQueue slot into the EXTERNAL_OES texture. PTS comes
+            //     from SurfaceTexture.getTimestamp().
+            //   - legacy ImageReader: acquireLatestImage + getHardwareBuffer
+            //     + glEGLImageTargetTexture2DOES on the gralloc buffer.
+            // Both run on the GL thread (current EGL context). If no new
+            // frame is ready (spurious wakeup or notify race), return — the
+            // finally re-posts the loop and we wait again.
             long stageT0 = System.nanoTime();
-            if (!consumeLatestImageAndBind()) {
-                return;
+            if (USE_ESCO_SURFACE_TEXTURE_PATH) {
+                if (cameraSurfaceTexture == null) {
+                    return;
+                }
+                if (!consumeSurfaceTextureFrame()) {
+                    return;
+                }
+            } else {
+                if (cameraImageReader == null) {
+                    return;
+                }
+                if (!consumeLatestImageAndBind()) {
+                    return;
+                }
             }
             long stageAfterAcquireNs = System.nanoTime();
             frameCounter++;
@@ -1292,6 +2026,12 @@ public class PanoramicCameraGpu {
             HardwareEventRecorderGpu localEncoder = encoder;
             long stageBeforeMosaicNs = System.nanoTime();
             if (localRecorder != null) {
+                // Publish per-frame transform matrix to recorder before draw.
+                // Cheap (16-float arraycopy); matches esco's per-frame
+                // getTransformMatrix → uTexMatrix flow.
+                if (USE_ESCO_SURFACE_TEXTURE_PATH) {
+                    localRecorder.setTextureMatrix(currentTexMatrix);
+                }
                 // Pass the HAL-provided sensor timestamp straight through to
                 // eglPresentationTimeANDROID. Replaces the old TBC EMA path:
                 // the encoder now produces PTS values that exactly mirror real
@@ -1360,6 +2100,9 @@ public class PanoramicCameraGpu {
             com.overdrive.app.streaming.GpuStreamScaler localStreamScaler = streamScaler;
             HardwareEventRecorderGpu localStreamEncoder = streamEncoder;
             if (localStreamScaler != null && localStreamEncoder != null) {
+                if (USE_ESCO_SURFACE_TEXTURE_PATH) {
+                    localStreamScaler.setTextureMatrix(currentTexMatrix);
+                }
                 localStreamScaler.drawFrame(cameraTextureId);
                 localStreamEncoder.drainEncoder();
             }
@@ -1554,7 +2297,7 @@ public class PanoramicCameraGpu {
         // Close current camera cleanly
         if (cameraObj != null) {
             try {
-                BydCameraCoordinator.closeCamera(cameraObj, cameraSurfaceMode);
+                closeCameraForPath(cameraObj);
             } catch (Exception closeEx) {
                 logger.warn("Error closing camera for probe: " + closeEx.getMessage());
             }
@@ -1828,7 +2571,7 @@ public class PanoramicCameraGpu {
         }
         
         if (cameraObj != null) {
-            BydCameraCoordinator.closeCamera(cameraObj, cameraSurfaceMode);
+            closeCameraForPath(cameraObj);
             cameraObj = null;
             if (cameraCoordinator != null) {
                 cameraCoordinator.resetEventCallbackState();
@@ -1887,7 +2630,7 @@ public class PanoramicCameraGpu {
             
             // Close with proper cleanup + notify service
             if (cameraObj != null) {
-                BydCameraCoordinator.closeCamera(cameraObj, cameraSurfaceMode);
+                closeCameraForPath(cameraObj);
                 cameraObj = null;
                 if (cameraCoordinator != null) {
                     cameraCoordinator.resetEventCallbackState();
@@ -2009,7 +2752,7 @@ public class PanoramicCameraGpu {
         
         // Close camera with proper cleanup + notify service
         if (cameraObj != null) {
-            BydCameraCoordinator.closeCamera(cameraObj, cameraSurfaceMode);
+            closeCameraForPath(cameraObj);
             cameraObj = null;
             if (cameraCoordinator != null) {
                 cameraCoordinator.notifyPosCloseCamera();
@@ -2094,7 +2837,7 @@ public class PanoramicCameraGpu {
             if (cameraObj != null) {
                 Object toClose = cameraObj;
                 cameraObj = null;
-                BydCameraCoordinator.closeCamera(toClose, cameraSurfaceMode);
+                closeCameraForPath(toClose);
                 if (cameraCoordinator != null) {
                     cameraCoordinator.resetEventCallbackState();
                 }
@@ -2331,10 +3074,17 @@ public class PanoramicCameraGpu {
      * Sets the AVMCamera surface mode for addPreviewSurface().
      * Must be called before start(). Default is 0 (works on Seal).
      * Atto 1 may need mode 1 for processed panoramic output.
+     *
+     * On the esco SurfaceTexture path this same value is the previewIndex
+     * argument to addTexture/setTexture/rmTexture: 0=mosaic, 1-4=quadrant.
      */
     public void setCameraSurfaceMode(int mode) {
         this.cameraSurfaceMode = mode;
         logger.info("Camera surface mode set to: " + mode);
+    }
+
+    public boolean isUsingEscoSurfaceTexturePath() {
+        return USE_ESCO_SURFACE_TEXTURE_PATH;
     }
     
     /**
@@ -2565,20 +3315,58 @@ public class PanoramicCameraGpu {
     }
 
     /**
-     * Sample one camera tile from the raw strip at FULL per-camera resolution.
+     * Sample one camera tile at FULL per-camera resolution.
      * Seal: 1280×960. Tang: 1280×720. Recording-safe — same threading model
      * as {@link #sampleFullResMosaicJpeg}.
      *
-     * @param sliceOffsetX strip-X offset for the slice (0.00, 0.25, 0.50, 0.75)
+     * <p>Layout-aware:
+     * <ul>
+     *   <li>Default mode (legacy 4-strip HAL): pass {@code sliceOffsetX} only;
+     *       cornerX/cornerY default to NaN → sampler uses 4-strip math.</li>
+     *   <li>DiLink 4 mode (2x2-native HAL): pass corner XY for the slice's
+     *       0.5×0.5 corner → sampler uses 2x2 math.</li>
+     * </ul>
+     *
+     * @param sliceOffsetX strip-X offset for the slice (legacy path)
      */
     public byte[] samplePerQuadrantJpeg(float sliceOffsetX) {
+        return samplePerQuadrantJpeg(sliceOffsetX, Float.NaN, Float.NaN);
+    }
+
+    /**
+     * Layout-aware variant. cornerX/cornerY are the slice's top-left in a
+     * 2x2-native HAL frame (only used when the camera is in DiLink 4 mode).
+     */
+    public byte[] samplePerQuadrantJpeg(float sliceOffsetX,
+                                        float cornerX, float cornerY) {
+        return samplePerQuadrantJpeg(sliceOffsetX, cornerX, cornerY, 0f, 0f);
+    }
+
+    /**
+     * Layout-aware variant with per-role flip flags. xFlip/yFlip apply to
+     * the local 0.5×0.5 sample window when DiLink 4's HAL emits a flipped
+     * tile for that role. {@code 0f, 0f} = no flip (legacy/canonical).
+     */
+    public byte[] samplePerQuadrantJpeg(float sliceOffsetX,
+                                        float cornerX, float cornerY,
+                                        float xFlip, float yFlip) {
         HighResPreviewSampler sampler = ensureHighResSampler();
         if (sampler == null || cameraTextureId == 0) {
             logger.warn("samplePerQuadrantJpeg early-exit sampler="
                     + (sampler != null) + " textureId=" + cameraTextureId);
             return null;
         }
-        return sampler.samplePerQuadrantJpeg(cameraTextureId, width, height, sliceOffsetX);
+        // Force 2x2 math when DiLink 4 is active AND caller supplied corner
+        // values; otherwise legacy 4-strip math.
+        boolean useCorner = USE_ESCO_SURFACE_TEXTURE_PATH
+            && !Float.isNaN(cornerX) && !Float.isNaN(cornerY);
+        if (useCorner) {
+            return sampler.samplePerQuadrantJpeg(
+                cameraTextureId, width, height, sliceOffsetX,
+                cornerX, cornerY, xFlip, yFlip);
+        }
+        return sampler.samplePerQuadrantJpeg(
+            cameraTextureId, width, height, sliceOffsetX);
     }
 
     /**
@@ -2597,6 +3385,25 @@ public class PanoramicCameraGpu {
         }
         try {
             highResSampler = new HighResPreviewSampler(sharedContext);
+            // Layout mirrors the active camera layout mode; matrix is
+            // refreshed on every consume tick so even legacy mode (which
+            // uses identity) stays current.
+            highResSampler.setCameraLayout(getCameraLayoutMode());
+            if (USE_ESCO_SURFACE_TEXTURE_PATH) {
+                highResSampler.setTextureMatrix(currentTexMatrix);
+                try {
+                    org.json.JSONObject camCfgHr = com.overdrive.app.config
+                        .UnifiedConfigManager.loadConfig().optJSONObject("camera");
+                    if (camCfgHr != null) {
+                        highResSampler.setRedMaskEnabled(
+                            camCfgHr.optBoolean("dilink4RedMask", false));
+                        highResSampler.setApaCenterInset(
+                            (float) camCfgHr.optDouble("dilink4ApaCenterInset", 0.09375));
+                    }
+                } catch (Throwable t) {
+                    logger.warn("Sampler red-mask flag read failed: " + t.getMessage());
+                }
+            }
             return highResSampler;
         } catch (Throwable t) {
             logger.warn("ensureHighResSampler failed: " + t.getMessage());

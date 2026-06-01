@@ -19,6 +19,7 @@ import com.google.android.material.button.MaterialButton
 import com.google.android.material.button.MaterialButtonToggleGroup
 import com.google.android.material.card.MaterialCardView
 import com.google.android.material.chip.Chip
+import com.google.android.material.chip.ChipGroup
 import com.google.android.material.datepicker.CalendarConstraints
 import com.google.android.material.datepicker.DateValidatorPointBackward
 import com.google.android.material.datepicker.MaterialDatePicker
@@ -66,6 +67,27 @@ class RecordingsFragment : Fragment() {
      * Empty set => show both (the default). Both selected => same as empty.
      */
     private val dashcamTypes = mutableSetOf<String>()
+
+    /**
+     * v3 place filter. Selected short-labels (district / city, lowercased
+     * for case-insensitive match against [RecordingFile.placeShortLabel]).
+     * Empty set => no place narrowing.
+     *
+     * The chip ROW is dynamically populated from the places actually
+     * present in the current scan — there's no fixed taxonomy. We can't
+     * know in advance whether a user lives in "Cheras" or "Munich," so
+     * the chips are derived per-page and re-populated whenever the
+     * library reports a new list via [RecordingLibraryFragment.onListChanged].
+     */
+    private val placeFilter = mutableSetOf<String>()
+
+    /**
+     * Snapshot of every distinct place short-label that has appeared in a
+     * recording in the current scan, in descending count order. Capped at
+     * MAX_PLACE_CHIPS so the chip row doesn't sprawl on a long road trip.
+     * Empty until the first scan completes.
+     */
+    private var availablePlaces: List<String> = emptyList()
 
     // -------- Date state --------
     private val calendar = Calendar.getInstance()
@@ -139,6 +161,7 @@ class RecordingsFragment : Fragment() {
             state.getStringArray(KEY_ACTORS)?.let { actorClassFilter.addAll(it) }
             state.getStringArray(KEY_SEVERITY)?.let { severityFilter.addAll(it) }
             state.getStringArray(KEY_DASHCAM_TYPES)?.let { dashcamTypes.addAll(it) }
+            state.getStringArray(KEY_PLACES)?.let { placeFilter.addAll(it) }
             val y = state.getInt(KEY_DATE_Y, -1)
             val m = state.getInt(KEY_DATE_M, -1)
             val d = state.getInt(KEY_DATE_D, -1)
@@ -163,6 +186,10 @@ class RecordingsFragment : Fragment() {
 
         updateDateHeader(view)
         renderActiveFilterAffordances(view)
+        // Initial render with whatever availablePlaces we have (may be
+        // empty on first mount — refreshCounts() populates the set
+        // asynchronously and re-renders when it lands).
+        renderPlaceChips(view)
         refreshCounts()
 
         // Back-press: collapse fullscreen first when active. The callback is
@@ -201,6 +228,7 @@ class RecordingsFragment : Fragment() {
         outState.putStringArray(KEY_ACTORS, actorClassFilter.toTypedArray())
         outState.putStringArray(KEY_SEVERITY, severityFilter.toTypedArray())
         outState.putStringArray(KEY_DASHCAM_TYPES, dashcamTypes.toTypedArray())
+        outState.putStringArray(KEY_PLACES, placeFilter.toTypedArray())
         outState.putInt(KEY_DATE_Y, calendar.get(Calendar.YEAR))
         outState.putInt(KEY_DATE_M, calendar.get(Calendar.MONTH))
         outState.putInt(KEY_DATE_D, selectedDay)
@@ -250,6 +278,14 @@ class RecordingsFragment : Fragment() {
             if (currentPath == null && currentInlineIndex >= 0) {
                 currentInlineIndex = -1
             }
+        }
+        // Library content changed (delete / batch-delete) — re-scan to
+        // refresh the chip-derivation set + segment counters. Distinct
+        // from `onListChanged` which fires on every filter pass /
+        // re-render and would cause a redundant disk walk on every chip
+        // tap.
+        lib.onContentChanged = {
+            refreshCounts()
         }
         applyAllFiltersTo(lib)
     }
@@ -318,7 +354,8 @@ class RecordingsFragment : Fragment() {
             month = calendar.get(Calendar.MONTH),
             day = selectedDay,
             extraSource = extra,
-            narrowToDate = dateNarrowed
+            narrowToDate = dateNarrowed,
+            places = placeFilter.toSet()
         )
     }
 
@@ -511,6 +548,13 @@ class RecordingsFragment : Fragment() {
             // Reset button visibility depends on which segment we're on
             // (Dashcam = dashcamTypes, Surveillance = actor/severity).
             renderActiveFilterAffordances(view)
+            // Place chip set is now segment-scoped — a switch could
+            // surface different chips and possibly invalidate the
+            // active place filter. Trigger a counts refresh so the
+            // executor re-derives availablePlaces under the new
+            // sourceAtDispatch; the post's stale-cleanup will clear
+            // any place no longer in the new segment.
+            refreshCounts()
             libraryFragment?.let { applyAllFiltersTo(it) }
         }
     }
@@ -659,15 +703,19 @@ class RecordingsFragment : Fragment() {
             actorClassFilter.clear()
             severityFilter.clear()
             dashcamTypes.clear()
+            placeFilter.clear()
             syncChipChecks(view)
+            renderPlaceChips(view)
             onFiltersChanged(view)
         }
     }
 
     private fun renderActiveFilterAffordances(view: View) {
         val chipsActive = when (currentSource) {
-            Source.DASHCAM -> dashcamTypes.isNotEmpty()
-            Source.SURVEILLANCE -> actorClassFilter.isNotEmpty() || severityFilter.isNotEmpty()
+            Source.DASHCAM -> dashcamTypes.isNotEmpty() || placeFilter.isNotEmpty()
+            Source.SURVEILLANCE -> actorClassFilter.isNotEmpty()
+                || severityFilter.isNotEmpty()
+                || placeFilter.isNotEmpty()
         }
         // Reset only governs chip filters now — the date has its own clear-X
         // on the date card.
@@ -801,6 +849,13 @@ class RecordingsFragment : Fragment() {
         val ctx = context ?: return
         val executor = metricsExecutor ?: return
         val viewRef = WeakReference(view)
+        // Snapshot the active segment NOW (on the UI thread) so the
+        // executor's chip-bucket derivation scopes to the segment the
+        // user has visible. Without this, the chips would be built
+        // from the global recording set — the user could tap a place
+        // chip that has no clips in the active segment and get an
+        // empty list.
+        val sourceAtDispatch = currentSource
 
         executor.execute {
             val today0 = startOfTodayMillis()
@@ -821,6 +876,43 @@ class RecordingsFragment : Fragment() {
             val totalCount = dashcamStats.total + surveillanceStats.total
             val totalToday = dashcamStats.today + surveillanceStats.today
             val totalBytes = dashcamStats.bytes + surveillanceStats.bytes
+
+            // Place chip set: derive from the unfiltered scan within
+            // the ACTIVE SEGMENT (Dashcam vs Surveillance). Without
+            // segment scoping a user on Dashcam could tap a chip whose
+            // only clips are sentry events and get an empty list. The
+            // "unfiltered" part is still relative to the place filter
+            // itself — applying a place filter doesn't shrink the chip
+            // row, but switching segments does (correctly).
+            val segmentClips = when (sourceAtDispatch) {
+                Source.DASHCAM -> dashcam
+                Source.SURVEILLANCE -> surveillance
+            }
+            data class PlaceBucket(var count: Int, var displayLabel: String, var newestTs: Long)
+            val placeBuckets = LinkedHashMap<String, PlaceBucket>()
+            for (rec in segmentClips) {
+                val raw = rec.placeShortLabel ?: continue
+                if (raw.isEmpty()) continue
+                val key = raw.lowercase()
+                val bucket = placeBuckets[key]
+                if (bucket == null) {
+                    placeBuckets[key] = PlaceBucket(1, raw, rec.timestamp)
+                } else {
+                    bucket.count++
+                    if (rec.timestamp > bucket.newestTs) {
+                        bucket.newestTs = rec.timestamp
+                        bucket.displayLabel = raw
+                    }
+                }
+            }
+            // Sort by count desc, then alpha asc — stable across rescans.
+            val sortedPlaces = placeBuckets.entries
+                .sortedWith(
+                    compareByDescending<Map.Entry<String, PlaceBucket>> { it.value.count }
+                        .thenBy { it.key }
+                )
+                .take(MAX_PLACE_CHIPS)
+                .map { it.value.displayLabel }
 
             val post = object : Runnable {
                 override fun run() {
@@ -846,11 +938,129 @@ class RecordingsFragment : Fragment() {
                             R.string.recordings_segment_surveillance_count,
                             surveillanceStats.total
                         )
+
+                    availablePlaces = sortedPlaces
+                    // Drop any selected places that are no longer in the
+                    // available set (e.g. all clips for that place got
+                    // deleted). Otherwise the user sees an empty list with
+                    // an invisible filter blocking everything.
+                    //
+                    // Re-compute the stale set HERE on the main thread so a
+                    // chip clicked between scan-start and this post-arrival
+                    // is honoured. The set comprehension reads the current
+                    // `placeFilter` (just mutated by the click) and the
+                    // freshly-published `availablePlaces` — neither is the
+                    // executor-thread snapshot. Without this, a click that
+                    // selects "Cheras" milliseconds before the post lands
+                    // could be silently reverted because the executor's
+                    // sortedPlaces snapshot doesn't yet contain "cheras"
+                    // (the scan that produced the snapshot ran BEFORE the
+                    // newly-tagged clip showed up).
+                    val availableLower = availablePlaces
+                        .map { it.lowercase() }
+                        .toSet()
+                    val staleSelections = placeFilter
+                        .filter { it !in availableLower }
+                        .toList()
+                    if (staleSelections.isNotEmpty()) {
+                        placeFilter.removeAll(staleSelections.toSet())
+                        libraryFragment?.let { applyAllFiltersTo(it) }
+                    }
+                    renderPlaceChips(v)
                 }
             }
             synchronized(pendingPosts) { pendingPosts.add(post) }
             mainHandler.post(post)
         }
+    }
+
+    /**
+     * (Re)build the Place chip row from [availablePlaces]. Hidden when no
+     * geocoded clips exist — legacy users never see the row appear unless
+     * they enable the feature and capture at least one tagged clip.
+     *
+     * Chip identity is the lowercased label (matched against
+     * [placeFilter] / [RecordingFile.placeShortLabel]); the chip TEXT is
+     * the canonical mixed-case form so "Cheras" doesn't render as
+     * "cheras" just because the lowercase form drives matching.
+     *
+     * Includes a leading "Any" chip whose tap clears [placeFilter].
+     */
+    private fun renderPlaceChips(view: View) {
+        val row = view.findViewById<View>(R.id.rowPlaceFilter) ?: return
+        val group = view.findViewById<ChipGroup>(R.id.chipGroupPlace) ?: return
+        if (availablePlaces.isEmpty()) {
+            row.visibility = View.GONE
+            group.removeAllViews()
+            return
+        }
+        row.visibility = View.VISIBLE
+        group.removeAllViews()
+
+        val ctx = view.context
+        // Cap individual chip width so a SafeLocation label like
+        // "Wonderfully Quaint Borough of South-Eastern Münster" can't
+        // push every later chip out of the horizontally-scrolled row's
+        // visible area or distort layout. ~180dp matches the wider
+        // existing chip presets in the toolbar.
+        val maxChipWidthPx = (180 * ctx.resources.displayMetrics.density).toInt()
+
+        // "Any" — clears row.
+        val anyChip = Chip(ctx)
+        anyChip.text = ctx.getString(R.string.recording_lib_chip_any)
+        anyChip.isCheckable = true
+        anyChip.isChecked = placeFilter.isEmpty()
+        anyChip.isSingleLine = true
+        anyChip.ellipsize = android.text.TextUtils.TruncateAt.END
+        anyChip.maxWidth = maxChipWidthPx
+        // Any is the only chip checked when nothing's selected; tapping it
+        // again should NOT toggle off (otherwise the row enters an
+        // ambiguous "everything is unchecked but no filter is active"
+        // state — same UX as the existing chipActorAny / chipSevAny).
+        anyChip.setOnClickListener {
+            if (placeFilter.isNotEmpty()) {
+                placeFilter.clear()
+                onPlaceFilterChanged(view)
+            } else {
+                anyChip.isChecked = true  // re-arm — Any is sticky once selected
+            }
+        }
+        group.addView(anyChip)
+
+        for (label in availablePlaces) {
+            val key = label.lowercase()
+            val chip = Chip(ctx)
+            chip.text = label
+            chip.isCheckable = true
+            chip.isChecked = key in placeFilter
+            chip.isSingleLine = true
+            chip.ellipsize = android.text.TextUtils.TruncateAt.END
+            chip.maxWidth = maxChipWidthPx
+            chip.setOnClickListener {
+                if (key in placeFilter) {
+                    placeFilter.remove(key)
+                } else {
+                    placeFilter.add(key)
+                }
+                onPlaceFilterChanged(view)
+            }
+            group.addView(chip)
+        }
+    }
+
+    /**
+     * Atomic re-render after a Place chip toggle: re-syncs the Any chip
+     * checked state, refreshes the row's reset-button affordance, and
+     * pushes the updated filter into the library.
+     */
+    private fun onPlaceFilterChanged(view: View) {
+        // Re-sync the "Any" chip across the whole row. Easiest: full
+        // re-render — chip-count is bounded by MAX_PLACE_CHIPS so this is
+        // cheap. Avoids a partial-update bug where Any stays "checked"
+        // alongside a data chip.
+        renderPlaceChips(view)
+        renderActiveFilterAffordances(view)
+        libraryFragment?.let { applyAllFiltersTo(it) }
     }
 
     /**
@@ -886,11 +1096,14 @@ class RecordingsFragment : Fragment() {
         private const val KEY_ACTORS = "recordings_actor_classes"
         private const val KEY_SEVERITY = "recordings_severity"
         private const val KEY_DASHCAM_TYPES = "recordings_dashcam_types"
+        private const val KEY_PLACES = "recordings_places"
         private const val KEY_DATE_Y = "recordings_date_year"
         private const val KEY_DATE_M = "recordings_date_month"
         private const val KEY_DATE_D = "recordings_date_day"
         private const val KEY_DATE_NARROWED = "recordings_date_narrowed"
         private const val KEY_PLAYER_FULLSCREEN = "recordings_player_fullscreen"
         private const val TAG_INLINE_PLAYER = "inline_player"
+        /** Cap on chips to avoid sprawl after a long road trip. */
+        private const val MAX_PLACE_CHIPS = 8
     }
 }

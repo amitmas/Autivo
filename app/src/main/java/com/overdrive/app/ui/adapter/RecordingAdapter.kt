@@ -101,6 +101,7 @@ class RecordingAdapter(
         private val tvSeverity: TextView? = itemView.findViewById(R.id.tvSeverity)
         private val tvActorSummary: TextView? = itemView.findViewById(R.id.tvActorSummary)
         private val severityStripe: View? = itemView.findViewById(R.id.severityStripe)
+        private val tvLocation: TextView? = itemView.findViewById(R.id.tvLocation)
 
         fun bind(recording: RecordingFile) {
             tvCameraId.text = "C${recording.cameraId}"
@@ -152,6 +153,19 @@ class RecordingAdapter(
                 tvActorSummary?.text = parts.joinToString(" · ")
             } else {
                 tvActorSummary?.visibility = View.GONE
+            }
+
+            // Place chip — geocoded location from the v3 sidecar's geo.place
+            // block. Prefers mediumLabel ("Cheras, Kuala Lumpur") so the row
+            // tells the user something meaningful at a glance; falls back to
+            // the short label for tight grids and is hidden entirely when no
+            // place was resolved.
+            val placeText = recording.placeMediumLabel ?: recording.placeShortLabel
+            if (!placeText.isNullOrEmpty()) {
+                tvLocation?.visibility = View.VISIBLE
+                tvLocation?.text = placeText
+            } else {
+                tvLocation?.visibility = View.GONE
             }
 
             // Load thumbnail

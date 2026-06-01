@@ -378,6 +378,27 @@
                     android:textAppearance="@style/TextAppearance.Material3.HeadlineSmall"
                     android:textColor="?attr/colorOnSurfaceVariant"
                     android:textStyle="bold" />
+
+                <!-- Frame mismatch advisory pill — only shown when the
+                     daemon reports peak/nominal < 0.85 after the anchor
+                     has stabilized. Tap the tile (already clickable) to
+                     open the dialog where the "Use observed value" action
+                     lives. We keep the badge text small + tonal so it
+                     reads as advisory, not error. -->
+                <TextView
+                    android:id="@+id/tvBatteryReviewBadge"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:paddingStart="8dp"
+                    android:paddingEnd="8dp"
+                    android:paddingTop="2dp"
+                    android:paddingBottom="2dp"
+                    android:background="@drawable/bg_battery_review_pill"
+                    android:text="@string/diagnostics_battery_needs_review"
+                    android:textAppearance="@style/TextAppearance.Material3.LabelSmall"
+                    android:textColor="?attr/colorOnSecondaryContainer"
+                    android:visibility="gone" />
             </LinearLayout>
         </com.google.android.material.card.MaterialCardView>
     </LinearLayout>

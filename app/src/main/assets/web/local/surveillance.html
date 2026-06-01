@@ -689,6 +689,60 @@
                     </div>
                 </div>
 
+                <!-- Place Tagging (reverse geocoding) — General tab.
+                     This card controls the "surveillance" flow only — sentry
+                     and proximity-while-parked event clips. Dashcam tagging
+                     lives on recording.html. The custom Nominatim URL is
+                     shared between both pages and surfaces here too so a
+                     privacy-paranoid user setting up sentry surveillance
+                     can find it without bouncing between pages. -->
+                <div class="card" data-tab="general">
+                    <div class="card-header">
+                        <div class="card-title">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/>
+                                <circle cx="12" cy="10" r="3"/>
+                            </svg>
+                            <span data-i18n="surveillance.geocoding_title">Place Tagging</span>
+                        </div>
+                    </div>
+                    <div class="card-body">
+                        <div class="setting-row">
+                            <div class="setting-info">
+                                <div class="setting-name" data-i18n="surveillance.geocoding_enabled_name">Tag sentry events with place names</div>
+                                <div class="setting-desc" data-i18n="surveillance.geocoding_enabled_desc">Reverse-geocode the event-start GPS into a district/city label and save it next to each clip's sidecar. Off by default to keep parked-at-home addresses out of shared notifications.</div>
+                            </div>
+                            <div class="setting-control">
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="survGeocodingEnabled" onchange="SurvSettings.toggleGeocodingEnabled()">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                        </div>
+                        <div class="setting-row">
+                            <div class="setting-info">
+                                <div class="setting-name" data-i18n="surveillance.geocoding_online_name">Use online resolver</div>
+                                <div class="setting-desc" data-i18n="surveillance.geocoding_online_desc">Falls back to OpenStreetMap Nominatim when on-device geocoding cannot name a location. Sends only the event-start coordinates and your device language.</div>
+                            </div>
+                            <div class="setting-control">
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="survGeocodingOnline" onchange="SurvSettings.toggleGeocodingOnline()">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                        </div>
+                        <div class="setting-row" style="border-bottom:none;">
+                            <div class="setting-info" style="flex:1 1 auto;">
+                                <div class="setting-name" data-i18n="surveillance.geocoding_custom_url_name">Custom Nominatim URL</div>
+                                <div class="setting-desc" data-i18n="surveillance.geocoding_custom_url_desc">Optional. Point to a self-hosted instance to skip the public OSM endpoint entirely. Shared with dashcam settings.</div>
+                            </div>
+                            <div class="setting-control">
+                                <input type="url" id="survGeocodingCustomUrl" class="text-input" inputmode="url" placeholder="https://nominatim.example.com" onchange="SurvSettings.saveGeocodingCustomUrl()" />
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- Recording Settings -->
                 <div class="card" data-tab="recording">
                     <div class="card-header">

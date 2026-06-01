@@ -11,7 +11,8 @@
     "charging_stopped": "{0}% पर चार्जिंग बंद",
     "charging_complete": "{0}% पर बैटरी  डिस्प्लग करने के लिए तैयार",
     "recording_started": "रिकॉर्डिंग शुरू",
-    "recording_ended": "रिकॉर्डिंग समाप्त"
+    "recording_ended": "रिकॉर्डिंग समाप्त",
+    "location_prefix": "स्थान: {0}"
   },
   "errors": {
     "rate_limited_locked_for_seconds": "{0}s के लिए बहुत अधिक प्रयास  बंद",
@@ -35,6 +36,7 @@
     "models_invalid_json": "अमान्य JSON",
     "models_unknown_id_with_id": "अज्ञात मॉडल आईडीः {0}",
     "models_invalid_color": "अमान्य रंग (अनुमानित #RRGGBB)",
+    "models_invalid_drive_side": "अमान्य वाहन लेआउट (अपेक्षित «lhd» या «rhd»)",
     "models_nothing_to_update": "अद्यतन करने के लिए कुछ भी नहीं",
     "models_persist_failed": "दृढ़ता से काम करने में विफल रहा",
     "models_id_required": "आईडी की आवश्यकता है",
@@ -99,8 +101,7 @@
     "mqtt_not_initialized": "MQTT प्रारंभ नहीं किया गया",
     "max_connections_reached": "अधिकतम कनेक्शन प्राप्त ({0})",
     "missing_connection_id": "अनुपस्थित कनेक्शन आईडी",
-    "connection_not_found": "कनेक्शन नहीं मिलाः {0}",
-    "models_invalid_drive_side": "अमान्य वाहन लेआउट (अपेक्षित «lhd» या «rhd»)"
+    "connection_not_found": "कनेक्शन नहीं मिलाः {0}"
   },
   "notifications": {
     "charging_started": "चार्जिंग शुरू",
@@ -119,7 +120,9 @@
     "area_hood": "हुड",
     "area_trunk": "ट्रंक",
     "area_fuel_cap": "ईंधन कैप",
-    "area_door_n": "दरवाजा {0}"
+    "area_door_n": "दरवाजा {0}",
+    "soh_frame_mismatch_title": "बैटरी क्षमता आवश्यकताओं की समीक्षा",
+    "soh_frame_mismatch_body": "वाहन {0} kWh को पूर्ण चार्ज पर रिपोर्ट करता है लेकिन पैक क्षमता {1} kWh पर सेट है। एक नल में फिक्स्ड करने के लिए बैटरी स्वास्थ्य खोलें।"
   },
   "telegram": {
     "recording_caption": " रिकॉर्डिंग ({0}) - {1}s",

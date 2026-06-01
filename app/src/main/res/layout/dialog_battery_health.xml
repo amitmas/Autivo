@@ -373,7 +373,92 @@
                     android:textAppearance="@style/TextAppearance.Material3.BodyLarge"
                     android:textColor="?attr/colorOnSurface" />
             </LinearLayout>
+
+            <!-- Row: Frame anchor (PHEV only — observed peak remainKwh at SOC≥99%).
+                 Hidden unless frameAnchor.peakKwh > 0. -->
+            <LinearLayout
+                android:id="@+id/rowSohFrameAnchor"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:orientation="vertical"
+                android:visibility="gone">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:letterSpacing="0.05"
+                    android:text="@string/soh_dialog_frame_anchor_label"
+                    android:textAllCaps="true"
+                    android:textAppearance="@style/TextAppearance.Material3.LabelSmall"
+                    android:textColor="?attr/colorOnSurfaceVariant" />
+
+                <TextView
+                    android:id="@+id/tvSohFrameAnchor"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
+                    android:text="@string/battery_health_dashes"
+                    android:textAppearance="@style/TextAppearance.Material3.BodyLarge"
+                    android:textColor="?attr/colorOnSurface" />
+            </LinearLayout>
         </LinearLayout>
+
+        <!-- Frame mismatch warning card (PHEV only — peakObserved/nominal < 0.85
+             after the anchor stabilizes). Shown above the divider so it reads
+             as a recommendation about the SOH numbers above, not part of the
+             reset action below. -->
+        <com.google.android.material.card.MaterialCardView
+            android:id="@+id/cardSohFrameMismatch"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="@dimen/card_gap_vertical"
+            android:visibility="gone"
+            app:cardBackgroundColor="?attr/colorErrorContainer"
+            app:cardCornerRadius="@dimen/card_radius_standard"
+            app:cardElevation="0dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:padding="@dimen/card_padding_standard">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:letterSpacing="0.05"
+                    android:text="@string/soh_dialog_frame_mismatch_title"
+                    android:textAllCaps="true"
+                    android:textAppearance="@style/TextAppearance.Material3.LabelSmall"
+                    android:textColor="?attr/colorOnErrorContainer" />
+
+                <TextView
+                    android:id="@+id/tvSohFrameMismatch"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
+                    android:textAppearance="@style/TextAppearance.Material3.BodyMedium"
+                    android:textColor="?attr/colorOnErrorContainer" />
+
+                <!-- One-tap consent action: POSTs the observed-peak value to
+                     /api/performance/soh/nominal so the user doesn't have to
+                     navigate back to the nominal-input UI and retype it. We
+                     keep this in-card (rather than a separate FAB) so the
+                     action sits next to the explanation that justifies it. -->
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btnSohUseObservedValue"
+                    style="@style/Widget.Material3.Button.TonalButton"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="12dp"
+                    android:minHeight="44dp"
+                    android:text="@string/soh_dialog_use_observed_value"
+                    android:textAllCaps="false"
+                    android:textAppearance="@style/TextAppearance.Material3.LabelLarge"
+                    app:cornerRadius="20dp" />
+            </LinearLayout>
+        </com.google.android.material.card.MaterialCardView>
 
         <!-- Divider -->
         <View

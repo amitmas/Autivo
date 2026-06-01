@@ -278,6 +278,57 @@ object UnifiedConfigManager {
         }
         if (!vehicle.has("modelId")) vehicle.put("modelId", "seal")
         if (!vehicle.has("color")) vehicle.put("color", "#E8E8EC")  // Aurora White
+
+        // Geocoding (place-name tagging) defaults — opt-in, fully offline by
+        // default so the upgrade is non-surprising for existing users.
+        // Per-flow split (recording / surveillance) so dashcam and sentry
+        // clips can be tagged independently.
+        //
+        // Migration: if a pre-split config has top-level enabled / allowOnline
+        // / customNominatimBase / nominatimCooldownUntilMs fields, fold them
+        // into the new shape. The fold is one-shot and idempotent — once the
+        // sub-objects exist applyDefaults is a no-op. Without this, users who
+        // had the feature enabled under the old schema would silently lose
+        // the toggle on first run after upgrade.
+        val geocoding = config.optJSONObject("geocoding") ?: JSONObject().also {
+            config.put("geocoding", it)
+        }
+
+        // Capture legacy values BEFORE constructing nested defaults so the
+        // sub-objects pick up the old settings instead of defaulting to off.
+        val legacyEnabled = geocoding.has("enabled") && geocoding.optBoolean("enabled", false)
+        val legacyOnline  = geocoding.has("allowOnline") && geocoding.optBoolean("allowOnline", false)
+        val legacyCustomUrl = geocoding.optString("customNominatimBase", "")
+        val legacyCooldown = geocoding.optLong("nominatimCooldownUntilMs", 0L)
+
+        val recordingGeo = geocoding.optJSONObject("recording") ?: JSONObject().also {
+            geocoding.put("recording", it)
+        }
+        if (!recordingGeo.has("enabled")) recordingGeo.put("enabled", legacyEnabled)
+        if (!recordingGeo.has("allowOnline")) recordingGeo.put("allowOnline", legacyOnline)
+
+        val surveillanceGeo = geocoding.optJSONObject("surveillance") ?: JSONObject().also {
+            geocoding.put("surveillance", it)
+        }
+        if (!surveillanceGeo.has("enabled")) surveillanceGeo.put("enabled", legacyEnabled)
+        if (!surveillanceGeo.has("allowOnline")) surveillanceGeo.put("allowOnline", legacyOnline)
+
+        val advancedGeo = geocoding.optJSONObject("advanced") ?: JSONObject().also {
+            geocoding.put("advanced", it)
+        }
+        if (!advancedGeo.has("customNominatimBase")) {
+            advancedGeo.put("customNominatimBase", legacyCustomUrl)
+        }
+        if (!advancedGeo.has("nominatimCooldownUntilMs")) {
+            advancedGeo.put("nominatimCooldownUntilMs", legacyCooldown)
+        }
+
+        // Strip the legacy top-level keys after migration so future writers
+        // don't accidentally re-introduce stale values.
+        if (geocoding.has("enabled")) geocoding.remove("enabled")
+        if (geocoding.has("allowOnline")) geocoding.remove("allowOnline")
+        if (geocoding.has("customNominatimBase")) geocoding.remove("customNominatimBase")
+        if (geocoding.has("nominatimCooldownUntilMs")) geocoding.remove("nominatimCooldownUntilMs")
     }
     
     /**
@@ -300,6 +351,35 @@ object UnifiedConfigManager {
                 if (configFile.exists()) {
                     val content = configFile.readText()
                     val config = JSONObject(content)
+                    // Run schema migration on every load. applyDefaults is
+                    // idempotent — it only fills in absent fields and only
+                    // strips legacy top-level geocoding keys that have
+                    // already been folded into the nested shape. Without
+                    // this call, a user with a pre-split flat geocoding
+                    // schema on disk would silently lose their toggle —
+                    // getGeocoding() would return false because the new
+                    // nested keys wouldn't exist.
+                    //
+                    // Detect "needs migration" cheaply (legacy key at the
+                    // top of geocoding) so non-migrating loads stay zero-
+                    // overhead.
+                    val migrationNeeded = run {
+                        val geo = config.optJSONObject("geocoding") ?: return@run false
+                        geo.has("enabled") || geo.has("allowOnline")
+                            || geo.has("customNominatimBase")
+                            || geo.has("nominatimCooldownUntilMs")
+                    }
+                    if (migrationNeeded) {
+                        applyDefaults(config)
+                        // Persist the migrated shape so subsequent loads
+                        // skip the migration check entirely.
+                        try {
+                            saveConfigInternal(config)
+                            Log.i(TAG, "Migrated legacy geocoding schema to nested form")
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Failed to persist migrated schema: ${e.message}")
+                        }
+                    }
                     cachedConfig = config
                     lastModified.set(configFile.lastModified())
                     Log.d(TAG, "Config loaded from $CONFIG_PATH")
@@ -629,6 +709,82 @@ object UnifiedConfigManager {
     }
 
     /**
+     * Geocoding (place-name tagging) section. Per-flow split so dashcam
+     * and surveillance recordings can be tagged independently.
+     *
+     * Schema:
+     *   recording: { enabled (bool, default false),
+     *                allowOnline (bool, default false) }
+     *   surveillance: { enabled (bool, default false),
+     *                   allowOnline (bool, default false) }
+     *   advanced: { customNominatimBase (string, default ""),
+     *               nominatimCooldownUntilMs (long, default 0) }
+     *
+     * Why per-flow: a user driving a road-trip wants dashcam clips tagged
+     * with the cities they passed through, but the same user parking at
+     * home overnight may NOT want sentry clips tagged with their home
+     * address (especially if shared via Telegram pushes). Per-flow toggles
+     * give that distinction; a shared "advanced" sub-section keeps
+     * power-user knobs (custom URL + cooldown state) singletons.
+     *
+     * The resolver picks {@code recording.allowOnline} for normal/proximity
+     * recordings and {@code surveillance.allowOnline} for sentry events.
+     * Cache + rate limiter are process-shared (one rate budget, one cache).
+     */
+    @JvmStatic
+    fun getGeocoding(): JSONObject {
+        return loadConfig().optJSONObject("geocoding") ?: JSONObject().apply {
+            put("recording", JSONObject().apply {
+                put("enabled", false)
+                put("allowOnline", false)
+            })
+            put("surveillance", JSONObject().apply {
+                put("enabled", false)
+                put("allowOnline", false)
+            })
+            put("advanced", JSONObject().apply {
+                put("customNominatimBase", "")
+                put("nominatimCooldownUntilMs", 0L)
+            })
+        }
+    }
+
+    @JvmStatic
+    fun setGeocoding(geocoding: JSONObject): Boolean {
+        return updateSection("geocoding", geocoding)
+    }
+
+    /**
+     * Convenience: query whether a given flow ("recording" or "surveillance")
+     * is enabled. Falls back to {@code false} on any read failure so the
+     * recorder's hot path is fail-closed.
+     */
+    @JvmStatic
+    fun isGeocodingEnabledForFlow(flow: String): Boolean {
+        try {
+            val geo = loadConfig().optJSONObject("geocoding") ?: return false
+            val sec = geo.optJSONObject(flow) ?: return false
+            return sec.optBoolean("enabled", false)
+        } catch (t: Throwable) {
+            return false
+        }
+    }
+
+    /**
+     * Companion to [isGeocodingEnabledForFlow] for the online tier gate.
+     */
+    @JvmStatic
+    fun isGeocodingOnlineAllowedForFlow(flow: String): Boolean {
+        try {
+            val geo = loadConfig().optJSONObject("geocoding") ?: return false
+            val sec = geo.optJSONObject(flow) ?: return false
+            return sec.optBoolean("allowOnline", false)
+        } catch (t: Throwable) {
+            return false
+        }
+    }
+
+    /**
      * Native-shell preferences. Today this carries `locale` for the Android
      * UI's language picker — kept separate from `appearance.locale` (which
      * is the WebView-only locale) so a tunnel-side picker doesn't change
@@ -775,6 +931,7 @@ object UnifiedConfigManager {
         config.put("telemetryOverlay", JSONObject())
         config.put("tripAnalytics", JSONObject())
         config.put("bydCloud", JSONObject())
+        config.put("geocoding", JSONObject())
         config.put("version", 1)
         config.put("lastModified", System.currentTimeMillis())
         applyDefaults(config)

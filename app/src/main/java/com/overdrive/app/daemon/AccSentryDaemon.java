@@ -257,22 +257,24 @@ public class AccSentryDaemon {
      */
     private static void configurePeripheralPower(boolean enable) {
         log("Configuring Peripheral Power (USB/Data): " + (enable ? "ON" : "OFF"));
-        
+
         if (!enable) {
             // DISABLE — restore stock, allow MCU to cut power
             setSpecialConfig(SPECIAL_CONFIG_REMOTE_POWER_MODE, 0);  // Sentry keep-alive OFF
             setSpecialConfig(SPECIAL_CONFIG_DATA_MODULE_POWER, 2);  // Allow sleep (value=2, NOT 0)
             setPowerConfig(-1442840502, 0);                         // Release power hold (PowerDevice, not SpecialDevice)
+            applyEscoSentrySpecialConfig(false);                    // dilink4-only esco-parity disable
         } else {
             // ENABLE — check MCU state first
             int mcuStatus = getMcuStatus();
             log("MCU status for peripheral power: " + mcuStatus);
-            
+
             if (mcuStatus == 1 || mcuStatus == 10) {
                 // MCU is in normal standby — use signal-based path
                 setSpecialConfig(SPECIAL_CONFIG_REMOTE_POWER_MODE, 1);  // Sentry keep-alive ON
                 setSpecialConfig(SPECIAL_CONFIG_DATA_MODULE_POWER, 1);  // Wake request ON
                 // NOTE: -1442840502 is NOT set to 1 here — it's a release-only signal
+                applyEscoSentrySpecialConfig(true);                    // dilink4-only esco-parity enable
             } else {
                 // MCU needs active wake — use wakeUpMcu() then retry
                 log("MCU not ready (status=" + mcuStatus + "), waking up and retrying...");
@@ -285,16 +287,47 @@ public class AccSentryDaemon {
                     if (retryStatus == 1 || retryStatus == 10) {
                         setSpecialConfig(SPECIAL_CONFIG_REMOTE_POWER_MODE, 1);
                         setSpecialConfig(SPECIAL_CONFIG_DATA_MODULE_POWER, 1);
+                        applyEscoSentrySpecialConfig(true);
                     } else {
                         // One more attempt
                         wakeUpMcu();
                         try { Thread.sleep(1000); } catch (InterruptedException ignored) {}
                         setSpecialConfig(SPECIAL_CONFIG_REMOTE_POWER_MODE, 1);
                         setSpecialConfig(SPECIAL_CONFIG_DATA_MODULE_POWER, 1);
+                        applyEscoSentrySpecialConfig(true);
                         log("Forced peripheral power enable after second wake attempt");
                     }
                 }).start();
             }
+        }
+    }
+
+    // ==================== ESCO-PARITY SENTRY KEYS (DILINK 4) ====================
+
+    // Esco's BatteryVoltageMonitorV2 sentry keep-alive IDs. Different magic
+    // numbers from our 782237711 / 782237728 (which are DiPlus-derived, kept
+    // additive and unchanged for legacy fleet). On byd_apa firmware the
+    // AVMCamera HAL gates frame production on these specific BYD-internal
+    // peripheral-power flags being held active; without them the producer
+    // surface delivers all-zero pixels post ACC OFF.
+    //
+    // ENABLE  (esco kh/C6861d.java m30171B "sentry wakeUp"): [1901]=1, [1902]=1
+    // DISABLE (esco kh/C6861d.java m30170A "sentry sleep"):  [1901]=0, [1902]=2
+    //
+    // Gated to cameraMode=dilink4. Legacy cars don't read or write these.
+    private static final int ESCO_SENTRY_KEY_1 = 1901;
+    private static final int ESCO_SENTRY_KEY_2 = 1902;
+
+    private static void applyEscoSentrySpecialConfig(boolean enable) {
+        if (!isDilink4CameraMode()) return;
+        if (enable) {
+            log("[esco-parity] sentry wakeUp: SpecialDevice [1901]=1, [1902]=1");
+            setSpecialConfig(ESCO_SENTRY_KEY_1, 1);
+            setSpecialConfig(ESCO_SENTRY_KEY_2, 1);
+        } else {
+            log("[esco-parity] sentry sleep: SpecialDevice [1901]=0, [1902]=2");
+            setSpecialConfig(ESCO_SENTRY_KEY_1, 0);
+            setSpecialConfig(ESCO_SENTRY_KEY_2, 2);
         }
     }
     
@@ -726,8 +759,14 @@ public class AccSentryDaemon {
      * AppOps gate. Mirrors DiPlus's vanss daemon, which arrives at shell UID via
      * an ADB-localhost tunnel and then makes this exact call.
      *
-     * SDK ≥ 32 → byd_datacached.setAppStartupData(uid, 0)
-     * SDK < 32 → bg_datacache.setAppOpsData(uid, 0)
+     * SDK ≥ 31 → byd_datacached.setAppStartupData(uid, 0)
+     * SDK < 31 → bg_datacache.setAppOpsData(uid, 0)
+     *
+     * Threshold matches esco's C0241c.m941c() — earlier we used >= 32, but
+     * BYD DiLink 4 ROMs that ship Android 12 (API 31) base have the new
+     * byd_datacached service available, and the old bg_datacache.setAppOpsData
+     * gates on ACCESS_APPOPSDATA (denied to shell UID 2000 → frames all-black
+     * post ACC OFF on byd_apa).
      */
     private static void applyDataCacheWhitelist() {
         if (appContext == null) {
@@ -747,7 +786,7 @@ public class AccSentryDaemon {
         log("Applying data-cache whitelist for " + pkg + " (uid=" + appUid + ")");
 
         Context permissiveContext = new PermissionBypassContext(appContext);
-        boolean useNewService = android.os.Build.VERSION.SDK_INT >= 32;
+        boolean useNewService = android.os.Build.VERSION.SDK_INT >= 31;
 
         if (useNewService) {
             try {
@@ -1716,7 +1755,24 @@ public class AccSentryDaemon {
                     // backlight-off tick. Otherwise this loop would clobber
                     // the wake within 10s and the user would never see the
                     // deterrent through to its full duration.
-                    if (!isScreenDeterrentActive()) {
+                    //
+                    // DiLink 4 gate: byd_apa AVMCamera HAL ties its preview
+                    // surface to display power state. setBacklightState(false)
+                    // makes the HAL emit event=8 ("camera died") and tear
+                    // down the preview, killing 24/7 sentry recording on a
+                    // 10s cadence. Skip the backlight-off entirely on
+                    // dilink4 — the wakelock keeps CPU alive, and the
+                    // display naturally dims via the head-unit's own timeout.
+                    // Legacy pano_h/pano_l HALs are display-state-agnostic
+                    // and keep their existing power-save behaviour.
+                    //
+                    // The cameraActiveUntilMs check is the finer-grained
+                    // gate: only the slice of time when the GPU pipeline is
+                    // actively consuming frames. Useful even on legacy if
+                    // a dashcam mode is running across ACC OFF (rare).
+                    if (!isScreenDeterrentActive()
+                            && !isDilink4CameraMode()
+                            && !isCameraPipelineActive()) {
                         setBacklightState(false);
                     }
 
@@ -1764,6 +1820,47 @@ public class AccSentryDaemon {
                     .optJSONObject("surveillance");
             if (s == null) return false;
             long deadline = s.optLong("screenDeterrentActiveUntilMs", 0L);
+            return deadline > System.currentTimeMillis();
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /**
+     * True when the user has selected DiLink 4 mode for the camera. On
+     * byd_apa firmware the AVMCamera HAL tears down the preview surface
+     * whenever the display backlight goes off, so the keepalive's
+     * setBacklightState(false) tick must be suppressed entirely. Reads
+     * the same UnifiedConfigManager cross-UID cache as the screen-deterrent
+     * gate; cheap (~0 GC churn between writes since loadConfig() is mtime-
+     * gated). Returns false on any failure so a stuck flag can never
+     * keep the legacy fleet's screen on permanently.
+     */
+    private static boolean isDilink4CameraMode() {
+        try {
+            org.json.JSONObject c = com.overdrive.app.config.UnifiedConfigManager.loadConfig()
+                    .optJSONObject("camera");
+            if (c == null) return false;
+            return "dilink4".equalsIgnoreCase(c.optString("cameraMode", "default"));
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /**
+     * True when CameraDaemon's GPU pipeline is actively consuming camera
+     * frames. CameraDaemon writes surveillance.cameraActiveUntilMs ~5s ahead
+     * of now while gpuPipeline.isRunning(); we read it here to skip the
+     * keepalive's backlight-off tick during that window. Legacy fleet
+     * doesn't write the key (default 0), so isCameraPipelineActive() is
+     * false there and the existing power-save behaviour stays bit-exact.
+     */
+    private static boolean isCameraPipelineActive() {
+        try {
+            org.json.JSONObject s = com.overdrive.app.config.UnifiedConfigManager.loadConfig()
+                    .optJSONObject("surveillance");
+            if (s == null) return false;
+            long deadline = s.optLong("cameraActiveUntilMs", 0L);
             return deadline > System.currentTimeMillis();
         } catch (Throwable t) {
             return false;

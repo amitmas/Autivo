@@ -26,7 +26,15 @@ data class RecordingFile(
     val bikeCount: Int = 0,
     val animalCount: Int = 0,
     val heroThumbnailFile: File? = null,  // Sibling JPEG path or null
-    val actorClasses: List<String> = emptyList()  // ["person","vehicle",...] for filtering
+    val actorClasses: List<String> = emptyList(),  // ["person","vehicle",...] for filtering
+    // ---- v3 sidecar geo enrichment ----
+    val placeShortLabel: String? = null,    // "Cheras" / "Home" — chip text
+    val placeMediumLabel: String? = null,   // "Cheras, Kuala Lumpur" — push body
+    val placeDisplayName: String? = null,   // Long form, "Bandar Tun Razak, Cheras, KL, MY"
+    val placeCountryCode: String? = null,   // ISO 3166-1 alpha-2, lowercased
+    val placeSource: String? = null,        // "cache" / "nominatim" / "safezone" / "android-geocoder"
+    val startLat: Double? = null,           // Recording-start GPS — used by "show on map"
+    val startLng: Double? = null
 ) {
     // Secondary constructor for MediaStore results
     constructor(

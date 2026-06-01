@@ -16,7 +16,7 @@
 
   Preserved IDs (RecordingAdapter.kt findViewById targets):
     ivThumbnail, severityStripe, tvSeverity, tvCameraId, tvDuration,
-    tvActorSummary, cbSelect, tvFilename, tvRecordingTime, tvSize,
+    tvActorSummary, tvLocation, cbSelect, tvFilename, tvRecordingTime, tvSize,
     btnDelete
 -->
 <com.google.android.material.card.MaterialCardView xmlns:android="http://schemas.android.com/apk/res/android"
@@ -158,6 +158,26 @@
                 android:textAppearance="@style/TextAppearance.Material3.LabelLarge"
                 android:textColor="?attr/colorOnSurface"
                 tools:text="event_20260514_223124.mp4" />
+
+            <!--
+              Location chip — populated from the v3 sidecar's geo.place block
+              when reverse-geocoding is enabled. Hidden entirely when no
+              place is known so legacy clips and clips with no GPS fix look
+              identical to the pre-geo design.
+            -->
+            <TextView
+                android:id="@+id/tvLocation"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:drawablePadding="6dp"
+                android:ellipsize="end"
+                android:singleLine="true"
+                android:textAppearance="@style/TextAppearance.Material3.LabelSmall"
+                android:textColor="?attr/colorOnSurfaceVariant"
+                android:visibility="gone"
+                tools:text="Cheras, Kuala Lumpur"
+                tools:visibility="visible" />
 
             <LinearLayout
                 android:layout_width="match_parent"

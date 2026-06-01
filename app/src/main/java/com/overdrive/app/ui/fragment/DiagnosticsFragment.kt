@@ -59,6 +59,7 @@ class DiagnosticsFragment : Fragment() {
     // Battery tile
     private var tvBatteryValue: TextView? = null
     private var viewBatteryDot: View? = null
+    private var tvBatteryReviewBadge: TextView? = null
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var ssidRefreshRunnable: Runnable? = null
@@ -130,6 +131,7 @@ class DiagnosticsFragment : Fragment() {
         viewCameraDot = view.findViewById(R.id.viewCameraDot)
         tvBatteryValue = view.findViewById(R.id.tvBatteryValue)
         viewBatteryDot = view.findViewById(R.id.viewBatteryDot)
+        tvBatteryReviewBadge = view.findViewById(R.id.tvBatteryReviewBadge)
 
         // Tunnel-state-driven refresh (changes immediately when daemons toggle).
         val tunnelObserver = Observer<String?> { _ -> updateNetworkTile() }
@@ -214,6 +216,7 @@ class DiagnosticsFragment : Fragment() {
         tvCameraValue = null
         viewCameraDot = null
         tvBatteryValue = null
+        tvBatteryReviewBadge = null
         viewBatteryDot = null
     }
 
@@ -487,23 +490,47 @@ class DiagnosticsFragment : Fragment() {
                 // Stay null — UI will show "Pending data".
             }
 
+            // Frame mismatch is derived state — only the daemon knows. Best-
+            // effort fetch with tight timeouts; a daemon outage just means the
+            // pill stays hidden, not that the tile breaks.
+            var frameMismatch = false
+            try {
+                val conn = com.overdrive.app.util.DaemonHttpClient.open(
+                    "/api/performance/soh", "GET", 1500, 2000)
+                if (conn.responseCode == 200) {
+                    val body = conn.inputStream.bufferedReader().use { it.readText() }
+                    val frame = org.json.JSONObject(body).optJSONObject("frameAnchor")
+                    if (frame != null) frameMismatch = frame.optBoolean("mismatch", false)
+                }
+                conn.disconnect()
+            } catch (_: Throwable) { /* leave false */ }
+
             val finalSoh = sohPercent
+            val finalMismatch = frameMismatch
             mainHandler.post {
                 if (!isAdded) return@post
                 val tv = tvBatteryValue ?: return@post
                 val dot = viewBatteryDot ?: return@post
+                val badge = tvBatteryReviewBadge
                 if (finalSoh == null) {
                     tv.text = getString(R.string.diagnostics_battery_value_pending)
                     dot.setBackgroundResource(R.drawable.status_dot_neutral)
                 } else {
                     tv.text = getString(R.string.diagnostics_battery_value_soh, finalSoh)
+                    // When the frame anchor flags a mismatch, force the dot
+                    // amber regardless of the SOH bucket — the headline number
+                    // itself isn't trustworthy until the user confirms or
+                    // corrects nominal. Otherwise fall through to the normal
+                    // health bucket coloring.
                     val dotRes = when {
+                        finalMismatch -> R.drawable.status_dot_starting
                         finalSoh >= 80.0 -> R.drawable.status_dot_online
                         finalSoh >= 50.0 -> R.drawable.status_dot_starting
                         else -> R.drawable.status_dot_offline
                     }
                     dot.setBackgroundResource(dotRes)
                 }
+                badge?.visibility = if (finalMismatch) View.VISIBLE else View.GONE
             }
         }
     }

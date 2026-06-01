@@ -53,12 +53,40 @@ public class FoveatedCropper {
     private final int stripWidth;
     private final int stripHeight;
     private final float[] quadrantStripOffsetX;
+    // 8 floats: {fX,fY, rX,rY, bX,bY, lX,lY} — top-left of each role's
+    // 0.5×0.5 corner in a 2x2-native HAL frame (DiLink 4 path). Used when
+    // cameraLayout == 3. Mutable so the pipeline can override with the
+    // car's actual layout (Variant A) post-construction.
+    private final float[] quadrantCornerOffsetsXY;
+    // 8 floats: {fXFlip,fYFlip, rXFlip,rYFlip, bXFlip,bYFlip, lXFlip,lYFlip}.
+    // 1.0 = mirror inside the role's local 0.5×0.5 region. Used to map the
+    // motion-V2 centroid onto the right producer pixels when the HAL emits
+    // a flipped tile per role.
+    private final float[] flipFlags = {
+        0f, 0f,  0f, 0f,  0f, 0f,  0f, 0f
+    };
+    private final Object cornerMapLock = new Object();
+    // APA center inset — read under cornerMapLock alongside the producer
+    // map and flip flags. 0 = no crop (default / legacy). On dilink4 the
+    // pipeline pushes the producer-UV inset (e.g. 240/2560 = 0.09375).
+    private volatile float apaCenterInset = 0.0f;
+    // 0 = legacy 4-strip (default); 3 = esco-parity 2x2 passthrough.
+    // Volatile because the GL thread reads it inside crop() and the camera
+    // thread (or pipeline init) writes it via setCameraLayout.
+    private volatile int cameraLayout = 0;
 
     private int program = -1;
     private int aPosition = -1;
     private int aTexCoord = -1;
     private int uCameraTex = -1;
     private int uCropRect = -1;
+    private int uRedMaskStrength = -1;
+    private volatile boolean redMaskEnabled = false;
+
+    // The cropper does not consume a SurfaceTexture transform matrix —
+    // its samples are computed in producer-space UV directly via the
+    // role's corner remap + per-role flip. See the FRAGMENT_SHADER comment
+    // for why.
 
     // Single render FBO — readbacks pipeline through PBOs, not FBOs, so we
     // no longer need a ping-pong pair. The driver still does internal frame
@@ -98,6 +126,16 @@ public class FoveatedCropper {
     private FloatBuffer vertexBuffer;
     private FloatBuffer texCoordBuffer;
 
+    // The cropper samples the OES texture directly using a producer-space
+    // crop rect computed CPU-side from the role's corner + per-role flip.
+    // Unlike the recorder/stream/sampler, the cropper does NOT need to
+    // apply uTexMatrix in either shader: the HAL-marked live region is
+    // already factored into the corner remap (Variant A constants), and
+    // the cropper's output is bytes that go straight into YOLO — no
+    // composite step where a different consumer would re-interpret the
+    // sample positions. Keeping the matrix out avoids the double-flip
+    // that bit us when PanoramicCameraGpu auto-injected a Y-flip into
+    // currentTexMatrix for dilink4.
     private static final String VERTEX_SHADER =
         "attribute vec4 aPosition;\n" +
         "attribute vec2 aTexCoord;\n" +
@@ -112,13 +150,16 @@ public class FoveatedCropper {
         "precision mediump float;\n" +
         "uniform samplerExternalOES uCameraTex;\n" +
         "uniform vec4 uCropRect;\n" +
+        "uniform float uRedMaskStrength;\n" +
         "varying vec2 vTexCoord;\n" +
         "void main() {\n" +
         "    vec2 samplePos = vec2(\n" +
         "        uCropRect.x + vTexCoord.x * uCropRect.z,\n" +
         "        uCropRect.y + vTexCoord.y * uCropRect.w\n" +
         "    );\n" +
-        "    gl_FragColor = texture2D(uCameraTex, samplePos);\n" +
+        "    vec4 src = texture2D(uCameraTex, samplePos);\n" +
+        com.overdrive.app.camera.GlUtil.RED_MASK_GLSL +
+        "    gl_FragColor = src;\n" +
         "}\n";
 
     private static final float[] VERTEX_COORDS = {
@@ -142,20 +183,49 @@ public class FoveatedCropper {
         0.25f   // Q3 (BR → Left)
     };
 
+    // 2x2 corner offsets for DiLink 4 HAL: {fX,fY, rX,rY, bX,bY, lX,lY}.
+    // Mirrors GpuMosaicRecorder layout (Front=TL, Right=TR, Rear=BL, Left=BR).
+    private static final float[] DEFAULT_QUADRANT_CORNER_OFFSETS_XY = {
+        0.00f, 0.00f,  // Front (TL)
+        0.50f, 0.00f,  // Right (TR)
+        0.00f, 0.50f,  // Rear  (BL)
+        0.50f, 0.50f   // Left  (BR)
+    };
+
     public FoveatedCropper() {
-        this(5120, 960, DEFAULT_QUADRANT_STRIP_OFFSET_X);
+        this(5120, 960, DEFAULT_QUADRANT_STRIP_OFFSET_X,
+             DEFAULT_QUADRANT_CORNER_OFFSETS_XY);
     }
 
     public FoveatedCropper(int stripWidth, int stripHeight) {
-        this(stripWidth, stripHeight, DEFAULT_QUADRANT_STRIP_OFFSET_X);
+        this(stripWidth, stripHeight, DEFAULT_QUADRANT_STRIP_OFFSET_X,
+             DEFAULT_QUADRANT_CORNER_OFFSETS_XY);
     }
 
     public FoveatedCropper(int stripWidth, int stripHeight, float[] quadrantStripOffsetX) {
+        this(stripWidth, stripHeight, quadrantStripOffsetX,
+             DEFAULT_QUADRANT_CORNER_OFFSETS_XY);
+    }
+
+    /**
+     * @param quadrantStripOffsetX Per-role X offsets for legacy 4-strip
+     *     HAL. {Front, Right, Rear, Left}.
+     * @param quadrantCornerOffsetsXY Per-role (cornerX, cornerY) for the
+     *     0.5×0.5 corner in a 2x2-native HAL frame. {fX,fY, rX,rY, bX,bY,
+     *     lX,lY}. Used when cameraLayout == 3.
+     */
+    public FoveatedCropper(int stripWidth, int stripHeight,
+                           float[] quadrantStripOffsetX,
+                           float[] quadrantCornerOffsetsXY) {
         this.stripWidth = Math.max(1, stripWidth);
         this.stripHeight = Math.max(1, stripHeight);
         this.quadrantStripOffsetX = (quadrantStripOffsetX != null && quadrantStripOffsetX.length == 4)
             ? quadrantStripOffsetX.clone()
             : DEFAULT_QUADRANT_STRIP_OFFSET_X.clone();
+        this.quadrantCornerOffsetsXY =
+            (quadrantCornerOffsetsXY != null && quadrantCornerOffsetsXY.length == 8)
+                ? quadrantCornerOffsetsXY.clone()
+                : DEFAULT_QUADRANT_CORNER_OFFSETS_XY.clone();
     }
 
     /** Result of a crop call. {@link #rgb} may be null on the very first
@@ -184,6 +254,7 @@ public class FoveatedCropper {
             aTexCoord = GLES20.glGetAttribLocation(program, "aTexCoord");
             uCameraTex = GLES20.glGetUniformLocation(program, "uCameraTex");
             uCropRect = GLES20.glGetUniformLocation(program, "uCropRect");
+            uRedMaskStrength = GLES20.glGetUniformLocation(program, "uRedMaskStrength");
 
             // One-shot GL version probe. PBO + fence-sync require GLES 3.
             String glVer = GLES20.glGetString(GLES20.GL_VERSION);
@@ -269,6 +340,16 @@ public class FoveatedCropper {
      * @return Result whose bytes correspond to the PREVIOUS request's quadrant,
      *         or null on the very first call (nothing to read back yet).
      */
+    /**
+     * Layout-aware foveated AI crop. Branches between:
+     *   cameraLayout == 0 → legacy 4-strip: each role is a 0.25-wide
+     *       vertical strip indexed by stripOffsetX[quadrant].
+     *   cameraLayout == 3 → DiLink 4 2x2: each role is a 0.5×0.5 corner
+     *       indexed by quadrantCornerOffsetsXY[quadrant*2..+1].
+     * Centroid (centroidX, centroidY) is in V2 motion's single-quadrant
+     * local coordinates; we map it into the producer-frame UV based on
+     * the active layout.
+     */
     public Result crop(int cameraTextureId, int quadrant, float centroidX, float centroidY) {
         if (!initialized || quadrant < 0 || quadrant >= 4) return null;
 
@@ -278,21 +359,80 @@ public class FoveatedCropper {
         float camNormX = quadPixelX / 320.0f;
         float camNormY = quadPixelY / 240.0f;
 
-        float stripOffsetX = quadrantStripOffsetX[quadrant];
-
-        float cropWidthNorm = (float) CROP_SIZE / stripWidth;
-        float cropHeightNorm = (float) CROP_SIZE / stripHeight;
-
-        float centerX = stripOffsetX + camNormX * 0.25f;
-        float centerY = camNormY;
+        // Cropper's CROP_SIZE is in producer-frame pixels. The producer
+        // frame has different aspect on legacy (4-strip 5120×960) vs DiLink
+        // 4 (2x2 mosaic, e.g. 2560×1920) — derive crop dims from current
+        // layout rather than always assuming `stripWidth × stripHeight`.
+        boolean useCornerLayout = (cameraLayout == 3);
+        float cropWidthNorm;
+        float cropHeightNorm;
+        float quadLeft, quadTop;
+        float quadRight, quadBottom;
+        float centerX, centerY;
+        if (useCornerLayout) {
+            // 2x2 mosaic: each role lives in a 0.5×0.5 corner of the
+            // producer frame. The producer is roughly stripWidth/2 wide and
+            // stripHeight*2 tall when the recorder configured 5120×960 →
+            // 2560×1920 (or whatever the HAL emits). CROP_SIZE in
+            // normalised UV is CROP_SIZE / producer_dim.
+            int producerW = Math.max(1, stripWidth / 2);
+            int producerH = Math.max(1, stripHeight * 2);
+            cropWidthNorm = (float) CROP_SIZE / producerW;
+            cropHeightNorm = (float) CROP_SIZE / producerH;
+            // Look up role corner + flip. quadrant order matches
+            // stripOffsetX: 0=Front, 1=Right, 2=Rear, 3=Left → 2 floats each.
+            int base = quadrant * 2;
+            float xFlip, yFlip, inset;
+            synchronized (cornerMapLock) {
+                quadLeft = quadrantCornerOffsetsXY[base];
+                quadTop  = quadrantCornerOffsetsXY[base + 1];
+                xFlip = flipFlags[base];
+                yFlip = flipFlags[base + 1];
+                inset = apaCenterInset;
+            }
+            quadRight = quadLeft + 0.5f;
+            quadBottom = quadTop + 0.5f;
+            // V2 motion's centroid is in single-quadrant local coords
+            // (camNormX/Y in [0,1]) referenced to the canonical
+            // (post-rearrange) tile. The producer tile may be flipped, so
+            // mirror the centroid before mapping into the 0.5×0.5 corner.
+            float localX = (xFlip > 0.5f) ? (1.0f - camNormX) : camNormX;
+            float localY = (yFlip > 0.5f) ? (1.0f - camNormY) : camNormY;
+            centerX = quadLeft + localX * 0.5f;
+            centerY = quadTop  + localY * 0.5f;
+            // APA center inset (esco APACropFilter parity, mirror of
+            // GlUtil.APA_CENTER_INSET_GLSL): horizontal-only remap of the
+            // FULL producer x: [0, 1] -> [inset, 1 - inset]. Apply to
+            // both centerX and the role's x-bounds so the crop window and
+            // the centroid stay in lockstep with the GPU samplers.
+            if (inset > 0.0001f) {
+                float xScale = 1.0f - 2.0f * inset;
+                centerX  = inset + centerX  * xScale;
+                quadLeft = inset + quadLeft * xScale;
+                quadRight = inset + quadRight * xScale;
+                cropWidthNorm = cropWidthNorm * xScale;
+            }
+        } else {
+            // Legacy 4-strip: each role is a 0.25-wide vertical strip; full
+            // height. Producer is stripWidth × stripHeight as configured.
+            cropWidthNorm = (float) CROP_SIZE / stripWidth;
+            cropHeightNorm = (float) CROP_SIZE / stripHeight;
+            float stripOffsetX = quadrantStripOffsetX[quadrant];
+            quadLeft = stripOffsetX;
+            quadTop = 0.0f;
+            quadRight = stripOffsetX + 0.25f;
+            quadBottom = 1.0f;
+            centerX = stripOffsetX + camNormX * 0.25f;
+            centerY = camNormY;
+        }
 
         float cropLeft = centerX - cropWidthNorm / 2.0f;
         float cropTop = centerY - cropHeightNorm / 2.0f;
 
-        float camLeft = stripOffsetX;
-        float camRight = stripOffsetX + 0.25f;
-        cropLeft = Math.max(camLeft, Math.min(cropLeft, camRight - cropWidthNorm));
-        cropTop = Math.max(0.0f, Math.min(cropTop, 1.0f - cropHeightNorm));
+        // Clamp the crop window to the role's quadrant bounds so we never
+        // sample neighbouring cameras' pixels along the edges.
+        cropLeft = Math.max(quadLeft,  Math.min(cropLeft, quadRight  - cropWidthNorm));
+        cropTop  = Math.max(quadTop,   Math.min(cropTop,  quadBottom - cropHeightNorm));
 
         int[] savedViewport = new int[4];
         GLES20.glGetIntegerv(GLES20.GL_VIEWPORT, savedViewport, 0);
@@ -308,6 +448,9 @@ public class FoveatedCropper {
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, cameraTextureId);
         GLES20.glUniform1i(uCameraTex, 0);
         GLES20.glUniform4f(uCropRect, cropLeft, cropTop, cropWidthNorm, cropHeightNorm);
+        if (uRedMaskStrength >= 0) {
+            GLES20.glUniform1f(uRedMaskStrength, redMaskEnabled ? 1.0f : 0.0f);
+        }
 
         GLES20.glEnableVertexAttribArray(aPosition);
         GLES20.glVertexAttribPointer(aPosition, 2, GLES20.GL_FLOAT, false, 0, vertexBuffer);
@@ -443,6 +586,69 @@ public class FoveatedCropper {
 
     public boolean isInitialized() {
         return initialized;
+    }
+
+    /**
+     * Selects between layouts:
+     *   0 = legacy 4-strip (default — Seal/Atto/Dolphin).
+     *   3 = esco-parity 2x2 mosaic (DiLink 4 / byd_apa cars).
+     * Other values fall through to layout 0 in the math.
+     * Volatile read/write — set once at pipeline init, no per-frame churn.
+     */
+    public void setCameraLayout(int layout) { this.cameraLayout = layout; }
+
+    /** Enables the GL red-overlay suppression on AI thumbnails. Off by default. */
+    /** APA center inset (esco APACropFilter parity). See {@link
+     *  com.overdrive.app.surveillance.GpuMosaicRecorder#setApaCenterInset}. */
+    public void setApaCenterInset(float inset) {
+        this.apaCenterInset = Math.max(0.0f, Math.min(0.20f, inset));
+    }
+
+    public void setRedMaskEnabled(boolean enabled) {
+        this.redMaskEnabled = enabled;
+    }
+
+    /**
+     * Override the per-role producer corner XY map. Each pair is the
+     * top-left of the role's 0.5×0.5 sub-rect inside the producer surface,
+     * in {Front, Right, Rear, Left} order. Default = canonical 2x2; on
+     * DiLink 4 the pipeline pushes Variant A constants here so V2 motion
+     * crops sample the correct producer pixels.
+     */
+    public void setProducerCornerMap(float[] front, float[] right,
+                                     float[] rear, float[] left) {
+        if (front == null || right == null || rear == null || left == null
+                || front.length < 2 || right.length < 2
+                || rear.length  < 2 || left.length  < 2) {
+            return;
+        }
+        synchronized (cornerMapLock) {
+            quadrantCornerOffsetsXY[0] = front[0]; quadrantCornerOffsetsXY[1] = front[1];
+            quadrantCornerOffsetsXY[2] = right[0]; quadrantCornerOffsetsXY[3] = right[1];
+            quadrantCornerOffsetsXY[4] = rear[0];  quadrantCornerOffsetsXY[5] = rear[1];
+            quadrantCornerOffsetsXY[6] = left[0];  quadrantCornerOffsetsXY[7] = left[1];
+        }
+    }
+
+    /**
+     * Per-role X/Y flip flags ({xFlip, yFlip} ∈ {0,1}). The motion
+     * centroid is mirrored within the role's 0.5×0.5 region before the
+     * crop window is computed, so AI thumbnails point at the same
+     * physical-world pixels the recorder paints. {Front, Right, Rear, Left}.
+     */
+    public void setFlipFlags(float[] front, float[] right,
+                             float[] rear, float[] left) {
+        if (front == null || right == null || rear == null || left == null
+                || front.length < 2 || right.length < 2
+                || rear.length  < 2 || left.length  < 2) {
+            return;
+        }
+        synchronized (cornerMapLock) {
+            flipFlags[0] = front[0]; flipFlags[1] = front[1];
+            flipFlags[2] = right[0]; flipFlags[3] = right[1];
+            flipFlags[4] = rear[0];  flipFlags[5] = rear[1];
+            flipFlags[6] = left[0];  flipFlags[7] = left[1];
+        }
     }
 
     public void release() {

@@ -86,6 +86,18 @@ public class QualitySettingsApiHandler {
             handleAudioRecordingPost(out, body);
             return true;
         }
+        // Place tagging (reverse geocoding) — per-flow split so dashcam and
+        // surveillance can be enabled independently. GET returns the full
+        // schema; POST accepts a flow-keyed delta (recording / surveillance
+        // / advanced sub-objects).
+        if (path.equals("/api/settings/geocoding") && method.equals("GET")) {
+            sendGeocodingSettings(out);
+            return true;
+        }
+        if (path.equals("/api/settings/geocoding") && method.equals("POST")) {
+            handleGeocodingPost(out, body);
+            return true;
+        }
         // Web-shell appearance (theme picker shipped on every page).
         // Same UnifiedConfigManager-backed pattern as the rest of /api/settings.
         if (path.equals("/api/settings/appearance") && method.equals("GET")) {
@@ -1306,6 +1318,186 @@ public class QualitySettingsApiHandler {
             HttpResponse.sendJson(out, response.toString());
         } catch (Exception e) {
             CameraDaemon.log("Error setting telemetry overlay: " + e.getMessage());
+            HttpResponse.sendJsonError(out, e.getMessage());
+        }
+    }
+
+    // ======================================================================
+    // Geocoding (place-tagging) settings
+    // ======================================================================
+
+    /**
+     * GET /api/settings/geocoding — return the full geocoding schema:
+     * {@code { recording:{enabled,allowOnline}, surveillance:{enabled,allowOnline},
+     * advanced:{customNominatimBase} } }.
+     *
+     * <p>The persisted {@code nominatimCooldownUntilMs} is intentionally
+     * NOT exposed to the web — it's purely an internal rate-limiter
+     * signal, surfacing it would invite users to clear it manually and
+     * defeat the purpose of the persistent backoff.
+     */
+    private static void sendGeocodingSettings(OutputStream out) throws Exception {
+        JSONObject geo = com.overdrive.app.config.UnifiedConfigManager.getGeocoding();
+        JSONObject rec = geo.optJSONObject("recording");
+        JSONObject sur = geo.optJSONObject("surveillance");
+        JSONObject adv = geo.optJSONObject("advanced");
+
+        JSONObject response = new JSONObject();
+        response.put("success", true);
+
+        JSONObject recOut = new JSONObject();
+        recOut.put("enabled", rec != null && rec.optBoolean("enabled", false));
+        recOut.put("allowOnline", rec != null && rec.optBoolean("allowOnline", false));
+        response.put("recording", recOut);
+
+        JSONObject surOut = new JSONObject();
+        surOut.put("enabled", sur != null && sur.optBoolean("enabled", false));
+        surOut.put("allowOnline", sur != null && sur.optBoolean("allowOnline", false));
+        response.put("surveillance", surOut);
+
+        JSONObject advOut = new JSONObject();
+        advOut.put("customNominatimBase",
+                adv != null ? adv.optString("customNominatimBase", "") : "");
+        response.put("advanced", advOut);
+
+        HttpResponse.sendJson(out, response.toString());
+    }
+
+    /**
+     * POST /api/settings/geocoding — accept a partial delta. Body:
+     * <pre>{
+     *   recording?: { enabled?: bool, allowOnline?: bool },
+     *   surveillance?: { enabled?: bool, allowOnline?: bool },
+     *   advanced?: { customNominatimBase?: string }
+     * }</pre>
+     *
+     * <p>Each sub-object is optional; the handler only writes the fields
+     * the caller actually included. No mid-recording invalidation — the
+     * recorder's per-call read of UnifiedConfigManager picks up the
+     * change at the next rotation/start naturally.
+     */
+    private static void handleGeocodingPost(OutputStream out, String body) throws Exception {
+        try {
+            if (body == null || body.isEmpty()) {
+                HttpResponse.sendJsonError(out, "Empty body");
+                return;
+            }
+            JSONObject delta = new JSONObject(body);
+
+            // Lightweight URL validation — reject obvious garbage so a user
+            // typo doesn't drive NominatimRateLimiter into a 6-hour backoff
+            // by triggering MalformedURLException on every resolve attempt.
+            // Empty string is allowed (means "use default OSM endpoint").
+            // Scheme comparison is case-insensitive; URL parsers accept
+            // HTTP:// / HTTPS:// uppercase forms.
+            JSONObject inAdvCheck = delta.optJSONObject("advanced");
+            if (inAdvCheck != null && inAdvCheck.has("customNominatimBase")) {
+                String url = inAdvCheck.optString("customNominatimBase", "").trim();
+                if (!url.isEmpty()) {
+                    String urlLower = url.toLowerCase();
+                    if (!urlLower.startsWith("http://")
+                            && !urlLower.startsWith("https://")) {
+                        HttpResponse.sendJsonError(out,
+                                "customNominatimBase must start with http:// or https://");
+                        return;
+                    }
+                }
+            }
+
+            // The read-merge-write below MUST be atomic w.r.t.
+            // NominatimRateLimiter.writeCooldownUntilMs running on a
+            // worker thread. UnifiedConfigManager.updateSection serializes
+            // disk writes on `synchronized(this)` — Kotlin object's `this`
+            // is the singleton INSTANCE field, NOT the Class object. We
+            // MUST lock on UnifiedConfigManager.INSTANCE to share the
+            // same monitor as the internal critical section. Locking on
+            // .class would create a separate monitor and the TOCTOU race
+            // would still be open.
+            JSONObject merged = new JSONObject();
+            boolean ok;
+            JSONObject readBack;
+            synchronized (com.overdrive.app.config.UnifiedConfigManager.INSTANCE) {
+                JSONObject current = com.overdrive.app.config.UnifiedConfigManager.getGeocoding();
+
+                if (delta.has("recording") || current.has("recording")) {
+                    JSONObject curRec = current.optJSONObject("recording");
+                    if (curRec == null) curRec = new JSONObject();
+                    JSONObject inRec = delta.optJSONObject("recording");
+                    JSONObject outRec = new JSONObject();
+                    outRec.put("enabled",
+                            inRec != null && inRec.has("enabled")
+                                    ? inRec.optBoolean("enabled", false)
+                                    : curRec.optBoolean("enabled", false));
+                    outRec.put("allowOnline",
+                            inRec != null && inRec.has("allowOnline")
+                                    ? inRec.optBoolean("allowOnline", false)
+                                    : curRec.optBoolean("allowOnline", false));
+                    merged.put("recording", outRec);
+                }
+
+                if (delta.has("surveillance") || current.has("surveillance")) {
+                    JSONObject curSur = current.optJSONObject("surveillance");
+                    if (curSur == null) curSur = new JSONObject();
+                    JSONObject inSur = delta.optJSONObject("surveillance");
+                    JSONObject outSur = new JSONObject();
+                    outSur.put("enabled",
+                            inSur != null && inSur.has("enabled")
+                                    ? inSur.optBoolean("enabled", false)
+                                    : curSur.optBoolean("enabled", false));
+                    outSur.put("allowOnline",
+                            inSur != null && inSur.has("allowOnline")
+                                    ? inSur.optBoolean("allowOnline", false)
+                                    : curSur.optBoolean("allowOnline", false));
+                    merged.put("surveillance", outSur);
+                }
+
+                // Advanced sub-object — preserve cooldown when the caller
+                // writes a new customNominatimBase. Cooldown is set
+                // internally by NominatimRateLimiter; the web caller has
+                // no business clearing it, and now the lock above
+                // guarantees we read the latest cooldown value.
+                if (delta.has("advanced") || current.has("advanced")) {
+                    JSONObject curAdv = current.optJSONObject("advanced");
+                    if (curAdv == null) curAdv = new JSONObject();
+                    JSONObject inAdv = delta.optJSONObject("advanced");
+                    JSONObject outAdv = new JSONObject();
+                    if (inAdv != null && inAdv.has("customNominatimBase")) {
+                        String url = inAdv.optString("customNominatimBase", "").trim();
+                        outAdv.put("customNominatimBase", url);
+                    } else {
+                        outAdv.put("customNominatimBase",
+                                curAdv.optString("customNominatimBase", ""));
+                    }
+                    outAdv.put("nominatimCooldownUntilMs",
+                            curAdv.optLong("nominatimCooldownUntilMs", 0L));
+                    merged.put("advanced", outAdv);
+                }
+
+                ok = com.overdrive.app.config.UnifiedConfigManager
+                        .setGeocoding(merged);
+                readBack = com.overdrive.app.config.UnifiedConfigManager.getGeocoding();
+            }
+
+            JSONObject response = new JSONObject();
+            response.put("success", ok);
+            JSONObject readRec = readBack.optJSONObject("recording");
+            JSONObject readSur = readBack.optJSONObject("surveillance");
+            JSONObject readAdv = readBack.optJSONObject("advanced");
+            JSONObject echoRec = new JSONObject();
+            echoRec.put("enabled", readRec != null && readRec.optBoolean("enabled", false));
+            echoRec.put("allowOnline", readRec != null && readRec.optBoolean("allowOnline", false));
+            JSONObject echoSur = new JSONObject();
+            echoSur.put("enabled", readSur != null && readSur.optBoolean("enabled", false));
+            echoSur.put("allowOnline", readSur != null && readSur.optBoolean("allowOnline", false));
+            JSONObject echoAdv = new JSONObject();
+            echoAdv.put("customNominatimBase",
+                    readAdv != null ? readAdv.optString("customNominatimBase", "") : "");
+            response.put("recording", echoRec);
+            response.put("surveillance", echoSur);
+            response.put("advanced", echoAdv);
+            HttpResponse.sendJson(out, response.toString());
+        } catch (Exception e) {
+            CameraDaemon.log("Error setting geocoding: " + e.getMessage());
             HttpResponse.sendJsonError(out, e.getMessage());
         }
     }

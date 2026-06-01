@@ -151,8 +151,12 @@ object BydDataCacheWhitelist {
             val uid = pm.getApplicationInfo(PKG, 0).uid
             val opsValue = 0
             
-            // SDK >= 32 uses byd_datacached, otherwise bg_datacache
-            val useNewService = Build.VERSION.SDK_INT >= 32
+            // SDK >= 31 uses byd_datacached, otherwise bg_datacache.
+            // Esco gates on >= 31 (C0241c.m941c). DiLink 4 ROMs that ship
+            // Android 12 base (API 31) have the new service available;
+            // routing them through bg_datacache instead hits ACCESS_APPOPSDATA
+            // which the BYD ROM denies post-ACC-OFF.
+            val useNewService = Build.VERSION.SDK_INT >= 31
             
             if (useNewService) {
                 val dataCacheService = permissiveContext.getSystemService("byd_datacached")

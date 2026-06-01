@@ -11,7 +11,8 @@
     "charging_stopped": "{0}%で充電停止",
     "charging_complete": "{0}% のバッテリー",
     "recording_started": "録音開始",
-    "recording_ended": "録音終了"
+    "recording_ended": "録音終了",
+    "location_prefix": "場所: {0}"
   },
   "errors": {
     "rate_limited_locked_for_seconds": " {0} への 試行錯誤が 過ぎた",
@@ -35,6 +36,7 @@
     "models_invalid_json": "無効なJSON",
     "models_unknown_id_with_id": "未知のモデルID: {0}",
     "models_invalid_color": "不有効色 (期待 #RRGGBB)",
+    "models_invalid_drive_side": "車両レイアウトが無効です(「lhd」または「rhd」が必要)",
     "models_nothing_to_update": "更新する事は無い",
     "models_persist_failed": "耐えられなかった",
     "models_id_required": "id が求められる",
@@ -99,8 +101,7 @@
     "mqtt_not_initialized": "MQTT は初期化されていない",
     "max_connections_reached": "最大接続が達成された ({0})",
     "missing_connection_id": "接続 ID 欠落",
-    "connection_not_found": "接続が見つかりませんでした: {0}",
-    "models_invalid_drive_side": "車両レイアウトが無効です(「lhd」または「rhd」が必要)"
+    "connection_not_found": "接続が見つかりませんでした: {0}"
   },
   "notifications": {
     "charging_started": "充電開始",
@@ -119,7 +120,9 @@
     "area_hood": "ハード",
     "area_trunk": "トランク",
     "area_fuel_cap": "燃料キャップ",
-    "area_door_n": "ドア{0}"
+    "area_door_n": "ドア{0}",
+    "soh_frame_mismatch_title": "バッテリー容量需要のレビュー",
+    "soh_frame_mismatch_body": "車両は{0} kWhを充電した状態で報告しますが 梱包容量は{1} kWhに設定されています"
   },
   "telegram": {
     "recording_caption": " 記録 ({0}) - {1}",

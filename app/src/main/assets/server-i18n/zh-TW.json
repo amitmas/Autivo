@@ -11,7 +11,8 @@
     "charging_stopped": "在 {0}% 停止充電",
     "charging_complete": "在 {0}%  準備開關",
     "recording_started": "錄音開始",
-    "recording_ended": "錄音已結束"
+    "recording_ended": "錄音已結束",
+    "location_prefix": "位置:{0}"
   },
   "errors": {
     "rate_limited_locked_for_seconds": "太多的嘗試 鎖定了{0}",
@@ -35,6 +36,7 @@
     "models_invalid_json": "沒有效效的 JSON",
     "models_unknown_id_with_id": "不知名型號:{0}",
     "models_invalid_color": "不有效的顏色 (預期 #RRGGBB)",
+    "models_invalid_drive_side": "車輛配置無效(應為「lhd」或「rhd」)",
     "models_nothing_to_update": "沒有任何更新.",
     "models_persist_failed": "沒有堅持",
     "models_id_required": "必須提供ID",
@@ -99,8 +101,7 @@
     "mqtt_not_initialized": "MQTT沒有初始化",
     "max_connections_reached": "達到最大的連接 ({0})",
     "missing_connection_id": "缺失連接身份證",
-    "connection_not_found": "沒有找到連結: {0}",
-    "models_invalid_drive_side": "車輛配置無效(應為「lhd」或「rhd」)"
+    "connection_not_found": "沒有找到連結: {0}"
   },
   "notifications": {
     "charging_started": "開始充電",
@@ -119,7 +120,9 @@
     "area_hood": "子的子",
     "area_trunk": "箱子",
     "area_fuel_cap": "燃料封鎖",
-    "area_door_n": "門 {0}"
+    "area_door_n": "門 {0}",
+    "soh_frame_mismatch_title": "檢視電池容量需求",
+    "soh_frame_mismatch_body": "汽車報告 {0} kWh充電, 但包裝容量設定為 {1} kWh."
   },
   "telegram": {
     "recording_caption": "錄音 ({0}) - {1}",

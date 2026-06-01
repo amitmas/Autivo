@@ -123,6 +123,7 @@ BYD.surveillance = {
         await this.loadConfig();
         await this.loadStorageStats();
         await this.loadCameraFps();
+        await this.loadGeocoding();
         this.savedConfig = JSON.parse(JSON.stringify(this.config));
         this.updateUI();
         this.startClock();
@@ -2591,6 +2592,105 @@ BYD.surveillance = {
                 console.error('[deterrent] test failed:', err);
                 if (BYD.utils && BYD.utils.toast) BYD.utils.toast('Failed to trigger deterrent', 'error');
             });
+    },
+
+    // ==================== Geocoding (Place Tagging) ====================
+    //
+    // Surveillance side of the per-flow geocoding split. Toggles the
+    // "surveillance" sub-section only — dashcam tagging lives on
+    // recording.html. Custom Nominatim URL is shared between both pages
+    // (advanced sub-section); whichever page writes last wins.
+
+    async loadGeocoding() {
+        try {
+            const resp = await fetch('/api/settings/geocoding');
+            const data = await resp.json();
+            if (!data.success) return;
+            const surCfg = data.surveillance || {};
+            const advCfg = data.advanced || {};
+            const swEnabled = document.getElementById('survGeocodingEnabled');
+            const swOnline = document.getElementById('survGeocodingOnline');
+            const inputUrl = document.getElementById('survGeocodingCustomUrl');
+            if (swEnabled) swEnabled.checked = !!surCfg.enabled;
+            if (swOnline) {
+                swOnline.checked = !!surCfg.allowOnline;
+                swOnline.disabled = !surCfg.enabled;
+            }
+            if (inputUrl) {
+                inputUrl.value = advCfg.customNominatimBase || '';
+                inputUrl.disabled = !surCfg.enabled;
+            }
+        } catch (e) {
+            console.warn('Failed to load surveillance geocoding state:', e);
+        }
+    },
+
+    async _postGeocoding(delta) {
+        try {
+            const resp = await fetch('/api/settings/geocoding', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(delta)
+            });
+            const data = await resp.json();
+            return data && data.success ? data : null;
+        } catch (e) {
+            console.warn('Geocoding POST failed:', e);
+            return null;
+        }
+    },
+
+    async toggleGeocodingEnabled() {
+        const sw = document.getElementById('survGeocodingEnabled');
+        const swOnline = document.getElementById('survGeocodingOnline');
+        const inputUrl = document.getElementById('survGeocodingCustomUrl');
+        if (!sw) return;
+        const enabled = sw.checked;
+        const result = await this._postGeocoding({ surveillance: { enabled } });
+        if (result) {
+            const sur = result.surveillance || {};
+            sw.checked = !!sur.enabled;
+            if (swOnline) swOnline.disabled = !sur.enabled;
+            if (inputUrl) inputUrl.disabled = !sur.enabled;
+            if (BYD.utils && BYD.utils.toast) {
+                const key = sur.enabled
+                    ? 'surveillance.geocoding_enabled_toast'
+                    : 'surveillance.geocoding_disabled_toast';
+                BYD.utils.toast(BYD.i18n.t(key), 'success');
+            }
+        } else {
+            sw.checked = !enabled;
+            if (BYD.utils && BYD.utils.toast) {
+                BYD.utils.toast(BYD.i18n.t('surveillance.geocoding_update_failed'), 'error');
+            }
+        }
+    },
+
+    async toggleGeocodingOnline() {
+        const sw = document.getElementById('survGeocodingOnline');
+        if (!sw) return;
+        const allowOnline = sw.checked;
+        const result = await this._postGeocoding({ surveillance: { allowOnline } });
+        if (result && result.surveillance) {
+            sw.checked = !!result.surveillance.allowOnline;
+        } else {
+            sw.checked = !allowOnline;
+            if (BYD.utils && BYD.utils.toast) {
+                BYD.utils.toast(BYD.i18n.t('surveillance.geocoding_update_failed'), 'error');
+            }
+        }
+    },
+
+    async saveGeocodingCustomUrl() {
+        const input = document.getElementById('survGeocodingCustomUrl');
+        if (!input) return;
+        const url = (input.value || '').trim();
+        const result = await this._postGeocoding({
+            advanced: { customNominatimBase: url }
+        });
+        if (result && result.advanced) {
+            input.value = result.advanced.customNominatimBase || '';
+        }
     }
 };
 

@@ -77,6 +77,7 @@ public class SafeLocationManager {
         SafeLocation zone = new SafeLocation(name, lat, lng, radiusM);
         zones.add(zone);
         saveToFile();
+        invalidateGeoCacheNear(lat, lng, radiusM);
         // Re-evaluate immediately — maybe we just added a zone we're inside
         reevaluateZone();
         CameraDaemon.log(TAG + ": Added zone '" + name + "' at " + lat + "," + lng + " r=" + radiusM + "m");
@@ -86,12 +87,22 @@ public class SafeLocationManager {
     public boolean updateZone(String id, JSONObject updates) {
         for (SafeLocation zone : zones) {
             if (zone.getId().equals(id)) {
+                // Capture pre-edit centroid so we can sweep BOTH the old and
+                // new locations from the geocache. A zone moved 5 km away
+                // would otherwise leave a stale public-address row at the
+                // old centroid.
+                double oldLat = zone.getLatitude();
+                double oldLng = zone.getLongitude();
+                int oldRad = zone.getRadiusMeters();
                 if (updates.has("name")) zone.setName(updates.optString("name"));
                 if (updates.has("lat")) zone.setLatitude(updates.optDouble("lat"));
                 if (updates.has("lng")) zone.setLongitude(updates.optDouble("lng"));
                 if (updates.has("radiusM")) zone.setRadiusMeters(updates.optInt("radiusM"));
                 if (updates.has("enabled")) zone.setEnabled(updates.optBoolean("enabled"));
                 saveToFile();
+                invalidateGeoCacheNear(oldLat, oldLng, oldRad);
+                invalidateGeoCacheNear(zone.getLatitude(), zone.getLongitude(),
+                        zone.getRadiusMeters());
                 reevaluateZone();
                 return true;
             }
@@ -102,14 +113,36 @@ public class SafeLocationManager {
     public boolean removeZone(String id) {
         for (SafeLocation zone : zones) {
             if (zone.getId().equals(id)) {
+                double zLat = zone.getLatitude();
+                double zLng = zone.getLongitude();
+                int zRad = zone.getRadiusMeters();
                 zones.remove(zone);
                 saveToFile();
+                invalidateGeoCacheNear(zLat, zLng, zRad);
                 reevaluateZone();
                 CameraDaemon.log(TAG + ": Removed zone '" + zone.getName() + "'");
                 return true;
             }
         }
         return false;
+    }
+
+    /**
+     * Drop any geocache rows whose centroid is near a SafeLocation we just
+     * added/edited/removed so a stale public address can't shadow the new
+     * SafeZone label. Reflective dispatch keeps SafeLocationManager free of
+     * a hard compile-time dep on the geo package — the resolver may not be
+     * loaded in trimmed builds (e.g. unit-test classpath).
+     */
+    private void invalidateGeoCacheNear(double lat, double lng, int radiusM) {
+        try {
+            Class<?> cls = Class.forName("com.overdrive.app.geo.GeoCache");
+            Object inst = cls.getMethod("getInstance").invoke(null);
+            cls.getMethod("invalidateNear", double.class, double.class, double.class)
+                    .invoke(inst, lat, lng, (double) radiusM);
+        } catch (Throwable ignored) {
+            // GeoCache not on classpath / not yet initialised — safe to skip.
+        }
     }
 
     public List<SafeLocation> getZones() {

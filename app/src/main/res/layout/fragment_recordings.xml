@@ -419,6 +419,53 @@
                 android:insetBottom="0dp"
                 tools:visibility="visible" />
         </LinearLayout>
+
+        <!-- Row 5: PLACE chips. Dynamically populated from the visible
+             scan's distinct place.short labels in descending count order,
+             capped at MAX_PLACE_CHIPS. Hidden entirely when geocoding
+             never tagged anything (empty available set) — legacy users
+             see no extra chrome. -->
+        <HorizontalScrollView
+            android:id="@+id/rowPlaceFilter"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:scrollbars="none"
+            android:overScrollMode="never"
+            android:visibility="gone"
+            tools:visibility="visible">
+
+            <LinearLayout
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginEnd="8dp"
+                    android:text="@string/recording_lib_filter_section_place"
+                    android:textColor="?attr/colorOnSurfaceVariant"
+                    android:textSize="11sp"
+                    android:fontFamily="sans-serif-medium"
+                    android:letterSpacing="0.06"
+                    android:textAllCaps="true" />
+
+                <!-- ChipGroup is populated from Kotlin (chips are
+                     user-place-specific so they can't be authored as
+                     static resources). The "Any" chip is fixed but
+                     attached programmatically alongside the data
+                     chips so its order stays stable as the data
+                     refreshes. -->
+                <com.google.android.material.chip.ChipGroup
+                    android:id="@+id/chipGroupPlace"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    app:chipSpacingHorizontal="6dp"
+                    app:singleLine="true" />
+            </LinearLayout>
+        </HorizontalScrollView>
     </LinearLayout>
 
     <!-- ============ Library list (fills remaining height) ============ -->

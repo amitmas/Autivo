@@ -11,7 +11,8 @@
     "charging_stopped": "Việc sạc dừng ở {0}%",
     "charging_complete": "Pin ở {0}%  sẵn sàng để cắm",
     "recording_started": "Việc ghi âm bắt đầu",
-    "recording_ended": "Việc ghi âm đã kết thúc."
+    "recording_ended": "Việc ghi âm đã kết thúc.",
+    "location_prefix": "Địa điểm: {0}"
   },
   "errors": {
     "rate_limited_locked_for_seconds": "Quá nhiều nỗ lực  khóa cho {0}s",
@@ -35,6 +36,7 @@
     "models_invalid_json": "JSON không hợp lệ",
     "models_unknown_id_with_id": "Tên mẫu không rõ: {0}",
     "models_invalid_color": "Màu không hợp lệ (được kỳ vọng là #RRGGBB)",
+    "models_invalid_drive_side": "Bố trí xe không hợp lệ (mong đợi «lhd» hoặc «rhd»)",
     "models_nothing_to_update": "Không có gì để cập nhật",
     "models_persist_failed": "Không kiên trì",
     "models_id_required": "ID được yêu cầu",
@@ -99,8 +101,7 @@
     "mqtt_not_initialized": "MQTT không khởi tạo",
     "max_connections_reached": "Max kết nối đạt được ({0})",
     "missing_connection_id": "ID kết nối bị mất",
-    "connection_not_found": "Kết nối không được tìm thấy: {0}",
-    "models_invalid_drive_side": "Bố trí xe không hợp lệ (mong đợi «lhd» hoặc «rhd»)"
+    "connection_not_found": "Kết nối không được tìm thấy: {0}"
   },
   "notifications": {
     "charging_started": "Sạc bắt đầu",
@@ -119,7 +120,9 @@
     "area_hood": "Hood",
     "area_trunk": "Thùng bể",
     "area_fuel_cap": "Tấm nhiên liệu",
-    "area_door_n": "Cửa {0}"
+    "area_door_n": "Cửa {0}",
+    "soh_frame_mismatch_title": "Đánh giá nhu cầu dung lượng pin",
+    "soh_frame_mismatch_body": "Chiếc xe báo cáo {0} kWh khi sạc đầy nhưng dung lượng gói được thiết lập là {1} kWh."
   },
   "telegram": {
     "recording_caption": " Đăng ký ({0}) - {1}s",

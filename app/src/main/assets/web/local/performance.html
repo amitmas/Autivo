@@ -661,6 +661,16 @@
                     </div>
 
                     <div id="sohDetailHint" style="padding:8px 12px;background:var(--bg-elevated);border-radius:6px;font-size:12px;color:var(--text-secondary);margin-top:10px;display:none;"></div>
+
+                    <!-- Frame-mismatch banner — surfaces when the daemon detects
+                         peakObserved/nominal < 0.85 (PHEV, anchor stable). The
+                         notification's defaultClickUrl points here. JS wires
+                         the button to /api/performance/soh/nominal directly. -->
+                    <div id="sohFrameMismatchBanner" style="display:none;margin-top:10px;padding:12px 14px;background:rgba(255,176,0,0.08);border:1px solid rgba(255,176,0,0.4);border-radius:8px;">
+                        <div style="font-size:11px;font-weight:700;color:var(--chart-soh);text-transform:uppercase;letter-spacing:0.5px;" data-i18n="soh.frame_mismatch_title">Pack-capacity frame mismatch</div>
+                        <div id="sohFrameMismatchBody" style="font-size:12px;color:var(--text-primary);margin-top:6px;line-height:1.5;"></div>
+                        <button id="sohFrameMismatchAction" class="btn" style="margin-top:10px;font-size:12px;padding:6px 14px;border-radius:6px;background:var(--chart-soh);color:#000;border:none;cursor:pointer;font-weight:600;" data-i18n="soh.use_observed_value">Use observed value</button>
+                    </div>
                 </div>
 
                 <!-- SOH Battery Capacity Modal — theme-aware: every surface,
