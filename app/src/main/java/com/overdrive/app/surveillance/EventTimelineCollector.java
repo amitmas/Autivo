@@ -913,6 +913,17 @@ public class EventTimelineCollector {
             logger.info(String.format("Timeline saved (v3): %s (%d spans, %d actors, dur=%ds)",
                     jsonFile.getName(), count, actorsArr.length(), durationMs / 1000));
 
+            // Re-upsert the index now that the rich sidecar (stats, heroThumbnail,
+            // actors, geo.start/peak/end) has landed. The first upsert at rename
+            // time saw bare-mp4 metadata; this one populates peak_severity,
+            // hero_thumb, actor_classes, etc. so /api/recordings filter+chip
+            // queries reflect reality without waiting for FileObserver.
+            try {
+                com.overdrive.app.server.RecordingsIndex.getInstance().upsert(mp4File);
+            } catch (Throwable t) {
+                logger.warn("Index upsert failed for " + mp4File.getName() + ": " + t.getMessage());
+            }
+
         } catch (Exception e) {
             logger.error("Failed to write timeline JSON: " + e.getMessage(), e);
         }

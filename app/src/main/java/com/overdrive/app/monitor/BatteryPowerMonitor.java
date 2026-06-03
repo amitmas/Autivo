@@ -17,7 +17,10 @@ public class BatteryPowerMonitor extends BaseDeviceMonitor<BatteryPowerData> {
     private Object device;  // Real BYDAutoOtaDevice from system
     private final AtomicReference<BatteryPowerData> cachedData = new AtomicReference<>();
     private Thread pollThread;
-    private static final long POLL_INTERVAL_MS = 300000; // Poll every 5 min (collector handles frequent reads)
+    // Poll every 60s. Was 5 min — too coarse now that BatteryVoltageMonitorV2
+    // consumes voltage from the same poll loop for MCU sleep/wake hysteresis,
+    // and V2's hysteresis windows are minute-scale.
+    private static final long POLL_INTERVAL_MS = 60_000;
     
     public BatteryPowerMonitor() {
         super("BatteryPowerMonitor");
@@ -105,7 +108,16 @@ public class BatteryPowerMonitor extends BaseDeviceMonitor<BatteryPowerData> {
                     }
                     
                     cachedData.set(newData);
-                    
+
+                    // Fan out to BatteryVoltageMonitorV2 (acc_sentry-process MCU
+                    // sleep/wake hysteresis). V2 lives in this same process,
+                    // so the cross-process gap that affects the cam_daemon
+                    // fan-out doesn't apply here. No-op when V2 is not running.
+                    try {
+                        com.overdrive.app.power.BatteryVoltageMonitorV2
+                                .notifyBatteryPowerVoltage(voltage);
+                    } catch (Throwable ignored) {}
+
                     Thread.sleep(POLL_INTERVAL_MS);
                     
                 } catch (InterruptedException e) {

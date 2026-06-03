@@ -80,6 +80,7 @@ object UnifiedConfigManager {
         unified.put("proximityGuard", JSONObject())
         unified.put("telemetryOverlay", JSONObject())
         unified.put("tripAnalytics", JSONObject())
+        unified.put("oemDashcam", JSONObject())
         unified.put("version", 1)
         unified.put("lastModified", System.currentTimeMillis())
         
@@ -219,6 +220,13 @@ object UnifiedConfigManager {
         if (!recording.has("recordingQuality")) recording.put("recordingQuality", "STANDARD")
         if (!recording.has("quality")) recording.put("quality", recording.optString("recordingQuality", "STANDARD"))
         if (!recording.has("codec")) recording.put("codec", "H264")
+        // Recording-side dewarp strength (Fitzgibbon division model). 0..100,
+        // 0 = off (default). Single source of truth for both ACC-on dashcam
+        // and ACC-off surveillance flows — both pipelines read the same key
+        // so one slider in the UI applies everywhere. Only effective on the
+        // legacy 4-strip layout; dilink4 cars get a clean 2x2 from the HAL
+        // already and the recorder's shader gates the dewarp accordingly.
+        if (!recording.has("rectifyStrength")) recording.put("rectifyStrength", 0)
         
         // Streaming defaults
         if (!streaming.has("quality")) streaming.put("quality", "MEDIUM")
@@ -235,17 +243,85 @@ object UnifiedConfigManager {
         if (!camera.has("probedSurfaceMode")) camera.put("probedSurfaceMode", -1)
         if (!camera.has("roleMappings"))      camera.put("roleMappings", JSONObject())
 
+        // OEM Dashcam (separate forward sensor on vehicles that ship a DVR).
+        // -1 = unset; 0..5 = picked AVMCamera id. The resolver in
+        // resolveOemDashcamId() falls back to (panoId XOR 1) when the manual
+        // override is false, so a typical Seal install (pano=1) auto-picks
+        // dashcam=0 without the user touching anything.
+        if (!camera.has("oemDashcamCameraId"))      camera.put("oemDashcamCameraId", -1)
+        if (!camera.has("oemDashcamManualOverride")) camera.put("oemDashcamManualOverride", false)
+        // Sticky probe result. -1 = unprobed, 0 = single-client only,
+        // 1 = both AVMCamera ids deliver frames concurrently. Until probed,
+        // the daemon defaults to single-pipeline operation (yield protocol
+        // between pano and OEM dashcam).
+        if (!camera.has("concurrentAvmSupported"))   camera.put("concurrentAvmSupported", -1)
+
         // Proximity Guard defaults
         if (!proximityGuard.has("enabled")) proximityGuard.put("enabled", false)
         if (!proximityGuard.has("triggerLevel")) proximityGuard.put("triggerLevel", "RED")
         if (!proximityGuard.has("preRecordSeconds")) proximityGuard.put("preRecordSeconds", 5)
         if (!proximityGuard.has("postRecordSeconds")) proximityGuard.put("postRecordSeconds", 10)
         
-        // Telemetry Overlay defaults
-        val telemetryOverlay = config.optJSONObject("telemetryOverlay") ?: JSONObject().also { 
-            config.put("telemetryOverlay", it) 
+        // Telemetry Overlay defaults.
+        //
+        // Schema:
+        //   enabled            (legacy) — pano fallback when panoEnabled absent
+        //   panoEnabled        explicit pano gate; if absent, falls back to enabled
+        //   oemDashcamEnabled  explicit OEM Dashcam gate; default false (the OEM
+        //                      front sensor doesn't need a stamp by default —
+        //                      separate opt-in keeps pano clean while OEM is on)
+        //
+        // Resolver lives at isTelemetryOverlayEnabledFor(flow). Don't read
+        // panoEnabled / oemDashcamEnabled directly from callers — the legacy
+        // fallback is part of the contract.
+        val telemetryOverlay = config.optJSONObject("telemetryOverlay") ?: JSONObject().also {
+            config.put("telemetryOverlay", it)
         }
         if (!telemetryOverlay.has("enabled")) telemetryOverlay.put("enabled", false)
+
+        // OEM Dashcam toggles (separate from camera.* because they're feature
+        // gates, not HAL config). disableNativeDvr is sticky-applied on every
+        // daemon boot if true (handles OTA / factory reset un-doing the
+        // pm disable-user). bitrateBudget is the soft cap for the combined
+        // pano+OEM bitrate when both pipelines run; UI uses it to size the
+        // sliders. 10 Mbps matches the Adreno 610 H.264 ceiling under encoder
+        // isolation.
+        val oemDashcam = config.optJSONObject("oemDashcam") ?: JSONObject().also {
+            config.put("oemDashcam", it)
+        }
+        if (!oemDashcam.has("enabled")) oemDashcam.put("enabled", false)
+        // Note: legacy accOffMode key is intentionally NOT seeded here.
+        // migrateOemDashcamModes nulls it on upgrades; fresh installs simply
+        // don't have it. The modern schema is recordingMode + surveillanceMode.
+        if (!oemDashcam.has("disableNativeDvr")) oemDashcam.put("disableNativeDvr", false)
+        // Surveillance integration: when enabled, OEM dashcam pipeline records
+        // dvr_*.mp4 clips in parallel with pano event_*.mp4 on every motion
+        // trigger. Reuses the existing surveillance gating (SafeLocation,
+        // schedule, per-camera enable) — no duplicate config.
+        val oemSurv = oemDashcam.optJSONObject("surveillance") ?: JSONObject().also {
+            oemDashcam.put("surveillance", it)
+        }
+        if (!oemSurv.has("enabled")) oemSurv.put("enabled", false)
+        if (!oemDashcam.has("bitrateBudget"))    oemDashcam.put("bitrateBudget", 10_000_000)
+        // Per-pipeline quality slot. Pano reads recording.recordingQuality;
+        // OEM reads this. Without a separate slot, both pipelines pulled
+        // from the same key and the budget-cap math double-counted pano's
+        // tier (MAX→2 Mbps clamp regression). STANDARD default keeps OEM
+        // clips well under the budget without user tuning.
+        if (!oemDashcam.has("recordingQuality")) oemDashcam.put("recordingQuality", "STANDARD")
+        if (!oemDashcam.has("codec")) oemDashcam.put("codec", "H264")
+        if (!oemDashcam.has("fps")) oemDashcam.put("fps", 30)
+        if (!oemDashcam.has("priorityWhenContended")) {
+            // "pano" | "oemDashcam" — whichever pipeline holds the AVMCamera
+            // when concurrentAvmSupported=0. Default pano because pano feeds
+            // both surveillance and the existing dashcam mode.
+            oemDashcam.put("priorityWhenContended", "pano")
+        }
+        if (!oemDashcam.has("segmentRotateOffsetMs")) {
+            // Stagger OEM segment rotation so MediaMuxer.stop() bursts on the
+            // two pipelines don't collide. 30s into the pano cycle.
+            oemDashcam.put("segmentRotateOffsetMs", 30_000)
+        }
         
         // Trip Analytics defaults
         val tripAnalytics = config.optJSONObject("tripAnalytics") ?: JSONObject().also {
@@ -511,6 +587,34 @@ object UnifiedConfigManager {
     fun getStreaming(): JSONObject {
         return loadConfig().optJSONObject("streaming") ?: JSONObject()
     }
+
+    /**
+     * Recording-side dewarp strength (Fitzgibbon division model).
+     *
+     * Range: 0..100. 0 = off (passthrough — shader stays bit-exact to the
+     * legacy mosaic). 100 = maximum rectification.
+     *
+     * Single shared key used by BOTH the recording (ACC-on dashcam) and
+     * surveillance (ACC-off) flows. The UI exposes a slider in each section
+     * but they both read/write this key — flipping it in one place applies
+     * to the other automatically.
+     *
+     * Defaults to 0 if absent. Clamped on read so a corrupt config value
+     * cannot push the shader out of its safe range.
+     */
+    @JvmStatic
+    fun getRectifyStrength(): Int {
+        val raw = getRecording().optInt("rectifyStrength", 0)
+        return raw.coerceIn(0, 100)
+    }
+
+    /** Set the shared recording/surveillance dewarp strength (0..100). */
+    @JvmStatic
+    fun setRectifyStrength(strength: Int): Boolean {
+        return updateValues("recording", mapOf(
+            "rectifyStrength" to strength.coerceIn(0, 100)
+        ))
+    }
     
     /**
      * Get telegram config section.
@@ -587,6 +691,230 @@ object UnifiedConfigManager {
     @JvmStatic
     fun setTelemetryOverlay(telemetryOverlay: JSONObject): Boolean {
         return updateSection("telemetryOverlay", telemetryOverlay)
+    }
+
+    /**
+     * Resolve whether the telemetry overlay should burn-in for a given
+     * recording flow ("pano" or "oemDashcam"). The legacy `enabled` key acts
+     * as the pano fallback so pre-split installs keep their toggle. OEM
+     * dashcam defaults to off — separate opt-in.
+     */
+    @JvmStatic
+    fun isTelemetryOverlayEnabledFor(flow: String): Boolean {
+        val tel = getTelemetryOverlay()
+        return when (flow) {
+            "oemDashcam" -> tel.optBoolean("oemDashcamEnabled", false)
+            else /* "pano" */ -> {
+                if (tel.has("panoEnabled")) tel.optBoolean("panoEnabled", false)
+                else tel.optBoolean("enabled", false)
+            }
+        }
+    }
+
+    // ==================== OEM DASHCAM ====================
+
+    /**
+     * Get oemDashcam feature-gate section (separate from camera.* which is HAL
+     * config). Read fields: disableNativeDvr, bitrateBudget,
+     * priorityWhenContended, segmentRotateOffsetMs.
+     */
+    @JvmStatic
+    fun getOemDashcam(): JSONObject {
+        return loadConfig().optJSONObject("oemDashcam") ?: JSONObject().apply {
+            put("disableNativeDvr", false)
+            put("bitrateBudget", 10_000_000)
+            put("priorityWhenContended", "pano")
+            put("segmentRotateOffsetMs", 30_000)
+            // Two independent modes — one per page:
+            //   recordingMode      governs OEM behaviour during pano DASHCAM
+            //                      recording (cam_*.mp4 flow). Off | Continuous
+            //                      | Smart. Smart = follow whatever the pano
+            //                      Recording Mode is doing (Continuous /
+            //                      Drive Mode / Proximity Guard).
+            //   surveillanceMode   governs OEM behaviour during pano
+            //                      SURVEILLANCE (event_*.mp4 flow). Off |
+            //                      Continuous | Smart. Smart = follow pano
+            //                      surveillance motion detection.
+            put("recordingMode", "off")
+            put("surveillanceMode", "off")
+        }
+    }
+
+    @JvmStatic
+    fun setOemDashcam(oemDashcam: JSONObject): Boolean {
+        return updateSection("oemDashcam", oemDashcam)
+    }
+
+    /**
+     * True iff either OEM Dashcam mode is non-Off. Pipeline lifecycle is
+     * OR-gated. Streaming alone does NOT activate recording — that's gated
+     * separately by the daemon-side stream router, mirroring how pano
+     * keeps its recording and stream encoders independent.
+     */
+    @JvmStatic
+    fun isAnyOemDashcamTriggerEnabled(): Boolean {
+        val oem = getOemDashcam()
+        // Once either new key is present, it is the authoritative answer.
+        // Legacy `enabled` / `surveillance.enabled` are read-only mirrors
+        // post-migration and must NEVER override an explicit Off pick.
+        if (oem.has("recordingMode") || oem.has("surveillanceMode")) {
+            val rec = oem.optString("recordingMode", "off").lowercase()
+            val surv = oem.optString("surveillanceMode", "off").lowercase()
+            return rec != "off" || surv != "off"
+        }
+        // Pre-migration legacy schemas only.
+        if (oem.optBoolean("enabled", false)) return true
+        val legacySurv = oem.optJSONObject("surveillance")
+        if (legacySurv != null && legacySurv.optBoolean("enabled", false)) return true
+        return false
+    }
+
+    @JvmStatic
+    fun getOemRecordingMode(): String {
+        val oem = getOemDashcam()
+        if (oem.has("recordingMode")) return oem.optString("recordingMode", "off").lowercase()
+        // Legacy: enabled=true → smart (matched pano mode). enabled=false → off.
+        return if (oem.optBoolean("enabled", false)) "smart" else "off"
+    }
+
+    @JvmStatic
+    fun getOemSurveillanceMode(): String {
+        val oem = getOemDashcam()
+        if (oem.has("surveillanceMode")) return oem.optString("surveillanceMode", "off").lowercase()
+        // Legacy: surveillance.enabled=true → smart (follow pano motion).
+        val legacy = oem.optJSONObject("surveillance")
+        return if (legacy != null && legacy.optBoolean("enabled", false)) "smart" else "off"
+    }
+
+    /**
+     * Migrate legacy {@code enabled / surveillance.enabled / accOffMode} →
+     * {@code recordingMode / surveillanceMode}. Idempotent — once one of the
+     * new keys is present we treat the migration as done.
+     */
+    @JvmStatic
+    fun migrateOemDashcamModes(): Boolean {
+        val root = loadConfig()
+        val oem = root.optJSONObject("oemDashcam") ?: return false
+        if (oem.has("recordingMode") || oem.has("surveillanceMode")) return false
+        val delta = JSONObject()
+        val legacyEnabled = oem.optBoolean("enabled", false)
+        val legacyMode = oem.optString("accOffMode", "off")
+        val legacySurv = oem.optJSONObject("surveillance")
+        val survOn = legacySurv?.optBoolean("enabled", false) == true
+        // Pre-migration semantics: enabled=true recorded during the ACC ON
+        // (driving) phase regardless of accOffMode; accOffMode then governed
+        // what happened at ACC OFF (off=tear down, smart=event-trigger,
+        // continuous=keep recording). Map recording-side to "continuous" for
+        // any legacyEnabled=true install so the driving-phase recording
+        // promise is preserved. Surveillance-side then independently captures
+        // the parked-window intent from accOffMode + surveillance.enabled.
+        if (legacyEnabled) {
+            delta.put("recordingMode", "continuous")
+            // accOffMode=continuous → user wanted parked-window recording too.
+            // accOffMode=smart      → user wanted parked-window event clips.
+            // accOffMode=off/unset  → user wanted clean ACC OFF teardown,
+            //                          unless surveillance.enabled overrides.
+            val survFromAccOff = when (legacyMode) {
+                "continuous" -> "continuous"
+                "smart" -> "smart"
+                else -> if (survOn) "smart" else "off"
+            }
+            delta.put("surveillanceMode", survFromAccOff)
+        } else {
+            delta.put("recordingMode", "off")
+            delta.put("surveillanceMode", if (survOn) "smart" else "off")
+        }
+        // R8-A #19: copy pano's codec/quality/fps into the oemDashcam
+        // section so applyRecordingConfigFromUcm doesn't keep falling
+        // back to pano's keys. The fallback was the pre-migration design
+        // but now contradicts the doc comment that says OEM "deliberately
+        // does NOT read pano's recording.* keys". Migrate once at upgrade
+        // time; subsequent picks land directly into oemDashcam via
+        // QualitySettingsApiHandler.
+        val rec = root.optJSONObject("recording")
+        if (rec != null) {
+            if (!oem.has("codec") && rec.has("codec")) {
+                delta.put("codec", rec.optString("codec"))
+            }
+            if (!oem.has("recordingQuality") && rec.has("recordingQuality")) {
+                delta.put("recordingQuality", rec.optString("recordingQuality"))
+            }
+            if (!oem.has("fps") && rec.has("fps")) {
+                delta.put("fps", rec.optInt("fps"))
+            }
+        }
+        // Null out legacy keys so isAnyOemDashcamTriggerEnabled (and any
+        // other reader that hasn't been switched to the new accessors)
+        // can't resurrect a stale enabled=true from the pre-migration
+        // schema. The nested surveillance.enabled stays as a one-way
+        // mirror of surveillanceMode for readers that still consult it
+        // (SurveillanceEngineGpu) — but we explicitly write its new
+        // value so it can't disagree.
+        delta.put("enabled", JSONObject.NULL)
+        delta.put("accOffMode", JSONObject.NULL)
+        // Mirror the resolved surveillanceMode (post-migration) into the
+        // legacy nested boolean so readers that still consult it (e.g.
+        // SurveillanceEngineGpu) can't disagree with the new accessor.
+        val resolvedSurvMode = delta.optString("surveillanceMode", "off")
+        // Clone existing surveillance object (if any) and only mutate `enabled`,
+        // matching the POST handler's per-key merge semantics. Without the clone,
+        // any future sub-key under `oem.surveillance` would be silently dropped
+        // during migration.
+        val existingSurv = oem.optJSONObject("surveillance")
+        val sOut = if (existingSurv != null) JSONObject(existingSurv.toString()) else JSONObject()
+        sOut.put("enabled", "off" != resolvedSurvMode)
+        delta.put("surveillance", sOut)
+        return updateSection("oemDashcam", delta)
+    }
+
+    /**
+     * Resolve the effective OEM Dashcam AVMCamera id.
+     *
+     * Symmetric to pano's default: pano defaults to id=1 (see
+     * {@code PanoramicCameraGpu.PHYSICAL_CAMERA_ID = 1}), so OEM defaults
+     * to id=0. The two stay opposite by construction. Three rules in order:
+     *
+     *  1. **Manual override is honored verbatim.** When the user picked a
+     *     specific id in the camera-mapping dialog (
+     *     {@code oemDashcamManualOverride=true}), this returns that id —
+     *     including -1 if they chose "Off". Manual is the authoritative answer.
+     *  2. **Auto-infer from pano** when {@code oemDashcamManualOverride=false}:
+     *     - pano=0 → OEM=1 (Tang-style, e.g. user manually set pano to 0)
+     *     - pano=1 → OEM=0 (Seal/Han, the typical case)
+     *  3. **Default to 0** otherwise (pano unprobed, or pano is some other
+     *     id we don't have an XOR rule for). Symmetric to pano's id=1
+     *     default — out-of-the-box install on Seal/Han works without
+     *     forcing the user through the camera-mapping dialog. Tang users
+     *     who manually set pano to 0 get OEM=1 via rule 2; if they ALSO
+     *     don't set pano manually (pano stays at default 1, which is
+     *     wrong for Tang anyway), the user has to fix the pano side first
+     *     — no different from the pre-OEM situation.
+     *
+     * Safety net: even if this returns 0 on a vehicle where id=0 happens to
+     * be the pano sensor, {@code OemDashcamPipeline.validateHalDimsOrReject}
+     * checks BmmCameraInfo's declared dims and refuses to open anything with
+     * an aspect ≥ 2.0 (panoramic strip). The applyLifecycle catch then rolls
+     * UCM back to {@code enabled=false} with a {@code lastStartError} the UI
+     * surfaces.
+     *
+     * Caller must ensure the camera section is fresh (forceReload from app UID).
+     */
+    @JvmStatic
+    fun resolveOemDashcamId(): Int {
+        val camera = loadConfig().optJSONObject("camera") ?: return 0
+        if (camera.optBoolean("oemDashcamManualOverride", false)) {
+            return camera.optInt("oemDashcamCameraId", -1)
+        }
+        val panoId = if (camera.optBoolean("manualOverride", false)) {
+            camera.optInt("manualCameraId", -1)
+        } else {
+            camera.optInt("probedCameraId", -1)
+        }
+        return when (panoId) {
+            0 -> 1                  // Tang-style: pano=0 → OEM=1
+            1 -> 0                  // Seal/Han: pano=1 → OEM=0
+            else -> 0               // Default symmetric to pano's id=1 default
+        }
     }
     
     /**
@@ -930,6 +1258,7 @@ object UnifiedConfigManager {
         config.put("proximityGuard", JSONObject())
         config.put("telemetryOverlay", JSONObject())
         config.put("tripAnalytics", JSONObject())
+        config.put("oemDashcam", JSONObject())
         config.put("bydCloud", JSONObject())
         config.put("geocoding", JSONObject())
         config.put("version", 1)

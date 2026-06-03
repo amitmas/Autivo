@@ -3316,6 +3316,12 @@ public class BydDataCollector {
                     if (current != null) {
                         snapshot.set(current.toBuilder().socPercent(soc).build());
                     }
+                    // Fan out to the SoC voluntary-cutoff monitor (no-op when
+                    // not running). Doesn't try to subclass the abstract
+                    // listener separately — piggybacks on this hub.
+                    try {
+                        com.overdrive.app.power.SocCutoffMonitor.notifyElecPercentage(soc);
+                    } catch (Throwable ignored) {}
                 }
             } catch (Exception e) { /* ignore */ }
             return;
@@ -3364,6 +3370,12 @@ public class BydDataCollector {
                     if (current != null) {
                         snapshot.set(current.toBuilder().voltage12v(voltage).build());
                     }
+                    // Fan out — same rationale as onOtaCallback. Some BYD
+                    // trims route OTA voltage through the generic hub instead.
+                    try {
+                        com.overdrive.app.power.BatteryVoltageMonitorV2
+                                .notifyBatteryPowerVoltage(voltage);
+                    } catch (Throwable ignored) {}
                 }
             } catch (Exception e) { /* ignore */ }
             return;
@@ -3522,6 +3534,14 @@ public class BydDataCollector {
                     if (current != null) {
                         snapshot.set(current.toBuilder().voltage12v(voltage).build());
                     }
+                    // Fan out to BatteryVoltageMonitorV2's MCU sleep/wake
+                    // hysteresis (no-op when not running). The collector
+                    // subclasses AbsBYDAutoOtaListener once and routes here;
+                    // V2 piggybacks instead of trying its own registration.
+                    try {
+                        com.overdrive.app.power.BatteryVoltageMonitorV2
+                                .notifyBatteryPowerVoltage(voltage);
+                    } catch (Throwable ignored) {}
                 }
             } catch (Exception e) { /* ignore */ }
         }

@@ -95,6 +95,12 @@ public class AppAudioCaptureController {
     private MediaCodec aacEncoder;
     private Socket socket;
     private DataOutputStream out;
+    // FIX H3: per-frame scratch buffer for AAC packet copies. AAC frames are
+    // typically <1500 bytes (4-8 ms × 64 kbps mono ≈ 32-64 bytes for data,
+    // plus ADTS header). Allocating a fresh byte[info.size] per packet at
+    // ~50 Hz (20 ms AAC frames) churned ~3 KB/s through GC. Grows on the
+    // rare oversized frame, never shrinks.
+    private byte[] drainScratch = new byte[8192];
     // Mic-claim contention back-off. BYD voice-asst can grab the mic
     // mid-trip; AudioRecord then throws ERROR_INVALID_OPERATION on read.
     // We close + retry every 5 s instead of busy-looping or giving up.
@@ -458,10 +464,23 @@ public class AppAudioCaptureController {
                     // 64 kbps mono); 1-2 ms of timing noise is imperceptible
                     // for cabin audio.
                     o.writeLong(System.nanoTime() / 1000L);
-                    byte[] frame = new byte[info.size];
-                    outBuf.get(frame);
-                    o.write(frame);
-                    o.flush();
+                    // FIX H3: reuse drainScratch instead of `new byte[info.size]`.
+                    // AAC frames are <1500 bytes; the scratch starts at 8 KB
+                    // and only grows on the rare oversize frame.
+                    if (info.size > drainScratch.length) {
+                        drainScratch = new byte[info.size];
+                    }
+                    outBuf.get(drainScratch, 0, info.size);
+                    o.write(drainScratch, 0, info.size);
+                    // FIX M1: drop per-frame flush(). The socket already has
+                    // TCP_NODELAY set in initIngestSocket(), so the kernel
+                    // emits the segment immediately on every write() — the
+                    // explicit flush() was halving syscall throughput by
+                    // forcing an extra round through DataOutputStream's
+                    // (already empty) buffer drain at AAC frame rate
+                    // (~50 Hz). Recovery from a half-shipped frame is
+                    // identical with or without the flush; the receiver's
+                    // length-prefixed framer handles partial sends.
                 }
 
                 aacEncoder.releaseOutputBuffer(outputIndex, false);

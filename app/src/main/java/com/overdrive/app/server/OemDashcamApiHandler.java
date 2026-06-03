@@ -1,0 +1,934 @@
+package com.overdrive.app.server;
+
+import com.overdrive.app.logging.DaemonLogger;
+
+import org.json.JSONObject;
+
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+
+/**
+ * OEM Dashcam settings API handler.
+ *
+ * Currently exposes the "Disable Native DVR" toggle for BYD's factory dashcam
+ * package ({@code com.byd.cdr}). When the native DVR is disabled, our OEM
+ * Dashcam pipeline owns the AVMCamera without contention — the factory app
+ * stops opening AVMCamera on every ACC ON event and stops writing to
+ * /sdcard/DCIM/BYDCam.
+ *
+ * <p><b>Permission model.</b> The HTTP server runs in the {@code CameraDaemon}
+ * process which is launched via {@code adb shell ... app_process} and
+ * therefore runs as UID 2000 (shell). UID shell is allowed to call
+ * {@code pm disable-user --user 0 <pkg>} and {@code pm enable <pkg>}
+ * directly, so this handler shells out via {@link Runtime#exec} without
+ * needing an IPC roundtrip to AccSentryDaemon. (AccSentryDaemon's
+ * {@code disableBydTrafficMonitor} helper is the same idea — both daemons
+ * are UID shell.)
+ *
+ * <p>Endpoints:
+ * <pre>
+ *   GET  /api/oem-dashcam/native-dvr/status   — { state, package }
+ *   POST /api/oem-dashcam/native-dvr/disable  — runs pm disable-user, persists UCM
+ *   POST /api/oem-dashcam/native-dvr/enable   — runs pm enable, persists UCM
+ * </pre>
+ *
+ * <p>{@code state} is one of:
+ * <ul>
+ *   <li>{@code "enabled"}    — package present and not disabled (factory DVR active)</li>
+ *   <li>{@code "disabled"}   — package present and currently disabled (we own the camera)</li>
+ *   <li>{@code "not_installed"} — no com.byd.cdr on this firmware (e.g. trims without OEM dashcam);
+ *       UI hides the entire card on this state.</li>
+ * </ul>
+ */
+public class OemDashcamApiHandler {
+
+    private static final String TAG = "OemDashcamApi";
+    private static final DaemonLogger logger = DaemonLogger.getInstance(TAG);
+
+    /** Factory dashcam package — see AvcHalWarmup.java header for context. */
+    public static final String NATIVE_DVR_PACKAGE = "com.byd.cdr";
+
+    // Serialize lifecycle transitions so two rapid POST /config calls don't
+    // race start() and stop() against each other and leave the static
+    // pipeline reference half-initialised.
+    private static final Object LIFECYCLE_LOCK = new Object();
+
+    // Lifecycle thread pool — single thread, dedup via in-flight flag with
+    // a sticky re-arm so a click landing during execution still triggers
+    // exactly one follow-up apply (in case state diverged between submit
+    // and run). Replaces the per-call `new Thread(...).start()` pattern
+    // that was queueing dozens of LIFECYCLE_LOCK contenders during
+    // DVR-click hammering.
+    // Package-private so peer handlers in com.overdrive.app.server (e.g.
+    // QualitySettingsApiHandler's quality-mirror restart) can serialize their
+    // own stop+start cycles against picker applies on the same executor —
+    // otherwise rapid quality changes race the lifecycle worker and orphan
+    // a half-built pipeline.
+    static final java.util.concurrent.ExecutorService LIFECYCLE_EXEC =
+        java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "OemDashcamLifecycle");
+            t.setDaemon(true);
+            return t;
+        });
+    private static final java.util.concurrent.atomic.AtomicBoolean lifecycleInFlight =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
+    private static final java.util.concurrent.atomic.AtomicBoolean lifecyclePending =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    /**
+     * Schedule one trigger-lifecycle recalc on the dedicated executor.
+     * Idempotent under burst — N concurrent calls land on at most 2 runs
+     * (one in-flight, one re-armed). Use this from every place that
+     * previously did {@code new Thread(applyTriggerLifecycleFromUcm).start()}.
+     */
+    public static void scheduleLifecycleRecalc() {
+        if (lifecycleInFlight.compareAndSet(false, true)) {
+            try {
+                LIFECYCLE_EXEC.execute(LIFECYCLE_RUN);
+            } catch (Throwable t) {
+                // RejectedExecutionException post-shutdown / OOM / etc.
+                // Without resetting the flag, no future scheduleLifecycleRecalc
+                // would ever submit anything — the executor would be silently
+                // dead. Log + reset.
+                lifecycleInFlight.set(false);
+                logger.warn("scheduleLifecycleRecalc: executor rejected: " + t.getMessage());
+            }
+        } else {
+            lifecyclePending.set(true);
+        }
+    }
+
+    /** Single shared Runnable used by both the primary submission and the
+     *  race-recovery path, so the do-while body lives in exactly one place. */
+    private static final Runnable LIFECYCLE_RUN = new Runnable() {
+        @Override public void run() {
+            try {
+                do {
+                    lifecyclePending.set(false);
+                    try {
+                        applyTriggerLifecycleFromUcm();
+                    } catch (Throwable t) {
+                        com.overdrive.app.daemon.CameraDaemon.log(
+                            "scheduleLifecycleRecalc body threw: " + t.getMessage());
+                    }
+                } while (lifecyclePending.get());
+            } finally {
+                lifecycleInFlight.set(false);
+                // Race window — a caller may have flipped pending=true
+                // between our last check and the flag clear. Re-enter
+                // recursively (the top-level CAS handles maybe-in-flight).
+                if (lifecyclePending.get()) scheduleLifecycleRecalc();
+            }
+        }
+    };
+
+    /**
+     * Drive the OEM pipeline lifecycle from the trigger union. The pipeline
+     * runs whenever {@code recordingDesired} OR {@code streamingDesired}
+     * is true — the camera+EGL+encoder open is shared. Recording is gated
+     * separately on {@code recordingDesired} so a streaming-only viewer
+     * never spawns a dvr_*.mp4 file.
+     *
+     * <p>Mirrors how pano keeps {@link com.overdrive.app.surveillance.GpuSurveillancePipeline}
+     * running for streaming clients without writing event_*.mp4 unless the
+     * surveillance / continuous trigger is hot.
+     *
+     * @param recordingDesired true if any oemDashcam.triggers.* is true.
+     *                         The pipeline auto-rotates dvr_*.mp4 segments
+     *                         while this is set.
+     * @param streamingDesired true if a /api/stream/view/6 client is
+     *                         actively asking for the OEM feed. Keeps the
+     *                         pipeline warm without flipping recording on.
+     */
+    public static void applyTriggerLifecycle(boolean recordingDesired, boolean streamingDesired) {
+        boolean shouldRun = recordingDesired || streamingDesired;
+        com.overdrive.app.camera.OemDashcamPipeline existing;
+        boolean needFormatWait;
+        // Phase 1 (under lock): bring up pipeline + tear down. Both
+        // mutate the daemon-static OemDashcamPipeline ref so they MUST
+        // serialize. waitForEncoderFormat is read-only on the encoder
+        // field — pulled outside the lock so other lifecycle callers
+        // (ACC bounce, quality-mirror restart, view-6 click) don't
+        // block on a 3-second poll while the encoder warms up.
+        synchronized (LIFECYCLE_LOCK) {
+            existing = com.overdrive.app.daemon.CameraDaemon.getOemDashcamPipeline();
+            try {
+                if (shouldRun) {
+                    if (existing == null || !existing.isRunning()) {
+                        existing = startPipeline();
+                        if (existing == null) return;
+                    }
+                    // Wedge if format isn't ready AND we need recording —
+                    // we'll wait OUTSIDE the lock then re-enter to start
+                    // recording (re-checking liveness post-relock).
+                    needFormatWait = recordingDesired && !existing.isRecording();
+                    if (!recordingDesired && existing.isRecording()) {
+                        try { existing.stopRecording(); } catch (Throwable ignored) {}
+                    }
+                } else {
+                    // No triggers, no streaming — tear down completely.
+                    if (existing != null) {
+                        try { existing.stopRecording(); } catch (Throwable ignored) {}
+                        try { existing.stop(); } catch (Throwable ignored) {}
+                        com.overdrive.app.daemon.CameraDaemon.setOemDashcamPipeline(null);
+                        com.overdrive.app.daemon.CameraDaemon.log(
+                            "OemDashcam: pipeline stopped (no triggers, no streaming clients)");
+                    }
+                    return;
+                }
+            } catch (Throwable t) {
+                com.overdrive.app.daemon.CameraDaemon.log(
+                    "OemDashcam: trigger lifecycle failed (phase 1): " + t.getMessage());
+                return;
+            }
+        }
+
+        // Phase 2 (lock-free): wait for encoder OUTPUT_FORMAT_CHANGED.
+        // Without the wait, triggerEventRecording opens the muxer with
+        // savedFormat=null and produces a 168 KB empty .mp4. Wait
+        // outside the lock so concurrent lifecycle calls aren't pinned.
+        if (!needFormatWait) return;
+        boolean encoderReady = waitForEncoderFormat(existing, 3000);
+        if (!encoderReady) {
+            // R8-A #3: format never arrived. startRecording would build a
+            // muxer with savedFormat=null → 168 KB empty .mp4 (the exact
+            // pathology phase 2 was meant to avoid). Defer to next
+            // lifecycle recalc — a future ACC/click/timer event will
+            // retry.
+            com.overdrive.app.daemon.CameraDaemon.log(
+                "OemDashcam: encoder warmup timeout — deferring recording-start "
+                + "to next lifecycle recalc");
+            return;
+        }
+
+        // Phase 3 (under lock): re-acquire and start recording. State
+        // may have changed during the unlocked window (a competing
+        // teardown could have stopped + nulled the pipeline). Re-check
+        // every gate before mutating. R8-A #2: startRecording's own
+        // compareAndSet is the authoritative ownership gate; it returns
+        // false if a concurrent watchdog/render-loop stop has already
+        // flipped recording=false → running=false. The phase-3 isRunning
+        // check below is a fast-path; startRecording's CAS catches the
+        // residual race.
+        synchronized (LIFECYCLE_LOCK) {
+            try {
+                com.overdrive.app.camera.OemDashcamPipeline current =
+                    com.overdrive.app.daemon.CameraDaemon.getOemDashcamPipeline();
+                if (current == existing
+                    && current != null
+                    && current.isRunning()
+                    && !current.isRecording()) {
+                    if (!current.startRecording()) {
+                        com.overdrive.app.daemon.CameraDaemon.log(
+                            "OemDashcam: startRecording refused (recording trigger active "
+                            + "or pipeline torn down during phase-2 wait)");
+                    }
+                }
+                // Else: state changed during the unlocked window — let
+                // the next lifecycle recalc reconcile.
+            } catch (Throwable t) {
+                com.overdrive.app.daemon.CameraDaemon.log(
+                    "OemDashcam: trigger lifecycle failed (phase 3): " + t.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Recompute the recording / streaming desire from UCM + live pipeline
+     * state and apply. Resolution:
+     * <ul>
+     *   <li>{@code recordingMode == continuous} ⇒ recording always on.</li>
+     *   <li>{@code recordingMode == smart} ⇒ recording iff pano dashcam is
+     *       currently recording (cam_*.mp4 is being written).</li>
+     *   <li>{@code surveillanceMode == continuous} ⇒ recording always on
+     *       (effectively the same as recording.continuous from the
+     *       pipeline's perspective, separate UI control).</li>
+     *   <li>{@code surveillanceMode == smart} is event-driven — the actual
+     *       recording starts inside SurveillanceEngineGpu when motion fires;
+     *       this resolver only keeps the pipeline warm so the start latency
+     *       is small.</li>
+     * </ul>
+     */
+    public static void applyTriggerLifecycleFromUcm() {
+        // Force-reload from disk: the picker may have been written by the app process
+        // (settings activity), and our cache is mtime-gated to 1s — without a force
+        // reload we can read state up to ~1s stale. Per project convention
+        // (feedback_unified_config_force_reload.md), daemon-side reads of cross-UID
+        // state must forceReload first.
+        com.overdrive.app.config.UnifiedConfigManager.forceReload();
+        String rec = com.overdrive.app.config.UnifiedConfigManager.getOemRecordingMode();
+        String surv = com.overdrive.app.config.UnifiedConfigManager.getOemSurveillanceMode();
+
+        boolean accOn = com.overdrive.app.monitor.AccMonitor.isAccOn();
+
+        // surveillance-side continuous = "always record while parked" — gate on ACC OFF.
+        // Without this, the UI promise "Always record dvr_*.mp4 the whole time the car
+        // is parked" lies; users get continuous recording during driving phases too.
+        boolean recordingDesired = false;
+        if ("continuous".equals(rec)) recordingDesired = true;          // recording-side continuous = ACC ON phase
+        if ("continuous".equals(surv) && !accOn) recordingDesired = true; // surveillance-side continuous = ACC OFF phase only
+        if ("smart".equals(rec) && isPanoDashcamRecording()) recordingDesired = true;
+
+        // "smart" recording-side mirrors pano during ACC ON only — pano isn't recording
+        // during ACC OFF so there's nothing to mirror. Keeping the pipeline warm during
+        // the parked window burns 12V and contends with sentry for the AVMCamera handle.
+        boolean keepWarmRec = "smart".equals(rec) && accOn;
+        boolean keepWarm = keepWarmRec
+            || "smart".equals(surv)              // surveillance-smart needs warm pipeline for motion events
+            || isAnyStreamingViewerActive();
+
+        applyTriggerLifecycle(recordingDesired, keepWarm);
+    }
+
+    private static boolean isPanoDashcamRecording() {
+        try {
+            com.overdrive.app.surveillance.GpuSurveillancePipeline pano =
+                com.overdrive.app.daemon.CameraDaemon.getGpuPipeline();
+            return pano != null && pano.isRecording();
+        } catch (Throwable t) { return false; }
+    }
+
+    /** True iff the pano pipeline currently has streaming enabled AND its
+     *  scaler view-mode is 6 (OEM Dashcam). When the user navigates away
+     *  from DVR view, this flips false and the pipeline can shut down if
+     *  no other trigger is active. */
+    public static boolean isAnyStreamingViewerActive() {
+        try {
+            com.overdrive.app.surveillance.GpuSurveillancePipeline pano =
+                com.overdrive.app.daemon.CameraDaemon.getGpuPipeline();
+            if (pano == null || !pano.isStreamingEnabled()) return false;
+            return pano.getStreamViewMode() == 6;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /**
+     * Start the OEM pipeline (camera + EGL + encoder). Does NOT open a
+     * recording — caller is responsible for {@code startRecording()} when
+     * a trigger demands it. Returns null on failure (UCM gets a
+     * lastStartError).
+     */
+    private static com.overdrive.app.camera.OemDashcamPipeline startPipeline() {
+        int oemId = com.overdrive.app.config.UnifiedConfigManager.resolveOemDashcamId();
+        if (oemId < 0) {
+            com.overdrive.app.daemon.CameraDaemon.log(
+                "OemDashcam: cannot start — id explicitly disabled");
+            return null;
+        }
+        try {
+            com.overdrive.app.camera.AvcHalWarmup warmup =
+                new com.overdrive.app.camera.AvcHalWarmup();
+            warmup.warmupAndWait();
+        } catch (Throwable ignored) {}
+
+        String outDir = com.overdrive.app.storage.StorageManager.getInstance()
+            .getRecordingsPath();
+        try {
+            JSONObject clearErr = new JSONObject();
+            clearErr.put("lastStartError", JSONObject.NULL);
+            clearErr.put("lastStartErrorAt", 0);
+            // Wipe any prior writer-abort marker too so the OEM card on the
+            // surveillance page transitions from "errored" back to "armed"
+            // when the user retries after an SD remount.
+            clearErr.put("lastWriteError", JSONObject.NULL);
+            clearErr.put("lastWriteErrorAt", 0);
+            com.overdrive.app.config.UnifiedConfigManager.setOemDashcam(clearErr);
+        } catch (Throwable ignored) {}
+        com.overdrive.app.camera.OemDashcamPipeline p =
+            new com.overdrive.app.camera.OemDashcamPipeline(outDir);
+        try {
+            com.overdrive.app.telemetry.TelemetryDataCollector tdc =
+                com.overdrive.app.daemon.CameraDaemon.getTelemetryDataCollector();
+            if (tdc != null) p.setTelemetryCollector(tdc);
+        } catch (Throwable ignored) {}
+        boolean oemOverlay = com.overdrive.app.config.UnifiedConfigManager
+            .isTelemetryOverlayEnabledFor("oemDashcam");
+        p.setOverlayEnabled(oemOverlay);
+        // Parent-EGL wiring with bounded poll. Pano may still be in
+        // its own start() call (~2-4s for AVMCamera open + EGL setup) when
+        // we get here from a /api/stream/view/6 fast-path; without the
+        // poll, the bare isRunning() check returns false and OEM falls
+        // through to an INDEPENDENT EGL context, breaking the texture-
+        // sharing path. Cap the wait at 3s so a pano that's genuinely
+        // not coming up doesn't hold OEM forever.
+        try {
+            com.overdrive.app.surveillance.GpuSurveillancePipeline pano =
+                com.overdrive.app.daemon.CameraDaemon.getGpuPipeline();
+            if (pano != null) {
+                long deadline = System.currentTimeMillis() + 3000;
+                while (!pano.isRunning() && System.currentTimeMillis() < deadline) {
+                    try { Thread.sleep(50); }
+                    catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
+                if (pano.isRunning()) {
+                    com.overdrive.app.camera.PanoramicCameraGpu panoCam = pano.getCamera();
+                    if (panoCam != null && panoCam.getEglCore() != null) {
+                        p.setParentEglCore(panoCam.getEglCore());
+                    }
+                } else {
+                    com.overdrive.app.daemon.CameraDaemon.log(
+                        "OemDashcam: pano not ready within 3s — falling through to "
+                        + "independent EGL context (view-6 streaming will require an "
+                        + "OEM restart once pano comes up)");
+                }
+            }
+        } catch (Throwable ignored) {}
+        try {
+            p.start();
+        } catch (Throwable t) {
+            com.overdrive.app.daemon.CameraDaemon.log(
+                "OemDashcam: pipeline.start failed: " + t.getMessage());
+            try {
+                JSONObject rb = new JSONObject();
+                rb.put("lastStartError",
+                    t.getMessage() == null ? t.getClass().getSimpleName() : t.getMessage());
+                rb.put("lastStartErrorAt", java.lang.System.currentTimeMillis());
+                com.overdrive.app.config.UnifiedConfigManager.setOemDashcam(rb);
+            } catch (Throwable ignored) {}
+            return null;
+        }
+        com.overdrive.app.daemon.CameraDaemon.setOemDashcamPipeline(p);
+        com.overdrive.app.daemon.CameraDaemon.log(
+            "OemDashcam: pipeline ready (id=" + oemId + ", outDir=" + outDir + ")");
+        return p;
+    }
+
+    // ---------------------------------------------------------------
+    // Legacy single-flag entry kept so existing callers (CameraDaemon
+    // boot path, ACC dispatch, /api/oem-dashcam/config restart hook)
+    // keep compiling. Deprecated in favour of applyTriggerLifecycle.
+    // The boolean carries "recordingDesired"; streamingDesired is
+    // re-derived from pano state.
+    public static void applyLifecycle(boolean enabled) {
+        applyTriggerLifecycle(enabled, isAnyStreamingViewerActive());
+    }
+
+
+    /**
+     * Poll the OEM pipeline's encoder until OUTPUT_FORMAT_CHANGED has
+     * fired, so a subsequent {@code triggerEventRecording} can build a
+     * muxer with a valid track. Returns false on timeout. Direct accessor
+     * — no reflection on the hot path.
+     */
+    private static boolean waitForEncoderFormat(
+            com.overdrive.app.camera.OemDashcamPipeline pipeline, long timeoutMs) {
+        if (pipeline == null) return false;
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        while (System.currentTimeMillis() < deadline) {
+            try {
+                if (pipeline.isEncoderFormatAvailable()) return true;
+            } catch (Throwable ignored) {
+                return false;
+            }
+            try { Thread.sleep(50); }
+            catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Boot-time hook: if any oemDashcam trigger is on at boot, warm the
+     * pipeline. Mirrors enforceStickyDisableIfRequested for the native-DVR
+     * side. Runs the legacy-schema migration first so installs that
+     * pre-date the trigger refactor pick up their old enabled+accOffMode
+     * intent without forcing the user back into the dialog.
+     */
+    public static void enforceStickyEnableIfRequested() {
+        try {
+            com.overdrive.app.config.UnifiedConfigManager.migrateOemDashcamModes();
+            if (com.overdrive.app.config.UnifiedConfigManager.isAnyOemDashcamTriggerEnabled()) {
+                com.overdrive.app.daemon.CameraDaemon.log(
+                    "OemDashcam: re-applying mirror triggers at boot");
+                scheduleLifecycleRecalc();
+            }
+        } catch (Throwable t) {
+            com.overdrive.app.daemon.CameraDaemon.log(
+                "OemDashcam: sticky-enable check failed: " + t.getMessage());
+        }
+    }
+
+    public static boolean handle(String method, String path, String body, OutputStream out) throws Exception {
+        String cleanPath = path.contains("?") ? path.substring(0, path.indexOf("?")) : path;
+
+        if (cleanPath.equals("/api/oem-dashcam/native-dvr/status") && method.equals("GET")) {
+            handleStatus(out);
+            return true;
+        }
+        if (cleanPath.equals("/api/oem-dashcam/native-dvr/disable") && method.equals("POST")) {
+            handleDisable(out);
+            return true;
+        }
+        if (cleanPath.equals("/api/oem-dashcam/native-dvr/enable") && method.equals("POST")) {
+            handleEnable(out);
+            return true;
+        }
+        // OEM Dashcam feature toggle + ACC-off mode. The values land in the
+        // oemDashcam UCM section; the daemon-side lifecycle (Phase B) reads
+        // them at boot/start. GET returns current values; POST accepts
+        // partial updates ({enabled?, accOffMode?}).
+        if (cleanPath.equals("/api/oem-dashcam/config") && method.equals("GET")) {
+            handleGetConfig(out);
+            return true;
+        }
+        if (cleanPath.equals("/api/oem-dashcam/config") && method.equals("POST")) {
+            handlePostConfig(out, body);
+            return true;
+        }
+        return false;
+    }
+
+    private static void handleGetConfig(OutputStream out) throws Exception {
+        JSONObject oem = com.overdrive.app.config.UnifiedConfigManager.getOemDashcam();
+        JSONObject response = new JSONObject();
+        response.put("success", true);
+        // Two modes — one per page. Off | Continuous | Smart.
+        // Smart on the recording page = follow pano dashcam mode
+        //   (Continuous / Drive Mode / Proximity Guard).
+        // Smart on the surveillance page = follow pano surveillance motion
+        //   detection (record dvr_*.mp4 alongside event_*.mp4).
+        response.put("recordingMode",
+            com.overdrive.app.config.UnifiedConfigManager.getOemRecordingMode());
+        response.put("surveillanceMode",
+            com.overdrive.app.config.UnifiedConfigManager.getOemSurveillanceMode());
+        response.put("recordingQuality", oem.optString("recordingQuality", "STANDARD"));
+        response.put("codec", oem.optString("codec", "H264"));
+        response.put("fps", oem.optInt("fps", 30));
+        response.put("disableNativeDvr", oem.optBoolean("disableNativeDvr", false));
+        if (oem.has("lastStartError") && !oem.isNull("lastStartError")) {
+            response.put("lastStartError", oem.optString("lastStartError", ""));
+            response.put("lastStartErrorAt", oem.optLong("lastStartErrorAt", 0));
+        }
+        // Disk-writer aborts (SD unmount / full volume) flow into UCM via
+        // OemDashcamPipeline.handleWriterAbort. Surface the latest abort
+        // reason so the UI can transition the OEM badge from "recording"
+        // to "errored" instead of lying about a dead muxer.
+        if (oem.has("lastWriteError") && !oem.isNull("lastWriteError")) {
+            response.put("lastWriteError", oem.optString("lastWriteError", ""));
+            response.put("lastWriteErrorAt", oem.optLong("lastWriteErrorAt", 0));
+        }
+        com.overdrive.app.camera.OemDashcamPipeline pipe =
+            com.overdrive.app.daemon.CameraDaemon.getOemDashcamPipeline();
+        response.put("pipelineRunning", pipe != null && pipe.isRunning());
+        response.put("recording", pipe != null && pipe.isRecording());
+        HttpResponse.sendJson(out, response.toString());
+    }
+
+    private static void handlePostConfig(OutputStream out, String body) throws Exception {
+        JSONObject delta = new JSONObject();
+        try {
+            JSONObject req = new JSONObject(body == null ? "{}" : body);
+
+            // FIX M3: capture mode/quality before applying delta so we can
+            // skip the (expensive) lifecycle recalc when nothing material
+            // changed. Auto-save UIs hammer this endpoint on every keystroke
+            // / scroll-tick; without the early-out, the LIFECYCLE_EXEC kept
+            // submitting recalcs that triggered encoder rebuilds inside
+            // applyLifecycle even though the resolved state was identical.
+            JSONObject beforeOem = com.overdrive.app.config.UnifiedConfigManager.getOemDashcam();
+            String oldRec = com.overdrive.app.config.UnifiedConfigManager.getOemRecordingMode();
+            String oldSurv = com.overdrive.app.config.UnifiedConfigManager.getOemSurveillanceMode();
+            String oldQuality = beforeOem == null ? "" : beforeOem.optString("recordingQuality", "");
+            String oldCodec = beforeOem == null ? "" : beforeOem.optString("codec", "");
+            int oldFps = beforeOem == null ? 0 : beforeOem.optInt("fps", 0);
+
+            // The two mode pickers — recording page and surveillance page
+            // post their own flag independently. updateSection merges
+            // per-key so a partial post doesn't clobber the other.
+            if (req.has("recordingMode")) {
+                String m = req.optString("recordingMode", "off").toLowerCase();
+                if (!"off".equals(m) && !"continuous".equals(m) && !"smart".equals(m)) {
+                    JSONObject err = new JSONObject();
+                    err.put("success", false);
+                    err.put("error", "recordingMode must be off|continuous|smart");
+                    HttpResponse.sendJson(out, err.toString());
+                    return;
+                }
+                delta.put("recordingMode", m);
+            }
+            if (req.has("surveillanceMode")) {
+                String m = req.optString("surveillanceMode", "off").toLowerCase();
+                if (!"off".equals(m) && !"continuous".equals(m) && !"smart".equals(m)) {
+                    JSONObject err = new JSONObject();
+                    err.put("success", false);
+                    err.put("error", "surveillanceMode must be off|continuous|smart");
+                    HttpResponse.sendJson(out, err.toString());
+                    return;
+                }
+                delta.put("surveillanceMode", m);
+            }
+            // Legacy single-flag from older web shells. enabled=true ⇒ smart.
+            if (req.has("enabled") && !delta.has("recordingMode")) {
+                delta.put("recordingMode", req.optBoolean("enabled", false) ? "smart" : "off");
+            }
+            // Per-OEM quality/codec/fps overrides (optional). Pano picker
+            // already mirrors into oemDashcam.* via QualitySettingsApiHandler;
+            // these accept explicit OEM-only overrides from the future
+            // dedicated picker.
+            if (req.has("recordingQuality")) {
+                String t = req.optString("recordingQuality", "").toUpperCase();
+                if (t.equals("ECONOMY") || t.equals("STANDARD") || t.equals("HIGH")
+                        || t.equals("PREMIUM") || t.equals("MAX")) {
+                    delta.put("recordingQuality", t);
+                }
+            }
+            if (req.has("codec")) {
+                String c = req.optString("codec", "").toUpperCase();
+                if ("H264".equals(c) || "H265".equals(c)) delta.put("codec", c);
+            }
+            if (req.has("fps")) {
+                int f = req.optInt("fps", -1);
+                if (f >= 10 && f <= 60) delta.put("fps", f);
+            }
+
+            // Surveillance integration toggle. Web posts {"surveillance":
+            // {"enabled":true|false}}. Audit found the handler silently
+            // dropped this — the toggle in surveillance.html appeared to
+            // save but UCM never changed and the toggle popped back. Merge
+            // the nested object into the section delta so updateSection's
+            // per-key merge (UnifiedConfigManager.kt:817-825) picks it up.
+            //
+            // AUTO-PROMOTE: when user enables surveillance integration,
+            // automatically also flip oemDashcam.enabled=true. Without
+            // this, surveillance event recording is a silent no-op
+            // (SurveillanceEngineGpu.startEventRecording requires
+            // oemPipe.isRunning() which requires the pipeline to be
+            // started by the main toggle). The user opted in to OEM
+            // event clips; respecting that intent means the pipeline
+            // must actually run.
+            // Legacy nested surveillance.enabled from older web shells.
+            // Maps surveillanceMode = smart|off.
+            if (req.has("surveillance") && !delta.has("surveillanceMode")) {
+                JSONObject sIn = req.optJSONObject("surveillance");
+                if (sIn != null && sIn.has("enabled")) {
+                    boolean survOn = sIn.optBoolean("enabled", false);
+                    delta.put("surveillanceMode", survOn ? "smart" : "off");
+                }
+            }
+            // Mirror surveillanceMode != off into the legacy nested object so
+            // SurveillanceEngineGpu (which reads oemDashcam.surveillance.enabled)
+            // keeps working without a conversion sweep.
+            if (delta.has("surveillanceMode")) {
+                boolean survOn = !"off".equals(delta.optString("surveillanceMode", "off"));
+                JSONObject sExisting = com.overdrive.app.config.UnifiedConfigManager
+                    .getOemDashcam().optJSONObject("surveillance");
+                JSONObject sOut = sExisting != null
+                    ? new JSONObject(sExisting.toString())
+                    : new JSONObject();
+                sOut.put("enabled", survOn);
+                delta.put("surveillance", sOut);
+            }
+
+            if (delta.length() > 0) {
+                com.overdrive.app.config.UnifiedConfigManager.setOemDashcam(delta);
+            }
+
+            // Explicit restart knob — used by the camera-mapping dialog
+            // when the OEM camera id changes. Without this, the live
+            // pipeline keeps using the OLD id captured at start() and the
+            // user's new pick is silent until next toggle off+on. Always
+            // a stop+start cycle so the new HAL id is picked up.
+            if (req.optBoolean("restart", false)) {
+                com.overdrive.app.camera.OemDashcamPipeline live =
+                    com.overdrive.app.daemon.CameraDaemon.getOemDashcamPipeline();
+                if (live != null && live.isRunning()) {
+                    // Route through the same single-threaded executor so
+                    // rapid restart-cfg POSTs serialize cleanly with the
+                    // ordinary trigger-recalc submissions. Without this,
+                    // a per-call new-Thread spawn lets two concurrent
+                    // applyLifecycle(false)+applyLifecycle(true) pairs
+                    // race and orphan a half-built pipeline.
+                    LIFECYCLE_EXEC.execute(() -> {
+                        try {
+                            applyLifecycle(false);
+                            // After teardown, let the lifecycle worker compute the new desired
+                            // state from the just-applied UCM mode pair instead of hardcoding
+                            // recordingDesired=true. Otherwise a concurrent picker change can
+                            // get absorbed into a stale snapshot.
+                            applyTriggerLifecycleFromUcm();
+                        } catch (Exception e) {
+                            logger.warn("OEM dashcam restart failed: " + e.getMessage());
+                        }
+                    });
+                    com.overdrive.app.daemon.CameraDaemon.log(
+                        "OEM Dashcam: restart scheduled on lifecycle executor");
+                }
+            }
+
+            // Drive the pipeline lifecycle off the persisted state on the
+            // dedicated single-threaded executor — pipeline.start() blocks
+            // ~2-4s on warmup+camera+EGL, so the HTTP worker can't carry
+            // it. The dedup logic ensures rapid POSTs collapse to at most
+            // one in-flight + one re-armed run.
+            //
+            // FIX M3: skip the recalc when no field that affects pipeline
+            // state actually changed. The picker UI auto-saves on every
+            // keystroke; previously every save scheduled a recalc which
+            // queued a no-op applyTriggerLifecycle pass. With the early-out
+            // we only recalc on the actually-meaningful transitions.
+            String newRec = com.overdrive.app.config.UnifiedConfigManager.getOemRecordingMode();
+            String newSurv = com.overdrive.app.config.UnifiedConfigManager.getOemSurveillanceMode();
+            JSONObject afterOem = com.overdrive.app.config.UnifiedConfigManager.getOemDashcam();
+            String newQuality = afterOem == null ? "" : afterOem.optString("recordingQuality", "");
+            String newCodec = afterOem == null ? "" : afterOem.optString("codec", "");
+            int newFps = afterOem == null ? 0 : afterOem.optInt("fps", 0);
+            boolean modesChanged = !oldRec.equals(newRec) || !oldSurv.equals(newSurv);
+            boolean qualityChanged = !oldQuality.equals(newQuality)
+                    || !oldCodec.equals(newCodec)
+                    || oldFps != newFps;
+            // The 'restart' branch above already scheduled an applyLifecycle
+            // sequence; we still recalc on mode/quality changes regardless,
+            // because the restart path resolves desired state from UCM and
+            // benefits from the latest snapshot.
+            if (modesChanged || qualityChanged) {
+                scheduleLifecycleRecalc();
+            }
+
+            JSONObject response = new JSONObject();
+            response.put("success", true);
+            response.put("applied", delta);
+            response.put("recordingMode",
+                com.overdrive.app.config.UnifiedConfigManager.getOemRecordingMode());
+            response.put("surveillanceMode",
+                com.overdrive.app.config.UnifiedConfigManager.getOemSurveillanceMode());
+            response.put("lifecycleInFlight",
+                delta.has("recordingMode") || delta.has("surveillanceMode"));
+            HttpResponse.sendJson(out, response.toString());
+        } catch (Exception e) {
+            JSONObject err = new JSONObject();
+            err.put("success", false);
+            err.put("error", e.getMessage());
+            HttpResponse.sendJson(out, err.toString());
+        }
+    }
+
+    private static void handleStatus(OutputStream out) throws Exception {
+        JSONObject response = new JSONObject();
+        response.put("success", true);
+        response.put("package", NATIVE_DVR_PACKAGE);
+        response.put("state", currentState());
+        HttpResponse.sendJson(out, response.toString());
+    }
+
+    private static void handleDisable(OutputStream out) throws Exception {
+        JSONObject response = new JSONObject();
+        response.put("package", NATIVE_DVR_PACKAGE);
+
+        String pre = currentState();
+        if ("not_installed".equals(pre)) {
+            // Don't pretend to disable something that isn't there. UI hides
+            // the card in this case anyway, but a misrouted request still
+            // gets a structured answer instead of a confused pm error.
+            response.put("success", false);
+            response.put("state", "not_installed");
+            response.put("error", "package not installed");
+            HttpResponse.sendJson(out, response.toString());
+            return;
+        }
+
+        String shellOut = execShell("pm disable-user --user 0 " + NATIVE_DVR_PACKAGE + " 2>&1");
+        logger.info("pm disable-user " + NATIVE_DVR_PACKAGE + " → " + shellOut);
+
+        // FIX M5: drop the pm cache so the post-pm currentState() probe re-runs
+        // the shell call and sees the just-applied transition.
+        invalidatePmCache();
+        String post = currentState();
+        boolean ok = "disabled".equals(post);
+
+        // Persist preference last so a failed shell doesn't flip the UCM
+        // marker. The OTA-survives stickiness path in CameraDaemon reads
+        // this flag at boot and re-applies pm disable-user when the pkg has
+        // been silently re-enabled (factory reset, OTA, manual `pm enable`).
+        // Runs on the HTTP worker thread per memory feedback_no_unified_writes_on_ui_thread.md.
+        try {
+            JSONObject delta = new JSONObject();
+            delta.put("disableNativeDvr", ok);
+            com.overdrive.app.config.UnifiedConfigManager.updateSection("oemDashcam", delta);
+        } catch (Exception e) {
+            logger.warn("Failed to persist oemDashcam.disableNativeDvr: " + e.getMessage());
+        }
+
+        response.put("success", ok);
+        response.put("state", post);
+        if (!ok) response.put("error", "disable did not take effect: " + shellOut);
+        HttpResponse.sendJson(out, response.toString());
+    }
+
+    private static void handleEnable(OutputStream out) throws Exception {
+        JSONObject response = new JSONObject();
+        response.put("package", NATIVE_DVR_PACKAGE);
+
+        String pre = currentState();
+        if ("not_installed".equals(pre)) {
+            response.put("success", false);
+            response.put("state", "not_installed");
+            response.put("error", "package not installed");
+            HttpResponse.sendJson(out, response.toString());
+            return;
+        }
+
+        String shellOut = execShell("pm enable " + NATIVE_DVR_PACKAGE + " 2>&1");
+        logger.info("pm enable " + NATIVE_DVR_PACKAGE + " → " + shellOut);
+
+        // FIX M5: drop the pm cache so the post-pm currentState() probe re-runs
+        // the shell call and sees the just-applied transition.
+        invalidatePmCache();
+        String post = currentState();
+        boolean ok = "enabled".equals(post);
+
+        try {
+            JSONObject delta = new JSONObject();
+            // Mirror the post-state: if pm enable succeeded the user's
+            // intent is "don't keep re-disabling", so clear the sticky flag.
+            delta.put("disableNativeDvr", !ok);
+            com.overdrive.app.config.UnifiedConfigManager.updateSection("oemDashcam", delta);
+        } catch (Exception e) {
+            logger.warn("Failed to persist oemDashcam.disableNativeDvr: " + e.getMessage());
+        }
+
+        response.put("success", ok);
+        response.put("state", post);
+        if (!ok) response.put("error", "enable did not take effect: " + shellOut);
+        HttpResponse.sendJson(out, response.toString());
+    }
+
+    // ==================== Native DVR state probe ====================
+
+    /**
+     * Resolve the current state of {@link #NATIVE_DVR_PACKAGE}:
+     *   - "enabled"       — installed, not currently disabled
+     *   - "disabled"      — installed, in the disabled-user list
+     *   - "not_installed" — no entry in `pm list packages -a` at all
+     *
+     * <p>Order of checks matters: we look at the disabled list first, then
+     * the all-packages list. {@code pm list packages -d} only returns
+     * disabled packages; an empty result is ambiguous (could be enabled or
+     * uninstalled), which is why we follow up with {@code pm list packages -a}
+     * to disambiguate.
+     */
+    public static String currentState() {
+        // FIX M5: cache `pm list packages` output for PM_CACHE_TTL_MS. The
+        // pm CLI call forks a shell (~30-80 ms on BYD's slow flash on bad
+        // days) and the install state of NATIVE_DVR_PACKAGE doesn't change
+        // unless the user explicitly toggles it via pm enable / disable-user.
+        // We invalidate the cache from those code paths so a freshly-applied
+        // toggle's currentState() read after the pm op still sees ground truth.
+        String disabled = pmListPackages("-d");
+        if (disabled != null && disabled.contains(NATIVE_DVR_PACKAGE)
+                && !disabled.contains("NOT_DISABLED")) {
+            return "disabled";
+        }
+
+        // Not disabled — is it installed at all? -a includes uninstalled-for-user
+        // packages so we don't false-positive "not_installed" on a per-user
+        // state that pm enable can recover.
+        String all = pmListPackages("-a");
+        if (all != null && all.contains(NATIVE_DVR_PACKAGE)
+                && !all.contains("NOT_INSTALLED")) {
+            return "enabled";
+        }
+        return "not_installed";
+    }
+
+    // FIX M5: cached pm list packages outputs, keyed by flag (-d / -a).
+    // 10 s TTL — long enough to absorb a UI burst that polls /native-dvr-state
+    // on every panel render, short enough that out-of-band pm changes (e.g.
+    // user runs `pm enable` from adb manually) reflect within a UI cycle.
+    private static volatile long pmCacheAtMs = 0L;
+    private static volatile String pmDisabledCached = null;
+    private static volatile String pmAllCached = null;
+    private static final long PM_CACHE_TTL_MS = 10_000L;
+
+    /** Force the next currentState() call to re-execute the pm CLI. Call after
+     *  any code path that mutates pm state for NATIVE_DVR_PACKAGE so we don't
+     *  return a stale "enabled" / "disabled" read across the toggle. */
+    private static void invalidatePmCache() {
+        pmCacheAtMs = 0L;
+        pmDisabledCached = null;
+        pmAllCached = null;
+    }
+
+    /** Returns a cached pm list packages output for the given flag (-d or -a),
+     *  re-executing the shell call only when the cache is empty or older than
+     *  PM_CACHE_TTL_MS. Both flags share a single timestamp so the disabled +
+     *  installed views stay consistent within a single tick. */
+    private static String pmListPackages(String flag) {
+        long now = System.currentTimeMillis();
+        if ((now - pmCacheAtMs) < PM_CACHE_TTL_MS) {
+            String cached = "-d".equals(flag) ? pmDisabledCached : pmAllCached;
+            if (cached != null) return cached;
+        }
+        String sentinel = "-d".equals(flag) ? "NOT_DISABLED" : "NOT_INSTALLED";
+        String fresh = execShell(
+            "pm list packages " + flag + " 2>/dev/null | grep -F " + NATIVE_DVR_PACKAGE
+                + " || echo " + sentinel);
+        if (fresh == null) fresh = "";
+        if ("-d".equals(flag)) {
+            pmDisabledCached = fresh;
+        } else {
+            pmAllCached = fresh;
+        }
+        pmCacheAtMs = now;
+        return fresh;
+    }
+
+    /**
+     * OTA-survives entry point. Called from {@link CameraDaemon#main} after
+     * UCM init — if the user previously disabled the native DVR but a factory
+     * reset / OTA / external `pm enable` resurrected it, re-apply the disable
+     * silently. No-op when the user never opted in or the package isn't there.
+     */
+    public static void enforceStickyDisableIfRequested() {
+        try {
+            JSONObject oem = com.overdrive.app.config.UnifiedConfigManager.getOemDashcam();
+            if (!oem.optBoolean("disableNativeDvr", false)) {
+                return; // user never opted in
+            }
+            String state = currentState();
+            if ("disabled".equals(state) || "not_installed".equals(state)) {
+                return; // nothing to do
+            }
+            // state == "enabled" but UCM says "stay disabled" — re-apply.
+            String result = execShell(
+                "pm disable-user --user 0 " + NATIVE_DVR_PACKAGE + " 2>&1");
+            logger.info("DVR disable: re-applied after OTA / factory reset / "
+                + "external `pm enable` — pm output: " + result);
+            // FIX M5: invalidate so the next currentState() probe sees the new state.
+            invalidatePmCache();
+        } catch (Exception e) {
+            logger.warn("DVR sticky-disable check failed: " + e.getMessage());
+        }
+    }
+
+    // ==================== Internal ====================
+
+    /**
+     * Execute a shell command and return trimmed stdout+stderr. Returns
+     * empty string on any IO/interrupt error so callers can `.contains()`
+     * safely without null-checking. Daemon runs as UID 2000 (shell), so
+     * `pm` is on PATH and exec'able without ADB.
+     */
+    private static String execShell(String cmd) {
+        try {
+            Process p = Runtime.getRuntime().exec(new String[]{"sh", "-c", cmd});
+            BufferedReader reader = new BufferedReader(new InputStreamReader(p.getInputStream()));
+            StringBuilder out = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null) {
+                out.append(line).append('\n');
+            }
+            p.waitFor();
+            return out.toString().trim();
+        } catch (Exception e) {
+            logger.warn("execShell failed for '" + cmd + "': " + e.getMessage());
+            return "";
+        }
+    }
+}

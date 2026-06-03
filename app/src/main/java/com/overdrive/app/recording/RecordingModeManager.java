@@ -122,11 +122,22 @@ public class RecordingModeManager {
             logger.debug("Constructor GearMonitor sync skipped: " + e.getMessage());
         }
 
-        // Activate the loaded mode if conditions are met.
-        // CONTINUOUS: activate immediately (accIsOn defaults to true)
-        // DRIVE_MODE: activate if in driving gear
-        // PROXIMITY_GUARD: activate if gear != P
-        // NONE: no action needed
+        // Schedule the auto-activate on a deferred worker rather than
+        // running it synchronously here. Reason: the constructor's
+        // queryAccStateFromHardware() can return a stale ACC=ON read
+        // (HAL hadn't propagated the power-down yet) on the same boot
+        // where CameraDaemon's recovery probe queues a pendingAccOff.
+        // Synchronous auto-activate races the drain — produces a 2-3s
+        // phantom cam_*.mp4 then a tear-down.
+        //
+        // We now await {@link #bootStableSignal}, which is released by the
+        // first ACC IPC (handler at the top of onAccStateChanged) OR by the
+        // first GearMonitor delivery (top of onGearChanged), whichever
+        // comes first. That way we don't activate against stale state, and
+        // we don't sleep longer than necessary on a clean boot. Hard cap is
+        // {@link #BOOT_AUTO_ACTIVATE_HARD_CAP_MS} so a daemon that never
+        // receives any IPC (e.g. AccSentry crashed) still falls through to
+        // the cold-start resync at +8s.
         //
         // CRITICAL: route through activateModeWithWarmup() instead of calling
         // activateMode() directly. After a hard reboot the BYD camera HAL has
@@ -134,16 +145,52 @@ public class RecordingModeManager {
         // warmup leaves it in a wedged state where pipeline.start() fails
         // silently. The result was that CONTINUOUS recording never started
         // until the user cycled ACC OFF → ON (the IPC path runs warmup).
-        if (currentMode == Mode.CONTINUOUS && accIsOn) {
-            logger.info("Auto-activating CONTINUOUS mode on startup");
-            activateModeWithWarmup(currentMode, "boot-auto-activate");
-        } else if (currentMode == Mode.DRIVE_MODE && isDrivingGear(currentGear) && accIsOn) {
-            logger.info("Auto-activating DRIVE_MODE on startup (gear=" + gearToString(currentGear) + ")");
-            activateModeWithWarmup(currentMode, "boot-auto-activate");
-        } else if (currentMode == Mode.PROXIMITY_GUARD && currentGear != GEAR_P && accIsOn) {
-            logger.info("Auto-activating PROXIMITY_GUARD on startup (gear=" + gearToString(currentGear) + ")");
-            activateModeWithWarmup(currentMode, "boot-auto-activate");
-        }
+        new Thread(() -> {
+            boolean signalled;
+            try {
+                signalled = bootStableSignal.await(
+                    BOOT_AUTO_ACTIVATE_HARD_CAP_MS,
+                    java.util.concurrent.TimeUnit.MILLISECONDS);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+            if (shuttingDown) {
+                logger.info("Boot auto-activate skipped — manager shutting down");
+                return;
+            }
+            // Re-snapshot under the monitor: accIsOn / currentGear / currentMode
+            // may have moved since the constructor read them (an ACC IPC may
+            // have landed during the wait). The activate path itself runs
+            // through runActivateGuarded which re-validates again — so this
+            // is a soft-pre-check that just decides whether to spawn the
+            // warmup in the first place.
+            Mode targetMode;
+            int gearNow;
+            boolean accNow;
+            synchronized (RecordingModeManager.this) {
+                targetMode = currentMode;
+                gearNow = currentGear;
+                accNow = accIsOn;
+            }
+            if (!accNow) {
+                logger.info("Boot auto-activate skipped — ACC OFF (signalled="
+                    + signalled + ")");
+                return;
+            }
+            if (targetMode == Mode.CONTINUOUS) {
+                logger.info("Boot auto-activate: CONTINUOUS (signalled=" + signalled + ")");
+                activateModeWithWarmup(targetMode, "boot-auto-activate");
+            } else if (targetMode == Mode.DRIVE_MODE && isDrivingGear(gearNow)) {
+                logger.info("Boot auto-activate: DRIVE_MODE (gear=" + gearToString(gearNow)
+                    + ", signalled=" + signalled + ")");
+                activateModeWithWarmup(targetMode, "boot-auto-activate");
+            } else if (targetMode == Mode.PROXIMITY_GUARD && gearNow != GEAR_P) {
+                logger.info("Boot auto-activate: PROXIMITY_GUARD (gear=" + gearToString(gearNow)
+                    + ", signalled=" + signalled + ")");
+                activateModeWithWarmup(targetMode, "boot-auto-activate");
+            }
+        }, "BootAutoActivate").start();
 
         // Belt-and-suspenders re-sync. Catches all the cold-start failure
         // modes uniformly: GearMonitor not yet running, AccSentryDaemon hasn't
@@ -153,6 +200,14 @@ public class RecordingModeManager {
         // active (modeActive guard in onAccStateChanged + onGearChanged).
         scheduleColdStartResync();
     }
+
+    // Hard upper bound on the boot auto-activate wait. The latch is released
+    // by the first ACC IPC or first GearMonitor delivery, whichever comes
+    // first; this cap is the fallback when neither arrives (e.g., AccSentry
+    // crashed AND GearMonitor failed to start). Set to 5s — comfortably above
+    // observed AccSentry IPC latency (2-3s) and the cold-start resync's 8s
+    // tick that picks up the slack if even this fails.
+    private static final long BOOT_AUTO_ACTIVATE_HARD_CAP_MS = 5_000L;
 
     /**
      * Run a periodic re-sync ticker. Initial cold-start re-sync at +8s
@@ -229,41 +284,99 @@ public class RecordingModeManager {
      * mode activation if state has drifted from what we currently believe.
      * Used both for cold-start re-sync and for any later resync hook.
      */
-    public synchronized void resyncFromHardware(String reason) {
+    public void resyncFromHardware(String reason) {
         boolean hwAcc = queryAccStateFromHardware();
-        int hwGear = currentGear;
+        int hwGear;
+        boolean accChanged;
+        boolean gearChanged;
+        boolean shouldRetryActivation;
+        Mode retryMode = null;
+
+        // Try to (re)start GearMonitor before reading. If GearMonitor.start()
+        // failed at cold boot (BYD HAL momentarily unavailable, binder service
+        // mid-restart, etc.), CameraDaemon's catch only logs — without this
+        // resync-driven retry, a hardware-failure-at-boot would leave the
+        // gear monitor permanently inert and DRIVE_MODE/PROXIMITY_GUARD
+        // would never auto-activate until the user cycled ACC OFF→ON.
+        // Done OUTSIDE the manager monitor: GearMonitor.start() can take
+        // seconds (reflective HAL bind), and we don't want to pin our
+        // monitor across that.
+        //
+        // Bounded retry: a permanently-broken HAL (BYDAutoGearboxDevice
+        // unreachable until reboot) would otherwise log "GearMonitor start
+        // retry failed" every 30s = 2880 lines/day. Stop attempting after
+        // {@link #GEAR_MONITOR_RETRY_CAP} failures; reset on a successful
+        // start so a transient outage that recovers later is still picked up.
         try {
             com.overdrive.app.monitor.GearMonitor gm =
                 com.overdrive.app.monitor.GearMonitor.getInstance();
             if (gm.isRunning()) {
-                hwGear = gm.getCurrentGear();
+                gearMonitorRetryFailures = 0;  // healthy — reset counter
+            } else if (accIsOn && gearMonitorRetryFailures < GEAR_MONITOR_RETRY_CAP) {
+                logger.info("GearMonitor not running — attempting start (" + reason
+                    + ", attempt " + (gearMonitorRetryFailures + 1)
+                    + "/" + GEAR_MONITOR_RETRY_CAP + ")");
+                try {
+                    gm.start();
+                    if (gm.isRunning()) {
+                        gearMonitorRetryFailures = 0;
+                    } else {
+                        gearMonitorRetryFailures++;
+                    }
+                } catch (Exception startErr) {
+                    gearMonitorRetryFailures++;
+                    logger.warn("GearMonitor start retry failed (" + reason + "): "
+                        + startErr.getMessage());
+                }
+                if (gearMonitorRetryFailures == GEAR_MONITOR_RETRY_CAP) {
+                    logger.warn("GearMonitor retry cap reached — suppressing further attempts "
+                        + "until next ACC ON cycle. HAL is likely permanently unavailable.");
+                }
             }
         } catch (Exception ignored) {
-            // GearMonitor unavailable — keep our current value
+            // GearMonitor instance unavailable entirely — fall through.
         }
 
-        boolean accChanged = hwAcc != accIsOn;
-        boolean gearChanged = hwGear != currentGear;
-        // Steady-state quiet logging: at 30s ticker interval, an info log
-        // every call = 2880 lines/day on a parked car for nothing useful.
-        // Log info only when something actually changed or a retry will
-        // fire; the no-change case stays at debug.
-        boolean willRetry = !accChanged && !gearChanged && accIsOn && !modeActive
-                && (currentMode == Mode.CONTINUOUS
-                    || (currentMode == Mode.DRIVE_MODE && isDrivingGear(currentGear))
-                    || (currentMode == Mode.PROXIMITY_GUARD && currentGear != GEAR_P));
-        String resyncMsg = "Re-sync (" + reason + "): hwAcc=" + hwAcc + " accIsOn=" + accIsOn
-            + ", hwGear=" + gearToString(hwGear) + " currentGear=" + gearToString(currentGear)
-            + ", mode=" + currentMode + ", modeActive=" + modeActive;
-        if (accChanged || gearChanged || willRetry) {
-            logger.info(resyncMsg);
-        } else {
-            logger.debug(resyncMsg);
+        synchronized (this) {
+            hwGear = currentGear;
+            try {
+                com.overdrive.app.monitor.GearMonitor gm =
+                    com.overdrive.app.monitor.GearMonitor.getInstance();
+                if (gm.isRunning()) {
+                    hwGear = gm.getCurrentGear();
+                }
+            } catch (Exception ignored) {
+                // GearMonitor unavailable — keep our current value
+            }
+
+            accChanged = hwAcc != accIsOn;
+            gearChanged = hwGear != currentGear;
+            // Steady-state quiet logging: at 30s ticker interval, an info log
+            // every call = 2880 lines/day on a parked car for nothing useful.
+            // Log info only when something actually changed or a retry will
+            // fire; the no-change case stays at debug.
+            shouldRetryActivation = !accChanged && !gearChanged && accIsOn && !modeActive
+                    && (currentMode == Mode.CONTINUOUS
+                        || (currentMode == Mode.DRIVE_MODE && isDrivingGear(currentGear))
+                        || (currentMode == Mode.PROXIMITY_GUARD && currentGear != GEAR_P));
+            String resyncMsg = "Re-sync (" + reason + "): hwAcc=" + hwAcc + " accIsOn=" + accIsOn
+                + ", hwGear=" + gearToString(hwGear) + " currentGear=" + gearToString(currentGear)
+                + ", mode=" + currentMode + ", modeActive=" + modeActive;
+            if (accChanged || gearChanged || shouldRetryActivation) {
+                logger.info(resyncMsg);
+            } else {
+                logger.debug(resyncMsg);
+            }
+
+            if (shouldRetryActivation) {
+                retryMode = currentMode;
+            }
         }
 
+        // onGearChanged / onAccStateChanged take their own synchronized blocks
+        // and dispatch I/O outside the manager monitor — call them outside our
+        // own synchronized scope so we don't pin the monitor unnecessarily.
         if (gearChanged) {
-            // Route through the public handler so existing
-            // activate/deactivate logic and modeActive bookkeeping run.
             onGearChanged(hwGear);
         }
         if (accChanged) {
@@ -276,64 +389,305 @@ public class RecordingModeManager {
         // the warmup path so a retried activation that follows a failed
         // cold-start (camera HAL wedged, pipeline.start() returned with
         // isRunning()==false) actually pokes com.byd.avc this time around.
-        if (accIsOn && !modeActive) {
-            if (currentMode == Mode.CONTINUOUS) {
-                logger.info("Re-sync retry: activating CONTINUOUS");
-                activateModeWithWarmup(currentMode, "resync-retry");
-            } else if (currentMode == Mode.DRIVE_MODE && isDrivingGear(currentGear)) {
-                logger.info("Re-sync retry: activating DRIVE_MODE (gear=" + gearToString(currentGear) + ")");
-                activateModeWithWarmup(currentMode, "resync-retry");
-            } else if (currentMode == Mode.PROXIMITY_GUARD && currentGear != GEAR_P) {
-                logger.info("Re-sync retry: activating PROXIMITY_GUARD (gear=" + gearToString(currentGear) + ")");
-                activateModeWithWarmup(currentMode, "resync-retry");
-            }
+        if (retryMode != null) {
+            logger.info("Re-sync retry: activating " + retryMode);
+            activateModeWithWarmup(retryMode, "resync-retry");
         }
     }
 
     /**
-     * Run the AVC HAL warmup on a background thread and then call
-     * activateMode(mode) under the manager lock. Mirrors the warmup-then-
-     * activate path used by onAccStateChanged() so cold-start auto-activation
-     * doesn't race with com.byd.avc's HAL initialization.
+     * Single-flight serializer for {@link #activateMode}/{@link #deactivateMode}.
+     * Held INSTEAD of the manager monitor across the heavy I/O inside those
+     * methods (camera/encoder init, storage cleanup pre-flight, etc.) so the
+     * manager monitor stays free for the resync ticker, gear/ACC IPC handlers,
+     * and HTTP introspection endpoints.
      *
-     * Skips warmup if the pipeline is already running (camera is open, no
+     * <p>Why this matters: a single shared cleanupLock in StorageManager once
+     * caused the recorder's pre-flight {@code ensureRecordingsSpace(100MB)}
+     * to block for ~7 minutes behind the boot startup reap. While that I/O
+     * stalled, {@code activateMode} held the manager monitor, which in turn
+     * starved the periodic resync ticker — its {@code synchronized}
+     * {@code resyncFromHardware} call queued up and the user's drive was
+     * silently never recorded. The storage-side fix (per-category locks) is
+     * the primary remediation; this monitor split is the belt-and-suspenders
+     * counterpart so future I/O stalls in the recording-start path can never
+     * starve the rest of the manager.
+     *
+     * <p>Lock ordering invariant: when both locks are needed, ALWAYS take
+     * activationLock OUTER, then the manager monitor INNER. Never the
+     * reverse — that would deadlock against {@code activateModeWithWarmup}'s
+     * pattern (snapshot under monitor, then I/O under activationLock).
+     */
+    private final Object activationLock = new Object();
+
+    /**
+     * In-flight guard for {@link #activateModeWithWarmup}. The warmup worker
+     * sleeps ~4s before activating; the resync ticker fires every 30s and
+     * can see modeActive=false (because warmup hasn't finished yet) and
+     * spawn a duplicate warmup thread that pays its own 4s sleep. Both
+     * serialise on activationLock, so functionally only one wins, but the
+     * second pays a wasted 4s warmup before its supplier returns false at
+     * runActivateGuarded's "already active" check. Coalesce here.
+     */
+    private final java.util.concurrent.atomic.AtomicBoolean warmupInFlight =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    /**
+     * Set whenever a {@link #activateModeWithWarmup} call is coalesced
+     * because a worker is already in-flight. The in-flight worker checks
+     * this in its finally block; if set, it spawns one re-trigger so the
+     * newer state (gear change, mode change) eventually drives an
+     * activation. Without this, the coalesced trigger would be silently
+     * dropped and the user would wait up to 30s for the next resync to
+     * pick it up.
+     *
+     * <p>Volatile because the in-flight worker reads it from a different
+     * thread than the writer (the peer trigger).
+     */
+    private volatile boolean warmupPendingRetrigger = false;
+
+    /**
+     * Number of consecutive failed GearMonitor.start() attempts in
+     * {@link #resyncFromHardware}. Capped at {@link #GEAR_MONITOR_RETRY_CAP}
+     * to prevent unbounded log spam on a permanently-broken HAL. Reset
+     * to 0 on a successful start AND on an ACC ON edge (transient HAL
+     * failure during a previous ACC cycle should not block recovery).
+     */
+    // Volatile because read by HTTP threads via getGearMonitorRetryFailures()
+    // for /api/status diagnostics, while writes happen under the manager
+    // monitor inside resyncFromHardware. Without volatile, the HTTP reader
+    // has no happens-before with the writer and can observe a stale 0
+    // forever — defeating the observability the field exists for.
+    private volatile int gearMonitorRetryFailures = 0;
+    private static final int GEAR_MONITOR_RETRY_CAP = 5;
+
+    /**
+     * Released by the first ACC IPC ({@link #onAccStateChanged}) AND by the
+     * first GearMonitor delivery ({@link #onGearChanged}). The boot
+     * auto-activate worker awaits this with a hard cap so it doesn't fire
+     * until either:
+     * <ul>
+     *   <li>AccSentry pushes its first ACC state IPC (so we know the daemon-
+     *       side hardware probe + pendingAccOff drain has run), OR</li>
+     *   <li>GearMonitor delivers its first gear update (so currentGear is no
+     *       longer the stale GEAR_P default), OR</li>
+     *   <li>{@link #BOOT_AUTO_ACTIVATE_HARD_CAP_MS} has elapsed.</li>
+     * </ul>
+     * Without this, a fixed delay either (a) too short → HAL-stale-ACC race
+     * produces phantom recordings, or (b) too long → user driving when
+     * daemon spawns sees an 8s recording gap until the cold-start resync.
+     */
+    private final java.util.concurrent.CountDownLatch bootStableSignal =
+        new java.util.concurrent.CountDownLatch(1);
+
+    /**
+     * Serializes setMode / onAccStateChanged so concurrent callers can't
+     * interleave their (1) state-snapshot, (2) I/O phases. Without this,
+     * two concurrent setMode(A)/setMode(B) calls each see the world in
+     * different states, both queue activate calls behind activationLock,
+     * and the resulting pipeline state can disagree with currentMode.
+     *
+     * <p>Held for the entire duration of setMode / onAccStateChanged. The
+     * manager monitor is acquired briefly inside for state reads; the
+     * activationLock is acquired for the I/O. Holding this lock does NOT
+     * pin the manager monitor, so it doesn't starve the resync ticker.
+     */
+    private final Object lifecycleSerializer = new Object();
+
+    /**
+     * Set by {@link #shutdown()} so any peer caller queued on
+     * {@link #lifecycleSerializer} or {@link #activationLock} aborts instead
+     * of resurrecting the just-torn-down pipeline. Volatile so the queued
+     * worker observes the flag the moment shutdown sets it.
+     */
+    private volatile boolean shuttingDown = false;
+
+    /**
+     * Run {@code activateMode(mode)} under {@link #activationLock} with a
+     * post-acquire re-validation under the manager monitor. The re-validation
+     * catches the case where the gating condition changed between the
+     * caller's snapshot and our acquisition of activationLock — e.g., the
+     * caller saw {@code accIsOn=true}, released the monitor, an ACC OFF IPC
+     * fired and stopped the pipeline via the OFF path, then we'd reacquire
+     * activationLock and start a recording with ACC physically off.
+     *
+     * <p>{@code revalidate} returns {@code true} when the activation should
+     * still proceed. If it returns {@code false}, we no-op and log.
+     */
+    private void runActivateGuarded(Mode mode, String reason,
+                                    java.util.function.Supplier<Boolean> revalidate) {
+        if (shuttingDown) {
+            logger.info("Activation aborted (" + reason + ") — manager is shutting down");
+            return;
+        }
+        synchronized (activationLock) {
+            if (shuttingDown) {
+                logger.info("Activation aborted (" + reason + ") — manager is shutting down");
+                return;
+            }
+            boolean stillValid;
+            synchronized (this) {
+                stillValid = revalidate.get();
+            }
+            if (!stillValid) {
+                // Re-snapshot under the monitor JUST for logging — keeps
+                // the success path off the string-concat hot path. The
+                // values may have moved since the supplier evaluation but
+                // they're still informative ("here's roughly where we were
+                // when we aborted").
+                String snapshot;
+                synchronized (this) {
+                    snapshot = "mode=" + currentMode + " accIsOn=" + accIsOn
+                        + " gear=" + gearToString(currentGear) + " modeActive=" + modeActive;
+                }
+                logger.info("Activation aborted (" + reason + ", target=" + mode
+                    + ") — gating state changed after monitor release: " + snapshot);
+                return;
+            }
+            activateMode(mode);
+        }
+    }
+
+    /**
+     * Run {@code deactivateMode(mode)} under {@link #activationLock}.
+     * No re-validation needed today (deactivate is idempotent —
+     * pipeline.stopRecording / pipeline.stop are safe to call repeatedly),
+     * but we still skip when {@code shuttingDown} is set so future
+     * non-idempotent additions can't silently bypass the abort gate.
+     * Centralised so future tooling (timing, audit logs) lives in one place.
+     */
+    private void runDeactivateGuarded(Mode mode) {
+        if (shuttingDown) {
+            // shutdown() does its own teardown directly; peer deactivates
+            // queued behind us are redundant.
+            return;
+        }
+        synchronized (activationLock) {
+            if (shuttingDown) return;
+            deactivateMode(mode);
+        }
+    }
+
+    /**
+     * Run the AVC HAL warmup on a background thread, then call
+     * {@link #activateMode} under {@link #activationLock} (NOT the manager
+     * monitor). Mirrors the warmup-then-activate path used by
+     * onAccStateChanged() so cold-start auto-activation doesn't race with
+     * com.byd.avc's HAL initialization.
+     *
+     * <p>Skips warmup if the pipeline is already running (camera is open, no
      * need to poke com.byd.avc) — same heuristic the IPC path uses.
      */
     private void activateModeWithWarmup(final Mode mode, final String reason) {
         if (mode == Mode.NONE) {
             return;
         }
+        if (shuttingDown) {
+            logger.info("Skipping warmup (" + reason + ") — manager is shutting down");
+            return;
+        }
+        // Coalesce duplicate warmups. If a worker is already in its 4s
+        // sleep (e.g., from a prior gear-change activate), spawning a
+        // second one means both pay the warmup cost, both serialise on
+        // activationLock, and the second's runActivateGuarded supplier
+        // returns false at the "already active" check — wasted work. The
+        // CAS gate skips spawning when one is already in flight.
+        //
+        // Setting warmupPendingRetrigger tells the in-flight worker to
+        // re-spawn after it finishes, so a coalesced trigger with newer
+        // state (e.g., user shifted gear during a slow warmup) is not
+        // silently dropped — it just gets serialised behind the current
+        // attempt instead of paralleling it.
+        if (!warmupInFlight.compareAndSet(false, true)) {
+            warmupPendingRetrigger = true;
+            logger.debug("Warmup already in flight — coalescing + scheduling re-trigger ("
+                + reason + ")");
+            return;
+        }
+        // Don't clear warmupPendingRetrigger here. A peer trigger arriving
+        // between our CAS-win above and any clear here would see
+        // inFlight=true, set pending=true, and a clear at this point would
+        // silently wipe the peer's signal. The previous cycle's finally
+        // already cleared pending under inFlight=true (see "shouldRetrigger"
+        // logic below), so on first-ever entry the field is already false
+        // (initial value), and on re-entry it's either still cleared or
+        // genuinely set by a peer that won the race against the previous
+        // finally — in either case we want to leave it alone.
         new Thread(() -> {
-            // Only warmup if pipeline isn't already running.
-            if (!pipeline.isRunning()) {
-                if (!avcWarmup.warmupAndWait()) {
-                    logger.warn("AVC warmup interrupted (" + reason + ") — skipping mode activation");
-                    return;
+            try {
+                // Only warmup if pipeline isn't already running.
+                if (!pipeline.isRunning()) {
+                    if (!avcWarmup.warmupAndWait()) {
+                        logger.warn("AVC warmup interrupted (" + reason + ") — skipping mode activation");
+                        return;
+                    }
                 }
-            }
-            synchronized (RecordingModeManager.this) {
+
+                // Route through runActivateGuarded so the same re-validation +
+                // shuttingDown check that protects setMode/onAccStateChanged
+                // also protects this path. Without it, a peer setMode(NONE)
+                // (or shutdown()) that lands during the 4s warmup sleep would
+                // be ignored — the worker would resurrect the user-cancelled
+                // mode after warmup completes.
+                runActivateGuarded(mode, "warmup-" + reason, () -> {
                 if (!accIsOn) {
                     logger.info("ACC turned OFF during warmup (" + reason + ") — skipping mode activation");
-                    return;
+                    return false;
+                }
+                if (currentMode != mode) {
+                    logger.info("Mode changed during warmup (" + currentMode + " != " + mode
+                        + ", " + reason + ") — skipping mode activation");
+                    return false;
                 }
                 int gearNow = currentGear;
-                // Re-check gear gates against the live value, in case it changed
-                // during the 4s warmup sleep.
                 if (mode == Mode.DRIVE_MODE && !isDrivingGear(gearNow)) {
                     logger.info("DRIVE_MODE waiting for driving gear (current="
                         + gearToString(gearNow) + ") — " + reason);
-                    return;
+                    return false;
                 }
                 if (mode == Mode.PROXIMITY_GUARD && gearNow == GEAR_P) {
                     logger.info("PROXIMITY_GUARD waiting for gear != P — " + reason);
-                    return;
+                    return false;
                 }
                 if (modeActive && pipeline.isRunning() && pipeline.isNormalRecordingMode()) {
                     logger.info("Mode " + mode + " already active — skipping re-activation ("
                         + reason + ")");
-                    return;
+                    return false;
                 }
-                activateMode(mode);
+                return true;
+            });
+            } finally {
+                // Read+clear the pending flag BEFORE releasing in-flight.
+                // Reading after the release would let a peer trigger that
+                // arrives between (in-flight=false) and (read pending) be
+                // counted twice — once by our re-spawn AND once by the
+                // peer's own CAS-win path — producing redundant warmups.
+                // Reading before the release means a peer landing during
+                // our finally sees in-flight=true, sets pending=true, and
+                // is correctly counted in the NEXT cycle instead of
+                // racing this one.
+                boolean shouldRetrigger = warmupPendingRetrigger && !shuttingDown;
+                warmupPendingRetrigger = false;
+
+                // Always clear the in-flight flag so a later trigger (gear
+                // change, mode change, resync retry) can spawn a new
+                // warmup. Done in finally so a thrown exception or an
+                // early return from runActivateGuarded doesn't leak the
+                // flag and lock out future activations forever.
+                warmupInFlight.set(false);
+
+                // Re-spawn ONE warmup with the latest state. The recursion
+                // is bounded: each cycle reads-and-clears pending under
+                // in-flight=true, so any peer landing during the new
+                // cycle's warmup gets queued for the cycle AFTER. Worst
+                // case under sustained flapping: one warmup running, one
+                // queued — bounded steady state, not an unbounded chain.
+                // The 30s resync ticker is the eventual backstop for any
+                // missed transition.
+                if (shouldRetrigger) {
+                    logger.debug("Coalesced trigger — re-spawning one warmup with latest state");
+                    activateModeWithWarmup(mode, "retrigger-" + reason);
+                }
             }
         }, "ModeWarmup-" + reason).start();
     }
@@ -347,86 +701,113 @@ public class RecordingModeManager {
     /**
      * Set recording mode.
      * Enforces mutual exclusivity by deactivating current mode before activating new.
+     *
+     * <p>Held under {@link #lifecycleSerializer} for the duration so concurrent
+     * setMode/onAccStateChanged calls can't interleave their snapshot+I/O
+     * phases. Decisions (gear/ACC sync, mode transition, persistence) run
+     * under the manager monitor; the actual {@link #deactivateMode}/
+     * {@link #activateMode} I/O runs under {@link #activationLock} with a
+     * post-acquire re-validation so a state change between the snapshot and
+     * the I/O (e.g., ACC OFF arriving on a sibling thread) is honored.
      */
-    public synchronized void setMode(Mode mode) {
-        if (mode == currentMode) {
-            logger.debug("Mode already set to: " + mode);
-            return;
-        }
-        
-        logger.info("Changing recording mode: " + currentMode + " -> " + mode);
-        
-        // Sync ACC state — query hardware directly for authoritative state
-        boolean actualAccState = queryAccStateFromHardware();
-        if (actualAccState != accIsOn) {
-            logger.info("Syncing ACC state: " + accIsOn + " -> " + actualAccState);
-            accIsOn = actualAccState;
-        }
-        
-        // Sync gear state from GearMonitor (authoritative source)
-        try {
-            com.overdrive.app.monitor.GearMonitor gearMonitor = com.overdrive.app.monitor.GearMonitor.getInstance();
-            if (gearMonitor.isRunning()) {
-                int actualGear = gearMonitor.getCurrentGear();
-                if (actualGear != currentGear) {
-                    logger.info("Syncing gear from GearMonitor: " + gearToString(currentGear) + " -> " + gearToString(actualGear));
-                    currentGear = actualGear;
+    public void setMode(Mode mode) {
+        synchronized (lifecycleSerializer) {
+            Mode oldMode;
+            final Mode targetMode = mode;
+            boolean shouldActivate;
+            synchronized (this) {
+                if (mode == currentMode) {
+                    logger.debug("Mode already set to: " + mode);
+                    return;
+                }
+
+                logger.info("Changing recording mode: " + currentMode + " -> " + mode);
+
+                // Sync ACC state — query hardware directly for authoritative state
+                boolean actualAccState = queryAccStateFromHardware();
+                if (actualAccState != accIsOn) {
+                    logger.info("Syncing ACC state: " + accIsOn + " -> " + actualAccState);
+                    accIsOn = actualAccState;
+                }
+
+                // Sync gear state from GearMonitor (authoritative source)
+                try {
+                    com.overdrive.app.monitor.GearMonitor gearMonitor = com.overdrive.app.monitor.GearMonitor.getInstance();
+                    if (gearMonitor.isRunning()) {
+                        int actualGear = gearMonitor.getCurrentGear();
+                        if (actualGear != currentGear) {
+                            logger.info("Syncing gear from GearMonitor: " + gearToString(currentGear) + " -> " + gearToString(actualGear));
+                            currentGear = actualGear;
+                        }
+                    }
+                } catch (Exception e) {
+                    logger.warn("Could not sync gear: " + e.getMessage());
+                }
+
+                oldMode = currentMode;
+                currentMode = mode;
+
+                // Persist mode to config EARLY — before activation which might fail
+                persistMode(mode);
+
+                // Decide whether the new mode should activate now (mode/gear/ACC gates).
+                if (mode == Mode.DRIVE_MODE) {
+                    shouldActivate = isDrivingGear(currentGear);
+                    if (!shouldActivate) {
+                        logger.info("Gear is " + gearToString(currentGear) + " - DRIVE_MODE will activate when in D/R/S/M");
+                    }
+                } else if (mode == Mode.PROXIMITY_GUARD) {
+                    shouldActivate = (currentGear != GEAR_P);
+                    if (!shouldActivate) {
+                        logger.info("Gear is P - PROXIMITY_GUARD will activate when gear changes");
+                    }
+                } else if (mode == Mode.NONE) {
+                    // NONE while ACC is OFF: do NOT call activateMode(NONE) — that
+                    // would tear down a pipeline that may be servicing an active
+                    // surveillance recording. CameraDaemon owns the pipeline
+                    // lifecycle during ACC OFF; let the next ACC ON tear it down
+                    // via the normal NONE-mode path (pipeline only kept alive by
+                    // CONTINUOUS/DRIVE_MODE/PROXIMITY_GUARD recording, and any of
+                    // those would have called deactivateMode first via setMode).
+                    //
+                    // NONE while ACC is ON: tear it down now — the user changed
+                    // mode mid-drive and expects "stop recording" to take effect.
+                    shouldActivate = accIsOn;
+                    if (!shouldActivate) {
+                        logger.info("ACC is OFF and mode set to NONE — pipeline stays under "
+                            + "CameraDaemon control (surveillance) until next ACC ON");
+                    }
+                } else {
+                    // CONTINUOUS — gated only on ACC.
+                    shouldActivate = accIsOn;
+                    if (!shouldActivate) {
+                        logger.info("ACC is OFF - mode will activate when ACC turns ON");
+                    }
                 }
             }
-        } catch (Exception e) {
-            logger.warn("Could not sync gear: " + e.getMessage());
+
+            // Deactivate runs unconditionally with no re-validation.
+            runDeactivateGuarded(oldMode);
+
+            // Activate with re-validation: if ACC flipped or gear moved
+            // between the snapshot above and this lock acquisition, abort.
+            if (shouldActivate) {
+                runActivateGuarded(targetMode, "setMode-" + targetMode, () -> {
+                    if (currentMode != targetMode) return false;  // a peer setMode ran first
+                    if (targetMode == Mode.NONE) return accIsOn;
+                    if (targetMode == Mode.DRIVE_MODE) {
+                        return accIsOn && isDrivingGear(currentGear);
+                    }
+                    if (targetMode == Mode.PROXIMITY_GUARD) {
+                        return accIsOn && currentGear != GEAR_P;
+                    }
+                    // CONTINUOUS
+                    return accIsOn;
+                });
+            }
+
+            logger.info("Recording mode changed: " + oldMode + " -> " + mode);
         }
-        
-        // Deactivate current mode
-        deactivateMode(currentMode);
-        
-        // Update current mode
-        Mode oldMode = currentMode;
-        currentMode = mode;
-        
-        // Persist mode to config EARLY — before activation which might fail
-        persistMode(mode);
-        
-        // Activate new mode based on appropriate trigger
-        if (mode == Mode.DRIVE_MODE) {
-            // DRIVE_MODE activates when in driving gears (D/R/S/M)
-            if (isDrivingGear(currentGear)) {
-                activateMode(mode);
-            } else {
-                logger.info("Gear is " + gearToString(currentGear) + " - DRIVE_MODE will activate when in D/R/S/M");
-            }
-        } else if (mode == Mode.PROXIMITY_GUARD) {
-            // PROXIMITY_GUARD activates in all gears except P
-            if (currentGear != GEAR_P) {
-                activateMode(mode);
-            } else {
-                logger.info("Gear is P - PROXIMITY_GUARD will activate when gear changes");
-            }
-        } else if (mode == Mode.NONE) {
-            // NONE while ACC is OFF: do NOT call activateMode(NONE) — that
-            // would tear down a pipeline that may be servicing an active
-            // surveillance recording. CameraDaemon owns the pipeline
-            // lifecycle during ACC OFF; let the next ACC ON tear it down
-            // via the normal NONE-mode path (pipeline only kept alive by
-            // CONTINUOUS/DRIVE_MODE/PROXIMITY_GUARD recording, and any of
-            // those would have called deactivateMode first via setMode).
-            //
-            // NONE while ACC is ON: tear it down now — the user changed
-            // mode mid-drive and expects "stop recording" to take effect.
-            if (accIsOn) {
-                activateMode(mode);
-            } else {
-                logger.info("ACC is OFF and mode set to NONE — pipeline stays under "
-                    + "CameraDaemon control (surveillance) until next ACC ON");
-            }
-        } else if (accIsOn) {
-            // CONTINUOUS activates when ACC is ON
-            activateMode(mode);
-        } else {
-            logger.info("ACC is OFF - mode will activate when ACC turns ON");
-        }
-        
-        logger.info("Recording mode changed: " + oldMode + " -> " + mode);
     }
     
     /**
@@ -439,122 +820,168 @@ public class RecordingModeManager {
     /**
      * Notify of ACC state change.
      * Activates/deactivates modes that depend on ACC state.
+     *
+     * <p>Lock hierarchy (outermost first):
+     * <ol>
+     *   <li>{@link #lifecycleSerializer} — held for the entire body so
+     *       concurrent setMode/onGearChanged/onAccStateChanged calls can't
+     *       interleave their decisions and produce a state-machine vs
+     *       pipeline mismatch.</li>
+     *   <li>Manager monitor ({@code synchronized(this)}) — held only for
+     *       the brief snapshot of {@code accIsOn}/{@code currentMode}/
+     *       {@code currentGear} mutations. Released across the I/O.</li>
+     *   <li>{@link #activationLock} (inside {@link #runActivateGuarded}) —
+     *       held across the heavy I/O (camera/encoder init, storage
+     *       cleanup pre-flight). Re-validates gating state under the
+     *       manager monitor before calling {@code activateMode}.</li>
+     * </ol>
+     *
+     * <p>Without this split, a slow first-recording-after-boot path can
+     * pin the manager monitor for minutes (reproduced in
+     * cam_daemon_20260602_151424.log). Without the
+     * {@code lifecycleSerializer} envelope, concurrent setMode/onAcc/onGear
+     * calls can race and leave {@code currentMode} disagreeing with the
+     * actually-activated pipeline.
      */
-    public synchronized void onAccStateChanged(boolean isOn) {
-        // wasOn reflects "was ACC observed ON via a *prior IPC*?" — not the
-        // hardware probe value seeded in the constructor. Without this guard,
-        // the very first ACC IPC after boot logs "wasOn=true" (because the
-        // probe set it) and triggers the "retrying activation" path, which is
-        // misleading: there was no prior activation to retry.
-        boolean wasOn = accIpcSeen && accIsOn;
-        boolean firstIpc = !accIpcSeen;
-        accIpcSeen = true;
+    public void onAccStateChanged(boolean isOn) {
+        // Release the boot-stable latch BEFORE taking lifecycleSerializer.
+        // We want the boot worker to wake up the moment any ACC IPC arrives,
+        // even if a peer setMode is currently inside lifecycleSerializer
+        // doing slow I/O. countDown is a no-op after the first call so
+        // subsequent IPCs are free.
+        bootStableSignal.countDown();
+        synchronized (lifecycleSerializer) {
+            onAccStateChangedLocked(isOn);
+        }
+    }
 
-        logger.info("ACC state changed: " + (isOn ? "ON" : "OFF") + " (mode=" + currentMode
-            + ", wasOn=" + wasOn + (firstIpc ? " [first IPC after boot]" : "")
-            + ", modeActive=" + modeActive + ")");
+    private void onAccStateChangedLocked(boolean isOn) {
+        boolean shouldStopAccOff = false;
+        Mode modeToActivate = null;
+        boolean stopPipelineOnAccOn = false;
+        synchronized (this) {
+            // wasOn reflects "was ACC observed ON via a *prior IPC*?" — not the
+            // hardware probe value seeded in the constructor. Without this guard,
+            // the very first ACC IPC after boot logs "wasOn=true" (because the
+            // probe set it) and triggers the "retrying activation" path, which is
+            // misleading: there was no prior activation to retry.
+            boolean wasOn = accIpcSeen && accIsOn;
+            boolean firstIpc = !accIpcSeen;
+            accIpcSeen = true;
 
-        accIsOn = isOn;
+            logger.info("ACC state changed: " + (isOn ? "ON" : "OFF") + " (mode=" + currentMode
+                + ", wasOn=" + wasOn + (firstIpc ? " [first IPC after boot]" : "")
+                + ", modeActive=" + modeActive + ")");
 
-        if (isOn) {
-            // Suppress only if the mode is genuinely already running. Keying
-            // the guard purely on `wasOn` was wrong: if a prior activation
-            // failed silently (constructor auto-activate threw, pipeline
-            // wasn't ready, etc.), accIsOn was still true and the next real
-            // ACC ON IPC was discarded as a "duplicate," leaving the user
-            // with no recording until the next ACC OFF/ON cycle.
-            if (wasOn && modeActive) {
-                logger.debug("ACC already ON and mode active, ignoring duplicate notification");
-                return;
-            }
-            if (wasOn && !modeActive) {
-                logger.info("ACC was already ON but mode not active — retrying activation");
-            }
-            
-            // ACC is ON — if pipeline is already running, keep it running.
-            // No need to stop and restart — the camera is already open and the
-            // mode will continue using it. Stopping causes a HAL teardown
-            // (stopPreview + close) that disrupts the native DVR.
-            // If surveillance was active, CameraDaemon.onAccStateChanged handles
-            // disabling it separately.
-            
-            // Start AVC keep-alive and activate mode after warmup.
-            // Skip the AVC warmup spawn when no recording mode is configured —
-            // otherwise the warmup `am start com.byd.avc/.MainActivity` runs
-            // for nothing, and per existing notes the AVC poke perturbs the
-            // camera HAL / drags panoramic FPS down.
-            final Mode modeToActivate = currentMode;
-            if (modeToActivate == Mode.NONE) {
-                // CRITICAL: don't bare-return here. Sentry/Surveillance can
-                // leave the pipeline running across ACC OFF→ON: pipeline.onAccOn()
-                // (called by CameraDaemon.onAccStateChanged before this method)
-                // disables surveillance mode and reopens the camera, but it
-                // does NOT stop the pipeline. Without an explicit teardown the
-                // camera + GL + encoder stay allocated indefinitely with no
-                // recording in flight, burning ~70% CPU until the user toggles
-                // a mode on then off again.
-                //
-                // activateMode(Mode.NONE) is the canonical "tear down" path —
-                // it calls pipeline.stop() + stopAvcKeepAlive() and clears
-                // modeActive. Idempotent if pipeline isn't running.
-                logger.info("ACC ON with mode=NONE — ensuring pipeline is stopped");
-                activateMode(Mode.NONE);
-                return;
-            }
-            new Thread(() -> {
-                // Only warmup if pipeline isn't already running
-                // (if it's running, camera is already open — no need to poke com.byd.avc)
-                if (!pipeline.isRunning()) {
-                    if (!avcWarmup.warmupAndWait()) {
-                        logger.warn("AVC warmup interrupted — skipping mode activation");
-                        return;
-                    }
+            accIsOn = isOn;
+
+            if (isOn) {
+                if (wasOn && modeActive) {
+                    logger.debug("ACC already ON and mode active, ignoring duplicate notification");
+                    return;
                 }
-
-                synchronized (RecordingModeManager.this) {
-                    if (!accIsOn) {
-                        logger.info("ACC turned OFF during reacquire delay — skipping mode activation");
-                        return;
-                    }
-
-                    // Use CURRENT gear, not the gear at ACC ON time — gear may have changed
-                    // during the delay (e.g., P→D or D→P)
-                    int gearNow = currentGear;
-
-                    if (modeToActivate == Mode.DRIVE_MODE && !isDrivingGear(gearNow)) {
-                        logger.info("DRIVE_MODE waiting for driving gear (current=" + gearToString(gearNow) + ")");
-                        return;
-                    }
-                    if (modeToActivate == Mode.PROXIMITY_GUARD && gearNow == GEAR_P) {
-                        logger.info("PROXIMITY_GUARD waiting for gear != P");
-                        return;
-                    }
-                    // Skip only if the desired mode's recording is genuinely
-                    // already running. Previously this checked
-                    // pipeline.isRecording() alone, which returns true for
-                    // SURVEILLANCE recordings still finalizing at the moment
-                    // of ACC ON — causing CONTINUOUS/DRIVE_MODE to be skipped
-                    // and never started until the next state transition.
-                    if (modeActive && pipeline.isRunning() && pipeline.isNormalRecordingMode()) {
-                        logger.info("Mode " + modeToActivate + " already active — skipping re-activation");
-                        return;
-                    }
-                    activateMode(modeToActivate);
+                if (wasOn && !modeActive) {
+                    logger.info("ACC was already ON but mode not active — retrying activation");
                 }
-            }, "AccOnReacquire").start();
-            
-        } else if (!isOn) {
+                // Reset GearMonitor retry counter on ACC ON edge — a HAL
+                // outage during the previous ACC cycle shouldn't permanently
+                // suppress retries once the user re-engages the system.
+                gearMonitorRetryFailures = 0;
+
+                if (currentMode == Mode.NONE) {
+                    // CRITICAL: don't bare-return here. Sentry/Surveillance can
+                    // leave the pipeline running across ACC OFF→ON: pipeline.onAccOn()
+                    // (called by CameraDaemon.onAccStateChanged before this method)
+                    // disables surveillance mode and reopens the camera, but it
+                    // does NOT stop the pipeline. Without an explicit teardown the
+                    // camera + GL + encoder stay allocated indefinitely with no
+                    // recording in flight, burning ~70% CPU until the user toggles
+                    // a mode on then off again.
+                    //
+                    // activateMode(Mode.NONE) is the canonical "tear down" path —
+                    // it calls pipeline.stop() + stopAvcKeepAlive() and clears
+                    // modeActive. Idempotent if pipeline isn't running.
+                    logger.info("ACC ON with mode=NONE — ensuring pipeline is stopped");
+                    stopPipelineOnAccOn = true;
+                } else {
+                    modeToActivate = currentMode;
+                }
+            } else {
+                shouldStopAccOff = true;
+            }
+        }
+
+        // Heavy I/O outside the manager monitor (still under lifecycleSerializer).
+        if (stopPipelineOnAccOn) {
+            // Final guard: re-read accIsOn — if a sibling ACC IPC flipped
+            // the state between snapshot and now, honor the latest.
+            runActivateGuarded(Mode.NONE, "acc-on-mode-none", () -> currentMode == Mode.NONE);
+            return;
+        }
+
+        if (shouldStopAccOff) {
             // ACC turned OFF — always stop the pipeline regardless of mode.
             // Recording modes only operate when ACC is ON. Surveillance (if enabled)
             // will be started separately by CameraDaemon.onAccStateChanged.
-            // pipeline.isRunning() guards against duplicate OFF events doing
-            // unnecessary teardown work.
+            //
+            // stopAvcKeepAlive runs unconditionally (even if pipeline isn't
+            // running, the keep-alive watchdog might be) — preserve that.
+            // Route the pipeline teardown through runActivateGuarded(NONE)
+            // so it honors the shuttingDown abort flag and shares the
+            // activate/deactivate centralization.
             CameraDaemon.stopAvcKeepAlive();
-            if (pipeline.isRunning()) {
-                pipeline.stopRecording();
-                pipeline.stop();
-            }
+            runActivateGuarded(Mode.NONE, "acc-off", () -> !accIsOn);
+            return;
         }
+
+        if (modeToActivate == null) return;
+
+        final Mode mta = modeToActivate;
+        new Thread(() -> {
+            // Only warmup if pipeline isn't already running
+            // (if it's running, camera is already open — no need to poke com.byd.avc)
+            if (!pipeline.isRunning()) {
+                if (!avcWarmup.warmupAndWait()) {
+                    logger.warn("AVC warmup interrupted — skipping mode activation");
+                    return;
+                }
+            }
+
+            // Re-validate the gates under the manager monitor inside
+            // runActivateGuarded — handles the case where ACC flipped, the
+            // user changed mode, or gear changed during the AVC warmup
+            // sleep (~4s). Pre-existing logic; now centralised.
+            runActivateGuarded(mta, "acc-on-reacquire-" + mta, () -> {
+                if (!accIsOn) {
+                    logger.info("ACC turned OFF during reacquire delay — skipping mode activation");
+                    return false;
+                }
+                if (currentMode != mta) {
+                    logger.info("Mode changed during reacquire delay (" + currentMode + " != " + mta + ")");
+                    return false;
+                }
+                int gearNow = currentGear;
+                if (mta == Mode.DRIVE_MODE && !isDrivingGear(gearNow)) {
+                    logger.info("DRIVE_MODE waiting for driving gear (current=" + gearToString(gearNow) + ")");
+                    return false;
+                }
+                if (mta == Mode.PROXIMITY_GUARD && gearNow == GEAR_P) {
+                    logger.info("PROXIMITY_GUARD waiting for gear != P");
+                    return false;
+                }
+                // Skip only if the desired mode's recording is genuinely
+                // already running. Previously this checked
+                // pipeline.isRecording() alone, which returns true for
+                // SURVEILLANCE recordings still finalizing at the moment
+                // of ACC ON — causing CONTINUOUS/DRIVE_MODE to be skipped
+                // and never started until the next state transition.
+                if (modeActive && pipeline.isRunning() && pipeline.isNormalRecordingMode()) {
+                    logger.info("Mode " + mta + " already active — skipping re-activation");
+                    return false;
+                }
+                return true;
+            });
+        }, "AccOnReacquire").start();
     }
     
     /**
@@ -564,68 +991,99 @@ public class RecordingModeManager {
      * 
      * @param gear The new gear position (GEAR_P, GEAR_R, GEAR_N, GEAR_D, etc.)
      */
-    public synchronized void onGearChanged(int gear) {
-        // Suppress no-op notifications — GearMonitor.start() calls onGearChanged()
-        // once with the initial gear so the rest of the system gets primed, but
-        // for RecordingModeManager that often matches the constructor default
-        // and there's nothing to do. Logging it as a "P -> P" change is just noise.
-        if (gear == currentGear) {
-            return;
+    public void onGearChanged(int gear) {
+        // Release the boot-stable latch — see onAccStateChanged for rationale.
+        // GearMonitor's start() fires this with the initial gear immediately
+        // after a successful HAL bind, so this is one of the fastest signals
+        // that "real state has arrived; boot auto-activate is safe to run."
+        bootStableSignal.countDown();
+
+        // Wrapped in lifecycleSerializer for parity with setMode/onAccStateChanged.
+        // Without this, a concurrent setMode(NONE) and onGearChanged(D) can
+        // interleave: setMode mutates currentMode=NONE while gear handler still
+        // sees the old PROXIMITY_GUARD/DRIVE_MODE and queues an activate that
+        // contradicts the user's mode change. Same shape as the original
+        // CRITICAL-2 race.
+        synchronized (lifecycleSerializer) {
+            onGearChangedLocked(gear);
+        }
+    }
+
+    private void onGearChangedLocked(int gear) {
+        Mode toDeactivate = null;
+        Runnable activateAfter = null;
+        synchronized (this) {
+            // Suppress no-op notifications — GearMonitor.start() calls onGearChanged()
+            // once with the initial gear so the rest of the system gets primed, but
+            // for RecordingModeManager that often matches the constructor default
+            // and there's nothing to do. Logging it as a "P -> P" change is just noise.
+            if (gear == currentGear) {
+                return;
+            }
+
+            String gearName = gearToString(gear);
+            logger.info("Gear changed: " + gearToString(currentGear) + " -> " + gearName + " (mode=" + currentMode + ")");
+
+            int previousGear = currentGear;
+            currentGear = gear;
+
+            // Only DRIVE_MODE and PROXIMITY_GUARD respond to gear changes
+            if (currentMode != Mode.DRIVE_MODE && currentMode != Mode.PROXIMITY_GUARD) {
+                logger.debug("Mode " + currentMode + " does not respond to gear changes");
+                return;
+            }
+
+            if (currentMode == Mode.DRIVE_MODE) {
+                // DRIVE_MODE: record when driving (D/R/S/M) AND ACC is ON
+                boolean wasDriving = isDrivingGear(previousGear);
+                boolean nowDriving = isDrivingGear(gear);
+
+                // Use modeActive (not just gear edge) so cold-start — where
+                // GearMonitor's first real reading arrives after construction with
+                // currentGear default GEAR_P — also activates DRIVE_MODE on the
+                // first delivered driving gear, even though the "edge" condition
+                // (wasDriving=false → nowDriving=true) only fires once.
+                if (nowDriving && accIsOn && !modeActive) {
+                    logger.info("Driving gear with mode not yet active - activating DRIVE_MODE recording");
+                    // Route through warmup. If the user shifts D within the 4s
+                    // AVC warmup window after ACC ON, calling activateMode()
+                    // directly would open the camera before com.byd.avc finished
+                    // initializing the HAL → wedged camera, no recording. The
+                    // warmup helper short-circuits when the pipeline is already
+                    // running, so it's a no-op cost when not needed.
+                    activateAfter = () -> activateModeWithWarmup(Mode.DRIVE_MODE, "gear-to-driving");
+                } else if (!nowDriving && (wasDriving || modeActive)) {
+                    logger.info("Shifted to parked gear - deactivating DRIVE_MODE recording");
+                    toDeactivate = Mode.DRIVE_MODE;
+                } else if (nowDriving && !accIsOn) {
+                    logger.info("Driving gear but ACC OFF - DRIVE_MODE will activate when ACC turns ON");
+                }
+            } else if (currentMode == Mode.PROXIMITY_GUARD) {
+                // PROXIMITY_GUARD: active in all gears except P, only when ACC is ON
+                boolean wasInP = (previousGear == GEAR_P);
+                boolean nowInP = (gear == GEAR_P);
+
+                if (!nowInP && accIsOn && !modeActive) {
+                    logger.info("Out of P with mode not yet active - activating PROXIMITY_GUARD");
+                    // Same rationale as DRIVE_MODE above — protect against the
+                    // user shifting out of P before the AVC HAL is warmed up.
+                    activateAfter = () -> activateModeWithWarmup(Mode.PROXIMITY_GUARD, "gear-out-of-P");
+                } else if (nowInP && (!wasInP || modeActive)) {
+                    logger.info("Shifted to P - deactivating PROXIMITY_GUARD");
+                    toDeactivate = Mode.PROXIMITY_GUARD;
+                } else if (!nowInP && !accIsOn) {
+                    logger.info("Not in P but ACC OFF - PROXIMITY_GUARD will activate when ACC turns ON");
+                }
+            }
         }
 
-        String gearName = gearToString(gear);
-        logger.info("Gear changed: " + gearToString(currentGear) + " -> " + gearName + " (mode=" + currentMode + ")");
-
-        int previousGear = currentGear;
-        currentGear = gear;
-
-        // Only DRIVE_MODE and PROXIMITY_GUARD respond to gear changes
-        if (currentMode != Mode.DRIVE_MODE && currentMode != Mode.PROXIMITY_GUARD) {
-            logger.debug("Mode " + currentMode + " does not respond to gear changes");
-            return;
+        if (toDeactivate != null) {
+            runDeactivateGuarded(toDeactivate);
         }
-        
-        if (currentMode == Mode.DRIVE_MODE) {
-            // DRIVE_MODE: record when driving (D/R/S/M) AND ACC is ON
-            boolean wasDriving = isDrivingGear(previousGear);
-            boolean nowDriving = isDrivingGear(gear);
-
-            // Use modeActive (not just gear edge) so cold-start — where
-            // GearMonitor's first real reading arrives after construction with
-            // currentGear default GEAR_P — also activates DRIVE_MODE on the
-            // first delivered driving gear, even though the "edge" condition
-            // (wasDriving=false → nowDriving=true) only fires once.
-            if (nowDriving && accIsOn && !modeActive) {
-                logger.info("Driving gear with mode not yet active - activating DRIVE_MODE recording");
-                // Route through warmup. If the user shifts D within the 4s
-                // AVC warmup window after ACC ON, calling activateMode()
-                // directly would open the camera before com.byd.avc finished
-                // initializing the HAL → wedged camera, no recording. The
-                // warmup helper short-circuits when the pipeline is already
-                // running, so it's a no-op cost when not needed.
-                activateModeWithWarmup(Mode.DRIVE_MODE, "gear-to-driving");
-            } else if (!nowDriving && (wasDriving || modeActive)) {
-                logger.info("Shifted to parked gear - deactivating DRIVE_MODE recording");
-                deactivateMode(Mode.DRIVE_MODE);
-            } else if (nowDriving && !accIsOn) {
-                logger.info("Driving gear but ACC OFF - DRIVE_MODE will activate when ACC turns ON");
-            }
-        } else if (currentMode == Mode.PROXIMITY_GUARD) {
-            // PROXIMITY_GUARD: active in all gears except P, only when ACC is ON
-            boolean wasInP = (previousGear == GEAR_P);
-            boolean nowInP = (gear == GEAR_P);
-
-            if (!nowInP && accIsOn && !modeActive) {
-                logger.info("Out of P with mode not yet active - activating PROXIMITY_GUARD");
-                // Same rationale as DRIVE_MODE above — protect against the
-                // user shifting out of P before the AVC HAL is warmed up.
-                activateModeWithWarmup(Mode.PROXIMITY_GUARD, "gear-out-of-P");
-            } else if (nowInP && (!wasInP || modeActive)) {
-                logger.info("Shifted to P - deactivating PROXIMITY_GUARD");
-                deactivateMode(Mode.PROXIMITY_GUARD);
-            } else if (!nowInP && !accIsOn) {
-                logger.info("Not in P but ACC OFF - PROXIMITY_GUARD will activate when ACC turns ON");
-            }
+        if (activateAfter != null) {
+            // activateModeWithWarmup spawns its own worker thread that takes
+            // activationLock — fire-and-forget here.
+            activateAfter.run();
         }
     }
     
@@ -635,7 +1093,30 @@ public class RecordingModeManager {
     public boolean isAccOn() {
         return accIsOn;
     }
-    
+
+    /**
+     * Check if the configured mode's pipeline/recording is genuinely live.
+     *
+     * <p>Distinguishes "user picked CONTINUOUS, ACC is ON, recording IS
+     * happening" from "user picked CONTINUOUS, ACC is ON, but a silent
+     * activation failure left modeActive=false." Surface this in status
+     * UIs so a stuck activation is observable rather than indistinguishable
+     * from a normal cold-start delay.
+     */
+    public boolean isModeActive() {
+        return modeActive;
+    }
+
+    /**
+     * Number of consecutive failed GearMonitor.start() retries from the
+     * resync ticker. 0 = healthy or never attempted; &gt;0 = HAL flaky;
+     * == {@link #GEAR_MONITOR_RETRY_CAP} = retries suppressed until next
+     * ACC ON edge. Surface in status for diagnostics.
+     */
+    public int getGearMonitorRetryFailures() {
+        return gearMonitorRetryFailures;
+    }
+
     /**
      * Get current gear position.
      */
@@ -706,6 +1187,15 @@ public class RecordingModeManager {
 
         switch (mode) {
             case NONE:
+                // Stop the proximity controller's ADAS listener if it was
+                // wired (PROXIMITY_GUARD active before this NONE transition).
+                // Without this, the controller's ADAS callbacks keep firing
+                // across the entire ACC-OFF window — chewing CPU and
+                // logging spurious proximity events while the user is parked.
+                // Idempotent: stop() is a no-op when state == IDLE.
+                if (proximityController != null) {
+                    proximityController.stop();
+                }
                 // Stop pipeline to save resources
                 if (pipeline.isRunning()) {
                     logger.info("Stopping pipeline for NONE mode (resource saving)");
@@ -735,6 +1225,7 @@ public class RecordingModeManager {
                     // Pipeline.start() blocks ~2s for GL init. Recorder should be ready.
                     if (!pipeline.isRecording()) {
                         pipeline.startRecording();
+                        OemDashcamMirror.onPanoRecordingStarted();
                     }
                     // Start AVC keep-alive (pipeline is now running with ACC ON)
                     CameraDaemon.startAvcKeepAliveIfNeeded();
@@ -762,6 +1253,7 @@ public class RecordingModeManager {
                     if (!pipeline.isRecording()) {
                         logger.info("Starting DRIVE_MODE recording");
                         pipeline.startRecording();
+                        OemDashcamMirror.onPanoRecordingStarted();
                     }
                     // Start AVC keep-alive (pipeline is now running with ACC ON)
                     CameraDaemon.startAvcKeepAliveIfNeeded();
@@ -825,17 +1317,19 @@ public class RecordingModeManager {
             case CONTINUOUS:
                 // Stop recording but keep pipeline if ACC is OFF (surveillance running)
                 pipeline.stopRecording();
+                OemDashcamMirror.onPanoRecordingStopped();
                 if (pipeline.isRunning() && !keepPipelineRunning) {
                     pipeline.stop();
                     CameraDaemon.stopAvcKeepAlive();
                 }
                 break;
-                
+
             case DRIVE_MODE:
                 // Stop recording only — keep pipeline alive for quick resume on next gear change.
                 // Full pipeline teardown (camera/EGL/encoder release) makes restart unreliable
                 // and slow. Only stop the pipeline on full ACC OFF (handled by onAccStateChanged).
                 pipeline.stopRecording();
+                OemDashcamMirror.onPanoRecordingStopped();
                 break;
                 
             case PROXIMITY_GUARD:
@@ -970,9 +1464,23 @@ public class RecordingModeManager {
     
     /**
      * Reload configuration (call when config changes).
+     *
+     * <p>Holds the manager monitor only while reading/writing internal mode
+     * fields; the proximityController callback runs unlocked so a long
+     * settings reload (UnifiedConfigManager hits disk) can't pin the
+     * monitor and starve the resync ticker.
+     *
+     * <p>Bails early if {@link #shuttingDown} — a late HTTP settings POST
+     * after shutdown shouldn't reach into a torn-down proximityController.
      */
-    public synchronized void reloadConfig() {
-        loadPersistedMode();
+    public void reloadConfig() {
+        if (shuttingDown) {
+            logger.info("reloadConfig skipped — manager is shutting down");
+            return;
+        }
+        synchronized (this) {
+            loadPersistedMode();
+        }
         if (proximityController != null) {
             proximityController.reloadConfig();
         }
@@ -984,6 +1492,19 @@ public class RecordingModeManager {
      */
     public void shutdown() {
         logger.info("Shutting down RecordingModeManager...");
+
+        // Set the abort flag BEFORE acquiring lifecycleSerializer. Any peer
+        // setMode/onAccStateChanged/onGearChanged that's already queued on
+        // lifecycleSerializer or activationLock will see this flag the
+        // moment it acquires the lock, abort, and not resurrect the
+        // pipeline we're about to tear down.
+        shuttingDown = true;
+
+        // Release the boot-stable latch so the BootAutoActivate worker
+        // (if it's still in its 5s wait) wakes up promptly, sees
+        // shuttingDown, and exits — instead of sleeping out the full cap.
+        bootStableSignal.countDown();
+
         // Stop the periodic resync ticker first so it can't fire one more
         // resyncFromHardware() against a torn-down pipeline. The thread
         // is daemon-flagged so it won't block process exit anyway, but
@@ -995,8 +1516,27 @@ public class RecordingModeManager {
             t.interrupt();
             resyncTickerThread = null;
         }
-        CameraDaemon.stopAvcKeepAlive();
-        deactivateMode(currentMode);
+
+        // Take lifecycleSerializer so any in-flight setMode/onAcc/onGear
+        // call (which holds it) finishes — its already-staged activate
+        // will be aborted by the shuttingDown check inside runActivateGuarded.
+        synchronized (lifecycleSerializer) {
+            Mode toDeactivate = currentMode;
+            // Direct activationLock acquisition — runDeactivateGuarded would
+            // also work, but we want to deactivate even if shuttingDown is
+            // set (which it is). The deactivate path doesn't gate on it.
+            synchronized (activationLock) {
+                deactivateMode(toDeactivate);
+                // Stop AVC keep-alive INSIDE the activationLock block so a
+                // peer activate that was queued behind us can't run
+                // startAvcKeepAliveIfNeeded() AFTER our stop and leave the
+                // keep-alive watchdog running post-shutdown. The peer is
+                // already gated by `shuttingDown` and will abort, but
+                // ordering this stop inside the lock makes the invariant
+                // hold even if a future change relaxes that gate.
+                CameraDaemon.stopAvcKeepAlive();
+            }
+        }
         if (proximityController != null) {
             proximityController.shutdown();
         }

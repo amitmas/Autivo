@@ -85,6 +85,31 @@ public class TelemetryDataCollector {
     private int leftTurnStickyCount = 0;
     private int rightTurnStickyCount = 0;
 
+    // FIX H2: per-tick reusable scratch to avoid allocation churn at 5 Hz.
+    // We can NOT mutate lastSeatbelts in place because the published snapshot
+    // shares the reference with the consumer. Use a 2-slot scratch and only
+    // promote into lastSeatbelts (which becomes the published reference) when
+    // the values actually changed — typical case is "no change", so the
+    // snapshot reuses the same array forever.
+    private final boolean[] seatbeltScratch = new boolean[2];
+
+    // FIX H2: log a WARN when a poll tick exceeds this budget. 50 ms at 5 Hz
+    // is 25% of the period — anything above that and we're risking missed
+    // ticks plus regressing the overlay's frame freshness.
+    private static final long SLOW_TICK_LOG_BUDGET_MS = 50L;
+    private long lastSlowTickWarnAtMs = 0L;
+
+    // 750ms heartbeat at 1Hz idle polling. The poll itself fires every 1000ms
+    // (SLOW_POLL_INTERVAL_MS) but ScheduledExecutorService.scheduleAtFixedRate
+    // can fire 1-2ms early due to Linux timer slack — at 1000ms the heartbeat
+    // gate would then slip to the NEXT tick (~2000ms total gap), exceeding
+    // GearMonitor's 1000ms freshness window (GearMonitor.java:133) and the
+    // 1000ms threshold of any other consumer. 750ms guarantees the heartbeat
+    // always fires before the next poll tick, keeping the snapshot freshness
+    // well under 1 second.
+    private static final long HEARTBEAT_INTERVAL_MS = 750L;
+    private long lastPublishedTimestampMs = 0L;
+
     /**
      * Initialize BYD device handles via reflection using PermissionBypassContext.
      * Each device is initialized independently — if one fails, others still work.
@@ -261,12 +286,28 @@ public class TelemetryDataCollector {
      * On failure for any individual field, uses the last-known-good value.
      */
     private void poll() {
+        // FIX H2: instrument tick duration. The 6+ reflective Method.invoke()
+        // calls per tick are the dominant CPU cost at 5 Hz; if a single
+        // BYD-HAL call gets slow (e.g., the speed device gets reconnected
+        // mid-tick) the tick can blow past the 200 ms period. We rate-limit
+        // the WARN to once per minute so a slow HAL doesn't spam the log.
+        long startNanos = System.nanoTime();
         try {
             pollInner();
         } catch (Throwable t) {
             // CRITICAL: ScheduledExecutorService silently stops if task throws.
             // Catch everything to keep polling alive.
             logger.error("Poll error (keeping alive): " + t.getMessage());
+        }
+        long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000L;
+        if (elapsedMs > SLOW_TICK_LOG_BUDGET_MS) {
+            long now = System.currentTimeMillis();
+            if (now - lastSlowTickWarnAtMs > 60_000L) {
+                lastSlowTickWarnAtMs = now;
+                logger.warn("Telemetry poll tick took " + elapsedMs
+                        + " ms (budget " + SLOW_TICK_LOG_BUDGET_MS
+                        + " ms) — BYD HAL may be slow");
+            }
         }
     }
 
@@ -385,13 +426,24 @@ public class TelemetryDataCollector {
         }
         if (instrumentDeviceForBelt != null && getSafetyBeltStatusMethod != null) {
             try {
-                boolean[] belts = new boolean[2];
+                // FIX H2: reuse a 2-slot scratch instead of allocating a fresh
+                // boolean[2] every tick. We only publish a NEW array when the
+                // values actually changed — the steady-state path (driver +
+                // passenger both buckled, unchanging) never allocates.
                 int driverRaw = (int) getSafetyBeltStatusMethod.invoke(instrumentDeviceForBelt, 1);
                 int passengerRaw = (int) getSafetyBeltStatusMethod.invoke(instrumentDeviceForBelt, 2);
-                belts[0] = (driverRaw != 0);
-                belts[1] = (passengerRaw != 0);
-                seatbelts = belts;
-                lastSeatbelts = seatbelts;
+                seatbeltScratch[0] = (driverRaw != 0);
+                seatbeltScratch[1] = (passengerRaw != 0);
+                if (lastSeatbelts == null
+                        || lastSeatbelts.length != 2
+                        || lastSeatbelts[0] != seatbeltScratch[0]
+                        || lastSeatbelts[1] != seatbeltScratch[1]) {
+                    // State changed — allocate a fresh array so prior
+                    // snapshots holding the old reference don't see a
+                    // mid-flight mutation.
+                    lastSeatbelts = new boolean[]{seatbeltScratch[0], seatbeltScratch[1]};
+                }
+                seatbelts = lastSeatbelts;
             } catch (Exception e) {
                 // Use defaults
             }
@@ -414,13 +466,41 @@ public class TelemetryDataCollector {
             }
         }
 
-        latestSnapshot = new TelemetrySnapshot(
-                speedKmh, accelPercent, brakePercent,
-                brakePedalPressed, gearMode,
-                leftTurn, rightTurn,
-                seatbelts, System.currentTimeMillis()
-        );
-        
+        // FIX H2: skip the snapshot allocation when none of the consumed
+        // fields have changed since the last published one. The overlay
+        // renderer keys on the published reference; the timestampMs delta
+        // alone is not user-visible and not worth the allocation+clone of
+        // the seatbelt array on every 200 ms tick. At 5 Hz with a parked
+        // car this collapses ~5 allocations/s into 0.
+        TelemetrySnapshot prev = latestSnapshot;
+        boolean fieldsChanged = (prev == null)
+                || prev.speedKmh != speedKmh
+                || prev.accelPedalPercent != accelPercent
+                || prev.brakePedalPercent != brakePercent
+                || prev.brakePedalPressed != brakePedalPressed
+                || prev.gearMode != gearMode
+                || prev.leftTurnSignal != leftTurn
+                || prev.rightTurnSignal != rightTurn
+                || prev.seatbeltBuckled == null
+                || prev.seatbeltBuckled.length != (seatbelts == null ? 0 : seatbelts.length)
+                || (seatbelts != null
+                        && (prev.seatbeltBuckled[0] != seatbelts[0]
+                            || prev.seatbeltBuckled[1] != seatbelts[1]));
+        // FIX L1: heartbeat — even with no field change, publish at 1 Hz so
+        // freshness-checking consumers (GearMonitor, TripTelemetryRecorder)
+        // don't see a stale timestampMs.
+        long now = System.currentTimeMillis();
+        boolean heartbeatDue = (now - lastPublishedTimestampMs) >= HEARTBEAT_INTERVAL_MS;
+        if (fieldsChanged || heartbeatDue) {
+            latestSnapshot = new TelemetrySnapshot(
+                    speedKmh, accelPercent, brakePercent,
+                    brakePedalPressed, gearMode,
+                    leftTurn, rightTurn,
+                    seatbelts, now
+            );
+            lastPublishedTimestampMs = now;
+        }
+
         pollCount++;
     }
 

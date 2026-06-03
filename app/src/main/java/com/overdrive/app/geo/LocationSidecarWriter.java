@@ -143,6 +143,17 @@ public final class LocationSidecarWriter {
 
             writeJsonAtomic(mp4File, root);
 
+            // Re-upsert the index so the just-written geo.start (and any
+            // geo.end) lands in /api/recordings without waiting on the
+            // FileObserver to spot the sidecar mtime change. The
+            // SidecarGeoUpdater's later mergePlace fires its own upsert.
+            try {
+                com.overdrive.app.server.RecordingsIndex.getInstance().upsert(mp4File);
+            } catch (Throwable t) {
+                logger.warn("Index upsert after geo sidecar write failed for "
+                        + mp4File.getName() + ": " + t.getMessage());
+            }
+
             // ---- SRT prefix (location label at t=0 only) ----
             // Mirrors sentry: cache-only resolve, frozen-at-write. A
             // miss leaves the SRT entirely absent for this flow (we

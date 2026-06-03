@@ -46,6 +46,40 @@ public class HttpResponse {
     public static void sendJsonSuccess(OutputStream out) throws Exception {
         sendJson(out, "{\"success\":true}");
     }
+
+    /**
+     * Send a JSON body with a non-200 status. Used when the body shape is
+     * still application JSON (so {@link #sendError} would obscure it) but
+     * the HTTP semantics require a 4xx/5xx — for example 410 Gone when a
+     * subscription id is tombstoned.
+     */
+    public static void sendJson(OutputStream out, int status, String json) throws Exception {
+        byte[] body = json.getBytes("UTF-8");
+        String reason;
+        switch (status) {
+            case 400: reason = "Bad Request"; break;
+            case 401: reason = "Unauthorized"; break;
+            case 403: reason = "Forbidden"; break;
+            case 404: reason = "Not Found"; break;
+            case 409: reason = "Conflict"; break;
+            case 410: reason = "Gone"; break;
+            case 429: reason = "Too Many Requests"; break;
+            case 500: reason = "Internal Server Error"; break;
+            case 503: reason = "Service Unavailable"; break;
+            default:  reason = "OK";
+        }
+        String headers = "HTTP/1.1 " + status + " " + reason + "\r\n" +
+                        "Content-Type: application/json\r\n" +
+                        "Access-Control-Allow-Origin: *\r\n" +
+                        "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\n" +
+                        "Access-Control-Allow-Headers: Content-Type, Authorization\r\n" +
+                        "Cache-Control: no-cache, no-store\r\n" +
+                        "Content-Length: " + body.length + "\r\n" +
+                        "Connection: close\r\n\r\n";
+        out.write(headers.getBytes());
+        out.write(body);
+        out.flush();
+    }
     
     /**
      * Send CORS preflight response for OPTIONS requests.

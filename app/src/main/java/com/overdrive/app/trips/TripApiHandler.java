@@ -70,6 +70,12 @@ public class TripApiHandler {
                 parseQueryParams(uri.substring(uri.indexOf("?") + 1), params);
             }
 
+            // Route: GET /api/trips/bootstrap — composite first-paint payload.
+            // Must precede the more general routes so it isn't shadowed.
+            if (path.equals("/api/trips/bootstrap") && "GET".equals(method)) {
+                return handleGetBootstrap(params);
+            }
+
             // Route: GET /api/trips/summary
             if (path.equals("/api/trips/summary") && "GET".equals(method)) {
                 return handleGetSummary(params);
@@ -141,6 +147,97 @@ public class TripApiHandler {
     }
 
     // ==================== ENDPOINT HANDLERS ====================
+
+    /**
+     * GET /api/trips/bootstrap — composite first-paint payload for trips.html.
+     *
+     * <p>Returns {@code {success, bootstrap: {config, storage, dna, summary,
+     * range, trips}}} in a single response by internally invoking the six
+     * existing per-section handlers. This saves 6 sequential RTTs on
+     * trips.html init; in practice this means the storage card paints in
+     * &lt;100ms instead of the 10-20 minute window it took while
+     * {@code getTripsSize()} walked the FUSE-mounted SD card. (The DB-backed
+     * size accounting fixes the underlying walk; this endpoint cuts the
+     * round-trip cost on top.)
+     *
+     * <p>Inner responses are stripped of {@code success} (the outer wrapper
+     * carries it) and {@code _status} (an internal HTTP-status hint, not
+     * client data). Other keys are preserved verbatim so the JS-side
+     * {@code _applyXPayload} helpers can consume the same shape they get
+     * from a direct fetch of each section.
+     *
+     * <p>If any inner handler errors out, the corresponding section is
+     * replaced with {@code {error: "..."}} and the rest of the payload
+     * still ships — the JS bootstrap path tolerates missing sections by
+     * skipping the matching {@code _apply}.
+     *
+     * <p>Defaults match the JS loader call sites: {@code days=30} for DNA,
+     * {@code days=7} for summary, {@code days=7&limit=20&offset=0} for the
+     * trip list (matches {@code TRIPS.pageSize}).
+     */
+    private JSONObject handleGetBootstrap(Map<String, String> params) {
+        JSONObject bootstrap = new JSONObject();
+        JSONObject response = new JSONObject();
+        try {
+            bootstrap.put("config", invokeSectionStripped(this::handleGetConfig));
+            bootstrap.put("storage", invokeSectionStripped(this::handleGetStorage));
+
+            Map<String, String> dnaParams = new HashMap<>();
+            dnaParams.put("days", "30");
+            bootstrap.put("dna", invokeSectionStripped(() -> handleGetDna(dnaParams)));
+
+            Map<String, String> summaryParams = new HashMap<>();
+            summaryParams.put("days", "7");
+            bootstrap.put("summary", invokeSectionStripped(() -> handleGetSummary(summaryParams)));
+
+            bootstrap.put("range", invokeSectionStripped(this::handleGetRange));
+
+            Map<String, String> tripsParams = new HashMap<>();
+            tripsParams.put("days", "7");
+            tripsParams.put("limit", "20");
+            tripsParams.put("offset", "0");
+            bootstrap.put("trips", invokeSectionStripped(() -> handleListTrips(tripsParams)));
+
+            response.put("success", true);
+            response.put("bootstrap", bootstrap);
+        } catch (Exception e) {
+            logger.error("Error building bootstrap response", e);
+            // Ensure caller still gets a valid envelope even on partial failure.
+            try {
+                if (!response.has("success")) response.put("success", false);
+                if (!response.has("bootstrap")) response.put("bootstrap", bootstrap);
+                response.put("error", e.getMessage() != null ? e.getMessage() : "bootstrap failed");
+            } catch (Exception ignored) {}
+        }
+        return response;
+    }
+
+    /**
+     * Functional helper for {@link #handleGetBootstrap}. Invokes the given
+     * section handler, removes the {@code success} and {@code _status}
+     * fields, and surfaces handler exceptions as a {@code {error: "..."}}
+     * stub so the bootstrap response always has a value for every section.
+     */
+    private JSONObject invokeSectionStripped(java.util.function.Supplier<JSONObject> handler) {
+        JSONObject section;
+        try {
+            section = handler.get();
+        } catch (Exception e) {
+            logger.warn("Bootstrap section failed: " + e.getMessage());
+            JSONObject err = new JSONObject();
+            try { err.put("error", e.getMessage() != null ? e.getMessage() : "section failed"); }
+            catch (Exception ignored) {}
+            return err;
+        }
+        if (section == null) {
+            JSONObject err = new JSONObject();
+            try { err.put("error", "empty section"); } catch (Exception ignored) {}
+            return err;
+        }
+        section.remove("success");
+        section.remove("_status");
+        return section;
+    }
 
     /**
      * GET /api/trips — list trips.
@@ -586,6 +683,7 @@ public class TripApiHandler {
         JSONObject storage = new JSONObject();
         try {
             storage.put("storageType", sm.getTripsStorageType().name());
+            storage.put("storageTypeActive", sm.getActiveTripsStorageType().name());
             storage.put("limitMb", sm.getTripsLimitMb());
             // Per-volume effective max so the slider stays accurate when the
             // user swaps cards or moves between SD/USB/internal.
@@ -707,6 +805,7 @@ public class TripApiHandler {
             // save (the slider may have snapped to a different value, the
             // storage type may have stayed at INTERNAL).
             response.put("appliedType", sm.getTripsStorageType().name());
+            response.put("appliedTypeActive", sm.getActiveTripsStorageType().name());
             response.put("appliedLimitMb", sm.getTripsLimitMb());
             if (rejected.length() > 0) {
                 response.put("rejected", rejected);

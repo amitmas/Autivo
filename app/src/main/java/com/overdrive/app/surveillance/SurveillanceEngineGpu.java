@@ -256,6 +256,17 @@ public class SurveillanceEngineGpu {
     private volatile boolean active = false;
     private boolean inActiveMode = false;
     private boolean recording = false;
+    // True only when THIS engine's surveillance event opened the OEM
+    // dashcam recording. Pre-fix the matching stop ran unconditionally,
+    // finalizing a user-initiated continuous OEM recording mid-segment.
+    // Now we track ownership: started-by-surveillance ⇒ stopped-by-surveillance;
+    // already-recording-when-surveillance-fired ⇒ left alone on event end.
+    private volatile boolean oemEventOwned = false;
+    // Captured pipeline generation at the moment we acquired ownership.
+    // If the pipeline is rebuilt (e.g. quality-mirror restart) BETWEEN
+    // start and stop, the new instance's generation differs and we MUST
+    // NOT stop it — that would kill the user's NEW continuous clip.
+    private volatile int oemEventOwnedGeneration = -1;
     // ACC-OFF mode: false (default) runs the V2 motion + YOLO event pipeline;
     // true bypasses everything and writes a continuous rolling 4-cam mosaic.
     // Latched at enable() from UnifiedConfigManager.surveillance.accOffMode so
@@ -4465,7 +4476,19 @@ public class SurveillanceEngineGpu {
         // automatic close. The encoder's pre-record buffer is harmless here
         // — it just front-loads the first segment with a few seconds of
         // pre-arm video, which is fine.
-        recorder.triggerEventRecording(currentEventFile.getAbsolutePath(), 0L);
+        //
+        // Honor triggerEventRecording's return — the recorder refuses to
+        // build a muxer when the encoder hasn't published its format
+        // (savedFormat barrier). Flipping `recording = true` regardless
+        // would leave the engine bookkeeping advanced (rotation listener
+        // attached, segment counter incremented) against a no-op recorder
+        // → user sees a "recording" indicator but no clip lands on disk.
+        if (!recorder.triggerEventRecording(currentEventFile.getAbsolutePath(), 0L)) {
+            logger.warn("Continuous-mode triggerEventRecording refused "
+                + "(encoder format not ready); will retry on next event");
+            currentEventFile = null;
+            return;
+        }
         recording = true;
 
         // Segment rotation listener: track the new segment filename for the
@@ -4552,6 +4575,28 @@ public class SurveillanceEngineGpu {
             recorder.stopEventRecording(true, 0);
         } catch (Throwable t) {
             logger.warn("Continuous recorder stop error: " + t.getMessage());
+        }
+        // Mirror stop on the OEM dashcam pipeline if it was running this
+        // continuous segment alongside pano (gate is in startContinuousRecording).
+        try {
+            com.overdrive.app.camera.OemDashcamPipeline oemPipe =
+                com.overdrive.app.daemon.CameraDaemon.getOemDashcamPipeline();
+            // Only stop if (a) we owned it AND (b) the pipeline is still
+            // the same instance we acquired ownership on. A rebuild between
+            // start and stop (quality-mirror restart, ACC cycle) advances
+            // the generation counter; the new instance's recording is
+            // user-initiated, not ours.
+            int curGen = com.overdrive.app.daemon.CameraDaemon
+                .getOemDashcamPipelineGeneration();
+            boolean canStop = oemEventOwned && curGen == oemEventOwnedGeneration;
+            // Continuous segment ends on a hard boundary (no post-event
+            // tail) — pass 0 so the OEM recorder finalizes immediately,
+            // matching pano's stopEventRecording(true, 0) on this path.
+            if (oemPipe != null) oemPipe.stopRecordingIfOwned(canStop, 0L);
+            oemEventOwned = false;
+            oemEventOwnedGeneration = -1;
+        } catch (Throwable t) {
+            logger.warn("OEM dashcam stop on continuous end failed: " + t.getMessage());
         }
         // Drop the segment listener that startContinuousRecording set so
         // a leftover closure can't fire during the gap between sessions.
@@ -4649,9 +4694,63 @@ public class SurveillanceEngineGpu {
         logger.info(String.format("Pre-record: %d sec, Post-record: %d sec", 
                 preRecordMs / 1000, postRecordMs / 1000));
         
-        // Trigger event recording (flushes pre-record buffer)
-        recorder.triggerEventRecording(currentEventFile.getAbsolutePath(), postRecordMs);
+        // Trigger event recording (flushes pre-record buffer).
+        // Honor the boolean — savedFormat barrier can refuse on cold-boot
+        // encoder warmup. See continuous-mode site above for rationale.
+        if (!recorder.triggerEventRecording(currentEventFile.getAbsolutePath(), postRecordMs)) {
+            logger.warn("Event triggerEventRecording refused (encoder format "
+                + "not ready); event skipped, will fire on next motion");
+            currentEventFile = null;
+            return;
+        }
         recording = true;
+
+        // OEM Dashcam parallel event recording. When the user has opted into
+        // surveillance-driven OEM clips (oemDashcam.surveillance.enabled),
+        // we ALSO trigger a recording on the OEM forward-sensor pipeline.
+        //
+        // Ownership: tryStartIfIdle returns true only when WE actually
+        // opened the OEM clip. If OEM was already recording (user enabled
+        // continuous mode), we MUST NOT stop it on event end — that would
+        // finalize the user's clip prematurely. Track the result and
+        // stopRecordingIfOwned matches the contract.
+        oemEventOwned = false;
+        oemEventOwnedGeneration = -1;
+        try {
+            org.json.JSONObject oem = com.overdrive.app.config.UnifiedConfigManager
+                .getOemDashcam();
+            org.json.JSONObject oemSurv = oem.optJSONObject("surveillance");
+            boolean oemSurvEnabled = oemSurv != null && oemSurv.optBoolean("enabled", false);
+            if (oemSurvEnabled) {
+                com.overdrive.app.camera.OemDashcamPipeline oemPipe =
+                    com.overdrive.app.daemon.CameraDaemon.getOemDashcamPipeline();
+                if (oemPipe != null && oemPipe.isRunning()) {
+                    // Capture the generation BEFORE start so a concurrent
+                    // pipeline rebuild (quality-mirror restart) doesn't
+                    // make us think we own a clip on a new instance.
+                    int gen = com.overdrive.app.daemon.CameraDaemon
+                        .getOemDashcamPipelineGeneration();
+                    // Pass our configured post-window so the OEM clip's tail
+                    // matches pano's. Pre-roll is handled by the pre-record
+                    // ring inside the OEM encoder (sized off
+                    // surveillance.preRecordSeconds at OEM init time).
+                    boolean started = oemPipe.tryStartIfIdle(postRecordMs);
+                    if (started) {
+                        oemEventOwned = true;
+                        oemEventOwnedGeneration = gen;
+                    }
+                    logger.info("OEM dashcam event recording: "
+                        + (started ? "started (owned, gen=" + gen + ")"
+                                   : "skipped (already in flight)"));
+                } else {
+                    logger.debug("OEM dashcam event recording skipped — pipeline not running");
+                }
+            }
+        } catch (Throwable t) {
+            // Surveillance must NEVER break because OEM dashcam threw; this
+            // is a parallel sink, not a primary one.
+            logger.warn("OEM dashcam event trigger failed: " + t.getMessage());
+        }
 
         // Per-segment hero / sidecar plumbing.
         // The recorder rotates .mp4 files at SEGMENT_DURATION_MS (2 min) so a
@@ -4783,6 +4882,27 @@ public class SurveillanceEngineGpu {
         // joins the encoder drainer thread, after which no further frames or
         // segment-rotation listener calls can fire.
         recorder.stopEventRecording(true, 0);
+        // Symmetric OEM stop — fire-and-forget; never block pano teardown.
+        try {
+            com.overdrive.app.camera.OemDashcamPipeline oemPipe =
+                com.overdrive.app.daemon.CameraDaemon.getOemDashcamPipeline();
+            // Only stop if (a) we owned it AND (b) the pipeline is still
+            // the same instance we acquired ownership on. A rebuild between
+            // start and stop (quality-mirror restart, ACC cycle) advances
+            // the generation counter; the new instance's recording is
+            // user-initiated, not ours.
+            int curGen = com.overdrive.app.daemon.CameraDaemon
+                .getOemDashcamPipelineGeneration();
+            boolean canStop = oemEventOwned && curGen == oemEventOwnedGeneration;
+            // Engine has already absorbed the post-record window via its
+            // own loop (lastMotionTime + postRecordMs gate). Pass 0 so the
+            // OEM recorder finalizes promptly, matching pano's behaviour.
+            if (oemPipe != null) oemPipe.stopRecordingIfOwned(canStop, 0L);
+            oemEventOwned = false;
+            oemEventOwnedGeneration = -1;
+        } catch (Throwable t) {
+            logger.warn("OEM dashcam stop on event end failed: " + t.getMessage());
+        }
         recording = false;
         lastRecordingStopTime = System.currentTimeMillis();  // Track when we stopped
         // Hygiene: clear the trigger-start clock on every stop path so a

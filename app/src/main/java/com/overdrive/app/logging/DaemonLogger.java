@@ -48,11 +48,22 @@ public class DaemonLogger {
         public boolean enableConsoleLog = true;
         public boolean enableFileLog = true;
         public boolean enableStdoutLog = false;  // Only enable for daemon processes (app_process)
-        
+        // Minimum level that gets emitted. Messages below this are dropped
+        // before any console/stdout/file write. Default INFO so DEBUG-level
+        // diagnostics don't clutter the daemon log / fill the disk. Raise to
+        // WARN for near-silent operation (errors + warnings only); set to
+        // DEBUG to restore fully verbose logging.
+        public Level minLevel = Level.INFO;
+
         public static Config defaults() {
             return new Config();
         }
-        
+
+        public Config withMinLevel(Level level) {
+            this.minLevel = level;
+            return this;
+        }
+
         public Config withLogDir(String dir) {
             this.logDir = dir;
             return this;
@@ -185,6 +196,11 @@ public class DaemonLogger {
      * Log a message with specified level.
      */
     public void log(Level level, String message) {
+        // Drop messages below the configured minimum level (default INFO) so
+        // DEBUG diagnostics don't flood the daemon log / disk.
+        if (level.ordinal() < globalConfig.minLevel.ordinal()) {
+            return;
+        }
         String timestamp = timestampFormat.format(new Date());
         String logLine = "[" + timestamp + "] [" + level.name() + "] [" + tag + "] " + message;
         

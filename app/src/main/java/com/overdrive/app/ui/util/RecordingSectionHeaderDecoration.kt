@@ -173,6 +173,12 @@ class RecordingSectionHeaderDecoration(
 
     /** Section label for an item. Null = skip (shouldn't happen here). */
     private fun labelFor(rec: RecordingFile): String? {
+        // API-sourced rows arrive with a pre-formatted bucketLabel
+        // ("Today" / "Yesterday" / "MMM d, yyyy") — trust the server's
+        // grouping and skip the in-process date math. The direct-FS
+        // fallback path (daemon unreachable) leaves bucketLabel null,
+        // so we keep the original logic for that case.
+        rec.bucketLabel?.let { return it }
         return if (singleDayMode) timeOfDayLabel(rec.timestamp)
         else dateLabel(rec.timestamp)
     }

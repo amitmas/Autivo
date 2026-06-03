@@ -61,6 +61,20 @@ public class GpuStreamScaler {
     private int aPositionLocation;
     private int aTexCoordLocation;
 
+    // OEM Dashcam (view-6) sampler — bound to texture unit 1 when an OEM
+    // pipeline is active and the user picked DVR. uOemTexMatrix carries
+    // the SurfaceTexture transform from the OEM camera (HAL Y-flip + crop)
+    // so the sample stays correctly oriented.
+    private int uOemTexLocation = -1;
+    private int uOemTexMatrixLocation = -1;
+    private int uOemActiveLocation = -1;
+    private final float[] oemTexMatrix = {
+        1f, 0f, 0f, 0f,
+        0f, 1f, 0f, 0f,
+        0f, 0f, 1f, 0f,
+        0f, 0f, 0f, 1f,
+    };
+
     // Producer-corner remap + per-role X/Y flip flags. Order matches
     // {Front, Right, Rear, Left}. Default = canonical 2x2; pipeline calls
     // setProducerCornerMap / setFlipFlags on DiLink 4 to override with the
@@ -75,6 +89,16 @@ public class GpuStreamScaler {
         0f, 0f,  0f, 0f,  0f, 0f,  0f, 0f
     };
     private final Object producerCornerMapLock = new Object();
+    // Reusable scratch buffers consumed inside drawFrame. The setters on
+    // the JS / app thread write into producerCornerMap / flipFlags under
+    // the lock; drawFrame copies into these scratch arrays under the same
+    // lock and then uploads. NO per-frame allocation.
+    private final float[] scratchCornerMap = new float[8];
+    private final float[] scratchFlipFlags = new float[8];
+    // Dirty bit — gates the eight glUniform2f calls. Setters flip it on,
+    // drawFrame consumes after upload. With the layout written once at
+    // start the typical case is a single upload.
+    private volatile boolean producerCornerDirty = true;
 
     // SurfaceTexture transform matrix, written from the camera GL thread
     // immediately before drawFrame. Identity until the first publish.
@@ -122,14 +146,19 @@ public class GpuStreamScaler {
     };
 
     // Vertex shader with conditional manual Y-flip (matches recorder).
+    // Also forwards the raw aTexCoord as vUnit so the fragment shader can
+    // sample non-pano sources (OEM dashcam) without composing pano's
+    // texture matrix on top.
     private static final String VERTEX_SHADER =
         "attribute vec4 aPosition;\n" +
         "attribute vec2 aTexCoord;\n" +
         "uniform mat4 uTexMatrix;\n" +
         "uniform float uApplyManualYFlip;\n" +
         "varying vec2 vTexCoord;\n" +
+        "varying vec2 vUnit;\n" +
         "void main() {\n" +
         "    gl_Position = aPosition;\n" +
+        "    vUnit = aTexCoord;\n" +
         "    vec2 src = aTexCoord;\n" +
         "    if (uApplyManualYFlip > 0.5) src.y = 1.0 - src.y;\n" +
         "    vTexCoord = (uTexMatrix * vec4(src, 0.0, 1.0)).xy;\n" +
@@ -201,13 +230,32 @@ public class GpuStreamScaler {
         uFlipForLeftLocation  = GLES20.glGetUniformLocation(programId, "uFlipForLeft");
         uRedMaskStrengthLocation = GLES20.glGetUniformLocation(programId, "uRedMaskStrength");
         uApaCenterInsetLocation = GLES20.glGetUniformLocation(programId, "uApaCenterInset");
-        
+        uOemTexLocation = GLES20.glGetUniformLocation(programId, "uOemTex");
+        uOemTexMatrixLocation = GLES20.glGetUniformLocation(programId, "uOemTexMatrix");
+        uOemActiveLocation = GLES20.glGetUniformLocation(programId, "uOemActive");
+
         GlUtil.checkGlError("glGetLocation");
-        
+
         // Create vertex buffers
         vertexBuffer = GlUtil.createFloatBuffer(VERTEX_COORDS);
         texCoordBuffer = GlUtil.createFloatBuffer(TEX_COORDS);
-        
+
+        // ONE-SHOT: bind texture-unit 1 to the GLES sampler `uOemTex` and
+        // leave it bound. drawFrame previously rebound this every frame to
+        // dodge an Adreno green-flash on first program use; binding once
+        // here costs nothing and removes ~3 GL calls + an active-unit
+        // ping-pong (TEXTURE1 → TEXTURE0) from the steady-state hot path.
+        if (uOemTexLocation >= 0) {
+            eglCore.makeCurrent(encoderSurface);
+            GLES20.glUseProgram(programId);
+            GLES20.glUniform1i(uOemTexLocation, 1);
+            // Don't actually bind a real texture here — drawFrame's first
+            // OEM-active path will. We only set the sampler unit assignment
+            // (which is a program-state property, not a context-state
+            // property). On Adreno the green-flash mitigation is the
+            // `uOemActive` gate in the shader, not the bind.
+        }
+
         logger.info("GpuStreamScaler initialized: " + outputWidth + "×" + outputHeight);
     }
     
@@ -235,23 +283,43 @@ public class GpuStreamScaler {
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, cameraTextureId);
         GLES20.glUniform1i(uCameraTexLocation, 0);
         
-        // Set view mode (0=Mosaic, 1-4=Single camera, 5=Raw)
-        GLES20.glUniform1i(uViewModeLocation, currentViewMode);
-        GLES20.glUniform1f(uApaModeLocation, (float) cameraLayout);
+        // Quasi-static uniforms — only re-upload when a setter flagged
+        // a change. uTexMatrix is exempt (camera transform changes every
+        // frame, written by setTextureMatrix below).
+        // CAS-claim BEFORE the reads so a setter racing into a fresh
+        // dirty=true on a subsequent frame replays correctly. Mirrors
+        // GpuMosaicRecorder.apaModeUniformDirty.compareAndSet pattern.
+        if (uniformsDirty.compareAndSet(true, false)) {
+            GLES20.glUniform1i(uViewModeLocation, currentViewMode);
+            GLES20.glUniform1f(uApaModeLocation, (float) cameraLayout);
+            if (uApplyManualYFlipLocation >= 0) {
+                // Legacy → manual Y-flip; DiLink 4 → matrix handles it.
+                GLES20.glUniform1f(uApplyManualYFlipLocation,
+                    cameraLayout == 3 ? 0.0f : 1.0f);
+            }
+            if (uRedMaskStrengthLocation >= 0) {
+                GLES20.glUniform1f(uRedMaskStrengthLocation, redMaskEnabled ? 1.0f : 0.0f);
+            }
+            if (uApaCenterInsetLocation >= 0) {
+                GLES20.glUniform1f(uApaCenterInsetLocation, apaCenterInset);
+            }
+        }
         if (uTexMatrixLocation >= 0) {
             GLES20.glUniformMatrix4fv(uTexMatrixLocation, 1, false, currentTexMatrix, 0);
         }
-        if (uApplyManualYFlipLocation >= 0) {
-            // Legacy → manual Y-flip; DiLink 4 → matrix handles it.
-            GLES20.glUniform1f(uApplyManualYFlipLocation,
-                cameraLayout == 3 ? 0.0f : 1.0f);
-        }
-        if (uProducerForFrontLocation >= 0) {
-            float[] m = new float[8];
-            float[] f = new float[8];
+        if (uProducerForFrontLocation >= 0 && producerCornerDirty) {
+            // Setters flip producerCornerDirty=true; we consume here under
+            // the same lock so the scratch copy is consistent with the
+            // setter's atomic writes. After the eight uniform uploads we
+            // clear the dirty bit. Subsequent frames skip the lock + copy
+            // + uniform uploads — at frame rate that's ~32B + 8 uniform
+            // calls per draw saved.
+            float[] m = scratchCornerMap;
+            float[] f = scratchFlipFlags;
             synchronized (producerCornerMapLock) {
                 System.arraycopy(producerCornerMap, 0, m, 0, 8);
                 System.arraycopy(flipFlags, 0, f, 0, 8);
+                producerCornerDirty = false;
             }
             GLES20.glUniform2f(uProducerForFrontLocation, m[0], m[1]);
             GLES20.glUniform2f(uProducerForRightLocation, m[2], m[3]);
@@ -264,11 +332,53 @@ public class GpuStreamScaler {
                 GLES20.glUniform2f(uFlipForLeftLocation,  f[6], f[7]);
             }
         }
-        if (uRedMaskStrengthLocation >= 0) {
-            GLES20.glUniform1f(uRedMaskStrengthLocation, redMaskEnabled ? 1.0f : 0.0f);
+        // OEM dashcam binding for view 6.
+        //   - View 0..4 with no OEM: skip everything in this block. The
+        //     fragment shader's `uViewMode == 6 && uOemActive == 1` gate
+        //     ignores texture unit 1 entirely, so an unbound sampler is fine
+        //     in steady state. uOemActive is uploaded once on bind/unbind.
+        //   - On bind/unbind transition (oemBindingDirty=true): re-bind the
+        //     texture id, write uOemActive, and re-upload uOemTexMatrix.
+        //   - Per-frame while bound: only re-upload the matrix (it's the
+        //     only thing that changes per frame). No glActiveTexture ping-
+        //     pong, no rebind, no uniform writes for unchanged uOemActive.
+        // Treat OEM as "not ready" until OEM has actually published its
+        // first transform matrix snapshot. Otherwise the first frame
+        // after bindOemSource samples the OEM EXTERNAL_OES texture with
+        // the identity matrix declared at field init — producing a
+        // garbled or upside-down frame for ~33 ms before OEM's render
+        // loop publishes its real matrix. Pin uOemActive=0 until snap
+        // arrives, then re-flip oemBindingDirty so the next frame picks
+        // up the real bind+matrix.
+        float[] snap = oemTexMatrixSnapshot;
+        boolean oemReady = oemSourceActive
+            && oemSurfaceTexture != null
+            && oemTextureId != 0
+            && snap != null;
+        if (uOemTexLocation >= 0 && oemBindingDirty.compareAndSet(true, false)) {
+            GLES20.glActiveTexture(GLES20.GL_TEXTURE1);
+            if (oemReady) {
+                GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oemTextureId);
+            } else {
+                GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, 0);
+            }
+            GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
+            if (uOemActiveLocation >= 0) {
+                GLES20.glUniform1i(uOemActiveLocation, oemReady ? 1 : 0);
+            }
+            // If OEM is still warming (snap not yet published), force the
+            // dirty bit back true so the next frame re-evaluates without
+            // requiring a setter call.
+            if (!oemReady && oemSourceActive) {
+                oemBindingDirty.set(true);
+            }
         }
-        if (uApaCenterInsetLocation >= 0) {
-            GLES20.glUniform1f(uApaCenterInsetLocation, apaCenterInset);
+        if (oemReady && uOemTexMatrixLocation >= 0) {
+            // OEM ownership of the SurfaceTexture lives in OEM's render
+            // loop; we just sample. snap is non-null here by the
+            // oemReady gate above.
+            System.arraycopy(snap, 0, oemTexMatrix, 0, 16);
+            GLES20.glUniformMatrix4fv(uOemTexMatrixLocation, 1, false, oemTexMatrix, 0);
         }
 
         // Set up vertex attributes
@@ -291,14 +401,95 @@ public class GpuStreamScaler {
     
     /**
      * Sets the view mode for streaming.
-     * 
-     * @param mode 0=Mosaic (2x2 grid), 1=Front(cam4), 2=Right(cam3), 3=Rear(cam1), 4=Left(cam2), 5=Raw strip
+     *
+     * @param mode 0=Mosaic, 1=Front, 2=Right, 3=Rear, 4=Left,
+     *             5=Raw (legacy debug passthrough — pano strip), 6=OEM Dashcam
      */
     public void setViewMode(int mode) {
-        if (mode >= 0 && mode <= 5) {
-            this.currentViewMode = mode;
-            String[] modeNames = {"Mosaic", "Front", "Right", "Rear", "Left", "Raw"};
-            logger.info("Stream view mode set to " + mode + " (" + modeNames[mode] + ")");
+        if (mode < 0 || mode > 6) return;
+        if (mode == this.currentViewMode) return;   // idempotent — no upload needed
+        this.currentViewMode = mode;
+        this.uniformsDirty.set(true);
+        String[] modeNames = {"Mosaic", "Front", "Right", "Rear", "Left", "Raw", "OEM Dashcam"};
+        logger.info("Stream view mode set to " + mode + " (" + modeNames[mode] + ")");
+    }
+
+    /**
+     * Bind the OEM Dashcam camera texture as the secondary source. View
+     * mode 6 ({@code uViewMode==6}) then samples {@code uOemTex} instead
+     * of the AVM mosaic. The texture id MUST be valid in the EGL share-
+     * group of THIS scaler's context — wire it via {@link
+     * com.overdrive.app.camera.EGLCore#createShared} at OEM pipeline start.
+     *
+     * <p>The SurfaceTexture stays attached to OEM's GL context — only OEM's
+     * render loop calls {@code updateTexImage}. The scaler simply samples
+     * the texture handle (cross-context shared via the EGL share group)
+     * and reads the most recent transform matrix that OEM published into
+     * {@link #publishOemTexMatrix}.
+     */
+    public void bindOemSource(int oemTextureId, android.graphics.SurfaceTexture oemSt) {
+        this.oemTextureId = oemTextureId;
+        this.oemSurfaceTexture = oemSt;
+        this.oemSourceActive = true;
+        this.oemBindingDirty.set(true);
+        logger.info("OEM source bound to streamScaler (tex=" + oemTextureId + ")");
+    }
+
+    public void unbindOemSource() {
+        this.oemSourceActive = false;
+        this.oemTextureId = 0;
+        this.oemSurfaceTexture = null;
+        // Drop the snapshot — without this, the OEM ping-pong matrix buffer
+        // remains reachable from the scaler indefinitely, pinning OEM's
+        // pipeline graph if the scaler outlives an OEM teardown.
+        this.oemTexMatrixSnapshot = null;
+        this.oemBindingDirty.set(true);
+        logger.info("OEM source unbound from streamScaler");
+    }
+
+    /** EGLCore behind this scaler; OEM pipeline shares its context with
+     *  this so texture handles cross over. Returns null when scaler isn't
+     *  initialised or has been released. */
+    public EGLCore getEglCore() { return eglCore; }
+
+    private volatile int oemTextureId = 0;
+    private volatile android.graphics.SurfaceTexture oemSurfaceTexture;
+    private volatile boolean oemSourceActive = false;
+    // Dirty bit — flipped on bindOemSource / unbindOemSource. drawFrame
+    // claims via compareAndSet(true,false) BEFORE consuming oemSourceActive,
+    // so a racing setter (unbind during a draw) re-flips dirty=true and
+    // the next frame replays. Same lost-update fix as uniformsDirty
+    // (R3 #2) — this one was missed.
+    private final java.util.concurrent.atomic.AtomicBoolean oemBindingDirty =
+        new java.util.concurrent.atomic.AtomicBoolean(true);
+
+    // Dirty bit for the ~5 quasi-static uniforms (uViewMode, uApaMode,
+    // uApplyManualYFlip, uRedMaskStrength, uApaCenterInset). drawFrame
+    // claims via compareAndSet(true,false) BEFORE the upload. A setter
+    // racing during the upload re-sets dirty=true and the next frame
+    // replays — without CAS, the naked-volatile clear-after pattern
+    // would clobber a setter's flag and silently drop the new state.
+    // Mirrors GpuMosaicRecorder.apaModeUniformDirty.
+    private final java.util.concurrent.atomic.AtomicBoolean uniformsDirty =
+        new java.util.concurrent.atomic.AtomicBoolean(true);
+    // Per-frame OEM tex matrix, published from OEM's GL thread after
+    // every updateTexImage. Volatile reference flip is enough — the
+    // scaler treats it as a snapshot and arraycopies into its own
+    // working buffer. Producer allocates a fresh float[16] per publish
+    // and never touches the buffer again, so a torn read across the
+    // 16-float / 2-cache-line span can't happen.
+    private volatile float[] oemTexMatrixSnapshot;
+
+    /** Publish the OEM SurfaceTexture's transform matrix. Called from the
+     *  OEM pipeline's GL thread immediately after updateTexImage. The
+     *  reference is volatile so the scaler GL thread sees the latest
+     *  publish. Caller MUST allocate a fresh buffer per publish — the
+     *  scaler holds the reference until the next publish replaces it,
+     *  so any post-publish mutation by the producer would be a torn
+     *  read on the consumer side. */
+    public void publishOemTexMatrix(float[] matrix) {
+        if (matrix != null && matrix.length >= 16) {
+            this.oemTexMatrixSnapshot = matrix;
         }
     }
     
@@ -309,16 +500,17 @@ public class GpuStreamScaler {
         return currentViewMode;
     }
     
-    /**
-     * Sets APA mode / camera layout.
-     * 0=4-camera, 1=APA passthrough, 2=3-camera
-     */
-    public void setApaMode(boolean apa) {
-        this.cameraLayout = apa ? 1 : 0;
-    }
-    
+    // setApaMode(boolean) intentionally NOT exposed.
+    // It only mapped to cameraLayout∈{0,1} and would silently downgrade
+    // a DiLink 4 stream's cameraLayout=3 (per-quadrant rearrange + flip
+    // path in the shader) to 0 or 1 — emitting the raw producer mosaic
+    // to the H.264 stream. Callers must use setCameraLayout(int) which
+    // preserves layout=3 verbatim.
+
     public void setCameraLayout(int layout) {
+        if (layout == this.cameraLayout) return;   // idempotent
         this.cameraLayout = layout;
+        this.uniformsDirty.set(true);
     }
 
     /**
@@ -339,6 +531,38 @@ public class GpuStreamScaler {
             producerCornerMap[2] = right[0]; producerCornerMap[3] = right[1];
             producerCornerMap[4] = rear[0];  producerCornerMap[5] = rear[1];
             producerCornerMap[6] = left[0];  producerCornerMap[7] = left[1];
+            producerCornerDirty = true;
+        }
+    }
+
+    /**
+     * Atomic combined setter for both producer corners and flip flags.
+     * Prefer this over the split setProducerCornerMap+setFlipFlags pair —
+     * a drawFrame landing between the two writes can render a frame
+     * with the new corners and the OLD flips (or vice versa), producing
+     * one wrong-orientation mosaic frame per init. Single lock + single
+     * dirty flip removes the window.
+     */
+    public void setProducerLayout(float[] frontC, float[] rightC,
+                                  float[] rearC, float[] leftC,
+                                  float[] frontF, float[] rightF,
+                                  float[] rearF, float[] leftF) {
+        if (frontC == null || rightC == null || rearC == null || leftC == null
+                || frontF == null || rightF == null || rearF == null || leftF == null
+                || frontC.length < 2 || rightC.length < 2 || rearC.length < 2 || leftC.length < 2
+                || frontF.length < 2 || rightF.length < 2 || rearF.length < 2 || leftF.length < 2) {
+            return;
+        }
+        synchronized (producerCornerMapLock) {
+            producerCornerMap[0] = frontC[0]; producerCornerMap[1] = frontC[1];
+            producerCornerMap[2] = rightC[0]; producerCornerMap[3] = rightC[1];
+            producerCornerMap[4] = rearC[0];  producerCornerMap[5] = rearC[1];
+            producerCornerMap[6] = leftC[0];  producerCornerMap[7] = leftC[1];
+            flipFlags[0] = frontF[0]; flipFlags[1] = frontF[1];
+            flipFlags[2] = rightF[0]; flipFlags[3] = rightF[1];
+            flipFlags[4] = rearF[0];  flipFlags[5] = rearF[1];
+            flipFlags[6] = leftF[0];  flipFlags[7] = leftF[1];
+            producerCornerDirty = true;
         }
     }
 
@@ -358,6 +582,7 @@ public class GpuStreamScaler {
             flipFlags[2] = right[0]; flipFlags[3] = right[1];
             flipFlags[4] = rear[0];  flipFlags[5] = rear[1];
             flipFlags[6] = left[0];  flipFlags[7] = left[1];
+            producerCornerDirty = true;
         }
     }
 
@@ -368,11 +593,16 @@ public class GpuStreamScaler {
     /** APA center inset (esco APACropFilter parity). See {@link
      *  com.overdrive.app.surveillance.GpuMosaicRecorder#setApaCenterInset}. */
     public void setApaCenterInset(float inset) {
-        this.apaCenterInset = Math.max(0.0f, Math.min(0.20f, inset));
+        float clamped = Math.max(0.0f, Math.min(0.20f, inset));
+        if (Float.compare(clamped, this.apaCenterInset) == 0) return;   // idempotent
+        this.apaCenterInset = clamped;
+        this.uniformsDirty.set(true);
     }
 
     public void setRedMaskEnabled(boolean enabled) {
+        if (enabled == this.redMaskEnabled) return;   // idempotent
         this.redMaskEnabled = enabled;
+        this.uniformsDirty.set(true);
     }
 
     /**
@@ -390,16 +620,53 @@ public class GpuStreamScaler {
      * Releases all resources.
      */
     public void release() {
+        // Drop OEM cross-context refs before anything else so any concurrent
+        // OEM render-loop tick that races with our release sees the
+        // unbound state and skips its publish/sample call entirely.
+        try { unbindOemSource(); } catch (Throwable ignored) {}
+
+        // glDeleteProgram requires a current EGL context. If we can't
+        // make our encoder surface current (encoderSurface null because
+        // of a partial init failure, or eglCore already released by a
+        // sibling teardown), we MUST skip the delete and log the leak —
+        // calling glDeleteProgram against a not-current context is a
+        // silent no-op on Adreno (program leaks until process exit).
         if (programId != 0) {
-            GlUtil.deleteProgram(programId);
+            boolean contextReady = false;
+            if (eglCore != null && encoderSurface != null) {
+                try {
+                    eglCore.makeCurrent(encoderSurface);
+                    contextReady = true;
+                } catch (Throwable t) {
+                    logger.warn("release: makeCurrent failed: " + t.getMessage());
+                }
+            }
+            if (contextReady) {
+                try { GlUtil.deleteProgram(programId); } catch (Throwable ignored) {}
+            } else {
+                logger.warn("release: skipping glDeleteProgram (programId="
+                    + programId + ", eglCore=" + (eglCore != null)
+                    + ", encoderSurface=" + (encoderSurface != null)
+                    + ") — leaking until process exit");
+            }
             programId = 0;
         }
-        
-        if (encoderSurface != null) {
-            eglCore.destroySurface(encoderSurface);
+
+        if (encoderSurface != null && eglCore != null) {
+            try { eglCore.destroySurface(encoderSurface); } catch (Throwable ignored) {}
             encoderSurface = null;
         }
-        
+        // Drop the EGLCore reference so getEglCore() (consumed by the
+        // OEM pipeline's setParentEglCore wiring) doesn't return a
+        // stale handle to a torn-down context. The scaler doesn't own
+        // the EGLCore lifecycle (PanoramicCameraGpu does), so we don't
+        // call release() on it — just null the field.
+        eglCore = null;
+        // Stale OEM source pointer won't reach the released sampler now
+        // that drawFrame can never run again, but null defensively so
+        // any stray getter / log shows the post-release state.
+        encoderInputSurface = null;
+
         logger.info("GpuStreamScaler released");
     }
 
@@ -430,6 +697,9 @@ public class GpuStreamScaler {
             "#extension GL_OES_EGL_image_external : require\n" +
             "precision mediump float;\n" +
             "uniform samplerExternalOES uCameraTex;\n" +
+            "uniform samplerExternalOES uOemTex;\n" +
+            "uniform mat4 uOemTexMatrix;\n" +
+            "uniform int uOemActive;\n" +
             "uniform int uViewMode;\n" +
             "uniform float uApaMode;\n" +
             "uniform vec2 uProducerForFront;\n" +
@@ -443,7 +713,20 @@ public class GpuStreamScaler {
             "uniform float uRedMaskStrength;\n" +
             "uniform float uApaCenterInset;\n" +
             "varying vec2 vTexCoord;\n" +
+            "varying vec2 vUnit;\n" +
             "void main() {\n" +
+            "    // View 6 with OEM bound: sample the OEM camera external\n" +
+            "    // texture using its own transform matrix on the\n" +
+            "    // un-transformed unit-quad coord (vUnit). The matrix\n" +
+            "    // returned by SurfaceTexture.getTransformMatrix already\n" +
+            "    // encodes the producer's Y-flip — applying a manual\n" +
+            "    // 1.0 - vUnit.y on top double-flips and lands the feed\n" +
+            "    // upside-down. Sample with the raw vUnit.\n" +
+            "    if (uViewMode == 6 && uOemActive == 1) {\n" +
+            "        vec2 oemTc = (uOemTexMatrix * vec4(vUnit, 0.0, 1.0)).xy;\n" +
+            "        gl_FragColor = texture2D(uOemTex, oemTc);\n" +
+            "        return;\n" +
+            "    }\n" +
             "    vec2 samplePos;\n" +
             "    float frontOffset = %.5ff;\n" +
             "    float rightOffset = %.5ff;\n" +

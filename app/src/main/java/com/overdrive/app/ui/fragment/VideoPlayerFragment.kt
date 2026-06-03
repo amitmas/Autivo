@@ -12,17 +12,19 @@ import android.view.ViewGroup
 import android.widget.ImageButton
 import android.widget.SeekBar
 import android.widget.TextView
-import android.widget.VideoView
 import androidx.fragment.app.Fragment
 import androidx.navigation.fragment.findNavController
 import com.overdrive.app.R
 import com.overdrive.app.ui.view.EventTimelineView
+import com.overdrive.app.ui.view.ZoomableVideoView
 import org.json.JSONObject
 import java.io.File
 
 /**
  * Native video player with event timeline overlay.
- * Uses Android VideoView for reliable local file playback.
+ * Built on a [ZoomableVideoView] so the same MP4 (a 2x2 mosaic of the four
+ * AVM cameras) can be panned/zoomed to a single quadrant for fullscreen
+ * single-camera review without a re-encode.
  * Reads JSON sidecar for detection event markers on the timeline.
  *
  * Optional playlist support: callers can pass [ARG_PLAYLIST_PATHS] +
@@ -53,6 +55,16 @@ class VideoPlayerFragment : Fragment() {
         // SharedPreferences-backed persistence for the mute toggle.
         private const val PREFS_PLAYER = "video_player_prefs"
         private const val PREF_MUTED = "muted"
+        // Persisted quadrant zoom selection. Survives clip changes so a user
+        // who's been reviewing the rear camera in clip A keeps that zoom on
+        // clip B without re-tapping. Value is the [ZoomableVideoView.Quadrant]
+        // enum name; missing/unknown → ALL.
+        private const val PREF_QUADRANT = "quadrant"
+        // saved-state keys for surviving config changes (rotation, dark
+        // mode toggle). Playhead + playing-state get restored so the user
+        // doesn't lose their place across orientation changes.
+        private const val STATE_POSITION_MS = "videoPlayer.positionMs"
+        private const val STATE_WAS_PLAYING = "videoPlayer.wasPlaying"
     }
 
     private var inlineMode: Boolean = false
@@ -60,7 +72,7 @@ class VideoPlayerFragment : Fragment() {
     private var playlistTitles: Array<String> = emptyArray()
     private var playlistIndex: Int = -1
 
-    private lateinit var videoView: VideoView
+    private lateinit var videoView: ZoomableVideoView
     private lateinit var seekBar: SeekBar
     private lateinit var tvCurrentTime: TextView
     private lateinit var tvDuration: TextView
@@ -73,6 +85,16 @@ class VideoPlayerFragment : Fragment() {
     private var btnNext: ImageButton? = null
     private var btnFullscreen: ImageButton? = null
     private var btnMute: ImageButton? = null
+
+    // Quadrant selector — null on layouts without the bar (none today, but
+    // the host could legitimately strip it for an embedded preview surface).
+    private var quadrantBar: View? = null
+    private var btnQuadrantAll: ImageButton? = null
+    private var btnQuadrantFront: ImageButton? = null
+    private var btnQuadrantRight: ImageButton? = null
+    private var btnQuadrantRear: ImageButton? = null
+    private var btnQuadrantLeft: ImageButton? = null
+    private var currentQuadrant: ZoomableVideoView.Quadrant = ZoomableVideoView.Quadrant.ALL
     // Tracks the desired mute state across clip changes within this
     // fragment instance. Initial value reads from SharedPreferences (default
     // = muted) so the user's choice survives navigation. The MediaPlayer's
@@ -161,6 +183,12 @@ class VideoPlayerFragment : Fragment() {
         btnNext = view.findViewById(R.id.btnNext)
         btnFullscreen = view.findViewById(R.id.btnFullscreen)
         btnMute = view.findViewById(R.id.btnMute)
+        quadrantBar = view.findViewById(R.id.quadrantBar)
+        btnQuadrantAll = view.findViewById(R.id.btnQuadrantAll)
+        btnQuadrantFront = view.findViewById(R.id.btnQuadrantFront)
+        btnQuadrantRight = view.findViewById(R.id.btnQuadrantRight)
+        btnQuadrantRear = view.findViewById(R.id.btnQuadrantRear)
+        btnQuadrantLeft = view.findViewById(R.id.btnQuadrantLeft)
         // Restore last-chosen mute state so the user's preference carries
         // across clips and app restarts. Order of precedence (mirrors the
         // events.html web player):
@@ -177,6 +205,23 @@ class VideoPlayerFragment : Fragment() {
             !readAudioEnabledFromConfig()
         }
         refreshMuteIcon()
+
+        // Restore persisted quadrant. ALL is the safe default for both new
+        // installs and clips that pre-date this feature. The enum's name()
+        // matches the persisted value exactly so a future enum-rename will
+        // surface as a missing-key fallback to ALL — never a crash.
+        //
+        // Pre-layout setQuadrant updates the field but skips the matrix
+        // paint (width/height==0). [ZoomableVideoView.onSizeChanged]
+        // picks up the stored quadrant once layout completes and paints
+        // the matching matrix on the first frame, so no flash.
+        currentQuadrant = runCatching {
+            val raw = prefs.getString(PREF_QUADRANT, ZoomableVideoView.Quadrant.ALL.name)
+            ZoomableVideoView.Quadrant.valueOf(raw ?: ZoomableVideoView.Quadrant.ALL.name)
+        }.getOrDefault(ZoomableVideoView.Quadrant.ALL)
+        videoView.setQuadrant(currentQuadrant, animate = false)
+        refreshQuadrantSelection()
+
         eventTimeline = view.findViewById(R.id.eventTimeline)
         topBar = view.findViewById(R.id.topBar)
         bottomControls = view.findViewById(R.id.bottomControls)
@@ -206,7 +251,18 @@ class VideoPlayerFragment : Fragment() {
             btnBack.visibility = View.GONE
         }
 
+        // Read playhead + playing intent stashed across config changes
+        // (rotation, dark mode, etc). Don't apply yet — loadVideo calls
+        // setVideoURI which resets the resume policy. Apply right after
+        // the URI is set, while the prepare is still in flight.
+        val restorePositionMs = savedInstanceState?.getInt(STATE_POSITION_MS, 0) ?: 0
+        val restoreWasPlaying = savedInstanceState?.getBoolean(STATE_WAS_PLAYING, true) ?: true
+
         loadVideo(initialPath, initialTitle)
+
+        if (restorePositionMs > 0 || !restoreWasPlaying) {
+            videoView.primeResume(restorePositionMs, restoreWasPlaying)
+        }
 
         setupControls()
         setupOverlayAutoHide()
@@ -289,6 +345,53 @@ class VideoPlayerFragment : Fragment() {
     }
 
     /**
+     * Switch to [target] and persist the selection so the next clip /
+     * relaunch honors it. The transform animation is owned by the
+     * ZoomableVideoView itself; this method just drives the icon highlight
+     * + persistence + auto-hide reset.
+     *
+     * Tap-to-toggle: tapping the active quadrant returns to ALL. Mirrors
+     * the events.html behavior so the surfaces feel identical.
+     */
+    private fun selectQuadrant(target: ZoomableVideoView.Quadrant) {
+        val resolved = if (target == currentQuadrant && target != ZoomableVideoView.Quadrant.ALL) {
+            ZoomableVideoView.Quadrant.ALL
+        } else target
+        if (resolved == currentQuadrant) return
+        currentQuadrant = resolved
+        videoView.setQuadrant(resolved, animate = true)
+        refreshQuadrantSelection()
+        runCatching {
+            requireContext()
+                .getSharedPreferences(PREFS_PLAYER, Context.MODE_PRIVATE)
+                .edit()
+                .putString(PREF_QUADRANT, resolved.name)
+                .apply()
+        }
+        if (overlayVisible && videoView.isPlaying) scheduleOverlayHide()
+    }
+
+    /**
+     * Repaint the quadrant icon row so the active button is fully opaque
+     * and the rest are dimmed. Cheaper than swapping background drawables
+     * and avoids inconsistencies with our drawable selectors.
+     */
+    private fun refreshQuadrantSelection() {
+        val map = listOf(
+            btnQuadrantAll to ZoomableVideoView.Quadrant.ALL,
+            btnQuadrantFront to ZoomableVideoView.Quadrant.FRONT,
+            btnQuadrantRight to ZoomableVideoView.Quadrant.RIGHT,
+            btnQuadrantRear to ZoomableVideoView.Quadrant.REAR,
+            btnQuadrantLeft to ZoomableVideoView.Quadrant.LEFT
+        )
+        for ((btn, q) in map) {
+            btn ?: continue
+            btn.alpha = if (q == currentQuadrant) 1f else 0.55f
+            btn.isSelected = q == currentQuadrant
+        }
+    }
+
+    /**
      * Read the recording.audioEnabled flag from UnifiedConfigManager so the
      * mute default for first-ever playback can mirror whether the user has
      * audio recording on. Best-effort: any exception or missing section
@@ -339,10 +442,11 @@ class VideoPlayerFragment : Fragment() {
 
     private fun setupVideoPlayer(path: String) {
         // Drop the stale MediaPlayer reference BEFORE setVideoURI tears down
-        // the previous one. VideoView destroys the old player internally on
-        // setVideoURI; without this clear, jumpTo() leaves currentMediaPlayer
-        // pointing at a released instance until the new prepare callback
-        // fires, which would route mute toggles to a dead player.
+        // the previous one. ZoomableVideoView releases the old player
+        // internally on setVideoURI; without this clear, jumpTo() leaves
+        // currentMediaPlayer pointing at a released instance until the new
+        // prepare callback fires, which would route mute toggles to a dead
+        // player.
         currentMediaPlayer = null
         videoView.setVideoURI(Uri.fromFile(File(path)))
 
@@ -359,10 +463,21 @@ class VideoPlayerFragment : Fragment() {
             // the public API. Done before start() so the first frame's
             // audio is silent if the user wants it that way.
             applyMuteToPlayer(mp)
-            videoView.start()
-            btnPlayPause.setImageResource(android.R.drawable.ic_media_pause)
-            handler.post(updateRunnable)
-            scheduleOverlayHide()
+            // Honor the user's pre-background play state. shouldAutoResume()
+            // returns true on first-clip prepare (default) and on returns
+            // where the user was playing before backgrounding; false when
+            // they had explicitly paused. Without this gate every resume
+            // unconditionally restarted playback, silently overriding
+            // intentional pauses.
+            if (videoView.shouldAutoResume()) {
+                videoView.start()
+                btnPlayPause.setImageResource(android.R.drawable.ic_media_pause)
+                handler.post(updateRunnable)
+                scheduleOverlayHide()
+            } else {
+                btnPlayPause.setImageResource(android.R.drawable.ic_media_play)
+                setOverlayVisible(true)
+            }
         }
 
         videoView.setOnCompletionListener {
@@ -417,6 +532,12 @@ class VideoPlayerFragment : Fragment() {
             }
         }
 
+        btnQuadrantAll?.setOnClickListener { selectQuadrant(ZoomableVideoView.Quadrant.ALL) }
+        btnQuadrantFront?.setOnClickListener { selectQuadrant(ZoomableVideoView.Quadrant.FRONT) }
+        btnQuadrantRight?.setOnClickListener { selectQuadrant(ZoomableVideoView.Quadrant.RIGHT) }
+        btnQuadrantRear?.setOnClickListener { selectQuadrant(ZoomableVideoView.Quadrant.REAR) }
+        btnQuadrantLeft?.setOnClickListener { selectQuadrant(ZoomableVideoView.Quadrant.LEFT) }
+
         btnMute?.setOnClickListener {
             userPrefMuted = !userPrefMuted
             // Persist immediately so a crash / process death between now and
@@ -468,6 +589,10 @@ class VideoPlayerFragment : Fragment() {
     }
 
     private fun setupOverlayAutoHide() {
+        // Single tap on the video = toggle the chrome (overlay auto-hide).
+        // The TextureView's GestureDetector dispatches single-tap-confirmed
+        // -> performClick(), so a double-tap doesn't accidentally also
+        // toggle the chrome between the two taps.
         videoView.setOnClickListener {
             if (overlayVisible) {
                 setOverlayVisible(false)
@@ -476,25 +601,35 @@ class VideoPlayerFragment : Fragment() {
                 scheduleOverlayHide()
             }
         }
+        // Double-tap = zoom into the tapped quadrant (or reset to ALL when
+        // already zoomed). Mirrors the events.html web player behavior.
+        videoView.setOnDoubleTapListener { target ->
+            selectQuadrant(target)
+        }
     }
 
     private fun setOverlayVisible(visible: Boolean) {
         overlayVisible = visible
-        val alpha = if (visible) 1f else 0f
         val duration = 250L
-        topBar?.animate()?.alpha(alpha)?.setDuration(duration)?.withEndAction {
-            if (!visible) topBar?.visibility = View.GONE
-        }?.start()
-        bottomControls?.animate()?.alpha(alpha)?.setDuration(duration)?.withEndAction {
-            if (!visible) bottomControls?.visibility = View.GONE
-        }?.start()
+        // Every chrome surface fades together — top bar, quadrant selector,
+        // bottom controls. quadrantBar joining this group is intentional:
+        // the user shouldn't see "switch camera" handles floating over a
+        // playing-but-controls-hidden video.
+        val chrome = listOfNotNull(topBar, quadrantBar, bottomControls)
         if (visible) {
-            topBar?.visibility = View.VISIBLE
-            topBar?.alpha = 0f
-            topBar?.animate()?.alpha(1f)?.setDuration(duration)?.start()
-            bottomControls?.visibility = View.VISIBLE
-            bottomControls?.alpha = 0f
-            bottomControls?.animate()?.alpha(1f)?.setDuration(duration)?.start()
+            for (v in chrome) {
+                v.animate().cancel()
+                v.visibility = View.VISIBLE
+                v.alpha = 0f
+                v.animate().alpha(1f).setDuration(duration).start()
+            }
+        } else {
+            for (v in chrome) {
+                v.animate().cancel()
+                v.animate().alpha(0f).setDuration(duration)
+                    .withEndAction { v.visibility = View.GONE }
+                    .start()
+            }
         }
     }
 
@@ -577,7 +712,32 @@ class VideoPlayerFragment : Fragment() {
     override fun onPause() {
         super.onPause()
         handler.removeCallbacks(updateRunnable)
+        // Snapshot playing-state BEFORE pausing so the resume-after-
+        // background path knows whether to auto-start on re-prepare. Order
+        // matters: pause() flips isPlaying to false, so a snapshot taken
+        // after would always read false.
+        videoView.snapshotPlayingState()
         if (videoView.isPlaying) videoView.pause()
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        // Persist playhead + playing intent across config changes.
+        //
+        // Read BEFORE any teardown — by the time onDestroyView runs, the
+        // MediaPlayer has been released and currentPosition reads 0.
+        //
+        // The Android lifecycle invokes onPause() BEFORE onSaveInstanceState,
+        // and our onPause unconditionally pauses the player. So a literal
+        // `videoView.isPlaying` check here always reads false — the
+        // user's pre-rotation playing intent would be silently dropped.
+        // [shouldAutoResume] returns the value snapshotPlayingState()
+        // captured in onPause BEFORE the pause() call, which is the
+        // truthful pre-pause state.
+        if (videoView.duration > 0) {
+            outState.putInt(STATE_POSITION_MS, videoView.currentPosition)
+            outState.putBoolean(STATE_WAS_PLAYING, videoView.shouldAutoResume())
+        }
     }
 
     override fun onDestroyView() {

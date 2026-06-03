@@ -225,11 +225,18 @@ public class StorageManager {
     private File usbProximityDir;
     private File usbTripsDir;
     
-    // Active directories (based on storage type selection)
-    private File recordingsDir;
-    private File surveillanceDir;
-    private File proximityDir;
-    private File tripsDir;
+    // Active directories (based on storage type selection).
+    // Volatile because they're written by setters/watchdog threads (which
+    // hold per-category cleanup locks during the assignment) and read by
+    // unrelated readers (size queries, file-saved handlers, recorder
+    // pre-flight) that may not hold the same lock. The previous design
+    // shared a single cleanupLock that ordered all reads/writes; with
+    // per-category locks the reads can land on a stale value without the
+    // volatile fence.
+    private volatile File recordingsDir;
+    private volatile File surveillanceDir;
+    private volatile File proximityDir;
+    private volatile File tripsDir;
     
     // Background cleanup scheduler
     private ScheduledExecutorService cleanupScheduler;
@@ -307,8 +314,38 @@ public class StorageManager {
     private static final String DEFERRED_PROXIMITY = "proximity";
     private static final String DEFERRED_TRIPS = "trips";
 
-    // Cleanup lock to prevent concurrent cleanup operations
-    private final Object cleanupLock = new Object();
+    // Per-category cleanup locks. The previous design used a single shared
+    // monitor for every ensureXxxSpace / sweep / wipe call across all four
+    // categories. That serialised unrelated work — most catastrophically,
+    // the boot startup reap (which sweeps all four categories under the same
+    // lock) blocked recorder.startRecording's pre-flight ensureRecordingsSpace
+    // for the entire duration of the reap. On a USB drive with 1k+ recordings,
+    // that's minutes of starvation, during which the user's drive is silently
+    // not recorded (RecordingModeManager.activateMode calls pipeline.startRecording
+    // synchronously and pins the manager monitor across the whole stall).
+    //
+    // Each category now owns its own monitor. Cross-category orchestrators
+    // (runCleanup, the periodic ticker, the boot reap) take the locks one
+    // category at a time so the windows of contention with per-recording calls
+    // are bounded to a single category's walk.
+    private final Object recordingsCleanupLock = new Object();
+    private final Object surveillanceCleanupLock = new Object();
+    private final Object proximityCleanupLock = new Object();
+    private final Object tripsCleanupLock = new Object();
+
+    /** Resolve the per-category lock by category key — used by helpers that
+     *  receive the category as a string (drainDeferredCleanup, sweep helpers).
+     *  Unknown keys map to {@code recordingsCleanupLock} as a safe default;
+     *  callers should still validate the category. */
+    private Object lockForCategory(String category) {
+        switch (category) {
+            case "recordings":  return recordingsCleanupLock;
+            case "surveillance": return surveillanceCleanupLock;
+            case "proximity":   return proximityCleanupLock;
+            case "trips":       return tripsCleanupLock;
+            default:            return recordingsCleanupLock;
+        }
+    }
     
     // SD card / USB mount watchdog (keeps the configured external volume
     // mounted during sentry mode). Single scheduler covers both classes —
@@ -338,6 +375,24 @@ public class StorageManager {
         if ("SD_CARD".equals(s)) return StorageType.SD_CARD;
         if ("USB".equals(s))     return StorageType.USB;
         return StorageType.INTERNAL;
+    }
+
+    /**
+     * Coerce a configured storage type to {@code INTERNAL} when the
+     * underlying volume isn't currently present. Per project spec, when the
+     * user-selected external volume isn't available the runtime default is
+     * always INTERNAL — never a "phantom" SD_CARD/USB whose path silently
+     * resolves to internal at every read.
+     *
+     * <p>Does NOT overwrite the persisted preference (the persisted value
+     * stays untouched in {@code overdrive_config.json}). On the next boot
+     * with the volume re-attached, parseStorageType + normalizeStorageType
+     * will return the user's original choice.
+     */
+    private StorageType normalizeStorageType(StorageType configured) {
+        if (configured == StorageType.SD_CARD && !sdCardAvailable) return StorageType.INTERNAL;
+        if (configured == StorageType.USB     && !usbAvailable)    return StorageType.INTERNAL;
+        return configured;
     }
 
     private StorageManager() {
@@ -390,17 +445,24 @@ public class StorageManager {
         // the limit. Reap them once at boot so the UI total agrees with
         // the configured limit before any new event fires the per-save
         // cleanup. Async — don't block daemon startup.
+        //
+        // Each ensureXxxSpace call self-acquires its own per-category lock,
+        // so this loop holds no lock between categories. That matters: on a
+        // first-recording-after-boot path the recorder calls
+        // ensureRecordingsSpace(100MB) under recordingsCleanupLock; if we
+        // held a single shared lock across the entire reap, that pre-flight
+        // would block until the boot reap finished walking every category.
+        // On a USB volume with thousands of clips, that's the difference
+        // between recording the user's drive and silently losing it.
         asyncCleanupExecutor.execute(() -> {
-            synchronized (cleanupLock) {
-                try {
-                    sweepOrphanTempFiles();
-                    ensureRecordingsSpace(0);
-                    ensureSurveillanceSpace(0);
-                    ensureProximitySpace(0);
-                    ensureTripsSpace(0);
-                } catch (Exception e) {
-                    logWarn("Startup reap failed: " + e.getMessage());
-                }
+            try {
+                sweepOrphanTempFiles();
+                ensureRecordingsSpace(0);
+                ensureSurveillanceSpace(0);
+                ensureProximitySpace(0);
+                ensureTripsSpace(0);
+            } catch (Exception e) {
+                logWarn("Startup reap failed: " + e.getMessage());
             }
         });
     }
@@ -432,36 +494,41 @@ public class StorageManager {
         for (String category : new String[]{"recordings", "surveillance", "proximity", "trips"}) {
             String[] partials = partialExtensionsForCategory(category);
             if (partials.length == 0) continue;
-            for (File dir : getReapableDirs(category)) {
-                if (dir == null) continue;
-                String path = dir.getAbsolutePath();
-                if (!seenPaths.add(path)) continue;
-                if (!dir.isDirectory()) continue;
-                File[] files = dir.listFiles((d, name) -> {
-                    for (String ext : partials) {
-                        if (name.endsWith(ext)) return true;
-                    }
-                    return false;
-                });
-                if (files == null) continue;
-                for (File f : files) {
-                    // Don't unlink a still-being-written trip file in case
-                    // the recorder uses an atomic ".jsonl.gz.tmp → .jsonl.gz"
-                    // rename and the in-flight file is the .tmp.
-                    if (activeTripFilePath != null
-                            && (activeTripFilePath.equals(f.getAbsolutePath())
-                                || activeTripFilePath.equals(f.getAbsolutePath() + ".tmp"))) {
-                        continue;
-                    }
-                    if (f.lastModified() > cutoff) continue;  // grace window
-                    long size = f.length();
-                    boolean ok = f.delete();
-                    if (!ok) ok = deleteFileViaShell(f);
-                    if (ok) {
-                        deleted++;
-                        bytesFreed += size;
-                    } else {
-                        logWarn("Orphan tmp delete failed: " + f.getAbsolutePath());
+            // Take this category's lock for its iteration only — releases
+            // between categories so a slow USB walk in "recordings" doesn't
+            // block ensureSurveillanceSpace fired by a concurrent event save.
+            synchronized (lockForCategory(category)) {
+                for (File dir : getReapableDirs(category)) {
+                    if (dir == null) continue;
+                    String path = dir.getAbsolutePath();
+                    if (!seenPaths.add(path)) continue;
+                    if (!dir.isDirectory()) continue;
+                    File[] files = dir.listFiles((d, name) -> {
+                        for (String ext : partials) {
+                            if (name.endsWith(ext)) return true;
+                        }
+                        return false;
+                    });
+                    if (files == null) continue;
+                    for (File f : files) {
+                        // Don't unlink a still-being-written trip file in case
+                        // the recorder uses an atomic ".jsonl.gz.tmp → .jsonl.gz"
+                        // rename and the in-flight file is the .tmp.
+                        if (activeTripFilePath != null
+                                && (activeTripFilePath.equals(f.getAbsolutePath())
+                                    || activeTripFilePath.equals(f.getAbsolutePath() + ".tmp"))) {
+                            continue;
+                        }
+                        if (f.lastModified() > cutoff) continue;  // grace window
+                        long size = f.length();
+                        boolean ok = f.delete();
+                        if (!ok) ok = deleteFileViaShell(f);
+                        if (ok) {
+                            deleted++;
+                            bytesFreed += size;
+                        } else {
+                            logWarn("Orphan tmp delete failed: " + f.getAbsolutePath());
+                        }
                     }
                 }
             }
@@ -955,12 +1022,12 @@ public class StorageManager {
                     (forSurveillance ? "surveillance" : "recordings"));
                 if (!ensureSdCardMounted()) {
                     logWarn("Failed to mount SD card, falling back to internal storage");
-                    if (forSurveillance) {
-                        surveillanceDir = internalSurveillanceDir;
-                        proximityDir = internalProximityDir;
-                    } else {
-                        recordingsDir = internalRecordingsDir;
-                    }
+                    // Let updateActiveDirectories handle the fallback via
+                    // resolveActive — single source of truth for "configured
+                    // external missing → use internal." Avoids the partial
+                    // assignment trap (writing only surveillanceDir+proximityDir
+                    // while leaving recordingsDir/tripsDir at stale values).
+                    updateActiveDirectories();
                     return true;
                 }
             }
@@ -985,12 +1052,7 @@ public class StorageManager {
                     (forSurveillance ? "surveillance" : "recordings"));
                 if (!ensureUsbMounted()) {
                     logWarn("Failed to mount USB, falling back to internal storage");
-                    if (forSurveillance) {
-                        surveillanceDir = internalSurveillanceDir;
-                        proximityDir = internalProximityDir;
-                    } else {
-                        recordingsDir = internalRecordingsDir;
-                    }
+                    updateActiveDirectories();
                     return true;
                 }
             }
@@ -1523,21 +1585,57 @@ public class StorageManager {
      * back to internal when the requested external volume isn't ready.
      * Logs the fallback only when we actually downgraded (else the boot path
      * spams "fell back" lines for users who never selected SD/USB).
+     *
+     * <p>Returns a small holder so the caller can log both the configured
+     * type AND the resolved type. The previous API returned only the File,
+     * forcing the caller to log the configured enum even when we'd
+     * downgraded — the resulting log line ("Trips using SD_CARD:
+     * /storage/emulated/0/...") was actively misleading on Seal trims with
+     * no SD slot.
      */
-    private File resolveActive(StorageType type,
-                               File internalDir, File sdDir, File usbDir,
-                               String label) {
+    private static final class ResolvedDir {
+        final File dir;
+        final StorageType resolved;
+        ResolvedDir(File dir, StorageType resolved) {
+            this.dir = dir;
+            this.resolved = resolved;
+        }
+    }
+
+    private ResolvedDir resolveActive(StorageType type,
+                                      File internalDir, File sdDir, File usbDir,
+                                      String label) {
         if (type == StorageType.SD_CARD) {
-            if (sdCardAvailable && sdDir != null) return sdDir;
+            if (sdCardAvailable && sdDir != null) {
+                return new ResolvedDir(sdDir, StorageType.SD_CARD);
+            }
             logWarn("SD card not available for " + label + ", falling back to internal storage");
-            return internalDir;
+            return new ResolvedDir(internalDir, StorageType.INTERNAL);
         }
         if (type == StorageType.USB) {
-            if (usbAvailable && usbDir != null) return usbDir;
+            if (usbAvailable && usbDir != null) {
+                return new ResolvedDir(usbDir, StorageType.USB);
+            }
             logWarn("USB not available for " + label + ", falling back to internal storage");
-            return internalDir;
+            return new ResolvedDir(internalDir, StorageType.INTERNAL);
         }
-        return internalDir;
+        return new ResolvedDir(internalDir, StorageType.INTERNAL);
+    }
+
+    /**
+     * Emit the canonical "<Category> using <type>: <path>" line. When the
+     * resolved type doesn't match what the user configured (external volume
+     * missing → fell back to internal), the line includes both so log
+     * readers don't have to cross-reference the path against the directory
+     * constants to detect a fallback.
+     */
+    private void logResolvedDir(String label, StorageType configured, ResolvedDir r) {
+        if (r.resolved != configured) {
+            logInfo(label + " configured=" + configured + " active=" + r.resolved
+                + " (fallback): " + r.dir.getAbsolutePath());
+        } else {
+            logInfo(label + " using " + r.resolved + ": " + r.dir.getAbsolutePath());
+        }
     }
 
     /**
@@ -1547,34 +1645,56 @@ public class StorageManager {
      * being split across volumes when the user changes storage mid-recording.
      */
     private void updateActiveDirectories() {
+        // Each per-category lock is taken briefly so a concurrent
+        // ensureXxxSpace / sweep / wipe sees an atomic dir swap (not a
+        // torn read where one volatile read returns the old dir and a
+        // later read in the same call path returns the new one).
+        // resolveActive reads internalXxxDir / sdCardXxxDir / usbXxxDir
+        // which are all immutable after init — it doesn't need the lock
+        // itself; we hold the lock only for the assignment fence.
+
         // Recordings directory
-        if (recordingActive.get()) {
-            logDebug("Recording active - skipping recordings directory update");
-        } else {
-            recordingsDir = resolveActive(recordingsStorageType,
-                internalRecordingsDir, sdCardRecordingsDir, usbRecordingsDir, "recordings");
-            logInfo("Recordings using " + recordingsStorageType + ": " + recordingsDir.getAbsolutePath());
+        synchronized (recordingsCleanupLock) {
+            if (recordingActive.get()) {
+                logDebug("Recording active - skipping recordings directory update");
+            } else {
+                ResolvedDir r = resolveActive(recordingsStorageType,
+                    internalRecordingsDir, sdCardRecordingsDir, usbRecordingsDir, "recordings");
+                recordingsDir = r.dir;
+                logResolvedDir("Recordings", recordingsStorageType, r);
+            }
         }
 
         // Surveillance directory
-        if (surveillanceActive.get()) {
-            logDebug("Surveillance active - skipping surveillance directory update");
-        } else {
-            surveillanceDir = resolveActive(surveillanceStorageType,
-                internalSurveillanceDir, sdCardSurveillanceDir, usbSurveillanceDir, "surveillance");
-            logInfo("Surveillance using " + surveillanceStorageType + ": " + surveillanceDir.getAbsolutePath());
+        synchronized (surveillanceCleanupLock) {
+            if (surveillanceActive.get()) {
+                logDebug("Surveillance active - skipping surveillance directory update");
+            } else {
+                ResolvedDir r = resolveActive(surveillanceStorageType,
+                    internalSurveillanceDir, sdCardSurveillanceDir, usbSurveillanceDir, "surveillance");
+                surveillanceDir = r.dir;
+                logResolvedDir("Surveillance", surveillanceStorageType, r);
+            }
         }
 
         // Proximity always uses same storage as surveillance
-        if (!surveillanceActive.get()) {
-            proximityDir = resolveActive(surveillanceStorageType,
-                internalProximityDir, sdCardProximityDir, usbProximityDir, "proximity");
+        synchronized (proximityCleanupLock) {
+            if (!surveillanceActive.get()) {
+                ResolvedDir r = resolveActive(surveillanceStorageType,
+                    internalProximityDir, sdCardProximityDir, usbProximityDir, "proximity");
+                proximityDir = r.dir;
+                // Proximity follows surveillance silently — no log here, the
+                // surveillance line already conveyed the resolution.
+            }
         }
 
         // Trips directory — trip telemetry files are small, no active guard
-        tripsDir = resolveActive(tripsStorageType,
-            internalTripsDir, sdCardTripsDir, usbTripsDir, "trips");
-        logInfo("Trips using " + tripsStorageType + ": " + tripsDir.getAbsolutePath());
+        synchronized (tripsCleanupLock) {
+            ResolvedDir rTrips = resolveActive(tripsStorageType,
+                internalTripsDir, sdCardTripsDir, usbTripsDir, "trips");
+            tripsDir = rTrips.dir;
+            logResolvedDir("Trips", tripsStorageType, rTrips);
+        }
     }
     
     /**
@@ -1600,7 +1720,12 @@ public class StorageManager {
                     proximityLimitMb = storage.optLong("proximityLimitMb", DEFAULT_PROXIMITY_LIMIT_MB);
                     tripsLimitMb = storage.optLong("tripsLimitMb", DEFAULT_TRIPS_LIMIT_MB);
                     
-                    // Load storage type selection
+                    // Load storage type selection. The configured values are
+                    // kept as-is so the watchdog still tries to mount what
+                    // the user originally asked for; the runtime "active"
+                    // type is reported via getActive*StorageType() and
+                    // resolves to INTERNAL when the configured external
+                    // volume isn't currently available.
                     recordingsStorageType   = parseStorageType(storage.optString("recordingsStorageType", "INTERNAL"));
                     surveillanceStorageType = parseStorageType(storage.optString("surveillanceStorageType", "INTERNAL"));
                     tripsStorageType        = parseStorageType(storage.optString("tripsStorageType", "INTERNAL"));
@@ -1881,17 +2006,38 @@ public class StorageManager {
     }
     
     // ==================== Storage Type Getters/Setters ====================
-    
+
+    /** The user's persisted choice. May not match where files are actually
+     *  written if the external volume isn't currently available — see
+     *  {@link #getActiveRecordingsStorageType}. */
     public StorageType getRecordingsStorageType() {
         return recordingsStorageType;
     }
-    
+
     public StorageType getSurveillanceStorageType() {
         return surveillanceStorageType;
     }
-    
+
     public StorageType getTripsStorageType() {
         return tripsStorageType;
+    }
+
+    /**
+     * The storage type that recordings are actually being written to right
+     * now. Returns INTERNAL if the configured external volume isn't
+     * currently mounted. UI should show this (with the configured value as
+     * a secondary "you wanted X, currently using Y" hint when they differ).
+     */
+    public StorageType getActiveRecordingsStorageType() {
+        return normalizeStorageType(recordingsStorageType);
+    }
+
+    public StorageType getActiveSurveillanceStorageType() {
+        return normalizeStorageType(surveillanceStorageType);
+    }
+
+    public StorageType getActiveTripsStorageType() {
+        return normalizeStorageType(tripsStorageType);
     }
     
     /**
@@ -2154,6 +2300,11 @@ public class StorageManager {
      */
     private static String[] auxiliaryPrefixesForCategory(String category) {
         switch (category) {
+            // OEM Dashcam clips share the recordings directory with cam_*.
+            // The primary prefix gate is "cam" (line 2136), so dvr_*.mp4
+            // would be invisible to size accounting and the reaper without
+            // this auxiliary entry — the SD card would fill silently.
+            case "recordings":   return new String[]{"dvr_"};
             // Per-actor JPGs are named `thumb_<anchorStem>_a<id>_<rel>.jpg`,
             // where anchorStem already includes the `event_` prefix
             // (SurveillanceEngineGpu:4815-4824 derives tmpBase from the
@@ -2494,16 +2645,112 @@ public class StorageManager {
     
     /**
      * Get current size of trips directory in bytes.
+     *
+     * <p>Prefers the DB-backed aggregate ({@code size_bytes + sidecar_size_bytes}
+     * column sum) once the one-shot backfill has populated every legacy row.
+     * On full-storage / FUSE-mounted SD cards the legacy filesystem walk took
+     * 10-20 minutes — the storage card on trips.html would block until that
+     * completed. The DB query is sub-millisecond.
+     *
+     * <p>While backfill is still running (or if the trip analytics manager
+     * isn't initialised yet), falls back to the legacy walk wrapped in a 30s
+     * in-memory cache so concurrent storage-card requests during the
+     * backfill window don't pile up. Once {@code isBackfillComplete()} flips
+     * to true, the DB path takes over and the cache path is unreachable.
      */
     public long getTripsSize() {
-        return getDirectoriesTotalSize("trips", getReapableDirs("trips"), namePrefixForCategory("trips"));
+        try {
+            com.overdrive.app.trips.TripAnalyticsManager tam =
+                    com.overdrive.app.daemon.CameraDaemon.getTripAnalyticsManager();
+            if (tam != null) {
+                com.overdrive.app.trips.TripDatabase db = tam.getDatabase();
+                if (db != null && db.isBackfillComplete()) {
+                    return getTripsSizeFromDbCached(db);
+                }
+            }
+        } catch (Throwable t) {
+            // Fall through to direct walk
+        }
+        // Fallback: legacy walk + 30s in-memory cache so concurrent requests
+        // during the backfill window don't pile up. Once backfill completes,
+        // the DB path takes over and this is unreachable.
+        return getTripsSizeWithCache();
+    }
+
+    private long cachedTripsSize = -1;
+    private long cachedTripsSizeAt = 0;
+    private static final long TRIPS_SIZE_CACHE_MS = 30_000;
+
+    // Short TTL cache for the DB-backed SUM(size_bytes+sidecar_size_bytes)
+    // aggregate. The query itself is sub-ms but it serializes on
+    // TripDatabase's monitor; without this cache, repeated ensureTripsSpace
+    // calls under tripsCleanupLock would each pay the round-trip while
+    // holding the lock, deferring peer cleanup. 5s is short enough that
+    // storage bookkeeping stays accurate but long enough to coalesce bursts.
+    private long cachedTripsDbSize = -1;
+    private long cachedTripsDbSizeAt = 0;
+    private static final long TRIPS_DB_SIZE_CACHE_MS = 5_000;
+
+    private synchronized long getTripsSizeFromDbCached(
+            com.overdrive.app.trips.TripDatabase db) {
+        long now = System.currentTimeMillis();
+        if (cachedTripsDbSize >= 0 && (now - cachedTripsDbSizeAt) < TRIPS_DB_SIZE_CACHE_MS) {
+            return cachedTripsDbSize;
+        }
+        long size = db.getTotalSizeBytes();
+        cachedTripsDbSize = size;
+        cachedTripsDbSizeAt = now;
+        return size;
+    }
+
+    private synchronized long getTripsSizeWithCache() {
+        long now = System.currentTimeMillis();
+        if (cachedTripsSize >= 0 && (now - cachedTripsSizeAt) < TRIPS_SIZE_CACHE_MS) {
+            return cachedTripsSize;
+        }
+        long size = getDirectoriesTotalSize("trips", getReapableDirs("trips"), namePrefixForCategory("trips"));
+        cachedTripsSize = size;
+        cachedTripsSizeAt = now;
+        return size;
     }
 
     /**
      * Get trips file count.
+     *
+     * <p>Same DB-vs-walk pattern as {@link #getTripsSize()}: prefer
+     * {@code TripDatabase.getTripCount()} once backfill is complete (a
+     * one-row aggregate against the indexed trips table), fall back to the
+     * filesystem walk wrapped in a 30s in-memory cache while backfill is
+     * still running.
      */
     public int getTripsCount() {
-        return getFileCountAcross("trips", getReapableDirs("trips"), namePrefixForCategory("trips"));
+        try {
+            com.overdrive.app.trips.TripAnalyticsManager tam =
+                    com.overdrive.app.daemon.CameraDaemon.getTripAnalyticsManager();
+            if (tam != null) {
+                com.overdrive.app.trips.TripDatabase db = tam.getDatabase();
+                if (db != null && db.isBackfillComplete()) {
+                    return db.getTripCount();
+                }
+            }
+        } catch (Throwable t) {
+            // Fall through to direct walk
+        }
+        return getTripsCountWithCache();
+    }
+
+    private int cachedTripsCount = -1;
+    private long cachedTripsCountAt = 0;
+
+    private synchronized int getTripsCountWithCache() {
+        long now = System.currentTimeMillis();
+        if (cachedTripsCount >= 0 && (now - cachedTripsCountAt) < TRIPS_SIZE_CACHE_MS) {
+            return cachedTripsCount;
+        }
+        int count = getFileCountAcross("trips", getReapableDirs("trips"), namePrefixForCategory("trips"));
+        cachedTripsCount = count;
+        cachedTripsCountAt = now;
+        return count;
     }
 
     /**
@@ -2548,7 +2795,100 @@ public class StorageManager {
         }
         return matched.toArray(new File[0]);
     }
-    
+
+    /**
+     * Public mp4-aware listing with the FUSE shell fallback. Mirrors what
+     * the legacy {@code RecordingsApiHandler.scanDirectory} did before the
+     * SOTA index rewrite — direct {@code listFiles()} returns null on SD
+     * card / USB FUSE mounts under daemon UID 2000, and silently dropping
+     * that directory leaves the recordings index empty.
+     *
+     * <p>Used by {@link com.overdrive.app.server.RecordingsIndex} during
+     * warmup + reconcile, and by the API handler's {@code hasAnyMp4OnDisk}
+     * probe. Returns an empty array (never null) so callers don't need to
+     * null-check.
+     */
+    public File[] listMp4Files(File dir) {
+        return listFilesWithFallback(dir, ".mp4");
+    }
+
+    /**
+     * Generic FUSE-fallback listing — same shell-ls fallback as
+     * {@link #listMp4Files(File)} but for any single suffix or
+     * prefix+suffix combination. Used by sidecar-cleanup paths that
+     * sweep per-actor thumbs ({@code thumb_<base>_a*.jpg}) and by
+     * {@code dir.listFiles(filter)} sites that would otherwise swallow
+     * the SD-card / USB null-listing case.
+     *
+     * <p>Pass null for {@code prefix} to filter on suffix only.
+     * Returns an empty array (never null).
+     */
+    public File[] listFilesWithFallback(File dir, String suffix) {
+        return listFilesWithFallback(dir, null, suffix);
+    }
+
+    public File[] listFilesWithFallback(File dir, String prefix, String suffix) {
+        if (dir == null || !dir.exists() || !dir.isDirectory() || !dir.canRead()) {
+            return new File[0];
+        }
+        java.io.FileFilter filter = f -> {
+            String n = f.getName();
+            if (suffix != null && !n.endsWith(suffix)) return false;
+            if (prefix != null && !n.startsWith(prefix)) return false;
+            return true;
+        };
+        File[] files = dir.listFiles(filter);
+        if (files == null) {
+            // FUSE returned null — shell ls then filter in-process. The
+            // listFilesViaShell path doesn't take a filter so we apply it
+            // ourselves on the returned array.
+            File[] all = listFilesViaShell(dir);
+            if (all == null || all.length == 0) return new File[0];
+            java.util.List<File> matched = new java.util.ArrayList<>();
+            for (File f : all) {
+                if (filter.accept(f)) matched.add(f);
+            }
+            files = matched.toArray(new File[0]);
+        }
+        return files != null ? files : new File[0];
+    }
+
+    /**
+     * Notify {@link com.overdrive.app.server.RecordingsIndex} that the
+     * active recordings/surveillance/proximity dir set has changed —
+     * either via user-driven storage-type switch (settings page) or via
+     * volume hot-plug detected by the SD/USB watchdogs.
+     *
+     * <p>Two-step recovery:
+     *  1. Re-arm FileObservers against the new dir set so future writes
+     *     reach the index.
+     *  2. Reconcile so existing files on the new volume populate the
+     *     index immediately. Without this, hot-mounted SD/USB sticks
+     *     stay invisible to events.html and the native fragment until
+     *     the 1-hour periodic reconcile.
+     *
+     * <p>Step 2 runs on a background thread so we don't block the
+     * caller (the SD/USB watchdog tick is on a single-thread executor;
+     * blocking it would delay the next health probe).
+     *
+     * <p>Best-effort: any failure here is logged and swallowed. The
+     * periodic reconcile is the absolute backstop.
+     */
+    private void notifyRecordingsIndexOfStorageChange(String reason) {
+        try {
+            com.overdrive.app.daemon.RecordingsIndexFileWatcher.getInstance().refresh();
+        } catch (Throwable t) {
+            logWarn(reason + ": RecordingsIndexFileWatcher refresh failed: " + t.getMessage());
+        }
+        new Thread(() -> {
+            try {
+                com.overdrive.app.server.RecordingsIndex.getInstance().reconcile();
+            } catch (Throwable t) {
+                logWarn(reason + ": RecordingsIndex reconcile failed: " + t.getMessage());
+            }
+        }, "RecordingsIndexHotplugReconcile").start();
+    }
+
     // ==================== Cleanup Logic ====================
     
     /**
@@ -2597,16 +2937,34 @@ public class StorageManager {
      *         when deferred (the deferred-cleanup drain will retry).
      */
     public boolean ensureRecordingsSpace(long reserveBytes) {
-        // cleanupLock serializes against post-save async cleanups, periodic
-        // ticks, and the reset/wipe path. Without it, two concurrent runs
-        // can sort overlapping file lists and double-delete or hit
-        // ConcurrentModificationException on the dedup set.
-        synchronized (cleanupLock) {
+        return ensureRecordingsSpace(reserveBytes, null);
+    }
+
+    /**
+     * Variant that takes an explicit {@code activeDir} so the caller can
+     * snapshot it once and pass through. Without this, two volatile reads
+     * of {@code recordingsDir} (one in the caller for filename construction,
+     * one inside this method for the cleanup target) can disagree if a
+     * concurrent storage-type switch swaps volumes between them — the
+     * recorder writes the file into the OLD volume while the pre-flight
+     * reserve targets the NEW volume.
+     *
+     * @param activeDir the directory the caller intends to write to. Pass
+     *                  {@code null} to use the live {@code recordingsDir}.
+     */
+    public boolean ensureRecordingsSpace(long reserveBytes, File activeDir) {
+        // recordingsCleanupLock serializes recordings-only work — post-save
+        // async cleanups, periodic ticks, the reset/wipe path, and the
+        // recorder's pre-flight reserve. It does NOT block on the surveillance
+        // / proximity / trips locks, so a long boot reap of one category can't
+        // starve the recorder's pre-flight in another.
+        synchronized (recordingsCleanupLock) {
+            File targetDir = (activeDir != null) ? activeDir : recordingsDir;
             if (deferIfEncoderBusy(DEFERRED_RECORDINGS, getRecordingsSize(),
                     recordingsLimitMb * 1024 * 1024)) {
                 return true;
             }
-            return ensureSpace("recordings", getReapableDirs("recordings"), recordingsDir,
+            return ensureSpace("recordings", getReapableDirs("recordings"), targetDir,
                 namePrefixForCategory("recordings"),
                 recordingsLimitMb * 1024 * 1024, reserveBytes);
         }
@@ -2621,7 +2979,7 @@ public class StorageManager {
      * @return true if cleanup was successful and space is available
      */
     public boolean ensureSurveillanceSpace(long reserveBytes) {
-        synchronized (cleanupLock) {
+        synchronized (surveillanceCleanupLock) {
             if (deferIfEncoderBusy(DEFERRED_SURVEILLANCE, getSurveillanceSize(),
                     surveillanceLimitMb * 1024 * 1024)) {
                 return true;
@@ -2641,7 +2999,7 @@ public class StorageManager {
      * @return true if cleanup was successful and space is available
      */
     public boolean ensureProximitySpace(long reserveBytes) {
-        synchronized (cleanupLock) {
+        synchronized (proximityCleanupLock) {
             if (deferIfEncoderBusy(DEFERRED_PROXIMITY, getProximitySize(),
                     proximityLimitMb * 1024 * 1024)) {
                 return true;
@@ -2660,7 +3018,7 @@ public class StorageManager {
      * @return true if cleanup was successful and space is available
      */
     public boolean ensureTripsSpace(long reserveBytes) {
-        synchronized (cleanupLock) {
+        synchronized (tripsCleanupLock) {
             if (deferIfEncoderBusy(DEFERRED_TRIPS, getTripsSize(),
                     tripsLimitMb * 1024 * 1024)) {
                 return true;
@@ -2876,6 +3234,19 @@ public class StorageManager {
                     reapedFromInactive = true;
                 }
                 logInfo("Deleted old file: " + file.getAbsolutePath() + " (" + formatSize(fileSize) + ")");
+
+                // Drop the H2 row immediately. Without this, a limit-driven
+                // retention sweep would leave phantom entries until the
+                // next 1-hour reconcile — chips and counts would lie for
+                // up to an hour. Cheap (single indexed DELETE), no-op for
+                // non-recording categories like trips because the index
+                // only knows about .mp4 filenames.
+                if (file.getName().endsWith(".mp4")) {
+                    try {
+                        com.overdrive.app.server.RecordingsIndex
+                                .getInstance().remove(file.getName());
+                    } catch (Throwable ignored) {}
+                }
 
                 // Sidecars share the anchor's stem and are dead weight once
                 // the anchor is gone. Walk the registered set instead of the
@@ -3097,18 +3468,19 @@ public class StorageManager {
     }
     
     /**
-     * Run cleanup across every category. Holds {@link #cleanupLock} once
-     * for the whole sweep so the four passes appear atomic to peers; the
-     * lock is reentrant, so the per-call locks in ensureXxxSpace are no-ops
-     * inside this scope.
+     * Run cleanup across every category. Each ensureXxxSpace self-acquires
+     * its own per-category lock; we no longer hold a single big lock across
+     * the four calls. That used to be done so the four passes "appeared
+     * atomic" to peers, but no caller relies on that atomicity — the four
+     * categories are independent volumes/limits. Removing the big lock lets
+     * a per-recording ensureRecordingsSpace overlap with a periodic
+     * ensureSurveillanceSpace, which is the common case.
      */
     public void runCleanup() {
-        synchronized (cleanupLock) {
-            ensureRecordingsSpace(0);
-            ensureSurveillanceSpace(0);
-            ensureProximitySpace(0);
-            ensureTripsSpace(0);
-        }
+        ensureRecordingsSpace(0);
+        ensureSurveillanceSpace(0);
+        ensureProximitySpace(0);
+        ensureTripsSpace(0);
     }
     
     // ==================== Utility ====================
@@ -3182,20 +3554,27 @@ public class StorageManager {
         }
 
         asyncCleanupExecutor.execute(() -> {
-            synchronized (cleanupLock) {
+            synchronized (recordingsCleanupLock) {
                 try {
                     // Make all files in directory readable
                     makeFilesReadable(recordingsDir);
-                    
+
                     long currentSize = getRecordingsSize();
                     long limitBytes = recordingsLimitMb * 1024 * 1024;
-                    
+
                     if (currentSize > limitBytes) {
-                        logInfo("Recording file saved - triggering cleanup (current=" + 
+                        logInfo("Recording file saved - triggering cleanup (current=" +
                             formatSize(currentSize) + ", limit=" + formatSize(limitBytes) + ")");
-                        ensureRecordingsSpace(0);
+                        // Call ensureSpace directly: we already hold
+                        // recordingsCleanupLock and already gated on
+                        // isEncoderWriting at the top. Going through
+                        // ensureRecordingsSpace would just re-take the
+                        // (reentrant) lock and re-check the encoder gate.
+                        ensureSpace("recordings", getReapableDirs("recordings"), recordingsDir,
+                            namePrefixForCategory("recordings"),
+                            limitBytes, 0);
                     } else {
-                        logDebug("Recording file saved - within limits (" + 
+                        logDebug("Recording file saved - within limits (" +
                             formatSize(currentSize) + "/" + formatSize(limitBytes) + ")");
                     }
                 } catch (Exception e) {
@@ -3233,20 +3612,22 @@ public class StorageManager {
         }
 
         asyncCleanupExecutor.execute(() -> {
-            synchronized (cleanupLock) {
+            synchronized (surveillanceCleanupLock) {
                 try {
                     // Make all files in directory readable
                     makeFilesReadable(surveillanceDir);
-                    
+
                     long currentSize = getSurveillanceSize();
                     long limitBytes = surveillanceLimitMb * 1024 * 1024;
-                    
+
                     if (currentSize > limitBytes) {
-                        logInfo("Surveillance file saved - triggering cleanup (current=" + 
+                        logInfo("Surveillance file saved - triggering cleanup (current=" +
                             formatSize(currentSize) + ", limit=" + formatSize(limitBytes) + ")");
-                        ensureSurveillanceSpace(0);
+                        ensureSpace("surveillance", getReapableDirs("surveillance"), surveillanceDir,
+                            namePrefixForCategory("surveillance"),
+                            limitBytes, 0);
                     } else {
-                        logDebug("Surveillance file saved - within limits (" + 
+                        logDebug("Surveillance file saved - within limits (" +
                             formatSize(currentSize) + "/" + formatSize(limitBytes) + ")");
                     }
                 } catch (Exception e) {
@@ -3276,20 +3657,22 @@ public class StorageManager {
         }
 
         asyncCleanupExecutor.execute(() -> {
-            synchronized (cleanupLock) {
+            synchronized (proximityCleanupLock) {
                 try {
                     // Make all files in directory readable
                     makeFilesReadable(proximityDir);
-                    
+
                     long currentSize = getProximitySize();
                     long limitBytes = proximityLimitMb * 1024 * 1024;
-                    
+
                     if (currentSize > limitBytes) {
-                        logInfo("Proximity file saved - triggering cleanup (current=" + 
+                        logInfo("Proximity file saved - triggering cleanup (current=" +
                             formatSize(currentSize) + ", limit=" + formatSize(limitBytes) + ")");
-                        ensureProximitySpace(0);
+                        ensureSpace("proximity", getReapableDirs("proximity"), proximityDir,
+                            namePrefixForCategory("proximity"),
+                            limitBytes, 0);
                     } else {
-                        logDebug("Proximity file saved - within limits (" + 
+                        logDebug("Proximity file saved - within limits (" +
                             formatSize(currentSize) + "/" + formatSize(limitBytes) + ")");
                     }
                 } catch (Exception e) {
@@ -3317,20 +3700,22 @@ public class StorageManager {
         }
 
         asyncCleanupExecutor.execute(() -> {
-            synchronized (cleanupLock) {
+            synchronized (tripsCleanupLock) {
                 try {
                     // Make all files in directory readable
                     makeFilesReadable(tripsDir);
-                    
+
                     long currentSize = getTripsSize();
                     long limitBytes = tripsLimitMb * 1024 * 1024;
-                    
+
                     if (currentSize > limitBytes) {
-                        logInfo("Trip file saved - triggering cleanup (current=" + 
+                        logInfo("Trip file saved - triggering cleanup (current=" +
                             formatSize(currentSize) + ", limit=" + formatSize(limitBytes) + ")");
-                        ensureTripsSpace(0);
+                        ensureSpace("trips", getReapableDirs("trips"), tripsDir,
+                            namePrefixForCategory("trips"),
+                            limitBytes, 0);
                     } else {
-                        logDebug("Trip file saved - within limits (" + 
+                        logDebug("Trip file saved - within limits (" +
                             formatSize(currentSize) + "/" + formatSize(limitBytes) + ")");
                     }
                 } catch (Exception e) {
@@ -3589,21 +3974,22 @@ public class StorageManager {
                 // re-converge after a long recording.
                 drainDeferredCleanupIfDue();
 
-                // Sweep orphan .mp4.tmp / .broken / .jpg.tmp partials. Held by
-                // a 10-minute grace window inside the helper, so anything
-                // touched by a live writer is safe. Without this in the
-                // periodic loop, partials accumulated only got reaped at
-                // daemon boot — a long-running daemon hit by an OOM kill
-                // mid-recording could leave the disk half-full of tmps that
-                // the size-based reaper never frees because it only walks
-                // primary-extension files.
-                synchronized (cleanupLock) {
-                    sweepOrphanTempFiles();
-                }
+                // Sweep orphan .mp4.tmp / .broken / .jpg.tmp partials. The
+                // helper itself takes per-category locks one at a time and
+                // holds a 10-minute grace window so live writers are never
+                // touched. Without this in the periodic loop, partials
+                // accumulated only got reaped at daemon boot — a long-running
+                // daemon hit by an OOM kill mid-recording could leave the
+                // disk half-full of tmps that the size-based reaper never
+                // frees because it only walks primary-extension files.
+                sweepOrphanTempFiles();
 
                 // Standard periodic pass (catches dirs that grew past the limit
                 // while the daemon was offline, or after a manual limit change).
-                synchronized (cleanupLock) {
+                // Each ensureXxxSpace self-acquires its category lock; the
+                // size readouts under the same monitor stay consistent with
+                // what ensureXxxSpace will operate on.
+                synchronized (recordingsCleanupLock) {
                     long currentSize = getRecordingsSize();
                     long limitBytes = recordingsLimitMb * 1024 * 1024;
                     if (currentSize > limitBytes * 0.9) {  // 90% threshold
@@ -3613,7 +3999,7 @@ public class StorageManager {
                     }
                 }
 
-                synchronized (cleanupLock) {
+                synchronized (surveillanceCleanupLock) {
                     long currentSize = getSurveillanceSize();
                     long limitBytes = surveillanceLimitMb * 1024 * 1024;
                     if (currentSize > limitBytes * 0.9) {  // 90% threshold
@@ -3623,7 +4009,7 @@ public class StorageManager {
                     }
                 }
 
-                synchronized (cleanupLock) {
+                synchronized (tripsCleanupLock) {
                     long currentSize = getTripsSize();
                     long limitBytes = tripsLimitMb * 1024 * 1024;
                     if (currentSize > limitBytes * 0.9) {  // 90% threshold
@@ -3660,11 +4046,17 @@ public class StorageManager {
         // snapshot on any exception, including dirs that had already been
         // cleaned successfully — wasting the next tick on idempotent re-runs
         // (audit P1).
+        // Same direct-ensureSpace pattern as onXxxFileSaved: we already
+        // hold the per-category lock and already gated on isEncoderWriting
+        // at the top. Going through ensureXxxSpace would re-take the
+        // (reentrant) lock and re-check the encoder gate.
         if (toRun.contains(DEFERRED_RECORDINGS)) {
             try {
-                synchronized (cleanupLock) {
-                    if (getRecordingsSize() > recordingsLimitMb * 1024 * 1024) {
-                        ensureRecordingsSpace(0);
+                synchronized (recordingsCleanupLock) {
+                    long limitBytes = recordingsLimitMb * 1024 * 1024;
+                    if (getRecordingsSize() > limitBytes) {
+                        ensureSpace("recordings", getReapableDirs("recordings"), recordingsDir,
+                            namePrefixForCategory("recordings"), limitBytes, 0);
                     }
                 }
             } catch (Exception e) {
@@ -3674,9 +4066,11 @@ public class StorageManager {
         }
         if (toRun.contains(DEFERRED_SURVEILLANCE)) {
             try {
-                synchronized (cleanupLock) {
-                    if (getSurveillanceSize() > surveillanceLimitMb * 1024 * 1024) {
-                        ensureSurveillanceSpace(0);
+                synchronized (surveillanceCleanupLock) {
+                    long limitBytes = surveillanceLimitMb * 1024 * 1024;
+                    if (getSurveillanceSize() > limitBytes) {
+                        ensureSpace("surveillance", getReapableDirs("surveillance"), surveillanceDir,
+                            namePrefixForCategory("surveillance"), limitBytes, 0);
                     }
                 }
             } catch (Exception e) {
@@ -3686,9 +4080,11 @@ public class StorageManager {
         }
         if (toRun.contains(DEFERRED_PROXIMITY)) {
             try {
-                synchronized (cleanupLock) {
-                    if (getProximitySize() > proximityLimitMb * 1024 * 1024) {
-                        ensureProximitySpace(0);
+                synchronized (proximityCleanupLock) {
+                    long limitBytes = proximityLimitMb * 1024 * 1024;
+                    if (getProximitySize() > limitBytes) {
+                        ensureSpace("proximity", getReapableDirs("proximity"), proximityDir,
+                            namePrefixForCategory("proximity"), limitBytes, 0);
                     }
                 }
             } catch (Exception e) {
@@ -3698,9 +4094,11 @@ public class StorageManager {
         }
         if (toRun.contains(DEFERRED_TRIPS)) {
             try {
-                synchronized (cleanupLock) {
-                    if (getTripsSize() > tripsLimitMb * 1024 * 1024) {
-                        ensureTripsSpace(0);
+                synchronized (tripsCleanupLock) {
+                    long limitBytes = tripsLimitMb * 1024 * 1024;
+                    if (getTripsSize() > limitBytes) {
+                        ensureSpace("trips", getReapableDirs("trips"), tripsDir,
+                            namePrefixForCategory("trips"), limitBytes, 0);
                     }
                 }
             } catch (Exception e) {
@@ -3820,6 +4218,14 @@ public class StorageManager {
                         } catch (Exception e) {
                             logWarn("SD card watchdog: could not update sentry dir: " + e.getMessage());
                         }
+
+                        // Re-arm RecordingsIndex against the freshly-mounted
+                        // SD dirs + reconcile so existing files on the card
+                        // populate the index immediately. Without this, a
+                        // hot-mounted SD stays invisible to events.html and
+                        // the native fragment until the 1-hour periodic
+                        // reconcile.
+                        notifyRecordingsIndexOfStorageChange("SD watchdog");
                     } else if (shouldLog) {
                         logError("SD card watchdog: remount FAILED - surveillance may use internal fallback");
                     }
@@ -3866,6 +4272,12 @@ public class StorageManager {
                         } catch (Exception e) {
                             logWarn("USB watchdog: could not update sentry dir: " + e.getMessage());
                         }
+
+                        // Same RecordingsIndex re-arm + reconcile pattern as
+                        // the SD watchdog branch — see comment there. Hot-
+                        // mounted USB sticks otherwise stay invisible to the
+                        // index until the 1-hour periodic reconcile.
+                        notifyRecordingsIndexOfStorageChange("USB watchdog");
                     } else if (shouldLogUsb) {
                         logError("USB watchdog: remount FAILED - surveillance may use internal fallback");
                     }
@@ -3985,8 +4397,9 @@ public class StorageManager {
      * all known storage locations — active dir, internal fallback, and SD-card
      * mirror — plus thumbnails for that category.
      *
-     * Used by the user-initiated "Reset Data" feature. Holds {@link #cleanupLock}
-     * so it cannot race with periodic cleanup or any in-flight delete.
+     * Used by the user-initiated "Reset Data" feature. Holds the per-category
+     * cleanup lock for {@code category} so it cannot race with periodic cleanup
+     * or any in-flight delete in that category.
      *
      * @param category one of "recordings", "surveillance", "proximity", "trips"
      * @return number of files deleted, or -1 on unknown category
@@ -4003,13 +4416,31 @@ public class StorageManager {
         }
 
         long deleted = 0;
-        synchronized (cleanupLock) {
+        synchronized (lockForCategory(category)) {
             for (File dir : dirs) {
                 if (dir == null || !dir.exists() || !dir.isDirectory()) continue;
                 File[] files = dir.listFiles();
                 if (files == null) continue;
                 for (File f : files) {
-                    if (f.isFile() && f.delete()) deleted++;
+                    if (f.isFile()) {
+                        String name = f.getName();
+                        if (f.delete()) {
+                            deleted++;
+                            // Drop the H2 row eagerly so the next
+                            // /api/recordings call doesn't return a phantom
+                            // entry for a just-wiped file. Mirrors the
+                            // single-file deleteRecording path.
+                            if (name.endsWith(".mp4")) {
+                                try {
+                                    com.overdrive.app.server.RecordingsIndex
+                                            .getInstance().remove(name);
+                                } catch (Throwable ignored) {
+                                    // Index not initialised in this
+                                    // process; reconcile() will catch up.
+                                }
+                            }
+                        }
+                    }
                 }
             }
 

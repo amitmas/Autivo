@@ -556,17 +556,14 @@ class MainActivity : AppCompatActivity() {
      * Schedule periodic update checks (every 6 hours).
      */
     private fun schedulePeriodicUpdateCheck() {
-        val sixHoursMs = 6 * 60 * 60 * 1000L
-        // Cancel any prior runnable (e.g. across activity recreate).
+        // AUTO-UPDATE DISABLED — the periodic 6h check called checkForAppUpdate()
+        // which can downloadAndInstall a newer release and silently overwrite a
+        // locally-patched build. Turned off so the device stays on the build you
+        // flashed. Manual updates still work (Settings → About → Check for
+        // updates / invokeCheckForUpdates()). To restore auto-update, revert
+        // this method to the periodic postDelayed scheduling.
         updateCheckRunnable?.let { mainHandler.removeCallbacks(it) }
-        val runnable = object : Runnable {
-            override fun run() {
-                checkForAppUpdate()
-                mainHandler.postDelayed(this, sixHoursMs)
-            }
-        }
-        updateCheckRunnable = runnable
-        mainHandler.postDelayed(runnable, sixHoursMs)
+        updateCheckRunnable = null
     }
 
     private fun performAppUpdate(updater: com.overdrive.app.updater.AppUpdater) {
@@ -1164,7 +1161,17 @@ class MainActivity : AppCompatActivity() {
         val cameraMode: String,
         // GL fragment-shader red-pixel suppression for the HAL "calibration
         // failed" overlay. Cosmetic mitigation only.
-        val dilink4RedMask: Boolean
+        val dilink4RedMask: Boolean,
+        // Resolved pano camera id (from /api/surveillance/config). Drives the
+        // "Auto — currently using id N (pano is id M)" sub-label on the OEM
+        // Dashcam card; -1 when probing or unconfigured.
+        val panoCameraId: Int,
+        // OEM Dashcam camera id (camera.oemDashcamCameraId). -1 when unset
+        // (Auto). Used as initial radio selection when manualOverride is true.
+        val oemDashcamCameraId: Int,
+        // Whether the user has manually overridden the OEM dashcam id
+        // (camera.oemDashcamManualOverride). false = Auto = infer pano^1.
+        val oemDashcamManualOverride: Boolean
     )
 
     /**
@@ -1267,6 +1274,18 @@ class MainActivity : AppCompatActivity() {
                 .lowercase(java.util.Locale.US)
                 .let { if (it == "dilink4") "dilink4" else "default" }
 
+            // OEM Dashcam state lives in the same camera.* UCM section but is
+            // not (yet) merged into /api/surveillance/config. Read it directly
+            // from UnifiedConfigManager — the daemon writes these from shell
+            // UID, so app-side reads need a forceReload to dodge the stale
+            // per-UID cache (see feedback_unified_config_force_reload.md).
+            com.overdrive.app.config.UnifiedConfigManager.forceReload()
+            val cameraSection = com.overdrive.app.config.UnifiedConfigManager
+                .loadConfig().optJSONObject("camera") ?: org.json.JSONObject()
+            val oemDashcamCameraId = cameraSection.optInt("oemDashcamCameraId", -1)
+            val oemDashcamManualOverride = cameraSection.optBoolean(
+                "oemDashcamManualOverride", false)
+
             CameraMappingState(
                 summary = summary,
                 roles = roles,
@@ -1275,7 +1294,10 @@ class MainActivity : AppCompatActivity() {
                 manualCameraId = manualCameraId,
                 isManualOverride = manualOverride,
                 cameraMode = cameraMode,
-                dilink4RedMask = config.optBoolean("dilink4RedMask", false)
+                dilink4RedMask = config.optBoolean("dilink4RedMask", false),
+                panoCameraId = panoCameraId,
+                oemDashcamCameraId = oemDashcamCameraId,
+                oemDashcamManualOverride = oemDashcamManualOverride
             )
         } catch (e: Exception) {
             logsViewModel.error("Camera", "Failed to load camera mapping state: ${e.message}")
@@ -1305,6 +1327,9 @@ class MainActivity : AppCompatActivity() {
         val saveCameraModeButton = dialogView.findViewById<View>(R.id.btnSaveCameraMode)
         val saveDilink4TweaksButton = dialogView.findViewById<View>(R.id.btnSaveCameraDilink4Tweaks)
         val dilink4RedMaskSwitch = dialogView.findViewById<com.google.android.material.materialswitch.MaterialSwitch>(R.id.swCameraDilink4RedMask)
+        val oemDashcamGroup = dialogView.findViewById<android.widget.RadioGroup>(R.id.rgOemDashcamId)
+        val currentOemDashcamView = dialogView.findViewById<TextView>(R.id.tvCurrentOemDashcam)
+        val saveOemDashcamButton = dialogView.findViewById<View>(R.id.btnSaveOemDashcamId)
         summaryView.text = state.summary
 
         val roleAdapter = android.widget.ArrayAdapter(
@@ -1755,6 +1780,160 @@ class MainActivity : AppCompatActivity() {
                     ).show()
                 }
             }
+        }
+
+        // OEM Dashcam camera ID picker. Mirrors the manual-camera-ID card
+        // above but writes to camera.oemDashcamCameraId / oemDashcamManual
+        // Override directly via UnifiedConfigManager.updateSection (same
+        // direct-write shape MainActivity.performCameraReconfigure uses) —
+        // the OEM dashcam fields aren't merged into /api/surveillance/config
+        // yet, so going through the daemon HTTP path would silently drop
+        // them. Auto means: let resolveOemDashcamId() infer pano^1 at
+        // pipeline init.
+        //
+        // After save we invalidate ConcurrentAvmProbe so the next daemon
+        // boot re-probes — the previous probe result was keyed against the
+        // old (pano,dashcam) pair and could be stale once the user picks a
+        // different dashcam id.
+        fun radioIdForOemDashcamId(id: Int): Int = when (id) {
+            0 -> R.id.rbOemDashcam0
+            1 -> R.id.rbOemDashcam1
+            2 -> R.id.rbOemDashcam2
+            3 -> R.id.rbOemDashcam3
+            4 -> R.id.rbOemDashcam4
+            5 -> R.id.rbOemDashcam5
+            else -> R.id.rbOemDashcamAuto
+        }
+        val initialOemDashcamRadioId = if (state.oemDashcamManualOverride) {
+            radioIdForOemDashcamId(state.oemDashcamCameraId)
+        } else {
+            R.id.rbOemDashcamAuto
+        }
+        oemDashcamGroup.check(initialOemDashcamRadioId)
+
+        fun refreshOemDashcamSubLabel(
+            isManual: Boolean,
+            dashcamId: Int,
+            panoId: Int
+        ) {
+            currentOemDashcamView.text = when {
+                isManual && dashcamId in 0..5 ->
+                    getString(R.string.camera_mapping_current_format, "Camera $dashcamId")
+                isManual ->
+                    getString(R.string.camera_current_auto)
+                else -> {
+                    val resolved = com.overdrive.app.config.UnifiedConfigManager
+                        .resolveOemDashcamId()
+                    if (resolved >= 0) {
+                        getString(
+                            R.string.camera_oem_dashcam_auto_resolved,
+                            resolved, panoId
+                        )
+                    } else {
+                        getString(
+                            R.string.camera_oem_dashcam_auto_unavailable,
+                            panoId
+                        )
+                    }
+                }
+            }
+        }
+        refreshOemDashcamSubLabel(
+            state.oemDashcamManualOverride,
+            state.oemDashcamCameraId,
+            state.panoCameraId
+        )
+
+        saveOemDashcamButton.setOnClickListener {
+            val selectedId = when (oemDashcamGroup.checkedRadioButtonId) {
+                R.id.rbOemDashcam0 -> 0
+                R.id.rbOemDashcam1 -> 1
+                R.id.rbOemDashcam2 -> 2
+                R.id.rbOemDashcam3 -> 3
+                R.id.rbOemDashcam4 -> 4
+                R.id.rbOemDashcam5 -> 5
+                else -> -1
+            }
+            val manualOverride = selectedId >= 0
+            val patch = org.json.JSONObject().apply {
+                put("oemDashcamManualOverride", manualOverride)
+                put("oemDashcamCameraId", if (manualOverride) selectedId else -1)
+            }
+            saveOemDashcamButton.isEnabled = false
+            // Background thread for the UCM write — updateSection rewrites
+            // the whole JSON file and is not safe on the UI looper (per
+            // feedback_no_unified_writes_on_ui_thread.md). Mirrors the
+            // performCameraReconfigure pattern.
+            Thread {
+                val ok = try {
+                    com.overdrive.app.config.UnifiedConfigManager
+                        .updateSection("camera", patch)
+                } catch (e: Exception) {
+                    logsViewModel.error(
+                        "Camera",
+                        "Failed to save OEM dashcam id: ${e.message}"
+                    )
+                    false
+                }
+                // Invalidate the concurrent-AVM probe so the next daemon
+                // boot re-probes against the new (pano, dashcam) pair.
+                if (ok) {
+                    try {
+                        com.overdrive.app.camera.ConcurrentAvmProbe.invalidate()
+                    } catch (e: Exception) {
+                        logsViewModel.warn(
+                            "Camera",
+                            "ConcurrentAvmProbe.invalidate failed: ${e.message}"
+                        )
+                    }
+                    // If OEM dashcam is currently running, the new id is in
+                    // UCM but the live pipeline captured the OLD id at
+                    // start(). Without an explicit restart the user's new
+                    // pick is silent until the next toggle off+on. Hit the
+                    // /api/oem-dashcam/config endpoint with restart:true so
+                    // the daemon does the stop+start cycle on its worker.
+                    try {
+                        val daemon = java.net.URL("http://127.0.0.1:8080/api/oem-dashcam/config")
+                            .openConnection() as java.net.HttpURLConnection
+                        daemon.requestMethod = "POST"
+                        daemon.doOutput = true
+                        daemon.connectTimeout = 2000
+                        daemon.readTimeout = 2000
+                        daemon.setRequestProperty("Content-Type", "application/json")
+                        daemon.outputStream.use { it.write("{\"restart\":true}".toByteArray()) }
+                        daemon.responseCode  // force send
+                        daemon.disconnect()
+                    } catch (e: Exception) {
+                        // Daemon may not be running, or the endpoint is
+                        // unreachable on this build — non-fatal. The user
+                        // can toggle off+on as a fallback.
+                        logsViewModel.warn("Camera",
+                            "OEM dashcam restart request failed: ${e.message}")
+                    }
+                }
+                runOnUiThread {
+                    if (isFinishing || isDestroyed) return@runOnUiThread
+                    saveOemDashcamButton.isEnabled = true
+                    if (ok) {
+                        refreshOemDashcamSubLabel(
+                            manualOverride,
+                            if (manualOverride) selectedId else -1,
+                            state.panoCameraId
+                        )
+                        Toast.makeText(
+                            this,
+                            getString(R.string.camera_mapping_saved),
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    } else {
+                        Toast.makeText(
+                            this,
+                            getString(R.string.toast_failed_to_save_short),
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
+                }
+            }.start()
         }
 
         updateCurrentMappingText()

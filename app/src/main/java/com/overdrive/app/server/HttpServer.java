@@ -698,6 +698,14 @@ public class HttpServer {
         if (path.startsWith("/api/vehicle")) {
             return VehicleControlApiHandler.handle(method, path, body, out);
         }
+
+        // Autoservice AIDL debug sweep — read-only reach probes for the BYD
+        // autoservice surface. Lets the operator hand-pick an `area`/`cmd`
+        // pair and observe what the bridge reads, since `service call` from
+        // a shell can't write the interface token and always returns INVALID.
+        if (path.startsWith("/api/debug/autoservice")) {
+            return AutoServiceDebugApiHandler.handle(method, path, body, out);
+        }
         
         // Performance API
         if (path.startsWith("/api/performance")) {
@@ -722,6 +730,14 @@ public class HttpServer {
         // Notification API — web push notifications
         if (path.startsWith("/api/notifications") || path.startsWith("/api/push")) {
             return NotificationApiHandler.handle(method, path, body, out);
+        }
+
+        // OEM Dashcam settings — currently the "Disable Native DVR" toggle
+        // for com.byd.cdr (factory dashcam). Lives on its own prefix instead
+        // of /api/settings/ because the handler shells out to `pm` rather
+        // than only mutating UCM. See OemDashcamApiHandler.
+        if (path.startsWith("/api/oem-dashcam/")) {
+            return OemDashcamApiHandler.handle(method, path, body, out);
         }
 
         return false;
@@ -922,10 +938,23 @@ public class HttpServer {
                 recordingStatus.put("pipelineRunning", pipeline != null && pipeline.isRunning());
                 recordingStatus.put("gear", com.overdrive.app.recording.RecordingModeManager.gearToString(rmm.getCurrentGear()));
                 recordingStatus.put("accOn", rmm.isAccOn());
+                // modeActive distinguishes "user picked CONTINUOUS, recording
+                // IS happening" from "user picked CONTINUOUS but activation
+                // failed silently and is waiting on the 30s resync retry."
+                // Without this, the UI can't tell a stuck activation from a
+                // normal cold-start delay.
+                recordingStatus.put("modeActive", rmm.isModeActive());
+                // Diagnostic: number of consecutive GearMonitor.start() failures
+                // from the resync ticker. 0 = healthy; positive = HAL flaky.
+                int gmRetries = rmm.getGearMonitorRetryFailures();
+                if (gmRetries > 0) {
+                    recordingStatus.put("gearMonitorRetryFailures", gmRetries);
+                }
             } else {
                 recordingStatus.put("configuredMode", "UNKNOWN");
                 recordingStatus.put("isRecording", false);
                 recordingStatus.put("pipelineRunning", false);
+                recordingStatus.put("modeActive", false);
             }
             status.put("recordingStatus", recordingStatus);
         } catch (Exception e) {
@@ -1210,8 +1239,18 @@ public class HttpServer {
             GpuPipelineConfig.StreamingQuality q = GpuPipelineConfig.StreamingQuality.fromString(
                 StreamingApiHandler.getStreamingQuality());
             
-            int savedViewMode = pipeline.getStreamViewMode();
-            if (savedViewMode < 0) savedViewMode = 0;
+            // Prefer the daemon-static "last desired view mode" set by
+            // StreamingApiHandler whenever the user picks a view. The
+            // scaler's own getStreamViewMode() returns -1 after a prior
+            // disableStreaming nulled the scaler — which is exactly the
+            // mobile-browser idle-shutdown reconnect window we need to
+            // recover from. Falling back to scaler-state alone would lose
+            // the user's pick on every reconnect after the WS idle timer.
+            int savedViewMode = StreamingApiHandler.getLastDesiredViewMode();
+            if (savedViewMode < 0) {
+                int scalerView = pipeline.getStreamViewMode();
+                savedViewMode = scalerView >= 0 ? scalerView : 0;
+            }
             
             // SOTA: Reuse existing encoder if streaming is already enabled at same quality.
             // Only restart if not enabled or quality changed.
@@ -1248,6 +1287,33 @@ public class HttpServer {
             if (savedViewMode > 0) {
                 pipeline.setStreamViewMode(savedViewMode);
                 CameraDaemon.log("WS: View mode " + savedViewMode);
+            }
+
+            // View 6 = OEM Dashcam. The HTTP /api/stream/view/6 path attaches
+            // the OEM encoder as the WS stream source via
+            // attachExternalStreamCallback. But after an idle-shutdown +
+            // reconnect (mobile browser is most common: backgrounding the
+            // tab kills the WS, idle timer disables streaming, scaler is
+            // freshly built on this WS open), the new scaler has NO OEM
+            // binding even though setStreamViewMode(6) above set the
+            // shader's uViewMode to 6. The shader then falls through to
+            // the legacy 4-pano mosaic branch (uViewMode==6 && uOemActive==0
+            // doesn't match the OEM-sample early-return; uApaMode>1.5
+            // catches it via the else-if chain). Symptom: mobile browser
+            // opens DVR view → sees 4-pano mosaic instead of OEM dashcam.
+            // Re-route here so the WS source switches back to the OEM
+            // encoder if the user's saved view is 6.
+            if (savedViewMode == 6) {
+                boolean rerouted = CameraDaemon.routeStreamToOemDashcam();
+                CameraDaemon.log("WS: View 6 OEM re-route " + (rerouted ? "ok" : "skipped (OEM not ready)"));
+                // OEM not ready (cold-boot first-WS-open race) — kick the
+                // lifecycle so it warms up; the next WS reconnect /
+                // /api/stream/view/6 poll will catch the route.
+                if (!rerouted) {
+                    try {
+                        com.overdrive.app.server.OemDashcamApiHandler.scheduleLifecycleRecalc();
+                    } catch (Throwable ignored) {}
+                }
             }
             
             HardwareEventRecorderGpu encoder = pipeline.getStreamEncoder();

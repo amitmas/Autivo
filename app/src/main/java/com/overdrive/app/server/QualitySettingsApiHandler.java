@@ -260,8 +260,15 @@ public class QualitySettingsApiHandler {
         response.put("recordingsCount", storage.getRecordingsCount());
         response.put("surveillanceCount", storage.getSurveillanceCount());
 
+        // Configured = what the user picked (persisted). Active = what we
+        // actually write to right now (INTERNAL when the configured external
+        // volume isn't currently mounted). UI picker should bind to the
+        // configured value; status chips / "currently writing to X" copy
+        // should bind to the Active variant.
         response.put("recordingsStorageType", storage.getRecordingsStorageType().name());
         response.put("surveillanceStorageType", storage.getSurveillanceStorageType().name());
+        response.put("recordingsStorageTypeActive", storage.getActiveRecordingsStorageType().name());
+        response.put("surveillanceStorageTypeActive", storage.getActiveSurveillanceStorageType().name());
 
         // SD card info
         response.put("sdCardAvailable", storage.isSdCardAvailable());
@@ -403,6 +410,8 @@ public class QualitySettingsApiHandler {
             response.put("surveillanceLimitMb", storage.getSurveillanceLimitMb());
             response.put("recordingsStorageType", storage.getRecordingsStorageType().name());
             response.put("surveillanceStorageType", storage.getSurveillanceStorageType().name());
+            response.put("recordingsStorageTypeActive", storage.getActiveRecordingsStorageType().name());
+            response.put("surveillanceStorageTypeActive", storage.getActiveSurveillanceStorageType().name());
             response.put("recordingsPath", storage.getRecordingsPath());
             response.put("surveillancePath", storage.getSurveillancePath());
             
@@ -423,6 +432,28 @@ public class QualitySettingsApiHandler {
                 response.put("message", Messages.get("messages.quality_storage_location_changed"));
             } else {
                 response.put("message", Messages.get("messages.quality_storage_settings_updated"));
+            }
+
+            // Re-arm RecordingsIndex FileObservers against the new active dir
+            // set, AND walk the new active dir to populate the index. The
+            // refresh-only call would only catch live writes going forward —
+            // existing files on the new volume would be invisible to the
+            // index until the 1-hour periodic reconcile. Reconcile here fills
+            // them immediately. Run on a background thread so the HTTP
+            // response doesn't block on the FUSE walk.
+            if (storageTypeChanged) {
+                try {
+                    com.overdrive.app.daemon.RecordingsIndexFileWatcher.getInstance().refresh();
+                } catch (Throwable t) {
+                    CameraDaemon.log("RecordingsIndexFileWatcher refresh failed: " + t.getMessage());
+                }
+                new Thread(() -> {
+                    try {
+                        com.overdrive.app.server.RecordingsIndex.getInstance().reconcile();
+                    } catch (Throwable t) {
+                        CameraDaemon.log("Post-storage-switch reconcile failed: " + t.getMessage());
+                    }
+                }, "RecordingsIndexStorageSwitchReconcile").start();
             }
             
             HttpResponse.sendJson(out, response.toString());
@@ -727,6 +758,64 @@ public class QualitySettingsApiHandler {
         }
         activeEstimate.put("qualityEquivalent", activeTier.getQualityEquivalent(codecForEstimate, currentFps));
         response.put("activeRecordingEstimate", activeEstimate);
+
+        // OEM Dashcam concurrency surface — gives the UI everything it needs
+        // to render the simultaneous-recording capability badge + bitrate
+        // budget slider:
+        //
+        //   oemDashcamCameraId       resolved AVMCamera id (-1 = unconfigured)
+        //   concurrentAvmSupported   -1 unprobed / 0 single-client / 1 dual
+        //   bitrateBudget            current combined cap (bps)
+        //   panoBitrateBps           pano's resolved bitrate at active tier+codec
+        //   oemHeadroomBps           remaining for OEM after pano (≥2M floor)
+        try {
+            JSONObject oem = new JSONObject();
+            int oemId = com.overdrive.app.config.UnifiedConfigManager.resolveOemDashcamId();
+            JSONObject cam = com.overdrive.app.config.UnifiedConfigManager
+                .loadConfig().optJSONObject("camera");
+            int concurrent = cam == null ? -1 : cam.optInt("concurrentAvmSupported", -1);
+            int budget = com.overdrive.app.config.UnifiedConfigManager
+                .getOemDashcam().optInt("bitrateBudget", 10_000_000);
+            int panoBps = activeTier.getBitrateForCodec(codecForEstimate);
+            int headroom = Math.max(2_000_000, budget - panoBps);
+            oem.put("oemDashcamCameraId", oemId);
+            oem.put("concurrentAvmSupported", concurrent);
+            oem.put("bitrateBudget", budget);
+            oem.put("panoBitrateBps", panoBps);
+            oem.put("oemHeadroomBps", headroom);
+            // Echo the OEM-specific quality slot so a future OEM picker can
+            // round-trip its own state (Round-3 audit: GET was missing these).
+            // Falls back to legacy recording.* keys if the OEM slot is empty
+            // — same precedence as OemDashcamPipeline.applyRecordingConfigFromUcm.
+            JSONObject oemCfg = com.overdrive.app.config.UnifiedConfigManager.getOemDashcam();
+            JSONObject recCfg = com.overdrive.app.config.UnifiedConfigManager.getRecording();
+            oem.put("recordingQuality", oemCfg.has("recordingQuality")
+                ? oemCfg.optString("recordingQuality", "STANDARD")
+                : recCfg.optString("recordingQuality", "STANDARD"));
+            oem.put("codec", oemCfg.has("codec")
+                ? oemCfg.optString("codec", "H264")
+                : recCfg.optString("codec", "H264"));
+            oem.put("fps", oemCfg.has("fps")
+                ? oemCfg.optInt("fps", 30)
+                : recCfg.optInt("fps", 30));
+            // Surface whether the OEM slot DIVERGES from pano. The R2 mirror
+            // writes populate oemDashcam.* on every pano POST, so a bare
+            // `oemCfg.has("recordingQuality")` returns true after the user's
+            // first quality save even when OEM matches pano — the UI would
+            // show a "Custom" badge for an install that's actually
+            // pano-linked. Compare values to render the badge correctly.
+            String oemQ = oemCfg.optString("recordingQuality", "");
+            String panoQ = recCfg.optString("recordingQuality", "");
+            String oemC = oemCfg.optString("codec", "");
+            String panoC = recCfg.optString("codec", "");
+            int oemF = oemCfg.optInt("fps", -1);
+            int panoF = recCfg.optInt("fps", -1);
+            boolean diverged = (oemCfg.has("recordingQuality") && !oemQ.equalsIgnoreCase(panoQ))
+                || (oemCfg.has("codec") && !oemC.equalsIgnoreCase(panoC))
+                || (oemCfg.has("fps") && oemF != panoF);
+            oem.put("hasOwnQuality", diverged);
+            response.put("oemDashcam", oem);
+        } catch (Exception ignored) {}
         
         // Add codec info for UI
         JSONObject codecInfo = new JSONObject();
@@ -825,6 +914,104 @@ public class QualitySettingsApiHandler {
                         .put("reason", "out of range [10..30]"));
                 } else {
                     pendingFps = fps;
+                }
+            }
+
+            // Mirror recording quality / codec / fps into the OEM Dashcam
+            // section. Without this, the new oem.recordingQuality slot is
+            // never written by the existing recording.html UI and OEM falls
+            // back to legacy `recording.*` keys via applyRecordingConfigFromUcm
+            // — which defeats the budget-cap fix that depends on the two
+            // pipelines having independent quality values.
+            //
+            // OEM-specific overrides (when web UI lands a dedicated picker)
+            // can use settings.oemDashcam.* keys; for now we just mirror the
+            // pano picks.
+            JSONObject oemDelta = new JSONObject();
+            if (pendingQuality != null) oemDelta.put("recordingQuality", pendingQuality);
+            if (pendingCodec != null)   oemDelta.put("codec", pendingCodec);
+            if (pendingFps != null)     oemDelta.put("fps", pendingFps);
+            // Also accept explicit oemDashcam.* overrides from a future UI.
+            JSONObject oemBlock = settings.optJSONObject("oemDashcam");
+            if (oemBlock != null) {
+                if (oemBlock.has("recordingQuality")) {
+                    String t = oemBlock.optString("recordingQuality", "").toUpperCase();
+                    if (t.equals("ECONOMY") || t.equals("STANDARD")
+                            || t.equals("HIGH") || t.equals("PREMIUM") || t.equals("MAX")) {
+                        oemDelta.put("recordingQuality", t);
+                    }
+                }
+                if (oemBlock.has("codec")) {
+                    String c = oemBlock.optString("codec", "").toUpperCase();
+                    if (c.equals("H264") || c.equals("H265")) oemDelta.put("codec", c);
+                }
+                if (oemBlock.has("fps")) {
+                    int f = oemBlock.optInt("fps", -1);
+                    if (f >= 10 && f <= 30) oemDelta.put("fps", f);
+                }
+            }
+            if (oemDelta.length() > 0) {
+                com.overdrive.app.config.UnifiedConfigManager.setOemDashcam(oemDelta);
+                // R8-A #16: forceReload so the upcoming OEM restart on
+                // a different thread sees the new mtime-cached values.
+                // Without this, the restart's applyRecordingConfigFromUcm
+                // can race the mtime invalidation and read stale codec /
+                // bitrate / fps. Cheap explicit signal.
+                com.overdrive.app.config.UnifiedConfigManager.forceReload();
+                CameraDaemon.log("OEM dashcam recording config mirrored: " + oemDelta.toString());
+                // If the OEM pipeline is currently running, the mirrored
+                // values only take effect at the next start — without an
+                // explicit restart, UCM and pipeline state diverge until the
+                // user toggles OEM off+on. Stop+start asynchronously to
+                // pick up the new bitrate / codec / fps without making the
+                // HTTP worker block on encoder teardown.
+                com.overdrive.app.camera.OemDashcamPipeline live =
+                    CameraDaemon.getOemDashcamPipeline();
+                if (live != null && live.isRunning()) {
+                    // Route through LIFECYCLE_EXEC so the restart serializes against picker
+                    // applies. Use applyTriggerLifecycleFromUcm instead of applyLifecycle(true)
+                    // so the desired-state computation reads the user's current
+                    // oemRecordingMode + oemSurveillanceMode rather than hardcoding
+                    // recordingDesired=true. Without this, a user with rec=off + surv=smart
+                    // would silently start recording a dvr_*.mp4 every time they change
+                    // quality/codec/fps. Mirrors the OemDashcamApiHandler.handlePost
+                    // restart:true path (OemDashcamApiHandler.java around line 618-625).
+                    com.overdrive.app.server.OemDashcamApiHandler.LIFECYCLE_EXEC.execute(() -> {
+                        try {
+                            com.overdrive.app.server.OemDashcamApiHandler.applyLifecycle(false);
+                            com.overdrive.app.server.OemDashcamApiHandler.applyTriggerLifecycleFromUcm();
+                        } catch (Exception e) {
+                            // Best-effort — quality apply itself already succeeded; restart
+                            // failure leaves the user with their old encoder settings until
+                            // the next mode change or ACC cycle.
+                            android.util.Log.w("QualitySettings",
+                                "OEM dashcam quality-mirror restart failed: " + e.getMessage());
+                        }
+                    });
+                }
+            }
+
+            // OEM Dashcam bitrate budget — soft cap on combined pano+OEM
+            // encoder bitrate when both pipelines run. The cap is advisory
+            // here (we just persist); the OEM pipeline reads the budget at
+            // start time and clamps its own requested bitrate against
+            // (budget - panoTier) with a 2 Mbps floor. Range 4..15 Mbps —
+            // below 4 the system has no headroom for both encoders, above
+            // 15 the Adreno 610 H.264 path fails under sustained load.
+            if (settings.has("oemDashcamBitrateBudget")) {
+                int budget = settings.optInt("oemDashcamBitrateBudget", 10_000_000);
+                if (budget < 4_000_000 || budget > 15_000_000) {
+                    CameraDaemon.log("Rejecting oemDashcamBitrateBudget=" + budget
+                        + " — out of [4..15] Mbps");
+                    rejected.put(new JSONObject()
+                        .put("field", "oemDashcamBitrateBudget")
+                        .put("value", budget)
+                        .put("reason", "out of [4..15] Mbps"));
+                } else {
+                    JSONObject delta = new JSONObject();
+                    delta.put("bitrateBudget", budget);
+                    com.overdrive.app.config.UnifiedConfigManager.setOemDashcam(delta);
+                    CameraDaemon.log("OEM Dashcam bitrate budget set to: " + budget);
                 }
             }
 
@@ -1141,12 +1328,29 @@ public class QualitySettingsApiHandler {
 
     /**
      * Send telemetry overlay settings.
+     *
+     * <p>Returns the full per-flow shape:
+     * <pre>
+     * {
+     *   enabled:           bool,    // legacy, pano fallback
+     *   panoEnabled:       bool,    // resolved pano gate (legacy if absent)
+     *   oemDashcamEnabled: bool     // OEM Dashcam gate (default false)
+     * }
+     * </pre>
+     * Older clients that only read {@code enabled} continue to work because
+     * the legacy field is the pano fallback. Newer clients can render two
+     * separate switches (one per pipeline).
      */
     private static void sendTelemetryOverlaySettings(OutputStream out) throws Exception {
-        JSONObject overlayConfig = com.overdrive.app.config.UnifiedConfigManager.getTelemetryOverlay();
+        boolean panoEffective = com.overdrive.app.config.UnifiedConfigManager
+            .isTelemetryOverlayEnabledFor("pano");
+        boolean oemEffective = com.overdrive.app.config.UnifiedConfigManager
+            .isTelemetryOverlayEnabledFor("oemDashcam");
         JSONObject response = new JSONObject();
         response.put("success", true);
-        response.put("enabled", overlayConfig.optBoolean("enabled", false));
+        response.put("enabled", panoEffective);              // legacy alias = pano
+        response.put("panoEnabled", panoEffective);
+        response.put("oemDashcamEnabled", oemEffective);
         HttpResponse.sendJson(out, response.toString());
     }
 
@@ -1295,26 +1499,61 @@ public class QualitySettingsApiHandler {
     }
 
     /**
-     * Handle telemetry overlay settings POST.
+     * Handle telemetry overlay settings POST. Accepts a per-flow body:
+     * <pre>{ enabled?: bool, panoEnabled?: bool, oemDashcamEnabled?: bool }</pre>
+     * All three are optional; only present keys are written. {@code enabled}
+     * is treated as the legacy pano alias and writes the legacy key + the
+     * canonical {@code panoEnabled} so a downgrade-then-upgrade resolves
+     * consistently.
      */
     private static void handleTelemetryOverlayPost(OutputStream out, String body) throws Exception {
         try {
-            JSONObject settings = new JSONObject(body);
-            boolean enabled = settings.optBoolean("enabled", false);
+            JSONObject settings = new JSONObject(body == null ? "{}" : body);
 
-            JSONObject overlayConfig = new JSONObject();
-            overlayConfig.put("enabled", enabled);
-            com.overdrive.app.config.UnifiedConfigManager.setTelemetryOverlay(overlayConfig);
+            JSONObject delta = new JSONObject();
+            // Legacy alias — write both legacy + panoEnabled so a future
+            // read with the new resolver picks up the user's intent.
+            if (settings.has("enabled")) {
+                boolean v = settings.optBoolean("enabled", false);
+                delta.put("enabled", v);
+                if (!settings.has("panoEnabled")) delta.put("panoEnabled", v);
+            }
+            if (settings.has("panoEnabled")) {
+                delta.put("panoEnabled", settings.optBoolean("panoEnabled", false));
+            }
+            if (settings.has("oemDashcamEnabled")) {
+                delta.put("oemDashcamEnabled", settings.optBoolean("oemDashcamEnabled", false));
+            }
+            if (delta.length() > 0) {
+                com.overdrive.app.config.UnifiedConfigManager.setTelemetryOverlay(delta);
+            }
 
-            // Notify pipeline
+            // Notify pano pipeline of the resolved pano state.
+            boolean panoEffective = com.overdrive.app.config.UnifiedConfigManager
+                .isTelemetryOverlayEnabledFor("pano");
             com.overdrive.app.surveillance.GpuSurveillancePipeline pipeline = CameraDaemon.getGpuPipeline();
             if (pipeline != null) {
-                pipeline.setOverlayEnabled(enabled);
+                pipeline.setOverlayEnabled(panoEffective);
+            }
+
+            // Notify OEM Dashcam pipeline of its resolved state. The pipeline
+            // holds the bit via setOverlayEnabled; its own GL draw pass
+            // composites the OverlayBitmapRenderer output onto the encoder
+            // surface during drawPassthrough (gated on overlayEnabled &&
+            // recording so the overlay only burns into actively-recording
+            // dvr_*.mp4 clips, not stream-only output).
+            boolean oemEffective = com.overdrive.app.config.UnifiedConfigManager
+                .isTelemetryOverlayEnabledFor("oemDashcam");
+            com.overdrive.app.camera.OemDashcamPipeline oem = CameraDaemon.getOemDashcamPipeline();
+            if (oem != null) {
+                oem.setOverlayEnabled(oemEffective);
             }
 
             JSONObject response = new JSONObject();
             response.put("success", true);
-            response.put("enabled", enabled);
+            response.put("enabled", panoEffective);              // legacy alias
+            response.put("panoEnabled", panoEffective);
+            response.put("oemDashcamEnabled", oemEffective);
             HttpResponse.sendJson(out, response.toString());
         } catch (Exception e) {
             CameraDaemon.log("Error setting telemetry overlay: " + e.getMessage());

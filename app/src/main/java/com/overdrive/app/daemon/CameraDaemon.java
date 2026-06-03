@@ -92,12 +92,45 @@ public class CameraDaemon {
     private static AccMonitor accMonitor;
     
     // ==================== SURVEILLANCE ====================
-    private static com.overdrive.app.surveillance.GpuSurveillancePipeline gpuPipeline;
-    private static boolean surveillanceEnabled = false;
+    // Volatile because static onAccStateChanged / onGearChanged / IPC
+    // handlers + pendingAccOff drain read this from arbitrary threads
+    // (GearMonitor poll, AccSentry IPC, HTTP, ADAS callbacks). Publication
+    // via Thread.start() happens-before is fragile against future refactors
+    // that read the field before the constructing thread starts a worker;
+    // volatile gives a hard guarantee on ARM weak-memory cores.
+    private static volatile com.overdrive.app.surveillance.GpuSurveillancePipeline gpuPipeline;
+    // Volatile: written from ACC handlers (multiple threads), read by HTTP
+    // handlers, accOnDisarmWatchdog poll thread, lock-gate watchdog, and
+    // status JSON readers. Without volatile, the ARM weak-memory model lets
+    // a writer's update sit unseen by peer threads for milliseconds —
+    // acceptable for cosmetic chip flicker but risky for the watchdog's
+    // force-disarm decision.
+    private static volatile boolean surveillanceEnabled = false;
+    // OEM Dashcam pipeline — separate forward sensor, distinct from pano AVM.
+    // Lazily allocated when the user enables OEM Dashcam recording or the
+    // streaming view mode 5 is requested. Both pipelines may run
+    // concurrently when camera.concurrentAvmSupported == 1; otherwise they
+    // share the single AVMCamera client via the priorityWhenContended UCM
+    // policy.
+    //
+    // VOLATILE: writers go through OemDashcamApiHandler.LIFECYCLE_LOCK, but
+    // readers (surveillance event handler, ACC dispatch, stream router,
+    // /api/oem-dashcam/config GET) deliberately don't hold the lock — the
+    // volatile barrier is what makes a freshly-published reference visible
+    // across CPU cores without a lock acquisition on every read.
+    private static volatile com.overdrive.app.camera.OemDashcamPipeline oemDashcamPipeline;
     private static volatile boolean safeZoneSuppressed = false;
     // Pending ACC OFF state: if ACC goes off before GPU pipeline is ready,
     // queue the request and apply it once the pipeline initializes
     private static volatile boolean pendingAccOff = false;
+
+    // DiLink 4 post-ACC-OFF camera-open grace duration. esco hardcodes 60 s
+    // (FlameoutService p111dh/C4995i.java:407 m22726w(60_000L)). Earlier
+    // AVMCamera.open races the MCU/ISP power-down and yields all-zero
+    // frames forever. The actual gate lives in PanoramicCameraGpu and
+    // covers ALL open paths (sentry, streaming, OEM, recording-mode).
+    // Legacy fleet never arms it.
+    private static final long DILINK4_SENTRY_DEFER_MS = 60_000L;
     
     // ==================== DOOR LOCK GATE (surveillance arm/disarm) ====================
     // Lock detection runs in CameraDaemon's process where cloud MQTT is active.
@@ -109,7 +142,6 @@ public class CameraDaemon {
     // even when MQTT is healthy), so device-SDK and polling exist as
     // independent backups rather than as a fallback chain.
     private static com.overdrive.app.byd.cloud.BydCloudDataProvider.CloudLockStateListener cloudLockListener = null;
-    private static com.overdrive.app.byd.BydDataCollector.DoorLockListener deviceLockSubscriber = null;
     private static Thread unlockPollThread = null;
     // Reverse watchdog: periodically queries hardware ACC state and force-
     // disables surveillance if ACC went ON without an event reaching us.
@@ -123,37 +155,57 @@ public class CameraDaemon {
     private static final int DOOR_STATE_LOCK = 2;
     
     // ==================== RECORDING MODE MANAGER ====================
-    private static com.overdrive.app.recording.RecordingModeManager recordingModeManager;
+    // Volatile: read by static onGearChanged/onAccStateChanged/onSafeZoneEnter
+    // from arbitrary threads. See gpuPipeline volatile rationale.
+    private static volatile com.overdrive.app.recording.RecordingModeManager recordingModeManager;
     
     // ==================== AVC HAL KEEP-ALIVE ====================
     // Keeps com.byd.avc alive while ACC is ON and pipeline is running.
     // Prevents BYD system from killing the camera app, which destabilizes
     // the HAL and causes "no video signal" on the native DVR.
-    private static com.overdrive.app.camera.AvcHalWarmup avcHalWarmup;
+    // Volatile + lazy-init guarded by AVC_WARMUP_INIT_LOCK. Without these,
+    // two worker threads (RMM activate paths, resync retry, IPC) can both
+    // observe `avcHalWarmup == null`, both `new AvcHalWarmup()`, both call
+    // startKeepAlive() — leaking a duplicate keep-alive thread that never
+    // gets stopped (the field holds only the second instance).
+    private static volatile com.overdrive.app.camera.AvcHalWarmup avcHalWarmup;
+    private static final Object AVC_WARMUP_INIT_LOCK = new Object();
     
     // ==================== STREAM MODE ====================
     public static final String STREAM_MODE_PRIVATE = "private";  // Local H.264 only
     public static final String STREAM_MODE_PUBLIC = "public";    // Tunnel access
-    private static String streamMode = STREAM_MODE_PRIVATE;
+    // Volatile: read/written from HTTP threads + boot init thread.
+    private static volatile String streamMode = STREAM_MODE_PRIVATE;
     
     // ==================== DEVICE ID ====================
-    private static String deviceId = "unknown";
+    // Volatile: written once at boot, read from many threads. Volatile
+    // documents the contract and protects future refactors that might read
+    // it before the writing thread starts a worker.
+    private static volatile String deviceId = "unknown";
     
     // ==================== ABRP TELEMETRY ====================
-    private static AbrpTelemetryService abrpTelemetryService;
-    private static com.overdrive.app.abrp.SohEstimator sohEstimator;
-    
+    // All four below are volatile for the same reason as gpuPipeline /
+    // recordingModeManager: cross-thread reads from IPC + HTTP + monitor
+    // poll threads, hard memory guarantee instead of relying on
+    // Thread.start() happens-before.
+    private static volatile AbrpTelemetryService abrpTelemetryService;
+    private static volatile com.overdrive.app.abrp.SohEstimator sohEstimator;
+
     // ==================== MQTT CONNECTIONS ====================
-    private static com.overdrive.app.mqtt.MqttConnectionManager mqttConnectionManager;
-    
+    private static volatile com.overdrive.app.mqtt.MqttConnectionManager mqttConnectionManager;
+
     // ==================== TRIP ANALYTICS ====================
-    private static com.overdrive.app.trips.TripAnalyticsManager tripAnalyticsManager;
-    
+    private static volatile com.overdrive.app.trips.TripAnalyticsManager tripAnalyticsManager;
+
     // ==================== TELEMETRY DATA COLLECTOR ====================
-    private static com.overdrive.app.telemetry.TelemetryDataCollector telemetryDataCollector;
+    private static volatile com.overdrive.app.telemetry.TelemetryDataCollector telemetryDataCollector;
     
     // ==================== SHARED APP CONTEXT ====================
-    private static android.content.Context sharedAppContext = null;
+    // Volatile: written at boot AND re-published on ACC ON via
+    // reinitContextDependentComponents (different thread). Without volatile,
+    // the re-publication has no happens-before guarantee for arbitrary
+    // readers (HTTP, monitors, IPC).
+    private static volatile android.content.Context sharedAppContext = null;
     
     /** Get the shared app context (for use by other components in this process). */
     public static android.content.Context getAppContext() { return sharedAppContext; }
@@ -247,6 +299,10 @@ public class CameraDaemon {
         }
     }
     
+    // Build stamp printed at startup so logs identify the running build.
+    // BUMP THIS on every code change you intend to deploy + verify.
+    private static final String BUILD_TAG = "20260603-coldstart-recfix-1";
+
     // Lock file for singleton enforcement
     private static final String LOCK_FILE = "/data/local/tmp/camera_daemon.lock";
     private static java.io.RandomAccessFile lockFile;
@@ -281,6 +337,11 @@ public class CameraDaemon {
         com.overdrive.app.storage.StorageManager.enableDaemonLogging();
 
         log("=== CAMERA DAEMON STARTING ===");
+        // Build stamp — bump BUILD_TAG on every change so the field log
+        // unambiguously identifies which build is actually running. (Deploys
+        // via `adb install -r` do NOT restart the in-memory daemon; this line
+        // makes it trivial to confirm a restart actually loaded new code.)
+        log("BUILD_TAG: " + BUILD_TAG);
         log("PID: " + android.os.Process.myPid() + ", UID: " + android.os.Process.myUid());
 
         // Grant all manifest permissions via shell (supplements PermissionBypassContext)
@@ -384,6 +445,36 @@ public class CameraDaemon {
 
         // SOTA: Initialize unified config manager (handles migration from legacy configs)
         com.overdrive.app.config.UnifiedConfigManager.init();
+
+        // OTA-survives stickiness for the "Disable Native DVR" toggle.
+        // If the user previously disabled com.byd.cdr but a factory reset /
+        // OTA / external `pm enable` resurrected it, re-apply pm disable-user
+        // here. Cheap (two `pm list packages` calls); no-op when the user
+        // never opted in or the package isn't on this trim. We're already
+        // running as UID shell so pm calls succeed directly.
+        com.overdrive.app.server.OemDashcamApiHandler.enforceStickyDisableIfRequested();
+        // OEM Dashcam pipeline: if the user had it enabled on a previous run,
+        // restart it now. Async — pipeline.start() blocks on AVC warmup +
+        // AVMCamera open and we don't want to delay daemon boot.
+        com.overdrive.app.server.OemDashcamApiHandler.enforceStickyEnableIfRequested();
+        // Concurrent-AVM probe: write camera.concurrentAvmSupported once
+        // when both pano and OEM ids are known. The probe opens both
+        // AVMCameras for ~2-5s to verify HAL allows simultaneous clients.
+        // Async on a background thread so daemon boot isn't blocked. The
+        // result feeds OemDashcamPipeline.applyBitrateBudgetCap so the
+        // OEM pipeline's bitrate is correctly capped when concurrent
+        // operation is supported. Without this call the probe is dead
+        // code and concurrentAvmSupported stays at -1 forever.
+        new Thread(() -> {
+            try {
+                Thread.sleep(15_000);   // wait for pano probe to settle
+                com.overdrive.app.camera.ConcurrentAvmProbe.runIfNeeded();
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            } catch (Throwable t) {
+                log("ConcurrentAvmProbe boot run failed: " + t.getMessage());
+            }
+        }, "ConcurrentAvmProbeBoot").start();
 
         // Load persisted quality settings BEFORE initializing surveillance
         // This ensures the encoder is created with the correct settings
@@ -509,34 +600,19 @@ public class CameraDaemon {
             log("GeoCache prewarm failed: " + t.getMessage());
         }
 
-        // Recordings parse-cache + inverted-index warmup. The very first
-        // /api/recordings call after a daemon restart pays a directory
-        // walk + sidecar parse for every recording (100-1000 typical).
-        // On the recorder thread that's invisible, but the HTTP worker
-        // thread that handles the user's first events.html load shows a
-        // 1-3 s spinner. Warming up here on a low-priority background
-        // thread shifts that cost off the user-visible path.
+        // Recordings index warmup. The very first /api/recordings call after
+        // a daemon restart used to pay a directory walk + sidecar parse for
+        // every recording (100-1000 typical) on the HTTP worker thread, so
+        // the first events.html load showed a 1-3 s spinner. The H2-backed
+        // RecordingsIndex now persists that work across daemon restarts;
+        // warmupAsync() is a no-op once warmupComplete is set, and the first
+        // run still happens off the user-visible path.
         //
-        // We dispatch on a daemon thread (NORM_PRIORITY - 2) so the
-        // initial scan competes with neither the recorder pipeline nor
-        // any HTTP worker. Failure is silent — warmup is a perf hint,
-        // not a correctness guarantee.
-        Thread warmupThread = new Thread(() -> {
-            try {
-                // Two-second nap so we don't fight the recorder pipeline
-                // setup / IPC / camera HAL warmup that the daemon does
-                // in parallel right after init.
-                Thread.sleep(2000);
-                com.overdrive.app.server.RecordingsApiHandler.warmupCache();
-            } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
-            } catch (Throwable t) {
-                log("Recordings cache warmup failed: " + t.getMessage());
-            }
-        }, "RecordingsCacheWarmup");
-        warmupThread.setDaemon(true);
-        warmupThread.setPriority(Thread.NORM_PRIORITY - 2);
-        warmupThread.start();
+        // Note: RecordingsIndex.init() + the FileObservers are wired in
+        // alongside TripAnalyticsManager init below — they need
+        // StorageManager/SohEstimator-adjacent state to be ready first.
+        // The legacy RecordingsApiHandler.warmupCache() in-memory cache is
+        // superseded by the index and will be removed in a follow-up.
 
         // Initialize SohEstimator (load persisted SOH — capacity detection deferred until collector is ready)
         try {
@@ -665,6 +741,39 @@ public class CameraDaemon {
             }
         } catch (Exception e) {
             log("Trip Analytics init error: " + e.getMessage());
+        }
+
+        // Initialize RecordingsIndex (H2-backed) — supersedes the legacy
+        // in-memory RECORDING_CACHE in RecordingsApiHandler. init() opens
+        // the H2 file at /data/local/tmp/overdrive_recordings_h2 (daemon
+        // UID 2000 owns it; cross-UID reads happen via /api/recordings,
+        // not direct JDBC). warmupAsync() walks every dir on a background
+        // thread so the first user-visible /api/recordings call doesn't
+        // block. Live updates flow through RecordingsIndexFileWatcher
+        // below; the 1-hour reconcile registered in
+        // startPeriodicMemoryLogging() is the FUSE-drop backstop.
+        try {
+            log("Initializing RecordingsIndex...");
+            boolean idxOk = com.overdrive.app.server.RecordingsIndex.getInstance().init();
+            if (idxOk) {
+                log("RecordingsIndex initialized — kicking off async warmup");
+                com.overdrive.app.server.RecordingsIndex.getInstance().warmupAsync();
+                // FileObservers AFTER warmup is dispatched — start() returns
+                // immediately, the warmup thread races independently.
+                // Wrapping in try/catch here too: a kernel that refuses to
+                // arm inotify on the SD card mount must not tank daemon
+                // bring-up.
+                try {
+                    RecordingsIndexFileWatcher.getInstance().start();
+                } catch (Throwable t) {
+                    log("RecordingsIndexFileWatcher start error: "
+                            + t.getClass().getSimpleName() + ": " + t.getMessage());
+                }
+            } else {
+                log("RecordingsIndex init returned false — API will fall back to direct-FS");
+            }
+        } catch (Exception e) {
+            log("RecordingsIndex init error: " + e.getMessage());
         }
 
         // Initialize OdometerReader for trip distance
@@ -888,22 +997,42 @@ public class CameraDaemon {
     // ==================== AVC HAL KEEP-ALIVE ====================
     
     /**
-     * Starts the AVC keep-alive watchdog if the pipeline is running.
+     * Starts the AVC keep-alive watchdog.
      *
-     * Runs regardless of ACC state. When ACC is OFF and the head unit stays
-     * awake (charging, sentry mode), the system can reap com.byd.avc and the
-     * AVM HAL goes cold — surface stays attached, onFrameAvailable still ticks,
-     * but the cameras deliver all-zero buffers. Keeping com.byd.avc warm
-     * prevents that black-frame state.
+     * On legacy cars: gated on the GPU pipeline being live so we don't
+     * waste am-start cycles when no consumer is using the camera.
+     *
+     * On dilink4 (byd_apa firmware): starts unconditionally. The AVM HAL
+     * gates frame delivery on com.byd.avc being a co-consumer of
+     * vendor.byd.avm; if BYD's reaper kills AVC at any point the next
+     * camera open lands on a zombie HAL that returns all-zero buffers.
+     * We keep AVC warm at all times — ACC ON or OFF — so a streaming-
+     * client connect, surveillance arm, or recording start can never
+     * race a fresh AVC reap.
      */
     public static void startAvcKeepAliveIfNeeded() {
-        if (avcHalWarmup == null) {
-            avcHalWarmup = new com.overdrive.app.camera.AvcHalWarmup();
+        // Double-checked locking: cheap volatile read on the hot path,
+        // synchronized init on the cold path. Prevents two concurrent
+        // callers from each instantiating AvcHalWarmup and orphaning a
+        // running keep-alive thread.
+        com.overdrive.app.camera.AvcHalWarmup local = avcHalWarmup;
+        if (local == null) {
+            synchronized (AVC_WARMUP_INIT_LOCK) {
+                local = avcHalWarmup;
+                if (local == null) {
+                    local = new com.overdrive.app.camera.AvcHalWarmup();
+                    avcHalWarmup = local;
+                }
+            }
         }
-        if (gpuPipeline != null && gpuPipeline.isRunning()) {
-            if (!avcHalWarmup.isActive()) {
-                avcHalWarmup.startKeepAlive();
-                log("AVC keep-alive started (pipeline running, accOn=" + AccMonitor.isAccOn() + ")");
+        boolean dilink4 = isDilink4ModeActive();
+        boolean pipelineLive = gpuPipeline != null && gpuPipeline.isRunning();
+        if (dilink4 || pipelineLive) {
+            if (!local.isActive()) {
+                local.startKeepAlive();
+                log("AVC keep-alive started (dilink4=" + dilink4
+                    + ", pipelineLive=" + pipelineLive
+                    + ", accOn=" + AccMonitor.isAccOn() + ")");
             }
             // Heartbeat is dilink4-only and self-gates inside; safe on legacy.
             startCameraActiveHeartbeatIfNeeded();
@@ -911,10 +1040,27 @@ public class CameraDaemon {
     }
 
     /**
-     * Stops the AVC keep-alive watchdog.
-     * Called when pipeline stops or daemon shuts down.
+     * Stops the AVC keep-alive watchdog when the pipeline stops.
+     *
+     * On dilink4 this is a no-op — see {@link #startAvcKeepAliveIfNeeded}
+     * for why AVC must stay alive across pipeline lifecycles. Use
+     * {@link #stopAvcKeepAliveForShutdown} on daemon teardown.
      */
     public static void stopAvcKeepAlive() {
+        if (isDilink4ModeActive()) {
+            // Skip — dilink4 needs AVC alive for the next pipeline start
+            // (streaming client connect, sentry arm, recording start).
+            return;
+        }
+        stopAvcKeepAliveForShutdown();
+    }
+
+    /**
+     * Force-stops the AVC keep-alive watchdog. Used on daemon shutdown
+     * regardless of camera mode — at that point we're tearing everything
+     * down and there will be no future camera consumer.
+     */
+    public static void stopAvcKeepAliveForShutdown() {
         if (avcHalWarmup != null && avcHalWarmup.isActive()) {
             avcHalWarmup.stopKeepAlive();
             log("AVC keep-alive stopped");
@@ -1064,7 +1210,23 @@ public class CameraDaemon {
                     + t.getClass().getSimpleName() + ": " + t.getMessage());
             }
         }, 60, 60, java.util.concurrent.TimeUnit.MINUTES);
-        log("Periodic memory monitor started (5-minute cadence); recording cache prune armed (60-minute cadence)");
+
+        // RecordingsIndex reconcile — backstop for FileObserver event drops
+        // on FUSE-mounted SD/USB volumes. Cheap when the index is in sync
+        // (one stat() per row); patches missing rows + drops phantoms.
+        // Same try/catch guard rationale as above: scheduleAtFixedRate
+        // permanently cancels the recurring task on first uncaught throw,
+        // and a flapping SD mount is exactly the case where one tick
+        // failing must not silently kill all future ticks.
+        memoryLogScheduler.scheduleAtFixedRate(() -> {
+            try {
+                com.overdrive.app.server.RecordingsIndex.getInstance().reconcile();
+            } catch (Throwable t) {
+                log("RecordingsIndex reconcile tick failed: "
+                    + t.getClass().getSimpleName() + ": " + t.getMessage());
+            }
+        }, 60, 60, java.util.concurrent.TimeUnit.MINUTES);
+        log("Periodic memory monitor started (5-minute cadence); recording cache prune + index reconcile armed (60-minute cadence)");
     }
 
     private static void logMemoryStatus() {
@@ -1119,9 +1281,9 @@ public class CameraDaemon {
     public static void shutdown() {
         log("Shutdown requested — writing disable sentinel and cleaning up...");
         running.set(false);
-        
-        // Stop AVC keep-alive immediately
-        stopAvcKeepAlive();
+
+        // Stop AVC keep-alive immediately (force, daemon teardown)
+        stopAvcKeepAliveForShutdown();
 
         // Stop periodic memory monitor
         if (memoryLogScheduler != null) {
@@ -1161,6 +1323,15 @@ public class CameraDaemon {
         
         // Stop services
         if (tripAnalyticsManager != null) tripAnalyticsManager.shutdown();
+        // Tear down RecordingsIndex AFTER trips so any in-flight upserts
+        // from the recorder have already drained. stop() the watcher
+        // first to silence inotify callbacks before close() yanks the
+        // H2 connection (otherwise a late event would log a noisy
+        // "upsert failed: connection closed" warning).
+        try { RecordingsIndexFileWatcher.getInstance().stop(); }
+        catch (Exception e) { log("RecordingsIndexFileWatcher stop error: " + e.getMessage()); }
+        try { com.overdrive.app.server.RecordingsIndex.getInstance().close(); }
+        catch (Exception e) { log("RecordingsIndex close error: " + e.getMessage()); }
         if (abrpTelemetryService != null) abrpTelemetryService.stop();
         if (mqttConnectionManager != null) mqttConnectionManager.stopAll();
         if (tcpServer != null) tcpServer.stop();
@@ -1401,6 +1572,26 @@ public class CameraDaemon {
                     log("Shutdown hook: GeoCache flush error: " + e.getMessage());
                 }
                 
+                // 1.6 Stop the OEM Dashcam pipeline outright. Pano's stop()
+                //     also cascades to OEM (when pano is running), but if a
+                //     user runs OEM standalone (recordingMode=continuous,
+                //     no pano dashcam) gpuPipeline.stop() early-returns at
+                //     !running and the cascade never fires — orphaning the
+                //     OEM MediaCodec, drainer, and AVMCamera handle until
+                //     daemon respawn. Tearing down here is unconditional.
+                try {
+                    com.overdrive.app.camera.OemDashcamPipeline oem =
+                        getOemDashcamPipeline();
+                    if (oem != null && oem.isRunning()) {
+                        try { oem.stopRecording(); } catch (Throwable ignored) {}
+                        oem.stop();
+                        setOemDashcamPipeline(null);
+                        log("Shutdown hook: OEM dashcam pipeline stopped");
+                    }
+                } catch (Exception e) {
+                    log("Shutdown hook: OEM cleanup error: " + e.getMessage());
+                }
+
                 // 2. Stop the GPU pipeline (releases MediaCodec encoder slot, camera HAL, EGL).
                 //    The encoder.release() and closeCamera() are synchronous.
                 //    releaseGl() is posted to the GL thread which may be blocked — that's
@@ -1412,6 +1603,26 @@ public class CameraDaemon {
                     }
                 } catch (Exception e) {
                     log("Shutdown hook: GPU pipeline cleanup error: " + e.getMessage());
+                }
+
+                // 2.5 Drain the streaming-encoder release executor.
+                //     gpuPipeline.stop()'s disableStreaming hands
+                //     encoder.release() to STREAM_ENCODER_RELEASE_EXEC and
+                //     returns immediately. Without an explicit drain, JVM
+                //     exit kills the daemon thread mid-release and leaks
+                //     the MediaCodec until the next process spawn.
+                try {
+                    boolean drained = com.overdrive.app.surveillance.GpuSurveillancePipeline
+                        .shutdownStreamEncoderReleaseExec(4000);
+                    if (drained) {
+                        log("Shutdown hook: stream encoder release executor drained");
+                    } else {
+                        log("Shutdown hook: stream encoder release exec did NOT drain in 4s — "
+                            + "shutdownNow used; queued releases dropped (MediaCodec may leak "
+                            + "until next daemon spawn)");
+                    }
+                } catch (Exception e) {
+                    log("Shutdown hook: stream encoder exec drain error: " + e.getMessage());
                 }
                 
                 // 3. Stop all monitors (VehicleDataMonitor, GpsMonitor, GearMonitor,
@@ -1444,7 +1655,14 @@ public class CameraDaemon {
                 try {
                     if (tripAnalyticsManager != null) tripAnalyticsManager.shutdown();
                 } catch (Exception e) { /* ignore */ }
-                
+                // RecordingsIndex teardown — same ordering as shutdown():
+                // unregister observers first so late inotify events don't
+                // hit a closed JDBC connection.
+                try { RecordingsIndexFileWatcher.getInstance().stop(); }
+                catch (Exception e) { /* ignore */ }
+                try { com.overdrive.app.server.RecordingsIndex.getInstance().close(); }
+                catch (Exception e) { /* ignore */ }
+
                 // 6. Stop servers (TCP, HTTP, IPC)
                 try {
                     if (tcpServer != null) tcpServer.stop();
@@ -1821,10 +2039,36 @@ public class CameraDaemon {
                 recordingModeManager = new com.overdrive.app.recording.RecordingModeManager(
                     sharedAppContext, gpuPipeline);
                 log("RecordingModeManager initialized");
-                
+
                 // Create AVC HAL warmup instance (shared with RecordingModeManager)
-                avcHalWarmup = new com.overdrive.app.camera.AvcHalWarmup();
+                // under the same init lock as startAvcKeepAliveIfNeeded so
+                // we don't race a worker thread that just observed null
+                // and is about to instantiate its own.
+                synchronized (AVC_WARMUP_INIT_LOCK) {
+                    if (avcHalWarmup == null) {
+                        avcHalWarmup = new com.overdrive.app.camera.AvcHalWarmup();
+                    }
+                }
                 log("AvcHalWarmup initialized");
+
+                // dilink4: kick AVC keep-alive at boot regardless of pipeline
+                // state. The byd_apa AVM HAL gates frame delivery on
+                // com.byd.avc being a co-consumer; we cannot afford to let it
+                // get reaped between camera consumers (streaming-client
+                // connect, sentry arm, recording start). startKeepAlive
+                // re-launches AVC every 60 s; AccSentry's 10 s pidof tick
+                // covers the gap during sentry mode.
+                if (isDilink4ModeActive()) {
+                    try {
+                        com.overdrive.app.camera.AvcHalWarmup.ensureAvcAlive();
+                    } catch (Throwable t) {
+                        log("Boot-time AVC ensureAlive failed: " + t.getMessage());
+                    }
+                    if (!avcHalWarmup.isActive()) {
+                        avcHalWarmup.startKeepAlive();
+                        log("AVC keep-alive started at daemon boot (dilink4)");
+                    }
+                }
                 
                 // Now initialize TelemetryDataCollector (context is guaranteed available)
                 try {
@@ -1833,11 +2077,14 @@ public class CameraDaemon {
                     telemetryDataCollector.init(sharedAppContext);
                     gpuPipeline.setTelemetryCollector(telemetryDataCollector);
                     
-                    // Apply persisted overlay enabled state
+                    // Apply persisted overlay enabled state. The resolver
+                    // honours per-flow keys (panoEnabled / oemDashcamEnabled)
+                    // and falls back to legacy `enabled` for pano so older
+                    // configs continue to work.
                     boolean overlayEnabled = com.overdrive.app.config.UnifiedConfigManager
-                        .getTelemetryOverlay().optBoolean("enabled", false);
+                        .isTelemetryOverlayEnabledFor("pano");
                     gpuPipeline.setOverlayEnabled(overlayEnabled);
-                    log("TelemetryDataCollector initialized, overlay=" + overlayEnabled);
+                    log("TelemetryDataCollector initialized, pano overlay=" + overlayEnabled);
                     
                     // Late-bind TelemetryDataCollector to TripAnalyticsManager
                     // (it was null when TripAnalytics was initialized before the 45s GPU delay)
@@ -1958,32 +2205,40 @@ public class CameraDaemon {
     private static void registerDoorLockListenerAndArmOnLock() {
         doorLockListenerArmed = false;
 
-        // Three parallel lock-event sources, all active simultaneously while
-        // the gate is open:
-        //   1. Cloud MQTT (BydCloudDataProvider)         — fast when it works,
-        //      but historically very fragile in the field (events rarely fire
-        //      even with healthy MQTT and fresh snapshots).
-        //   2. Device SDK typed listener (via BydDataCollector) — primary
-        //      reliable source. Single registration at daemon startup.
-        //   3. Periodic getDoorLockStatus(area=1) poll       — catches any
-        //      lock event that neither listener delivered.
+        // Two parallel lock-event sources, in priority order:
         //
-        // All three converge through applyLockEvent() which is idempotent —
+        //   1. OTA polling (BYDAutoOtaDevice.getLFDoorLockState) — primary.
+        //      Verified live ACC=OFF on DiLink 3.0 with ~1.5s latency. The
+        //      legacy BYDAutoDoorLockDevice path (typed listener +
+        //      getDoorLockStatus) returned INVALID on every firmware in the
+        //      field, so it was removed.
+        //
+        //   2. Cloud MQTT (BydCloudDataProvider) — secondary. Lags 1-2s
+        //      vs OTA on this trim but is the only source for the RF/LR/RR
+        //      doors (OTA exposes only LF on DiLink 3.0). When the trim
+        //      doesn't expose getLFDoorLockState (older firmware?), cloud
+        //      is the sole signal.
+        //
+        // Both converge through applyLockEvent() which is idempotent —
         // multiple sources reporting the same transition cause exactly one
-        // arm or disarm. There is no primary/fallback toggle: every source
-        // runs in parallel, so a silent failure of one doesn't gate the
-        // others.
+        // arm or disarm. attachDeviceLockSource() is now a no-op stub kept
+        // for symmetry with attachCloudLockSource and the poll thread.
 
         attachCloudLockSource();
         attachDeviceLockSource();
         startUnlockPollThread();
 
-        // Initial state probe: if doors are already locked at gate-entry, arm
-        // now without waiting for an event. Both sources are checked.
-        Boolean cloudInitial = currentCloudLockState();
-        if (cloudInitial != null) applyLockEvent(cloudInitial, "cloud-initial");
+        // Initial state probe — priority order: device (OTA-fast-path) BEFORE
+        // cloud. The OTA device exposes LF state ACC=OFF with sub-second
+        // latency; cloud MQTT can lag 1-2s and may not have a fresh
+        // snapshot at gate-entry on cold boot. If device is INVALID
+        // (older trim without OTA LF support), cloud initial fills the gap.
+        // Both calls are gate-idempotent so order only matters for the
+        // log line that reports which source decided.
         Boolean deviceInitial = currentDeviceLockState();
         if (deviceInitial != null) applyLockEvent(deviceInitial, "device-initial");
+        Boolean cloudInitial = currentCloudLockState();
+        if (cloudInitial != null) applyLockEvent(cloudInitial, "cloud-initial");
 
         // Force-arm timeout: if no source reports a lock within 60s, arm
         // anyway. Owner may have walked away without locking, or every event
@@ -2062,23 +2317,16 @@ public class CameraDaemon {
 
     /** Device-SDK lock-event source via BydDataCollector's typed listener.
      *  Always attached — runs in parallel with the cloud source. */
+    /**
+     * The legacy {@code BYDAutoDoorLockDevice} listener path was removed —
+     * its {@code onDoorLockStatusChanged} callback never fired on any
+     * firmware in the field, and the polled {@code getDoorLockStatus(area)}
+     * returned INVALID. The OTA device fast-path (5s poll via
+     * {@link #readDoorLockStatus}) replaces it. This stub is kept for
+     * symmetry with the cloud / poll attachers — call sites unchanged.
+     */
     private static void attachDeviceLockSource() {
-        if (sharedAppContext == null) {
-            log("LOCK GATE: No context — device-SDK source unavailable");
-            return;
-        }
-        try {
-            Object doorLockDevice = com.overdrive.app.byd.BydDeviceHelper.getDevice(
-                "android.hardware.bydauto.doorlock.BYDAutoDoorLockDevice", sharedAppContext);
-            if (doorLockDevice == null) {
-                log("LOCK GATE: BYDAutoDoorLockDevice unavailable — relying on cloud + timeout");
-                return;
-            }
-        } catch (Exception e) {
-            log("LOCK GATE: Device probe failed: " + e.getMessage());
-            return;
-        }
-        subscribeDeviceLockListener();
+        // Intentional no-op. See javadoc above.
     }
 
     /** @return true=locked, false=unlocked, null=unknown/cloud unavailable. */
@@ -2095,17 +2343,11 @@ public class CameraDaemon {
         return null;
     }
 
-    /** @return true=locked, false=unlocked, null=unknown/device unavailable. */
+    /** @return true=locked, false=unlocked, null=unknown/OTA unavailable. */
     private static Boolean currentDeviceLockState() {
-        if (sharedAppContext == null) return null;
-        try {
-            Object doorLockDevice = com.overdrive.app.byd.BydDeviceHelper.getDevice(
-                "android.hardware.bydauto.doorlock.BYDAutoDoorLockDevice", sharedAppContext);
-            if (doorLockDevice == null) return null;
-            int s = readDoorLockStatus(doorLockDevice);
-            if (s == DOOR_STATE_LOCK) return true;
-            if (s == DOOR_STATE_UNLOCK) return false;
-        } catch (Exception ignored) {}
+        int s = readDoorLockStatus();
+        if (s == DOOR_STATE_LOCK) return true;
+        if (s == DOOR_STATE_UNLOCK) return false;
         return null;
     }
 
@@ -2159,91 +2401,54 @@ public class CameraDaemon {
     
     
     /**
-     * Read door lock status using the correct SDK method.
-     * Tries getDoorLockStatus(int area) first (correct per SDK docs),
-     * falls back to getDoorLockState() for older firmware compatibility.
-     * 
-     * @return DOOR_STATE_INVALID(0), DOOR_STATE_UNLOCK(1), or DOOR_STATE_LOCK(2)
+     * Read driver-door (LF) lock status from {@code BYDAutoOtaDevice}.
+     *
+     * <p>Uses {@code BYDAutoOtaDevice.getLFDoorLockState()} — the OTA device
+     * caches the LF lock signal even when the BCM is asleep (ACC=OFF).
+     * Empirically verified live-tracking on DiLink 3.0 with ~1.5s
+     * transition latency.
+     *
+     * <p>The legacy {@code BYDAutoDoorLockDevice.getDoorLockStatus(area)} +
+     * {@code getDoorLockState()} paths were removed: every BYD firmware in
+     * the field returns INVALID for them to user UID — no observed
+     * firmware actually delivered a working signal. Cloud is the fallback
+     * (full 4-door state via {@code BydCloudDataProvider}); see
+     * {@link #currentCloudLockState}.
+     *
+     * <p>For all 4 doors (RF/LR/RR), the OTA device exposes only LF on
+     * DiLink 3.0 (verified 2026-06-03). Use the cloud snapshot path for
+     * full per-door state.
+     *
+     * @return {@link #DOOR_STATE_INVALID}(0), {@link #DOOR_STATE_UNLOCK}(1),
+     *         or {@link #DOOR_STATE_LOCK}(2).
      */
-    private static int readDoorLockStatus(Object doorLockDevice) {
-        if (doorLockDevice == null) return DOOR_STATE_INVALID;
-        
-        // Primary: getDoorLockStatus(int area) — per SDK documentation
-        // DOOR_LOCK_AREA_LEFT_FRONT = 1 (driver's door, most reliable indicator)
+    private static int readDoorLockStatus() {
+        if (sharedAppContext == null) return DOOR_STATE_INVALID;
         try {
-            java.lang.reflect.Method getStatus = doorLockDevice.getClass()
-                .getMethod("getDoorLockStatus", int.class);
-            Object result = getStatus.invoke(doorLockDevice, 1); // 1 = LEFT_FRONT
-            if (result instanceof Integer) {
-                int state = (Integer) result;
-                if (state >= 0 && state <= 2) return state;
+            Object otaDevice = com.overdrive.app.byd.BydDeviceHelper.getDevice(
+                "android.hardware.bydauto.ota.BYDAutoOtaDevice", sharedAppContext);
+            if (otaDevice == null) return DOOR_STATE_INVALID;
+            Object v = com.overdrive.app.byd.BydDeviceHelper.callGetter(
+                otaDevice, "getLFDoorLockState");
+            if (v instanceof Number) {
+                int state = ((Number) v).intValue();
+                if (state == DOOR_STATE_UNLOCK || state == DOOR_STATE_LOCK) {
+                    return state;
+                }
+                // 0=INVALID or anything out-of-range falls through.
             }
-        } catch (NoSuchMethodException e) {
-            // Method doesn't exist on this firmware — try fallback
-        } catch (Exception e) {
-            log("LOCK GATE: getDoorLockStatus(1) failed: " + e.getMessage());
+        } catch (Throwable t) {
+            // Trim doesn't expose getLFDoorLockState. Returned INVALID;
+            // caller relies on cloud as the secondary source.
         }
-        
-        // Fallback: getDoorLockState() — older/alternative API
-        try {
-            java.lang.reflect.Method getState = doorLockDevice.getClass()
-                .getMethod("getDoorLockState");
-            Object result = getState.invoke(doorLockDevice);
-            if (result instanceof Integer) {
-                return (Integer) result;
-            }
-        } catch (NoSuchMethodException e) {
-            log("LOCK GATE: Neither getDoorLockStatus nor getDoorLockState available");
-        } catch (Exception e) {
-            log("LOCK GATE: getDoorLockState failed: " + e.getMessage());
-        }
-        
         return DOOR_STATE_INVALID;
     }
     
-    /**
-     * Subscribe to BydDataCollector's typed door-lock listener for the
-     * sentry arming gate. The collector registers a single typed proxy on
-     * BYDAutoDoorLockDevice at startup and fans out events; we just attach a
-     * subscriber here when ACC OFF activates the gate, and detach on ACC ON.
-     *
-     * This replaces the old per-cycle Proxy.newProxyInstance + registerListener
-     * pattern, which leaked listener references onto the device every cycle.
-     */
-    private static void subscribeDeviceLockListener() {
-        // Already subscribed for this cycle
-        if (deviceLockSubscriber != null) return;
+    // BYDAutoDoorLockDevice listener path removed — it never fired on any
+    // firmware in the field. OTA polling (readDoorLockStatus) is the
+    // primary lock signal now; cloud is the secondary.
 
-        deviceLockSubscriber = (area, sdkState) -> {
-            // Ignore non-driver-door events: lock-gate has historically gated
-            // on the LF (driver's) door state, matching the prior behavior.
-            if (area != 1) return;
-            if (sdkState == DOOR_STATE_LOCK) {
-                applyLockEvent(true, "device");
-            } else if (sdkState == DOOR_STATE_UNLOCK) {
-                applyLockEvent(false, "device");
-            }
-        };
 
-        try {
-            com.overdrive.app.byd.BydDataCollector.getInstance()
-                .addDoorLockListener(deviceLockSubscriber);
-            log("LOCK GATE: Device-SDK lock subscriber attached to BydDataCollector");
-        } catch (Exception e) {
-            log("LOCK GATE: Failed to attach device-lock subscriber: " + e.getMessage());
-            deviceLockSubscriber = null;
-        }
-    }
-
-    private static void unsubscribeDeviceLockListener() {
-        if (deviceLockSubscriber == null) return;
-        try {
-            com.overdrive.app.byd.BydDataCollector.getInstance()
-                .removeDoorLockListener(deviceLockSubscriber);
-        } catch (Exception ignored) {}
-        deviceLockSubscriber = null;
-    }
-    
     /**
      * Continuous unlock polling thread — detects door lock/unlock transitions.
      * Uses getDoorLockStatus(1) for the driver's door.
@@ -2265,22 +2470,20 @@ public class CameraDaemon {
                 }
                 if (com.overdrive.app.monitor.AccMonitor.isAccOn()) return;
 
-                // Source 1: SDK device poll. Returns INVALID(0) on firmwares
-                // that don't expose getDoorLockStatus(area) to user UID, but
-                // still works on most cars and gives us a fast (5s) signal.
+                // Source 1: OTA device poll (BYDAutoOtaDevice.getLFDoorLockState).
+                // Works ACC=OFF with sub-second latency for the LF (driver) door —
+                // verified live on DiLink 3.0. The legacy BYDAutoDoorLockDevice
+                // path returned INVALID on every firmware we observed and was
+                // removed.
                 try {
-                    Object doorLockDevice = com.overdrive.app.byd.BydDeviceHelper.getDevice(
-                        "android.hardware.bydauto.doorlock.BYDAutoDoorLockDevice", sharedAppContext);
-                    if (doorLockDevice != null) {
-                        int state = readDoorLockStatus(doorLockDevice);
-                        if (state == DOOR_STATE_LOCK) {
-                            applyLockEvent(true, "poll");
-                        } else if (state == DOOR_STATE_UNLOCK) {
-                            applyLockEvent(false, "poll");
-                        }
+                    int state = readDoorLockStatus();
+                    if (state == DOOR_STATE_LOCK) {
+                        applyLockEvent(true, "ota-poll");
+                    } else if (state == DOOR_STATE_UNLOCK) {
+                        applyLockEvent(false, "ota-poll");
                     }
                 } catch (Exception e) {
-                    // Silently continue — device may be sleeping
+                    // Silently continue — OTA device may be unreachable
                 }
 
                 // Source 2: REST realtime poll fallback. Fires only when the
@@ -2331,7 +2534,7 @@ public class CameraDaemon {
             } catch (Exception ignored) {}
             cloudLockListener = null;
         }
-        unsubscribeDeviceLockListener();
+        // (legacy device-SDK lock listener removed — see attachDeviceLockSource javadoc)
         stopUnlockPollThread();
 
         // Stop the reverse-fallback ACC-ON disarm watchdog
@@ -2417,6 +2620,82 @@ public class CameraDaemon {
                     log("ACC OFF - notifying RecordingModeManager to finalize active recording...");
                     recordingModeManager.onAccStateChanged(false);
                 }
+                // OEM Dashcam ACC-off behaviour. accOffMode='off' (default)
+                // tears down the pipeline so the encoder + camera handle
+                // release at ACC-off; 'continuous' lets it run via the
+                // existing AccSentry peripheral keep-alive lease so the
+                // user gets parked-recording without separate plumbing.
+                //
+                // SURVEILLANCE INTEGRATION: when oem.surveillance.enabled is
+                // true the user has opted into OEM clips on motion events.
+                // If we tear down at ACC OFF, the surveillance event-trigger
+                // path (SurveillanceEngineGpu.startEventRecording) finds
+                // pipeline=null and silently skips OEM. Treat surveillance
+                // intent as an implicit "keep alive" — same path as
+                // accOffMode=continuous — so motion events can fire OEM
+                // recordings during sentry without the user needing to
+                // toggle continuous mode separately.
+                try {
+                    // Post-migration mode-based dispatch (R9 regression #1).
+                    // Pre-fix this read oem.enabled / oem.accOffMode — both
+                    // are nulled out by migrateOemDashcamModes, so this
+                    // branch silently no-op'd on every install after first
+                    // boot. Now read the mode-tier accessors directly.
+                    String recMode = com.overdrive.app.config.UnifiedConfigManager
+                        .getOemRecordingMode();
+                    String survMode = com.overdrive.app.config.UnifiedConfigManager
+                        .getOemSurveillanceMode();
+                    boolean anyTriggerOn = com.overdrive.app.config.UnifiedConfigManager
+                        .isAnyOemDashcamTriggerEnabled();
+                    // Determine whether surveillance suppression also suppresses OEM keep-alive.
+                    // User explicitly opted into safe-zone privacy / schedule windows; we honor
+                    // that for the OEM dashcam too.  Surveillance-side OEM modes
+                    // (continuous/smart on the surv axis) record / wake during the parked
+                    // window — same window the user told us to be silent in. The
+                    // recording-side continuous (rec=continuous) is the user's "record across
+                    // ACC OFF too" intent and intentionally bypasses surveillance suppression,
+                    // mirroring how pano dashcam recording continues across ACC OFF when
+                    // oem.recordingMode=continuous.
+                    boolean userEnabled = com.overdrive.app.config.UnifiedConfigManager.isSurveillanceEnabled();
+                    boolean inSafeZone = com.overdrive.app.surveillance.SafeLocationManager.getInstance().isInSafeZone();
+                    boolean outsideSchedule = false;
+                    try {
+                        com.overdrive.app.surveillance.SurveillanceSchedule schedule =
+                            com.overdrive.app.config.UnifiedConfigManager.getSurveillanceSchedule();
+                        outsideSchedule = (schedule != null && schedule.isEnabled() && !schedule.isActiveNow());
+                    } catch (Exception ignored) {}
+                    boolean surveillanceSuppressed = !userEnabled || inSafeZone || outsideSchedule;
+                    // Keep-alive when either mode is "continuous" (record
+                    // through ACC-off) OR surveillance is set (any non-off
+                    // value implies the pipeline must stay warm to fire on
+                    // motion events). Treat "smart" as ALSO requiring keep-
+                    // alive on the surveillance side because the engine
+                    // needs the pipeline ready to record event clips when
+                    // motion fires during sentry.
+                    boolean survSideKeepAlive = "continuous".equals(survMode) || "smart".equals(survMode);
+                    if (surveillanceSuppressed) survSideKeepAlive = false;
+                    boolean keepAlive = "continuous".equals(recMode) || survSideKeepAlive;
+                    if (anyTriggerOn) {
+                        if (keepAlive) {
+                            log("OEM Dashcam: ACC OFF — keep-alive (rec=" + recMode
+                                + ", surv=" + survMode + ")");
+                        } else {
+                            log("OEM Dashcam: ACC OFF — stopping pipeline (rec="
+                                + recMode + ", surv=" + survMode + ")");
+                            // Route through scheduleLifecycleRecalc so the
+                            // dedicated lifecycle executor dedups against any
+                            // user Apply / quality-mirror restart hitting
+                            // applyTriggerLifecycleFromUcm at the same instant.
+                            // The previous raw-thread path ran in parallel
+                            // with LIFECYCLE_EXEC and lost the dedup, racing
+                            // over LIFECYCLE_LOCK with no guarantee the
+                            // ACC-OFF intent landed last.
+                            com.overdrive.app.server.OemDashcamApiHandler.scheduleLifecycleRecalc();
+                        }
+                    }
+                } catch (Throwable t) {
+                    log("OEM Dashcam ACC OFF dispatch failed: " + t.getMessage());
+                }
                 
                 // CRITICAL: Force-stop TelemetryDataCollector when ACC goes off.
                 // No consumer needs it when the car is off (no overlay, no trip recording).
@@ -2491,30 +2770,77 @@ public class CameraDaemon {
                     log("Schedule check error (proceeding with surveillance): " + e.getMessage());
                 }
                 
-                if (!gpuPipeline.isRunning()) {
-                    log("Starting pipeline for sentry mode...");
-                    gpuPipeline.start();
+                Runnable startSentryPipeline = () -> {
+                    if (!gpuPipeline.isRunning()) {
+                        log("Starting pipeline for sentry mode...");
+                        try { gpuPipeline.start(); } catch (Exception e) {
+                            log("Pipeline start failed: " + e.getMessage());
+                            return;
+                        }
+                    }
+                    gpuPipeline.setRecordingMode(
+                        com.overdrive.app.surveillance.GpuPipelineConfig.RecordingMode.SENTRY);
+                    // AVC keep-alive for sentry — same 60s poke we use during ACC-ON
+                    // and streaming/recording-mode. See enableSurveillance() for why.
+                    startAvcKeepAliveIfNeeded();
+                    // Door lock gate: surveillance is armed only after doors are locked.
+                    // This prevents false motion events from the owner exiting the car.
+                    // Three parallel sources fire concurrently (cloud MQTT, device-SDK
+                    // typed listener, 5s polling); arm timeout at 60s; ACC-ON disarm
+                    // watchdog runs in parallel as reverse fallback.
+                    log("Pipeline started in sentry mode — waiting for door lock to arm surveillance");
+                    registerDoorLockListenerAndArmOnLock();
+
+                    // SOTA: Periodic schedule checker — monitors time window transitions
+                    // during active sentry. If the schedule window ends, surveillance stops.
+                    // If the window starts (e.g., user parked before the window), surveillance starts.
+                    // Runs every 5 minutes. Only active when ACC is off.
+                    startScheduleChecker();
+
+                    log("Pipeline started in sentry mode");
+                };
+
+                if (isDilink4ModeActive()) {
+                    // esco-parity 60 s grace before opening AVMCamera. Earlier
+                    // open races the MCU/ISP power-down and yields all-zero
+                    // frames forever (esco p111dh/C4995i.java:407 — fixed 60_000L
+                    // delay between ACC OFF and SentryRecordService.startService).
+                    //
+                    // The grace is enforced as a process-wide gate inside
+                    // PanoramicCameraGpu.startCameraViaAvmReflection. Every
+                    // open path (this handler, StreamingApiHandler, OEM,
+                    // RecordingModeManager) funnels through that method and
+                    // sleeps until the gate clears — so even if a user opens
+                    // /api/stream/view/N during the grace, the underlying
+                    // camera open still waits.
+                    com.overdrive.app.camera.PanoramicCameraGpu
+                        .armDilink4PostAccOffGrace(DILINK4_SENTRY_DEFER_MS);
+
+                    // Warm com.byd.avc up at the START of the grace so it's
+                    // alive and re-attached to the AVM HAL by the time we
+                    // open the camera 60 s from now. AccSentry's 10 s
+                    // keep-alive tick will sustain it past this point.
+                    try {
+                        com.overdrive.app.camera.AvcHalWarmup.ensureAvcAlive();
+                    } catch (Throwable th) {
+                        log("AVC initial warmup failed: " + th.getMessage());
+                    }
+
+                    log("DiLink 4: armed " + DILINK4_SENTRY_DEFER_MS
+                        + " ms open gate (esco-parity grace). Pipeline start "
+                        + "will sleep at lowest open level until gate clears.");
+                    // Run the start path in the background; gpuPipeline.start
+                    // will internally block on PanoramicCameraGpu.waitForDilink4OpenGate
+                    // before AVMCamera.open. We cannot run it inline because
+                    // onAccStateChanged is called from the IPC thread and
+                    // we don't want to block that for 60 s.
+                    Thread t = new Thread(startSentryPipeline,
+                        "Dilink4SentryStart");
+                    t.setDaemon(true);
+                    t.start();
+                } else {
+                    startSentryPipeline.run();
                 }
-                gpuPipeline.setRecordingMode(
-                    com.overdrive.app.surveillance.GpuPipelineConfig.RecordingMode.SENTRY);
-                // AVC keep-alive for sentry — same 60s poke we use during ACC-ON
-                // and streaming/recording-mode. See enableSurveillance() for why.
-                startAvcKeepAliveIfNeeded();
-                // Door lock gate: surveillance is armed only after doors are locked.
-                // This prevents false motion events from the owner exiting the car.
-                // Three parallel sources fire concurrently (cloud MQTT, device-SDK
-                // typed listener, 5s polling); arm timeout at 60s; ACC-ON disarm
-                // watchdog runs in parallel as reverse fallback.
-                log("Pipeline started in sentry mode — waiting for door lock to arm surveillance");
-                registerDoorLockListenerAndArmOnLock();
-                
-                // SOTA: Periodic schedule checker — monitors time window transitions
-                // during active sentry. If the schedule window ends, surveillance stops.
-                // If the window starts (e.g., user parked before the window), surveillance starts.
-                // Runs every 5 minutes. Only active when ACC is off.
-                startScheduleChecker();
-                
-                log("Pipeline started in sentry mode");
             } catch (Exception e) {
                 String errorMsg = e.getMessage();
                 if (errorMsg == null) {
@@ -2530,6 +2856,12 @@ public class CameraDaemon {
             // recordings until the user cycled ACC OFF→ON. The watchdog is
             // started at daemon boot in main() and runs for the daemon's
             // lifetime as long as any storage type is set to SD.
+
+            // Clear any active DiLink 4 post-ACC-OFF open gate so a quick
+            // OFF→ON cycle doesn't strand a pending camera open on a 60 s
+            // sleep that's no longer relevant.
+            com.overdrive.app.camera.PanoramicCameraGpu
+                .clearDilink4PostAccOffGrace();
 
             // Stop schedule checker (only runs during ACC OFF sentry mode)
             stopScheduleChecker();
@@ -2634,7 +2966,28 @@ public class CameraDaemon {
             log("ACC ON - notifying RecordingModeManager...");
             if (recordingModeManager != null) {
                 recordingModeManager.onAccStateChanged(true);
-            } else {
+            }
+            // OEM Dashcam ACC-on hook. If the user has enabled OEM dashcam
+            // and we tore it down at ACC-off (accOffMode='off' branch), the
+            // pipeline needs a fresh start now that the car is awake. The
+            // applyLifecycle helper is idempotent so a no-op fires when
+            // concurrent==1 already kept it running.
+            try {
+                // Post-migration mode-based gate (R9 regression #1). The
+                // legacy oem.enabled key is null after migrateOemDashcamModes
+                // runs; isAnyOemDashcamTriggerEnabled inspects recordingMode
+                // / surveillanceMode and returns true if either is non-off.
+                if (com.overdrive.app.config.UnifiedConfigManager
+                        .isAnyOemDashcamTriggerEnabled()
+                        && getOemDashcamPipeline() == null) {
+                    log("OEM Dashcam: ACC ON — restarting pipeline");
+                    // Route through scheduleLifecycleRecalc so the desired-state computation reads the user's current oemRecordingMode + oemSurveillanceMode rather than hardcoding recordingDesired=true. Without this, surveillance-only configs (rec=off, surv=smart) would silently start a dvr_*.mp4 on every ACC ON.
+                    com.overdrive.app.server.OemDashcamApiHandler.scheduleLifecycleRecalc();
+                }
+            } catch (Throwable t) {
+                log("OEM Dashcam ACC ON dispatch failed: " + t.getMessage());
+            }
+            if (recordingModeManager == null) {
                 // Fallback: Stop pipeline completely to save power (legacy behavior).
                 // gpuPipeline.onAccOn() already ran above; just tear down.
                 log("Stopping pipeline (ACC ON - saving power)...");
@@ -2913,6 +3266,73 @@ public class CameraDaemon {
      */
     public static com.overdrive.app.surveillance.GpuSurveillancePipeline getGpuPipeline() {
         return gpuPipeline;
+    }
+
+    /**
+     * Get the OEM Dashcam pipeline instance (or null if not started).
+     */
+    public static com.overdrive.app.camera.OemDashcamPipeline getOemDashcamPipeline() {
+        return oemDashcamPipeline;
+    }
+
+    /**
+     * Get the shared TelemetryDataCollector. Null until pano pipeline
+     * initialises it (line 1856-1858). OEM lifecycle injects this so its
+     * overlay refcount discipline can hold polling like pano does.
+     */
+    public static com.overdrive.app.telemetry.TelemetryDataCollector getTelemetryDataCollector() {
+        return telemetryDataCollector;
+    }
+
+    /**
+     * Generation counter for OEM dashcam pipeline instances. Bumped on
+     * every {@link #setOemDashcamPipeline} call. Surveillance captures
+     * the value at event-trigger time and compares on event-end so a
+     * stop call only fires against the SAME pipeline instance that
+     * issued tryStartIfIdle. Without this, a quality-mirror restart
+     * (which tears down and rebuilds the pipeline) would let
+     * surveillance's event-end stop the user's NEW continuous recording.
+     */
+    private static final java.util.concurrent.atomic.AtomicInteger
+        oemDashcamPipelineGeneration = new java.util.concurrent.atomic.AtomicInteger(0);
+
+    /**
+     * Set the OEM Dashcam pipeline reference. Called by RecordingModeManager
+     * after it constructs / starts the pipeline. Setting null indicates the
+     * pipeline has been torn down.
+     */
+    public static void setOemDashcamPipeline(com.overdrive.app.camera.OemDashcamPipeline p) {
+        oemDashcamPipeline = p;
+        oemDashcamPipelineGeneration.incrementAndGet();
+    }
+
+    /** Read the current pipeline generation. Surveillance compares this
+     *  on event-end against what it captured at event-start. */
+    public static int getOemDashcamPipelineGeneration() {
+        return oemDashcamPipelineGeneration.get();
+    }
+
+    /**
+     * Switch the WebSocket stream sink to the OEM Dashcam encoder. Called by
+     * StreamingApiHandler when view mode 6 is selected. Returns true if the
+     * routing actually attached, false otherwise — caller surfaces an
+     * honest error to the client when the underlying gates refuse.
+     */
+    public static boolean routeStreamToOemDashcam() {
+        if (oemDashcamPipeline == null) {
+            log("routeStreamToOemDashcam: pipeline null; ignoring");
+            return false;
+        }
+        if (gpuPipeline == null) {
+            log("routeStreamToOemDashcam: gpuPipeline null; ignoring");
+            return false;
+        }
+        try {
+            return gpuPipeline.attachExternalStreamCallback(oemDashcamPipeline);
+        } catch (Throwable t) {
+            log("routeStreamToOemDashcam: attach failed: " + t.getMessage());
+            return false;
+        }
     }
     
     // ==================== RECORDING MODE CONTROL ====================
@@ -3676,14 +4096,14 @@ public class CameraDaemon {
             socDb.setSohEstimator(sohEstimator);
             socDb.init();
             socDb.start();
-            
+
             // Fix stale kWh records from before PHEV capacity was correctly detected
             if (sohEstimator != null && sohEstimator.getNominalCapacityKwh() > 0
                     && sohEstimator.getNominalCapacityKwh() < 30.0) {
                 log("Fixing stale kWh records for PHEV (nominal=" + sohEstimator.getNominalCapacityKwh() + " kWh)");
                 socDb.fixStaleRemainingKwh(sohEstimator.getNominalCapacityKwh());
             }
-            
+
             log("SOC History Database initialized successfully");
             
         } catch (Exception e) {

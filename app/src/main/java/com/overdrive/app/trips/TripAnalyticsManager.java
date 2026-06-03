@@ -474,6 +474,26 @@ public class TripAnalyticsManager {
         // Set telemetry file path (using startTime-based filename)
         trip.telemetryFilePath = telemetryPath;
 
+        // Stat the finalized .jsonl.gz so we can store its size on the
+        // row at insert time. This single local-FS stat is what lets
+        // StorageManager.getTripsSize() answer via SUM(size_bytes)
+        // instead of walking every trips dir on every page load. The
+        // file isn't renamed yet (the dbId-based rename happens after
+        // insertTrip below) but the byte count is identical, so we stat
+        // the startTime-named file here. Errors leave sizeBytes at 0 —
+        // the backfill thread will catch it on the next daemon start.
+        if (telemetryPath != null) {
+            try {
+                File f = new File(telemetryPath);
+                if (f.exists() && f.isFile()) {
+                    trip.sizeBytes = f.length();
+                }
+            } catch (Throwable e) {
+                logger.warn("Failed to stat telemetry file for size accounting: " + e.getMessage());
+            }
+        }
+        // No sidecars in current builds; sidecarSizeBytes stays 0.
+
         // 4. Insert into database
         if (database != null) {
             long dbId = database.insertTrip(trip);

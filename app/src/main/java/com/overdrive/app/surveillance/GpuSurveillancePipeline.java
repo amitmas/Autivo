@@ -39,11 +39,35 @@ public class GpuSurveillancePipeline {
     private com.overdrive.app.streaming.GpuStreamScaler streamScaler;
     private HardwareEventRecorderGpu streamEncoder;
     private com.overdrive.app.streaming.WebSocketStreamServer wsStreamServer;
-    private boolean streamingEnabled = false;
+    // volatile so the camera GL render loop's read sees the latest
+    // disable-write atomically; otherwise the loop can keep snapshot
+    // streamScaler/streamEncoder past the disable cycle.
+    private volatile boolean streamingEnabled = false;
+    // Stream-lifecycle ReentrantLock replaces the per-instance monitor
+    // (synchronized) on enableStreaming/disableStreaming/attachExternalStreamCallback.
+    // ReentrantLock so we can explicitly release it around the 2-second
+    // GL-thread init wait inside enableStreamingInternal — pre-fix,
+    // synchronized(this) pinned every disable / attach / stop caller for
+    // the entire wait. ReentrantLock + "drop around the wait" lets the
+    // peers proceed while the stream init is pending; the partial-state
+    // window is bounded by the existing camera.setStreamingComponents
+    // invariant (called at the END of enableStreamingInternal, AFTER the
+    // GL init completes) so a concurrent disable observes either both
+    // components committed or neither.
+    private final java.util.concurrent.locks.ReentrantLock streamLifecycleLock =
+        new java.util.concurrent.locks.ReentrantLock();
     
     // Telemetry overlay
     private TelemetryDataCollector telemetryCollector;
     private volatile boolean overlayEnabledConfig = false;
+
+    // Config-change listener for live propagation of recording.rectifyStrength
+    // edits. UI writes to UnifiedConfigManager; this listener picks up the
+    // change and pushes to the active recorder so the next frame uses the
+    // new value — no daemon restart, no segment rotation. Held as a field so
+    // release() can deregister it cleanly.
+    private com.overdrive.app.config.UnifiedConfigManager.ConfigChangeListener
+        rectifyConfigListener;
     
     // Mode tracking
     private enum Mode {
@@ -79,7 +103,11 @@ public class GpuSurveillancePipeline {
     // otherwise we race the encoder release with init() allocating a new
     // one. Guarded by the same monitor as {@code running}.
     private volatile boolean stopping = false;
-    private boolean recordingMode = false;  // true = recording, false = viewing only
+    // volatile because the cold-start storage-retry thread (RecStorageRetry)
+    // reads this without holding the pipeline monitor; without volatile the
+    // retry thread can observe a stale `false` after stopRecording() flipped
+    // it, defeating the cancellation check.
+    private volatile boolean recordingMode = false;  // true = recording, false = viewing only
 
     // Serializes runtime reconfig methods (applyFpsChange, applyBitrateChange,
     // applyCodecChange). Without this, two web-UI changes arriving back-to-back
@@ -1089,16 +1117,19 @@ public class GpuSurveillancePipeline {
             // for that HAL: Front=TL X-flipped, Rear=TR Y-flipped, Left=BL
             // Y-flipped, Right=BR no flip. No user-tunable surface — every
             // DiLink 4 trim seen so far emits this exact mosaic.
-            recorder.setProducerCornerMap(
-                new float[] { 0.0f, 0.0f },  // Front  → TL
-                new float[] { 0.5f, 0.5f },  // Right  → BR
-                new float[] { 0.5f, 0.0f },  // Rear   → TR
-                new float[] { 0.0f, 0.5f }); // Left   → BL
-            recorder.setFlipFlags(
-                new float[] { 1.0f, 1.0f },  // Front  X+Y-flip
-                new float[] { 0.0f, 1.0f },  // Right  Y-flip
-                new float[] { 0.0f, 0.0f },  // Rear   no flip
-                new float[] { 0.0f, 0.0f }); // Left   no flip
+            // Combined setter — single source of truth for the DiLink 4
+            // mosaic arrangement (Dilink4Constants). Recorder + stream
+            // scaler both reference this so they can never silently
+            // disagree.
+            recorder.setProducerLayout(
+                com.overdrive.app.camera.Dilink4Constants.CORNER_FRONT,
+                com.overdrive.app.camera.Dilink4Constants.CORNER_RIGHT,
+                com.overdrive.app.camera.Dilink4Constants.CORNER_REAR,
+                com.overdrive.app.camera.Dilink4Constants.CORNER_LEFT,
+                com.overdrive.app.camera.Dilink4Constants.FLIP_FRONT,
+                com.overdrive.app.camera.Dilink4Constants.FLIP_RIGHT,
+                com.overdrive.app.camera.Dilink4Constants.FLIP_REAR,
+                com.overdrive.app.camera.Dilink4Constants.FLIP_LEFT);
             // Red-overlay mask (HAL 'calibration failed' chrome suppression).
             // Off by default; user opts in when the car is uncalibrated and
             // the chrome is in the way.
@@ -1120,11 +1151,61 @@ public class GpuSurveillancePipeline {
             } catch (Throwable t) {
                 logger.warn("Failed to read dilink4RedMask from config: " + t.getMessage());
             }
+            // Recording dewarp strength — shader gates on uApaMode==0, so
+            // pushing a non-zero value on dilink4 is a no-op (safe).
+            // We push regardless of layout so a layout flip later picks up
+            // the user's setting without a daemon restart.
+            try {
+                int rectifyStrength = com.overdrive.app.config
+                    .UnifiedConfigManager.getRectifyStrength();
+                recorder.setRectifyStrength((float) rectifyStrength);
+                // Push tile aspect (tile_height / tile_width) from the
+                // active profile so the dewarp's radial math runs in true
+                // pixel space. Profile.panoHeight is the per-cam tile
+                // height; tile width is panoWidth/4 (4 cams across the
+                // strip). Seal 5120×960 → 960 / (5120/4) = 0.75. Tang
+                // 5120×720 → 0.5625. Identity-equivalent at slider 0.
+                com.overdrive.app.camera.CameraProfile prof = profile;
+                if (prof != null) {
+                    float tileWidth = Math.max(1, prof.getPanoWidth() / 4f);
+                    float tileHeight = Math.max(1, prof.getPanoHeight());
+                    recorder.setRectifyAspect(tileHeight / tileWidth);
+                }
+            } catch (Throwable t) {
+                logger.warn("Failed to read rectifyStrength from config: " + t.getMessage());
+            }
         }
 
         // 6. Create adaptive bitrate controller
         bitrateController = new AdaptiveBitrateController(encoder, 6_000_000);
-        
+
+        // Register a single config-change listener that pushes rectifyStrength
+        // edits to the live recorder. Listener fires on ANY recording-section
+        // update (the listener API is section-granular, not field-granular);
+        // we re-read the rectifyStrength field and push, dedupe is handled by
+        // the recorder setter (no-op when the value didn't change).
+        // Idempotent registration: deregister any prior registration first so
+        // re-init paths (encoder reinit, profile change) don't stack listeners.
+        try {
+            if (rectifyConfigListener != null) {
+                com.overdrive.app.config.UnifiedConfigManager
+                    .removeListener(rectifyConfigListener);
+            }
+            rectifyConfigListener = (section, sectionConfig) -> {
+                if (!"recording".equals(section)) return;
+                GpuMosaicRecorder activeRecorder = recorder;
+                if (activeRecorder == null) return;
+                int strength = sectionConfig.optInt("rectifyStrength", 0);
+                if (strength < 0) strength = 0;
+                if (strength > 100) strength = 100;
+                activeRecorder.setRectifyStrength((float) strength);
+            };
+            com.overdrive.app.config.UnifiedConfigManager
+                .addListener(rectifyConfigListener);
+        } catch (Throwable t) {
+            logger.warn("Failed to register rectify config listener: " + t.getMessage());
+        }
+
         initialized = true;
         logger.info( "GPU surveillance pipeline initialized");
     }
@@ -1322,7 +1403,14 @@ public class GpuSurveillancePipeline {
             // Clear any pending deferred recording
             pendingRecordingDir = null;
             pendingRecordingPrefix = null;
-        
+            recordingMode = false;
+            // Cancel the cold-start storage retry too. Without this, a
+            // RecStorageRetry thread can outlive a full pipeline teardown,
+            // call recorder.startRecording on a half-released encoder, and
+            // either crash the daemon or resurrect a phantom recording on a
+            // recorder that's about to be nulled.
+            cancelStorageReadyRetry();
+
         // Reset mode so status API reflects that we're not in any active mode
         currentMode = Mode.IDLE;
         
@@ -1336,12 +1424,33 @@ public class GpuSurveillancePipeline {
         if (streamingEnabled) {
             disableStreaming();
         }
-        
+
         // Disable surveillance
         if (sentry != null) {
             sentry.disable();
         }
-        
+
+        // OEM Dashcam pipeline shares pano's eglDisplay via EGLCore.createShared.
+        // Calling pano camera.stop() (which terminates the display) before OEM
+        // tears down would leave OEM's render loop sampling against a dead
+        // EGLDisplay — every subsequent eglMakeCurrent / eglSwapBuffers fails
+        // silently with EGL_BAD_DISPLAY and the OEM encoder produces black
+        // frames. Tear OEM down here so its EGL release runs against a still-
+        // valid parent display.
+        try {
+            com.overdrive.app.camera.OemDashcamPipeline oem =
+                com.overdrive.app.daemon.CameraDaemon.getOemDashcamPipeline();
+            if (oem != null && oem.isRunning()) {
+                logger.info("Stopping OEM Dashcam pipeline before pano camera tear-down "
+                    + "(shared eglDisplay)");
+                try { oem.stopRecording(); } catch (Throwable ignored) {}
+                try { oem.stop(); } catch (Throwable ignored) {}
+                com.overdrive.app.daemon.CameraDaemon.setOemDashcamPipeline(null);
+            }
+        } catch (Throwable t) {
+            logger.warn("OEM pre-pano-stop teardown failed: " + t.getMessage());
+        }
+
         // Stop camera (this releases EGL context and surfaces)
         if (camera != null) {
             camera.stop();
@@ -1376,12 +1485,22 @@ public class GpuSurveillancePipeline {
      */
     public void release() {
         stop();
-        
+
+        // Deregister live-config listener BEFORE releasing the recorder so a
+        // racing UCM update can't fire into a half-released recorder.
+        if (rectifyConfigListener != null) {
+            try {
+                com.overdrive.app.config.UnifiedConfigManager
+                    .removeListener(rectifyConfigListener);
+            } catch (Throwable ignored) {}
+            rectifyConfigListener = null;
+        }
+
         if (bitrateController != null) {
             bitrateController.release();
             bitrateController = null;
         }
-        
+
         if (recorder != null) {
             recorder.release();
             recorder = null;
@@ -1422,6 +1541,20 @@ public class GpuSurveillancePipeline {
      * @param prefix Filename prefix (e.g., "cam", "proximity", "event")
      */
     public void startRecording(java.io.File outputDir, String prefix) {
+        // DIAG (Finding A): log the exact recorder/encoder/format state on
+        // every start request so a silent no-op explains itself in the field
+        // log. If this line is ABSENT from a drive's log right after "Starting
+        // DRIVE_MODE recording", the running daemon is NOT this build.
+        {
+            boolean recReady = recorder != null;
+            boolean encReady = recReady && recorder.getEncoder() != null;
+            boolean fmtReady = encReady && recorder.getEncoder().isFormatAvailable();
+            logger.info("startRecording(prefix=" + prefix + ", dir="
+                + (outputDir != null ? outputDir.getName() : "default")
+                + "): recorder=" + recReady + " encoder=" + encReady
+                + " formatAvailable=" + fmtReady + " currentMode=" + currentMode);
+        }
+
         // Stop surveillance if active (mutually exclusive)
         if (currentMode == Mode.SURVEILLANCE) {
             logger.info("Stopping surveillance to start normal recording (mutually exclusive)");
@@ -1429,8 +1562,11 @@ public class GpuSurveillancePipeline {
                 sentry.disable();
             }
         }
-        
-        // SOTA: Ensure storage is ready (mount SD card if needed) for recordings
+
+        // SOTA: Ensure storage is ready (mount SD card if needed) for recordings.
+        // Done OUTSIDE the synchronized block below — ensureStorageReady can
+        // take seconds (mount + dir-walk) and we don't want to hold the
+        // pipeline monitor across that I/O.
         if (outputDir == null) {  // Only check for default recordings dir
             try {
                 StorageManager storage = StorageManager.getInstance();
@@ -1441,18 +1577,72 @@ public class GpuSurveillancePipeline {
                 logger.warn("Error checking storage readiness: " + e.getMessage());
             }
         }
-        
-        if (recorder != null) {
+
+        // Snapshot the recorder under the pipeline monitor so a concurrent
+        // pipeline.stop() (called from CameraDaemon, SurveillanceApiHandler,
+        // SafeLocationManager, etc.) can't null the field between our checks.
+        // The snapshotted reference stays valid for the duration of this
+        // call; if stop() ran first, snapshotted is null and we early-return.
+        // If stop() runs concurrently AFTER snapshot, the encoder may still
+        // be released under us — but recorder.startRecording / triggerEvent
+        // hold their own locks (recordingLock + startStopLock) and a stop
+        // racing in returns its own clean failure path.
+        final GpuMosaicRecorder snapRecorder;
+        synchronized (this) {
+            snapRecorder = recorder;
+        }
+
+        if (snapRecorder != null) {
             // Check if encoder is ready (has received at least one frame from camera).
-            if (recorder.getEncoder() != null && recorder.getEncoder().isFormatAvailable()) {
-                recorder.startRecording(outputDir, prefix);
-                currentMode = Mode.NORMAL_RECORDING;
-                recorder.setOverlayRecordingModeAllowed(true);
-                if (telemetryCollector != null) {
-                    telemetryCollector.setOverlayRecordingActive(true);
-                    telemetryCollector.startPolling();
+            final HardwareEventRecorderGpu enc = snapRecorder.getEncoder();
+            if (enc != null && enc.isFormatAvailable()) {
+                // Pre-flight write probe (timeout-bounded). On a half-mounted USB
+                // at cold start the deeper start path (ensureRecordingsSpace scan
+                // / new MediaMuxer open) can BLOCK INDEFINITELY with no return —
+                // which hangs this thread and defeats the isRecording()-based
+                // retry below (it never runs). Probing first lets us fail fast
+                // and defer + retry instead of hanging.
+                java.io.File probeDir = (outputDir != null) ? outputDir
+                        : StorageManager.getInstance().getRecordingsDir();
+                if (!isStorageWriteReady(probeDir)) {
+                    logger.warn("Recordings volume not write-ready (probe failed/timed out) — "
+                        + "deferring and scheduling retry");
+                    pendingRecordingDir = outputDir;
+                    pendingRecordingPrefix = prefix;
+                    recordingMode = true;
+                    scheduleStorageReadyRetry(outputDir, prefix);
+                    return;
                 }
-                logger.info("Normal recording started (dir=" + (outputDir != null ? outputDir.getName() : "default") + ", prefix=" + prefix + ")");
+                snapRecorder.startRecording(outputDir, prefix);
+                if (snapRecorder.isRecording()) {
+                    currentMode = Mode.NORMAL_RECORDING;
+                    recordingMode = true;
+                    snapRecorder.setOverlayRecordingModeAllowed(true);
+                    if (telemetryCollector != null) {
+                        telemetryCollector.setOverlayRecordingActive(true);
+                        telemetryCollector.startPolling();
+                    }
+                    cancelStorageReadyRetry();
+                    logger.info("Normal recording started (dir=" + (outputDir != null ? outputDir.getName() : "default") + ", prefix=" + prefix + ")");
+                } else {
+                    // recorder.startRecording() returned WITHOUT starting — the
+                    // encoder's triggerEventRecording() failed, in the field
+                    // almost always because the USB volume was not write-ready
+                    // at this instant. This is the cold-start race: the daemon
+                    // boots straight into gear D and asks to record before the
+                    // USB has finished mounting, so mkdirs() on the recordings
+                    // dir fails ("Failed to create parent directory" /
+                    // "No writable USB drive found") and the WHOLE drive then
+                    // records nothing because the old code (a) logged a false
+                    // "Normal recording started" and (b) never retried.
+                    // Defer + retry until storage settles.
+                    logger.warn("Recording did not start — storage not write-ready "
+                        + "(USB still mounting?); deferring and scheduling retry");
+                    pendingRecordingDir = outputDir;
+                    pendingRecordingPrefix = prefix;
+                    recordingMode = true;
+                    scheduleStorageReadyRetry(outputDir, prefix);
+                }
             } else {
                 // Encoder not ready yet (camera still warming up). Store the
                 // request and register a one-shot listener that fires the
@@ -1465,7 +1655,6 @@ public class GpuSurveillancePipeline {
                 pendingRecordingDir = outputDir;
                 pendingRecordingPrefix = prefix;
                 recordingMode = true;
-                final HardwareEventRecorderGpu enc = recorder.getEncoder();
                 if (enc != null) {
                     enc.setFormatAvailableListener(() -> {
                         // Posted off the encoder thread so we don't block dequeue.
@@ -1479,6 +1668,21 @@ public class GpuSurveillancePipeline {
                     });
                 }
             }
+        } else {
+            // recorder == null: the GpuMosaicRecorder is created asynchronously
+            // on the GL thread by start(); a DRIVE_MODE/CONTINUOUS activation
+            // that reaches startRecording() before that completes would
+            // otherwise fall through this whole method and silently no-op —
+            // the daemon logs "Starting DRIVE_MODE recording" but no cam_*.mp4
+            // is ever written for the drive (Finding A: "no recordings while
+            // driving"). Defer instead: capture the intent so the
+            // format-available listener / checkPendingRecording() starts
+            // recording once the recorder + encoder are ready.
+            logger.info("Recorder not created yet — deferring recording start "
+                + "(will begin when pipeline is ready)");
+            pendingRecordingDir = outputDir;
+            pendingRecordingPrefix = prefix;
+            recordingMode = true;
         }
     }
     
@@ -1498,14 +1702,162 @@ public class GpuSurveillancePipeline {
         
         logger.info("Encoder now ready — starting deferred recording");
         recorder.startRecording(dir, prefix);
-        currentMode = Mode.NORMAL_RECORDING;
-        recorder.setOverlayRecordingModeAllowed(true);
-        if (telemetryCollector != null) {
-            telemetryCollector.setOverlayRecordingActive(true);
-            telemetryCollector.startPolling();
+        if (recorder.isRecording()) {
+            currentMode = Mode.NORMAL_RECORDING;
+            recordingMode = true;
+            recorder.setOverlayRecordingModeAllowed(true);
+            if (telemetryCollector != null) {
+                telemetryCollector.setOverlayRecordingActive(true);
+                telemetryCollector.startPolling();
+            }
+            cancelStorageReadyRetry();
+            logger.info("Deferred normal recording started (dir=" +
+                (dir != null ? dir.getName() : "default") + ", prefix=" + prefix + ")");
+        } else {
+            // Encoder ready but storage still not write-ready (cold-start USB
+            // mount race). Re-defer and retry until the volume settles, rather
+            // than silently dropping the whole drive's recording.
+            logger.warn("Deferred start: storage not write-ready yet — scheduling retry");
+            pendingRecordingDir = dir;
+            pendingRecordingPrefix = prefix;
+            recordingMode = true;
+            scheduleStorageReadyRetry(dir, prefix);
         }
-        logger.info("Deferred normal recording started (dir=" + 
-            (dir != null ? dir.getName() : "default") + ", prefix=" + prefix + ")");
+    }
+
+    // --- Cold-start storage-ready retry -----------------------------------
+    // The daemon can boot straight into gear D and request a DRIVE_MODE /
+    // CONTINUOUS recording before the USB volume has finished mounting. The
+    // encoder's MediaMuxer/mkdirs then fails on the not-yet-writable volume
+    // ("Failed to create parent directory" / "No writable USB drive found"),
+    // and historically the entire drive recorded nothing because the start
+    // path logged a false success and never retried. This bounded background
+    // retry re-attempts the start once the volume becomes write-ready, then
+    // exits. It is cancelled by a successful start or by stopRecording()
+    // (e.g. gear D->P), so it can never resurrect a recording after the driver
+    // has parked.
+    private volatile Thread storageRetryThread;
+    private static final long STORAGE_RETRY_INTERVAL_MS = 2000L;
+    private static final long STORAGE_RETRY_TIMEOUT_MS = 60_000L;
+    private static final long STORAGE_PROBE_TIMEOUT_MS = 1500L;
+
+    private synchronized void scheduleStorageReadyRetry(java.io.File outputDir, String prefix) {
+        if (storageRetryThread != null && storageRetryThread.isAlive()) {
+            return;  // a retry is already in flight
+        }
+        storageRetryThread = new Thread(() -> {
+            long deadline = System.currentTimeMillis() + STORAGE_RETRY_TIMEOUT_MS;
+            int attempt = 0;
+            while (System.currentTimeMillis() < deadline) {
+                try {
+                    Thread.sleep(STORAGE_RETRY_INTERVAL_MS);
+                } catch (InterruptedException e) {
+                    return;  // cancelled (stopRecording / success)
+                }
+                // Bail if the request was cancelled (gear change) or already
+                // satisfied by another path.
+                if (pendingRecordingPrefix == null && !recordingMode) return;
+                if (recorder != null && recorder.isRecording()) return;
+                attempt++;
+                try {
+                    // Re-resolve/mount storage, then re-attempt — but ONLY once a
+                    // timeout-bounded write probe confirms the volume is actually
+                    // writable, so a retry attempt can never itself hang inside
+                    // the blocking start path on a still-half-mounted USB.
+                    StorageManager.getInstance().ensureStorageReady(false);
+                    java.io.File probeDir = (outputDir != null) ? outputDir
+                            : StorageManager.getInstance().getRecordingsDir();
+                    if (recorder != null && recorder.getEncoder() != null
+                            && recorder.getEncoder().isFormatAvailable()
+                            && isStorageWriteReady(probeDir)) {
+                        recorder.startRecording(outputDir, prefix);
+                        if (recorder.isRecording()) {
+                            currentMode = Mode.NORMAL_RECORDING;
+                            recordingMode = true;
+                            recorder.setOverlayRecordingModeAllowed(true);
+                            if (telemetryCollector != null) {
+                                telemetryCollector.setOverlayRecordingActive(true);
+                                telemetryCollector.startPolling();
+                            }
+                            pendingRecordingDir = null;
+                            pendingRecordingPrefix = null;
+                            logger.info("Normal recording started on storage retry #" + attempt
+                                + " (dir=" + (outputDir != null ? outputDir.getName() : "default")
+                                + ", prefix=" + prefix + ")");
+                            return;
+                        }
+                    }
+                    logger.info("Storage-ready retry #" + attempt
+                        + ": still not write-ready, will retry");
+                } catch (Exception e) {
+                    logger.warn("Storage-ready retry #" + attempt + " error: " + e.getMessage());
+                }
+            }
+            logger.warn("Storage-ready retry gave up after "
+                + (STORAGE_RETRY_TIMEOUT_MS / 1000) + "s — USB never became write-ready");
+        }, "RecStorageRetry");
+        storageRetryThread.setDaemon(true);
+        storageRetryThread.start();
+    }
+
+    private synchronized void cancelStorageReadyRetry() {
+        Thread t = storageRetryThread;
+        if (t != null) {
+            t.interrupt();
+            storageRetryThread = null;
+        }
+    }
+
+    /**
+     * Timeout-bounded write probe for the target recordings volume. Creates the
+     * dir if needed, then writes + deletes a tiny temp file on a worker thread
+     * joined with a short timeout.
+     *
+     * <p>Returns false if the volume can't be written OR — the key case — the
+     * probe doesn't finish in time. On a half-mounted USB at cold start,
+     * filesystem ops (mkdirs / ensureRecordingsSpace's scan / {@code new
+     * MediaMuxer()}'s open) can block indefinitely with no return, which would
+     * otherwise hang the recording-start thread and defeat the retry above (the
+     * isRecording() check never runs). Gating the real start on this cheap probe
+     * turns that indefinite hang into a fast, recoverable "not ready → retry".
+     * The probe thread is a daemon and holds no pipeline locks, so even if it
+     * does hang on a wedged volume it is harmless and reaped when the process or
+     * the volume recovers.
+     */
+    private boolean isStorageWriteReady(java.io.File dir) {
+        if (dir == null) return false;
+        final java.io.File target = dir;
+        final boolean[] ok = {false};
+        Thread probe = new Thread(() -> {
+            try {
+                if (!target.exists()) {
+                    target.mkdirs();
+                }
+                if (!target.isDirectory()) return;
+                java.io.File t = new java.io.File(target,
+                    ".wrprobe_" + android.os.Process.myPid());
+                java.io.FileOutputStream fos = new java.io.FileOutputStream(t);
+                try {
+                    fos.write(0);
+                    fos.flush();
+                } finally {
+                    try { fos.close(); } catch (Exception ignored) {}
+                }
+                t.delete();
+                ok[0] = true;
+            } catch (Throwable ignored) {
+                // ok stays false — volume not write-ready
+            }
+        }, "RecWriteProbe");
+        probe.setDaemon(true);
+        probe.start();
+        try {
+            probe.join(STORAGE_PROBE_TIMEOUT_MS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+        return ok[0];  // false if the probe timed out (still running) or failed
     }
     
     /**
@@ -1520,10 +1872,11 @@ public class GpuSurveillancePipeline {
         pendingRecordingDir = null;
         pendingRecordingPrefix = null;
         recordingMode = false;
-        
+        cancelStorageReadyRetry();
+
         if (recorder != null) {
             recorder.stopRecording();
-            
+
             // Disable overlay compositing when recording stops
             recorder.setOverlayRecordingModeAllowed(false);
             if (telemetryCollector != null) {
@@ -1648,25 +2001,95 @@ public class GpuSurveillancePipeline {
      * @param streamFps Stream FPS (e.g., 10)
      * @param streamBitrate Stream bitrate (e.g., 2 Mbps)
      */
-    public void enableStreaming(int streamWidth, int streamHeight, int streamFps, 
+    public void enableStreaming(int streamWidth, int streamHeight, int streamFps,
                                int streamBitrate) throws Exception {
-        if (streamingEnabled) {
-            logger.warn("Streaming already enabled");
-            return;
+        streamLifecycleLock.lock();
+        try {
+            if (streamingEnabled) {
+                logger.warn("Streaming already enabled");
+                return;
+            }
+
+            // Auto-start pipeline if not running (e.g., DRIVE_MODE in gear P, user opens stream)
+            if (!running) {
+                logger.info("Pipeline not running — auto-starting for streaming (view-only)");
+                start(false);  // Start without auto-recording
+            }
+
+            // Verify camera GL thread is ready after start
+            if (camera == null || camera.getGlHandler() == null) {
+                logger.error("Cannot enable streaming - camera GL thread not ready");
+                throw new IllegalStateException("Camera GL thread not initialized");
+            }
+            try {
+                enableStreamingInternal(streamWidth, streamHeight, streamFps, streamBitrate);
+            } catch (Throwable t) {
+            // On any failure during init, mirror disableStreaming's
+            // teardown order:
+            //   1. clear camera-side refs FIRST so the GL render loop
+            //      stops dereferencing the about-to-be-released scaler
+            //      / encoder. enableStreamingInternal calls
+            //      camera.setStreamingComponents BEFORE wsStreamServer
+            //      starts, so by the time we reach this catch the
+            //      camera may already hold them.
+            //   2. snapshot + null pipeline fields.
+            //   3. shutdown ws server.
+            //   4. post scaler.release on the GL handler; encoder.release
+            //      goes through STREAM_ENCODER_RELEASE_EXEC so the 3s
+            //      waitForFinalizers doesn't pin the GL handler.
+            // Without #1 the camera GL render loop calls drawFrame on a
+            // released GL program after this catch returns.
+            try {
+                if (camera != null) camera.clearStreamingComponents();
+            } catch (Throwable ignored) {}
+            final HardwareEventRecorderGpu encLocal = streamEncoder;
+            final com.overdrive.app.streaming.GpuStreamScaler scLocal = streamScaler;
+            final com.overdrive.app.streaming.WebSocketStreamServer wsLocal = wsStreamServer;
+            streamEncoder = null;
+            streamScaler = null;
+            wsStreamServer = null;
+            try { if (wsLocal != null) wsLocal.shutdown(); } catch (Throwable ignored) {}
+            android.os.Handler glH = (camera != null) ? camera.getGlHandler() : null;
+            boolean glPostAccepted = false;
+            if (glH != null && scLocal != null) {
+                glPostAccepted = glH.post(() -> {
+                    try { scLocal.unbindOemSource(); scLocal.release(); }
+                    catch (Throwable ignored) {}
+                    // Encoder release dispatched AFTER scaler.release runs
+                    // (still on GL thread), so the BufferQueue tear-down
+                    // can't race the EGLWindowSurface destroy.
+                    if (encLocal != null) submitEncoderRelease(encLocal);
+                });
+            }
+            if (!glPostAccepted) {
+                // Either no GL handler available, or post() returned false
+                // (Looper.quit() ran concurrently on a competing stop). In
+                // either case the GL Runnable will never execute, so
+                // scaler + encoder must be released here or both leak. The
+                // Adreno EGLWindowSurface-destroy race the GL ordering
+                // protects against can't trip if there's no GL thread to
+                // race with — fall back to direct release for both.
+                try { if (scLocal != null) { scLocal.unbindOemSource(); scLocal.release(); } }
+                catch (Throwable ignored) {}
+                if (encLocal != null) submitEncoderRelease(encLocal);
+            }
+            if (t instanceof Exception) throw (Exception) t;
+            throw new RuntimeException(t);
         }
-        
-        // Auto-start pipeline if not running (e.g., DRIVE_MODE in gear P, user opens stream)
-        if (!running) {
-            logger.info("Pipeline not running — auto-starting for streaming (view-only)");
-            start(false);  // Start without auto-recording
+        } finally {
+            streamLifecycleLock.unlock();
         }
-        
-        // Verify camera GL thread is ready after start
-        if (camera == null || camera.getGlHandler() == null) {
-            logger.error("Cannot enable streaming - camera GL thread not ready");
-            throw new IllegalStateException("Camera GL thread not initialized");
-        }
-        
+    }
+
+    private void enableStreamingInternal(int streamWidth, int streamHeight, int streamFps,
+                                         int streamBitrate) throws Exception {
+        // R8-A #18: defensively reset externalStreamSourceActive on every
+        // enable. The disable path resets it at line ~1999 — but a disable
+        // that threw before reaching that line could leave the flag stuck
+        // at true, causing the next reattachOwnStreamCallback to try
+        // unbinding an OEM source that this fresh enable never bound.
+        externalStreamSourceActive = false;
+
         logger.info(String.format("Enabling H.264 streaming: %dx%d @ %dfps, %d Mbps",
                 streamWidth, streamHeight, streamFps, streamBitrate / 1_000_000));
         
@@ -1700,16 +2123,18 @@ public class GpuSurveillancePipeline {
         // GpuMosaicRecorder so live stream and recording stay aligned. On
         // legacy cars the uniforms are unused (uApaMode != 3 path).
         if (streamUsingEscoPath) {
-            streamScaler.setProducerCornerMap(
-                new float[] { 0.0f, 0.0f },  // Front  → producer TL
-                new float[] { 0.5f, 0.5f },  // Right  → producer BR
-                new float[] { 0.5f, 0.0f },  // Rear   → producer TR
-                new float[] { 0.0f, 0.5f }); // Left   → producer BL
-            streamScaler.setFlipFlags(
-                new float[] { 1.0f, 1.0f },  // Front  X+Y-flip
-                new float[] { 0.0f, 1.0f },  // Right  Y-flip
-                new float[] { 0.0f, 0.0f },  // Rear   no flip
-                new float[] { 0.0f, 0.0f }); // Left   no flip
+            // Single combined call referencing the shared Dilink4Constants
+            // so the stream scaler can never silently diverge from the
+            // recorder's mosaic arrangement.
+            streamScaler.setProducerLayout(
+                com.overdrive.app.camera.Dilink4Constants.CORNER_FRONT,
+                com.overdrive.app.camera.Dilink4Constants.CORNER_RIGHT,
+                com.overdrive.app.camera.Dilink4Constants.CORNER_REAR,
+                com.overdrive.app.camera.Dilink4Constants.CORNER_LEFT,
+                com.overdrive.app.camera.Dilink4Constants.FLIP_FRONT,
+                com.overdrive.app.camera.Dilink4Constants.FLIP_RIGHT,
+                com.overdrive.app.camera.Dilink4Constants.FLIP_REAR,
+                com.overdrive.app.camera.Dilink4Constants.FLIP_LEFT);
             // Red-overlay suppression follows the recorder. Read the same
             // unified-config flag so the live preview matches the MP4.
             try {
@@ -1726,15 +2151,25 @@ public class GpuSurveillancePipeline {
             }
         }
         
-        // Initialize on GL thread and WAIT for completion
-        // This ensures the scaler is ready before we set streaming components
+        // Initialize on GL thread and WAIT for completion.
+        // Captured locals (NOT the instance fields) — so if the wait
+        // times out and the catch path nulls this.streamScaler /
+        // this.streamEncoder, the queued init lambda still has a
+        // coherent view of the objects to operate on. Without this,
+        // a 2-second timeout with the GL thread mid-shader-compile
+        // would null the fields, then the eventually-running lambda
+        // would NPE on `streamScaler.init` and the partially-built
+        // GL program would leak (caught lambda swallowed the NPE).
+        final com.overdrive.app.streaming.GpuStreamScaler scalerLocal = streamScaler;
+        final HardwareEventRecorderGpu encoderLocal = streamEncoder;
+        final com.overdrive.app.camera.EGLCore eglCoreLocal = camera.getEglCore();
         final Object initLock = new Object();
         final boolean[] initDone = {false};
         final Exception[] initError = {null};
-        
+
         camera.getGlHandler().post(() -> {
             try {
-                streamScaler.init(camera.getEglCore(), streamEncoder);
+                scalerLocal.init(eglCoreLocal, encoderLocal);
                 logger.info("Stream scaler initialized on GL thread");
             } catch (Exception e) {
                 logger.error("Failed to initialize stream scaler on GL thread", e);
@@ -1746,22 +2181,50 @@ public class GpuSurveillancePipeline {
                 }
             }
         });
-        
-        // Wait for GL thread initialization (max 2 seconds)
-        synchronized (initLock) {
-            if (!initDone[0]) {
-                initLock.wait(2000);
+
+        // Wait for GL thread initialization (max 2 seconds). Release the
+        // streamLifecycleLock around the wait so concurrent disable /
+        // attach / stop callers don't pin for the full 2 seconds — the
+        // pre-fix synchronized(this) held the monitor across this wait
+        // and starved every peer. The components aren't published to the
+        // camera yet (camera.setStreamingComponents happens AFTER this
+        // wait), so a concurrent disableStreaming will see streamingEnabled
+        // == false and bail; a concurrent attachExternalStreamCallback
+        // will see streamScaler == null and refuse. Both safe.
+        boolean lockHeld = streamLifecycleLock.isHeldByCurrentThread();
+        if (lockHeld) streamLifecycleLock.unlock();
+        try {
+            synchronized (initLock) {
+                if (!initDone[0]) {
+                    initLock.wait(2000);
+                }
             }
+        } finally {
+            if (lockHeld) streamLifecycleLock.lock();
         }
-        
+
         if (!initDone[0]) {
             throw new RuntimeException("Stream scaler initialization timed out");
         }
-        
+
         if (initError[0] != null) {
             throw new RuntimeException("Stream scaler initialization failed: " + initError[0].getMessage(), initError[0]);
         }
-        
+
+        // R8-A #9: a concurrent stop() running on the pipeline-level
+        // monitor (different from streamLifecycleLock) could have torn
+        // down `camera` during the unlocked GL-init wait. Check pipeline
+        // viability BEFORE publishing components onto the camera —
+        // otherwise camera.setStreamingComponents would write into a
+        // released camera object whose eglCore + glHandler are dead, and
+        // subsequent draws against streamScaler / streamEncoder would
+        // NPE or render to a destroyed context. The catch path in the
+        // caller will release the just-allocated scaler+encoder.
+        if (!running || camera == null || camera.getGlHandler() == null) {
+            throw new IllegalStateException(
+                "Pipeline torn down during stream init wait — abandoning enable");
+        }
+
         // Now set components on camera (scaler is guaranteed initialized)
         logger.info("Setting streaming components on camera...");
         camera.setStreamingComponents(streamScaler, streamEncoder);
@@ -1783,6 +2246,13 @@ public class GpuSurveillancePipeline {
                     public void run() {
                         try {
                             self.disableStreaming();
+                            // The WS pipe just went dark — view 6 is no longer
+                            // a "keep warm" reason for OEM. Re-evaluate so OEM
+                            // tears down if no recording mode is asking for it.
+                            try {
+                                com.overdrive.app.server.OemDashcamApiHandler
+                                    .scheduleLifecycleRecalc();
+                            } catch (Throwable ignored) {}
                             // Snapshot every cross-thread field once. Without this, a
                             // concurrent stop() can null `recorder` between the null
                             // check and the isRecording() call, NPEing into the
@@ -1836,12 +2306,30 @@ public class GpuSurveillancePipeline {
      * Disables H.264 streaming and releases stream encoder.
      */
     public void disableStreaming() {
+        streamLifecycleLock.lock();
+        try {
+            disableStreamingLocked();
+        } finally {
+            streamLifecycleLock.unlock();
+        }
+    }
+
+    private void disableStreamingLocked() {
+        // Held under streamLifecycleLock to prevent two concurrent
+        // disable callers (idle-shutdown thread vs HTTP DELETE /stream
+        // vs stop()) from both passing the gate and double-releasing
+        // scaler/encoder. ReentrantLock semantics keep nesting safe.
         if (!streamingEnabled) {
             return;
         }
-        
+
         logger.info("Disabling H.264 streaming...");
         streamingEnabled = false;
+        // Reset the external-source flag here so a future re-enableStreaming
+        // followed by view 0..4 doesn't trip the SPS/PPS-resend storm path
+        // in reattachOwnStreamCallback (the flag was added precisely to
+        // avoid that storm; leaving it stale survives the disable cycle).
+        externalStreamSourceActive = false;
         
         // CRITICAL: Clear streaming components from camera FIRST
         // This prevents render loop from using released surfaces
@@ -1859,21 +2347,199 @@ public class GpuSurveillancePipeline {
             wsStreamServer.shutdown();
             wsStreamServer = null;
         }
-        
-        // Release stream encoder
-        if (streamEncoder != null) {
-            streamEncoder.release();
-            streamEncoder = null;
+
+        // R8-A #4 ORDERING: null streamScaler/streamEncoder fields FIRST
+        // so a concurrent attachExternalStreamCallbackLocked observes
+        // streamScaler == null (post-CAS) and refuses to install the OEM
+        // publish ref. Pre-fix, we cleared the OEM publish ref BEFORE
+        // nulling the field — that left a TOCTOU window where attach
+        // could pass `streamScaler != liveScaler` (still equal!) and
+        // re-install the publish ref into the about-to-be-released
+        // scaler. Field-null first, publish-clear second, then the GL
+        // Runnable does belt-and-braces re-clear inside the GL thread.
+        final com.overdrive.app.streaming.GpuStreamScaler scalerRef = streamScaler;
+        final HardwareEventRecorderGpu encoderRef = streamEncoder;
+        streamScaler = null;        // field-null visible to render loop + attach NOW
+        streamEncoder = null;
+
+        // OEM publish ref clear runs AFTER the field-null so any concurrent
+        // attach that captured a non-null scaler reference observes the
+        // streamScaler==null on its re-check and unbinds. Done on the
+        // caller thread because OEM's render loop reads the volatile
+        // reference; once it sees null, no more publishOemTexMatrix calls
+        // touch our scaler.
+        try {
+            com.overdrive.app.camera.OemDashcamPipeline oem =
+                com.overdrive.app.daemon.CameraDaemon.getOemDashcamPipeline();
+            if (oem != null) oem.setStreamScalerForOemPublish(null);
+        } catch (Throwable ignored) {}
+
+        // Stream encoder + scaler MUST be torn down ON the GL thread, in
+        // order: scaler.unbindOemSource → scaler.release → encoder.release.
+        // Reasoning: pano's drawFrame on the GL thread reads streamScaler
+        // and pumps frames into streamEncoder.getInputSurface(). If we
+        // released the encoder on the HTTP worker first (the pre-fix
+        // sequence), an in-flight scaler.drawFrame would race against
+        // inputSurface.release() — Adreno would either silently swallow
+        // the swap or crash on EGL_BAD_NATIVE_WINDOW. Folding both into a
+        // single posted Runnable serializes them between two render
+        // iterations.
+        android.os.Handler glHandler = (camera != null) ? camera.getGlHandler() : null;
+        // GL-bound teardown — scaler.unbindOemSource + scaler.release ONLY.
+        // encoder.release is offloaded to the dedicated stream-encoder
+        // executor below so a 3s waitForFinalizers can't pin pano's GL
+        // thread (and therefore frame production) post-disable.
+        if (scalerRef != null && glHandler != null) {
+            final java.util.concurrent.CountDownLatch latch =
+                new java.util.concurrent.CountDownLatch(1);
+            boolean posted = glHandler.post(() -> {
+                try {
+                    // Belt-and-braces: a racy attach that landed between
+                    // pre-post null and this Runnable's run could have
+                    // re-installed the OEM publish ref. Clear it here so
+                    // the OEM render loop can't keep writing into the
+                    // about-to-be-released scaler.
+                    try {
+                        com.overdrive.app.camera.OemDashcamPipeline oem2 =
+                            com.overdrive.app.daemon.CameraDaemon.getOemDashcamPipeline();
+                        if (oem2 != null) oem2.setStreamScalerForOemPublish(null);
+                    } catch (Throwable ignored) {}
+                    try { scalerRef.unbindOemSource(); } catch (Throwable ignored) {}
+                    try { scalerRef.release(); } catch (Throwable t) {
+                        logger.warn("scaler release on GL thread: " + t.getMessage());
+                    }
+                    // CRITICAL ORDERING: encoder.release MUST happen AFTER
+                    // scaler.release. The scaler's encoderSurface wraps
+                    // encoder.getInputSurface(); destroying the BufferQueue
+                    // (encoder.release → inputSurface.release) before
+                    // eglDestroySurface on the EGLWindowSurface that
+                    // wrapped it crashes Adreno with EGL_BAD_NATIVE_WINDOW.
+                    // Dispatch the encoder release HERE (inside the GL
+                    // Runnable's finally, after scaler.release returned)
+                    // so order is preserved without pinning the GL thread
+                    // for the 3s waitForFinalizers.
+                    if (encoderRef != null) {
+                        submitEncoderRelease(encoderRef);
+                    }
+                } finally {
+                    latch.countDown();
+                }
+            });
+            if (!posted) {
+                logger.warn("scaler release: GL handler post() rejected; falling back");
+                try { scalerRef.unbindOemSource(); } catch (Throwable ignored) {}
+                try { scalerRef.release(); } catch (Throwable ignored) {}
+                if (encoderRef != null) submitEncoderRelease(encoderRef);
+            } else {
+                try {
+                    // 1000ms ceiling: scaler.release does eglCore.makeCurrent +
+                    // glDeleteProgram + destroySurface + makeNothingCurrent and
+                    // queues encoder.release on the offload exec — all of which
+                    // need to complete on the GL thread before the next
+                    // enableStreaming's init Runnable runs, otherwise the new
+                    // init lands queued behind the old release and the user
+                    // sees a black flash on rapid disable→enable. 200ms was
+                    // shorter than worst-case GL frame stalls observed in V19
+                    // stage timings (~207ms outlier).
+                    if (!latch.await(1000, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                        logger.warn("scaler release on GL thread did not complete within 1000ms");
+                    }
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        } else if (scalerRef != null) {
+            try { scalerRef.unbindOemSource(); } catch (Throwable ignored) {}
+            try { scalerRef.release(); } catch (Throwable ignored) {}
+            if (encoderRef != null) submitEncoderRelease(encoderRef);
+        } else if (encoderRef != null) {
+            // Scaler-less path (initialization aborted before scaler).
+            submitEncoderRelease(encoderRef);
         }
-        
-        // Release stream scaler
-        if (streamScaler != null) {
-            streamScaler.release();
-            streamScaler = null;
-        }
-        
+
         logger.info("H.264 streaming disabled");
     }
+
+    /**
+     * Fire-and-forget submit of {@code encoder.release()} onto the dedicated
+     * streaming-encoder release executor. NEVER blocks the caller — the GL
+     * render thread inside the disable Runnable returns immediately while
+     * the native release runs on the executor.
+     *
+     * <p>Single-threaded executor: Adreno's HAL refcount has known bugs
+     * around concurrent {@code MediaCodec.release()} calls. If a release
+     * wedges, subsequent ones queue behind it — that's an accepted cost
+     * in exchange for a design we can reason about. The shutdown hook
+     * drains the queue inline at process exit so encoders are released
+     * before the JVM goes away.
+     */
+    static void submitEncoderRelease(HardwareEventRecorderGpu encoderRef) {
+        if (encoderRef == null) return;
+        try {
+            STREAM_ENCODER_RELEASE_EXEC.submit(() -> {
+                try { encoderRef.release(); } catch (Throwable t) {
+                    DaemonLogger.getInstance(TAG).warn(
+                        "streamEncoder release on offload thread: " + t.getMessage());
+                }
+            });
+        } catch (java.util.concurrent.RejectedExecutionException re) {
+            // Executor shut down (typically JVM exit racing the disable
+            // path). Best-effort: spawn a one-shot daemon thread so the
+            // encoder still releases without pinning the caller.
+            Thread t = new Thread(() -> {
+                try { encoderRef.release(); } catch (Throwable ignored) {}
+            }, "StreamEncoderReleaseFallback");
+            t.setDaemon(true);
+            t.start();
+        }
+    }
+
+    /**
+     * Static shutdown hook for the encoder-release executor. Called from
+     * CameraDaemon's JVM shutdown hook so any in-flight releases drain
+     * before the process exits.
+     *
+     * @return true iff the executor drained cleanly within {@code awaitMs};
+     *         false if the timeout fired — in which case shutdownNow's
+     *         dropped Runnables are run inline so encoders still release
+     *         before process exit.
+     */
+    public static boolean shutdownStreamEncoderReleaseExec(long awaitMs) {
+        boolean drained = false;
+        try {
+            STREAM_ENCODER_RELEASE_EXEC.shutdown();
+            drained = STREAM_ENCODER_RELEASE_EXEC.awaitTermination(
+                awaitMs, java.util.concurrent.TimeUnit.MILLISECONDS);
+            if (!drained) {
+                DaemonLogger.getInstance(TAG).warn(
+                    "streamEncoder release exec did not drain in " + awaitMs
+                    + "ms; forcing shutdownNow + inline-draining queued releases");
+                for (Runnable r : STREAM_ENCODER_RELEASE_EXEC.shutdownNow()) {
+                    try { r.run(); } catch (Throwable ignored) {}
+                }
+            }
+        } catch (InterruptedException ie) {
+            DaemonLogger.getInstance(TAG).warn(
+                "shutdownStreamEncoderReleaseExec interrupted; forcing shutdownNow");
+            try {
+                for (Runnable r : STREAM_ENCODER_RELEASE_EXEC.shutdownNow()) {
+                    try { r.run(); } catch (Throwable ignored) {}
+                }
+            } catch (Throwable ignored) {}
+            Thread.currentThread().interrupt();
+        }
+        return drained;
+    }
+
+    // Single-thread executor for streamEncoder.release(). Single-threaded
+    // because two concurrent native-codec releases on Adreno occasionally
+    // trip a HAL refcount bug. Daemon thread so it doesn't block JVM exit.
+    private static final java.util.concurrent.ExecutorService STREAM_ENCODER_RELEASE_EXEC =
+        java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "StreamEncoderRelease");
+            t.setDaemon(true);
+            return t;
+        });
     
     /**
      * Checks if streaming is enabled.
@@ -2041,21 +2707,178 @@ public class GpuSurveillancePipeline {
     }
     
     /**
+     * Switch the WebSocket stream sink from this pano pipeline's stream
+     * encoder to the OEM Dashcam pipeline's encoder. Called via reflection
+     * by {@code CameraDaemon.routeStreamToOemDashcam} when view mode 6 is
+     * selected. Returns silently when streaming isn't active or the OEM
+     * pipeline isn't running.
+     *
+     * <p>Bidirectional: when view mode 0..4 is selected later,
+     * {@code reattachOwnStreamCallback} reverses this — the WS server is
+     * the same instance throughout, only the source encoder changes.
+     */
+    /**
+     * @return true iff the OEM encoder is now feeding the WS sink. Returns
+     *         false (with a WARN log) when streaming wasn't enabled, the
+     *         OEM pipeline wasn't running, or its encoder hadn't been
+     *         constructed yet. Caller surfaces the failure to the client
+     *         instead of misreporting success.
+     */
+    public boolean attachExternalStreamCallback(
+            com.overdrive.app.camera.OemDashcamPipeline oemPipeline) {
+        streamLifecycleLock.lock();
+        try {
+            return attachExternalStreamCallbackLocked(oemPipeline);
+        } finally {
+            streamLifecycleLock.unlock();
+        }
+    }
+
+    private boolean attachExternalStreamCallbackLocked(
+            com.overdrive.app.camera.OemDashcamPipeline oemPipeline) {
+        // Held under streamLifecycleLock so we share the lock with
+        // disableStreaming. Otherwise: HTTP worker A passes the
+        // `streamingEnabled` gate, worker B's disableStreaming acquires
+        // the lock, nulls streamScaler + clears OEM publish ref +
+        // posts the GL release Runnable; worker A then re-installs the
+        // publish ref onto the about-to-be-released scaler and the OEM
+        // render loop pins it indefinitely. Symptom: live stream
+        // switches feeds 1-2s after a view change because the scaler
+        // the OEM loop is publishing into is a stale ref the WS server
+        // is no longer reading from.
+        if (!streamingEnabled || wsStreamServer == null) {
+            logger.warn("attachExternalStreamCallback: streaming not enabled — ignoring");
+            return false;
+        }
+        if (oemPipeline == null || !oemPipeline.isRunning()) {
+            logger.warn("attachExternalStreamCallback: OEM pipeline not running — ignoring");
+            return false;
+        }
+        // Capture the live scaler under the monitor.
+        final com.overdrive.app.streaming.GpuStreamScaler liveScaler = streamScaler;
+        if (liveScaler == null) {
+            logger.warn("attachExternalStreamCallback: streamScaler null — streaming not initialized");
+            return false;
+        }
+        int oemTex = oemPipeline.getCameraTextureId();
+        android.graphics.SurfaceTexture oemSt = oemPipeline.getCameraSurfaceTexture();
+        if (oemTex == 0 || oemSt == null) {
+            logger.warn("attachExternalStreamCallback: OEM texture not yet allocated — ignoring");
+            return false;
+        }
+        try {
+            liveScaler.bindOemSource(oemTex, oemSt);
+            // Defensive: a concurrent disable that BARELY missed the
+            // monitor entry could have just nulled streamScaler and
+            // cleared the OEM publish ref. Re-check under our held
+            // monitor that the captured scaler is still THE live scaler
+            // before we re-install the publish ref. If not, undo and
+            // refuse the route.
+            if (streamScaler != liveScaler) {
+                try { liveScaler.unbindOemSource(); } catch (Throwable ignored) {}
+                logger.warn("attachExternalStreamCallback: scaler swapped under us; aborting attach");
+                return false;
+            }
+            oemPipeline.setStreamScalerForOemPublish(liveScaler);
+        } catch (Throwable t) {
+            logger.warn("attachExternalStreamCallback: streamScaler.bindOemSource failed: "
+                + t.getMessage());
+            return false;
+        }
+        externalStreamSourceActive = true;
+        logger.info("Stream sink switched: pano → OEM Dashcam");
+        return true;
+    }
+
+    /**
+     * True when the WS sink is currently bound to an external (OEM)
+     * encoder rather than this pipeline's own streamEncoder. Used by
+     * reattachOwnStreamCallback to skip the SPS/PPS-resend storm on
+     * every view 0..4 click — only fires when there's actually something
+     * to swap back.
+     */
+    private volatile boolean externalStreamSourceActive = false;
+
+    /**
+     * Restore the AVM mosaic as the streamScaler's source. Called by the
+     * existing /api/stream/view/{0..4} path after the scaler view-mode is
+     * set. Under the SOTA texture-sharing architecture there's no encoder
+     * swap or callback rebind — the same {@code streamEncoder} keeps
+     * feeding the WS sink throughout. We only tell the scaler to stop
+     * sampling the OEM OES texture and resume reading the AVM mosaic.
+     */
+    public void reattachOwnStreamCallback() {
+        // Held under streamLifecycleLock so a concurrent disableStreaming
+        // can't null streamScaler between our null-check and the
+        // unbindOemSource call (R8 regression #2). Lock is cheap — no
+        // GL post inside, just a setter on the scaler and an OEM publish
+        // ref clear.
+        streamLifecycleLock.lock();
+        try {
+            // Capture the scaler under the lock; release immediately
+            // before invoking unbindOemSource so the call doesn't pin
+            // peers, but keep the local reference so a concurrent disable
+            // that nulls streamScaler post-capture can't NPE us.
+            final com.overdrive.app.streaming.GpuStreamScaler scaler = streamScaler;
+            if (!streamingEnabled || scaler == null) return;
+            if (!externalStreamSourceActive) return;
+            externalStreamSourceActive = false;
+            try {
+                scaler.unbindOemSource();
+            } catch (Throwable t) {
+                logger.warn("streamScaler.unbindOemSource failed: " + t.getMessage());
+            }
+            // Stop the OEM render loop's per-frame matrix publish — once
+            // the scaler is no longer sampling OEM, the publish is wasted
+            // work.
+            try {
+                com.overdrive.app.camera.OemDashcamPipeline oem =
+                    com.overdrive.app.daemon.CameraDaemon.getOemDashcamPipeline();
+                if (oem != null) oem.setStreamScalerForOemPublish(null);
+            } catch (Throwable ignored) {}
+            logger.info("Stream source: OEM → AVM mosaic");
+        } finally {
+            streamLifecycleLock.unlock();
+        }
+    }
+
+    /**
+     * Tracks whether THIS pipeline instance currently holds an active polling
+     * refcount on the shared TelemetryDataCollector. The collector is
+     * refcount-floored at 0, but asymmetric start/stop calls (start gated on
+     * NORMAL_RECORDING, stop unconditional) underflow against the floor and
+     * silently consume a future consumer's release. Tracking explicit hold
+     * state keeps every start/stop pair balanced regardless of mode.
+     */
+    private boolean overlayPollingHeld = false;
+
+    /**
      * Enables or disables the telemetry overlay.
      * Starts/stops the telemetry collector based on current recording mode.
+     *
+     * <p>Refcount discipline: start path is gated on {@code enabled &&
+     * currentMode == NORMAL_RECORDING}; stop path mirrors that gate via the
+     * {@code overlayPollingHeld} flag so we never issue more stops than
+     * starts. Without this, a user toggling overlay-off outside NORMAL_RECORDING
+     * issues an unmatched decrement that the collector's atomic floor
+     * absorbs but that steals the next legitimate consumer's release.
      */
     public void setOverlayEnabled(boolean enabled) {
         this.overlayEnabledConfig = enabled;
         if (recorder != null) {
             recorder.setOverlayEnabled(enabled);
         }
-        // Start/stop telemetry collector based on overlay state
-        if (enabled && currentMode == Mode.NORMAL_RECORDING && telemetryCollector != null) {
+        if (telemetryCollector == null) return;
+
+        boolean shouldHold = enabled && currentMode == Mode.NORMAL_RECORDING;
+        if (shouldHold && !overlayPollingHeld) {
             telemetryCollector.setOverlayRecordingActive(true);
             telemetryCollector.startPolling();
-        } else if (!enabled && telemetryCollector != null) {
+            overlayPollingHeld = true;
+        } else if (!shouldHold && overlayPollingHeld) {
             telemetryCollector.setOverlayRecordingActive(false);
             telemetryCollector.stopPolling();
+            overlayPollingHeld = false;
         }
     }
 }

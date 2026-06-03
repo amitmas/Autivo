@@ -213,24 +213,41 @@ public final class BydApaViewpointHelper {
                     if (device instanceof Integer && (Integer) device == DEVICE_PANORAMA
                             && feature instanceof Integer
                             && (Integer) feature == FEATURE_PANORAMA_OUTPUT_STATE
-                            && value instanceof Integer
-                            && (Integer) value == 1) {
-                        // HAL came back online — re-apply mosaic viewpoint.
-                        // Hold LOCK + check enabled to avoid racing disable().
-                        // The listener fires on a BYDAutoManager binder thread;
-                        // disable() runs on whichever thread closes the camera.
-                        synchronized (LOCK) {
-                            if (!enabled) return null;  // disable() already ran
-                            try {
-                                int rc = invokeSetIntArray(mgr, DEVICE_PANORAMA,
-                                    PANO_VIEWPOINT_SET_FEATURES,
-                                    new int[]{ 7, 0, 1, 0, 0 });
-                                logger.info("Re-applied viewpoint=" + VIEWPOINT_ON
-                                    + " on PANORAMA_OUTPUT_STATE=1 (rc=" + rc + ")");
-                            } catch (Throwable t) {
-                                logger.warn("Re-apply viewpoint failed: " + t.getMessage());
+                            && value instanceof Integer) {
+                        int v = (Integer) value;
+                        // Always log so we can correlate value transitions
+                        // against event=8 cadence in the field.
+                        logger.info("PANORAMA_OUTPUT_STATE=" + v);
+                        if (v == 1) {
+                            // HAL came back online — re-apply mosaic viewpoint.
+                            // Hold LOCK + check enabled to avoid racing disable().
+                            // The listener fires on a BYDAutoManager binder thread;
+                            // disable() runs on whichever thread closes the camera.
+                            synchronized (LOCK) {
+                                if (!enabled) return null;  // disable() already ran
+                                try {
+                                    int rc = invokeSetIntArray(mgr, DEVICE_PANORAMA,
+                                        PANO_VIEWPOINT_SET_FEATURES,
+                                        new int[]{ 7, 0, 1, 0, 0 });
+                                    logger.info("Re-applied viewpoint=" + VIEWPOINT_ON
+                                        + " on PANORAMA_OUTPUT_STATE=1 (rc=" + rc + ")");
+                                } catch (Throwable t) {
+                                    logger.warn("Re-apply viewpoint failed: " + t.getMessage());
+                                }
                             }
                         }
+                        // PANORAMA_OUTPUT_STATE=7 (compositor reporting
+                        // non-matching mode) is intentionally unhandled.
+                        // Esco only releases viewpoint here when AVC is
+                        // foreground (il/C6498a.java:310-313 — guarded by
+                        // processMonitor.m28938a()). We don't have UsageStats
+                        // access, so we previously fired UNCONDITIONAL release
+                        // — which corrupted every dilink4 session: the =7
+                        // event fires within milliseconds of every HAL warmup,
+                        // releasing the panorama viewpoint right as we open
+                        // the camera. Frames came back at 24 KB instead of
+                        // ~80 KB. Without UsageStats we'd rather hold
+                        // viewpoint=2012 always than mis-release it.
                     }
                 }
                 return null;

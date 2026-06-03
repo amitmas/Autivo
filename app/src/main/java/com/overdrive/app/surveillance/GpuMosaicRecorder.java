@@ -65,6 +65,33 @@ public class GpuMosaicRecorder {
     private int uRedMaskStrengthLocation;
     private int uApaCenterInsetLocation;
     private volatile float apaCenterInset = 0.0f;
+    // Two-parameter division-model dewarp coefficients. 0 = passthrough
+    // (identity). Positive values pull peripheral output pixels toward the
+    // centre of the source so straight world lines come out straighter.
+    // Sampling formula:
+    //     r_source = r_output / (1 + k1·r² + k2·r⁴)
+    // Single slider drives both in a fixed 3:1 ratio so the UX stays one
+    // control; k2 disproportionately corrects the corners (r⁴ grows 4×
+    // faster than r² between mid-radius and corner) while leaving the
+    // centre unchanged. UI exposes 0..100 mapped to k1∈[0,0.30], k2∈[0,0.10];
+    // see setRectifyStrength. Gated to the legacy 4-strip layout
+    // (uApaMode==0): dilink4's HAL-emitted 2x2 lands clean per-tile, and
+    // 3-cam / APA paths have non-square producer tiles where a global
+    // radial formula would distort rather than rectify.
+    //
+    // Volatile — UI thread writes via the public setter, GL thread reads
+    // inside the dirty-flag CAS block in drawFrame.
+    private volatile float rectifyK1 = 0.0f;
+    private volatile float rectifyK2 = 0.0f;
+    // Per-cam tile aspect ratio (height/width). Default 0.75 = Seal
+    // (1280×960). Pipeline pushes the profile-resolved value via
+    // setRectifyAspect on init; volatile because the writer is the camera
+    // GL thread (init) and the reader is the encoder GL thread (drawFrame),
+    // and there's no enclosing lock between them.
+    private volatile float rectifyAspect = 0.75f;
+    private int uRectifyK1Location;
+    private int uRectifyK2Location;
+    private int uRectifyAspectLocation;
     private int aPositionLocation;
     private int aTexCoordLocation;
 
@@ -142,6 +169,20 @@ public class GpuMosaicRecorder {
     // reinit's fresh programId picks up the layout on first drawFrame.
     private final java.util.concurrent.atomic.AtomicBoolean apaModeUniformDirty =
         new java.util.concurrent.atomic.AtomicBoolean(true);
+    // Broader dirty bit covering the OTHER quasi-static uniforms that
+    // change only on configuration: uApplyManualYFlip (depends on
+    // cameraLayout), uProducerFor* / uFlipFor* (set once at init),
+    // uRedMaskStrength + uApaCenterInset (rare config flips). Pre-fix
+    // every drawFrame uploaded all 11 uniforms unconditionally and
+    // alloc'd two scratch float[8] arrays. This bit is CAS-claimed so
+    // a setter racing the consume re-flips dirty=true and the next
+    // frame replays.
+    private final java.util.concurrent.atomic.AtomicBoolean uniformsDirty =
+        new java.util.concurrent.atomic.AtomicBoolean(true);
+    // Scratch buffers for the per-frame producer-corner snapshot under
+    // the lock. Reused — no per-frame alloc.
+    private final float[] producerCornerScratch = new float[8];
+    private final float[] flipFlagsScratch = new float[8];
     private long lastFrameTime = 0;
     private long frameCount = 0;
     
@@ -452,7 +493,10 @@ public class GpuMosaicRecorder {
         uFlipForLeftLocation  = GLES20.glGetUniformLocation(programId, "uFlipForLeft");
         uRedMaskStrengthLocation = GLES20.glGetUniformLocation(programId, "uRedMaskStrength");
         uApaCenterInsetLocation = GLES20.glGetUniformLocation(programId, "uApaCenterInset");
-        
+        uRectifyK1Location = GLES20.glGetUniformLocation(programId, "uRectifyK1");
+        uRectifyK2Location = GLES20.glGetUniformLocation(programId, "uRectifyK2");
+        uRectifyAspectLocation = GLES20.glGetUniformLocation(programId, "uRectifyAspect");
+
         GlUtil.checkGlError("glGetLocation");
         
         // Create vertex buffers
@@ -619,40 +663,53 @@ public class GpuMosaicRecorder {
         if (uTexMatrixLocation >= 0) {
             GLES20.glUniformMatrix4fv(uTexMatrixLocation, 1, false, currentTexMatrix, 0);
         }
-        if (uApplyManualYFlipLocation >= 0) {
-            // Legacy (cameraLayout != 3) → ImageReader output is canonical
-            // Y-up; we must manually flip V to put producer-top at screen-top.
-            // DiLink 4 (cameraLayout == 3) → SurfaceTexture matrix already
-            // contains the producer Y-flip; manual flip would double-flip.
-            GLES20.glUniform1f(uApplyManualYFlipLocation,
-                cameraLayout == 3 ? 0.0f : 1.0f);
-        }
-        // Per-output-corner producer mapping + per-role flip flags.
-        // Snapshot under lock; UI thread can race the GL upload here.
-        if (uProducerForFrontLocation >= 0) {
-            float[] m = new float[8];
-            float[] f = new float[8];
-            synchronized (producerCornerMapLock) {
-                System.arraycopy(producerCornerMap, 0, m, 0, 8);
-                System.arraycopy(flipFlags, 0, f, 0, 8);
+        // Quasi-static uniforms (manual-Y-flip, per-role producer corner +
+        // flip, red-mask, APA center inset) change only on config / layout
+        // changes. Wrap behind a CAS-claimed dirty bit so steady-state
+        // frames pay zero uniform uploads + zero lock acquisitions.
+        if (uniformsDirty.compareAndSet(true, false)) {
+            if (uApplyManualYFlipLocation >= 0) {
+                // Legacy (cameraLayout != 3) → ImageReader output is canonical
+                // Y-up; we must manually flip V to put producer-top at screen-top.
+                // DiLink 4 (cameraLayout == 3) → SurfaceTexture matrix already
+                // contains the producer Y-flip; manual flip would double-flip.
+                GLES20.glUniform1f(uApplyManualYFlipLocation,
+                    cameraLayout == 3 ? 0.0f : 1.0f);
             }
-            GLES20.glUniform2f(uProducerForFrontLocation, m[0], m[1]);
-            GLES20.glUniform2f(uProducerForRightLocation, m[2], m[3]);
-            GLES20.glUniform2f(uProducerForRearLocation,  m[4], m[5]);
-            GLES20.glUniform2f(uProducerForLeftLocation,  m[6], m[7]);
-            if (uFlipForFrontLocation >= 0) {
-                GLES20.glUniform2f(uFlipForFrontLocation, f[0], f[1]);
-                GLES20.glUniform2f(uFlipForRightLocation, f[2], f[3]);
-                GLES20.glUniform2f(uFlipForRearLocation,  f[4], f[5]);
-                GLES20.glUniform2f(uFlipForLeftLocation,  f[6], f[7]);
+            if (uProducerForFrontLocation >= 0) {
+                synchronized (producerCornerMapLock) {
+                    System.arraycopy(producerCornerMap, 0, producerCornerScratch, 0, 8);
+                    System.arraycopy(flipFlags, 0, flipFlagsScratch, 0, 8);
+                }
+                float[] m = producerCornerScratch;
+                float[] f = flipFlagsScratch;
+                GLES20.glUniform2f(uProducerForFrontLocation, m[0], m[1]);
+                GLES20.glUniform2f(uProducerForRightLocation, m[2], m[3]);
+                GLES20.glUniform2f(uProducerForRearLocation,  m[4], m[5]);
+                GLES20.glUniform2f(uProducerForLeftLocation,  m[6], m[7]);
+                if (uFlipForFrontLocation >= 0) {
+                    GLES20.glUniform2f(uFlipForFrontLocation, f[0], f[1]);
+                    GLES20.glUniform2f(uFlipForRightLocation, f[2], f[3]);
+                    GLES20.glUniform2f(uFlipForRearLocation,  f[4], f[5]);
+                    GLES20.glUniform2f(uFlipForLeftLocation,  f[6], f[7]);
+                }
             }
-        }
-        if (uRedMaskStrengthLocation >= 0) {
-            GLES20.glUniform1f(uRedMaskStrengthLocation,
-                redMaskEnabled ? 1.0f : 0.0f);
-        }
-        if (uApaCenterInsetLocation >= 0) {
-            GLES20.glUniform1f(uApaCenterInsetLocation, apaCenterInset);
+            if (uRedMaskStrengthLocation >= 0) {
+                GLES20.glUniform1f(uRedMaskStrengthLocation,
+                    redMaskEnabled ? 1.0f : 0.0f);
+            }
+            if (uApaCenterInsetLocation >= 0) {
+                GLES20.glUniform1f(uApaCenterInsetLocation, apaCenterInset);
+            }
+            if (uRectifyK1Location >= 0) {
+                GLES20.glUniform1f(uRectifyK1Location, rectifyK1);
+            }
+            if (uRectifyK2Location >= 0) {
+                GLES20.glUniform1f(uRectifyK2Location, rectifyK2);
+            }
+            if (uRectifyAspectLocation >= 0) {
+                GLES20.glUniform1f(uRectifyAspectLocation, rectifyAspect);
+            }
         }
 
         // Set up vertex attributes
@@ -837,14 +894,18 @@ public class GpuMosaicRecorder {
     
     /**
      * Starts recording to a file.
-     * 
+     *
      * @param outputPath Path for the output MP4 file
+     * @return true iff the encoder accepted the trigger and a muxer is now
+     *         live (or recording was already in flight). False when the
+     *         encoder is null OR the savedFormat barrier inside
+     *         HardwareEventRecorderGpu refused.
      */
-    public void startRecording(String outputPath) {
+    public boolean startRecording(String outputPath) {
         synchronized (recordingLock) {
             if (recording) {
                 logger.warn("Already recording");
-                return;
+                return true;
             }
 
             // Start encoder recording (with pre-record buffer flush)
@@ -861,21 +922,29 @@ public class GpuMosaicRecorder {
 
                 logger.info("Recording started: " + outputPath + " (codec=" +
                     (encoder.isHevcCodec() ? "H.265" : "H.264") + ")");
-            } else {
-                logger.error("Failed to start encoder recording");
+                return true;
             }
+            logger.error("Failed to start encoder recording");
+            return false;
         }
     }
 
     /**
      * Triggers event recording with pre-record buffer flush.
      * Alias for startRecording for API compatibility.
+     *
+     * @return true iff the encoder accepted the trigger and a muxer is now
+     *         live. False when the encoder is null OR the savedFormat
+     *         barrier inside HardwareEventRecorderGpu refused (encoder
+     *         hasn't published its format yet — typically a cold-boot
+     *         race). "Already recording" is reported as true since the
+     *         existing recording satisfies the caller's intent.
      */
-    public void triggerEventRecording(String outputPath, long postRecordDurationMs) {
+    public boolean triggerEventRecording(String outputPath, long postRecordDurationMs) {
         synchronized (recordingLock) {
             if (recording) {
                 logger.warn("Already recording");
-                return;
+                return true;
             }
 
             // Start encoder recording (with pre-record buffer flush)
@@ -883,9 +952,10 @@ public class GpuMosaicRecorder {
                 recording = true;
                 frameCount = 0;
                 logger.info("Recording started: " + outputPath);
-            } else {
-                logger.error("Failed to start encoder recording");
+                return true;
             }
+            logger.error("Failed to start encoder recording");
+            return false;
         }
     }
     
@@ -929,32 +999,60 @@ public class GpuMosaicRecorder {
                 (outputDir != null ? outputDir.getName() : "default") + ", prefix=" + prefix + ")");
             return;
         }
-        // SOTA: Use StorageManager for recordings directory and auto-cleanup
+        // SOTA: Use StorageManager for recordings directory and auto-cleanup.
+        // Each step is wrapped in lightweight timing because this path used
+        // to silently stall for minutes when the boot reap held the storage
+        // cleanup lock and ensureRecordingsSpace blocked behind it. With no
+        // logs between "Starting DRIVE_MODE recording" and the muxer start,
+        // the symptom looked like "recording isn't triggering" rather than
+        // "storage cleanup is starving the recorder." Treat any pre-flight
+        // step that takes &gt;1s as suspicious and log it.
+        long startNs = System.nanoTime();
         try {
             com.overdrive.app.storage.StorageManager storageManager =
                 com.overdrive.app.storage.StorageManager.getInstance();
-            
+
             // Use provided directory or default to recordings dir
             java.io.File targetDir = outputDir != null ? outputDir : storageManager.getRecordingsDir();
-            
+
             // Ensure directory exists
             if (!targetDir.exists()) {
                 targetDir.mkdirs();
             }
-            
-            // Reserve ~100MB for new recording
-            storageManager.ensureRecordingsSpace(100 * 1024 * 1024);
-            
+
+            // Reserve ~100MB for new recording. Time it explicitly — a slow
+            // call here means the storage cleanup lock is contended (boot
+            // reap walking a large external volume, periodic cleanup running
+            // a deletion burst, etc.) and the user's recording is being held
+            // up by housekeeping.
+            //
+            // Pass `targetDir` explicitly so the pre-flight reserve operates
+            // on the SAME directory we're about to write into. Without this,
+            // a concurrent storage-type switch (HTTP setRecordingsStorageType)
+            // could swap recordingsDir between our targetDir read above and
+            // ensureRecordingsSpace's internal re-read, leaving the reserve
+            // pointed at the new volume while the file lands on the old.
+            long reserveStartNs = System.nanoTime();
+            storageManager.ensureRecordingsSpace(100 * 1024 * 1024, targetDir);
+            long reserveMs = (System.nanoTime() - reserveStartNs) / 1_000_000L;
+            if (reserveMs > 1_000) {
+                logger.warn("Recorder pre-flight ensureRecordingsSpace took " + reserveMs
+                    + "ms — storage cleanup is starving the recording start path");
+            } else if (reserveMs > 100) {
+                logger.info("Recorder pre-flight ensureRecordingsSpace: " + reserveMs + "ms");
+            }
+
             // Generate filename with timestamp
             String timestamp = new java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US)
                     .format(new java.util.Date());
             String filename = prefix + "_" + timestamp + ".mp4";
-            
+
             // Use target directory
             String outputPath = new java.io.File(targetDir, filename).getAbsolutePath();
             startRecording(outputPath);
         } catch (Exception e) {
-            logger.error("Failed to start recording: " + e.getMessage());
+            long ms = (System.nanoTime() - startNs) / 1_000_000L;
+            logger.error("Failed to start recording after " + ms + "ms: " + e.getMessage());
             // Fallback to legacy path
             String timestamp = new java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US)
                     .format(new java.util.Date());
@@ -1073,11 +1171,15 @@ public class GpuMosaicRecorder {
      *     pairs with uTexMatrix from SurfaceTexture.getTransformMatrix().
      */
     public void setCameraLayout(int layout) {
+        if (layout == this.cameraLayout) return;
         this.apaMode = (layout == 1);
         this.cameraLayout = layout;
         // Defer the actual glUniform1f to the next drawFrame on the
         // encoder GL thread; we don't own that context here.
         this.apaModeUniformDirty.set(true);
+        // Also flag the broader quasi-static set: uApplyManualYFlip
+        // depends on cameraLayout==3.
+        this.uniformsDirty.set(true);
         String[] names = {
             "4-camera mosaic", "APA passthrough", "3-camera mosaic",
             "esco-parity passthrough"
@@ -1118,6 +1220,50 @@ public class GpuMosaicRecorder {
             if (left != null && left.length >= 2) {
                 flipFlags[6] = left[0]; flipFlags[7] = left[1];
             }
+            // Set dirty INSIDE the lock so the field-write happens-before
+            // the unlock; otherwise drawFrame can observe dirty=false
+            // between the unlock and the set, skipping the upload for
+            // one frame (one-frame staleness on DiLink 4 mosaic flips).
+            uniformsDirty.set(true);
+        }
+    }
+
+    /**
+     * Atomic combined setter for producer corners + flip flags.
+     * Prefer this over the split pair to avoid a drawFrame landing
+     * between the two writes and rendering one frame with mismatched
+     * pair on DiLink 4. Single lock, single dirty flip.
+     */
+    public void setProducerLayout(float[] frontC, float[] rightC,
+                                  float[] rearC, float[] leftC,
+                                  float[] frontF, float[] rightF,
+                                  float[] rearF, float[] leftF) {
+        synchronized (producerCornerMapLock) {
+            if (frontC != null && frontC.length >= 2) {
+                producerCornerMap[0] = frontC[0]; producerCornerMap[1] = frontC[1];
+            }
+            if (rightC != null && rightC.length >= 2) {
+                producerCornerMap[2] = rightC[0]; producerCornerMap[3] = rightC[1];
+            }
+            if (rearC != null && rearC.length >= 2) {
+                producerCornerMap[4] = rearC[0]; producerCornerMap[5] = rearC[1];
+            }
+            if (leftC != null && leftC.length >= 2) {
+                producerCornerMap[6] = leftC[0]; producerCornerMap[7] = leftC[1];
+            }
+            if (frontF != null && frontF.length >= 2) {
+                flipFlags[0] = frontF[0]; flipFlags[1] = frontF[1];
+            }
+            if (rightF != null && rightF.length >= 2) {
+                flipFlags[2] = rightF[0]; flipFlags[3] = rightF[1];
+            }
+            if (rearF != null && rearF.length >= 2) {
+                flipFlags[4] = rearF[0]; flipFlags[5] = rearF[1];
+            }
+            if (leftF != null && leftF.length >= 2) {
+                flipFlags[6] = leftF[0]; flipFlags[7] = leftF[1];
+            }
+            uniformsDirty.set(true);
         }
     }
     public float[] getFlipFlags() {
@@ -1148,13 +1294,108 @@ public class GpuMosaicRecorder {
      * Clamped to [0, 0.20] so the visible window never collapses to zero.
      */
     public void setApaCenterInset(float inset) {
-        this.apaCenterInset = Math.max(0.0f, Math.min(0.20f, inset));
+        float clamped = Math.max(0.0f, Math.min(0.20f, inset));
+        if (Float.compare(clamped, this.apaCenterInset) == 0) return;
+        this.apaCenterInset = clamped;
+        this.uniformsDirty.set(true);
     }
 
     public void setRedMaskEnabled(boolean enabled) {
+        if (enabled == this.redMaskEnabled) return;
         this.redMaskEnabled = enabled;
+        this.uniformsDirty.set(true);
     }
     public boolean isRedMaskEnabled() { return redMaskEnabled; }
+
+    /**
+     * Sets the recording-side dewarp strength.
+     *
+     * <p>Maps a UI slider value in [0, 100] to a pair of division-model
+     * coefficients (k1, k2) that drive the shader formula
+     * {@code r_source = r_output / (1 + k1·r² + k2·r⁴)}. The single slider
+     * scales both linearly in a fixed 3:1 ratio:
+     * <pre>
+     *   k1 = 0.30 * slider/100   // primary curvature (uniform across radius)
+     *   k2 = 0.10 * slider/100   // 4th-order term (boosts corner correction)
+     * </pre>
+     *
+     * <p>Why two parameters: the single-parameter Fitzgibbon model runs out
+     * of corner-correction power at high strengths — the centre keeps
+     * stretching but corners stop straightening proportionally. Adding the
+     * r⁴ term grows 16× faster at the corner relative to the centre
+     * (compared to r²'s 4×), so it disproportionately corrects the corner
+     * region without affecting central pixels. Same family OpenCV's
+     * {@code cv::fisheye} uses, just with 2 coeffs instead of 4.
+     *
+     * <p>Sign convention: positive k1, k2 means "for each rectified-output
+     * pixel, sample a SMALLER radius in the source fisheye image" — i.e.
+     * the output's corners pull in from the source's centre, which is the
+     * geometric definition of barrel-removal. Combined with a zoom-to-fill
+     * factor in the shader, this produces the crop-and-stretch look:
+     * outer ring of the source is cropped, inner content stretches to
+     * fill the tile, lines that were curving at the corners come out
+     * straighter.
+     *
+     * <p>0 is identity (bit-exact to the legacy passthrough). 100 is
+     * maximum dewarp at ~32% peripheral crop. Values clamped to [0, 100].
+     *
+     * <p>Only effective on the legacy 4-strip layout (uApaMode==0). DiLink 4
+     * (uApaMode==3), 3-cam (uApaMode==2), and APA (uApaMode==1) paths are
+     * unaffected — the shader's other branches read whatever sample position
+     * they computed without consulting the rectify uniforms. Callers may
+     * freely write non-zero values regardless of layout; the GPU cost is
+     * identical.
+     *
+     * <p>Default: 0 (off). Persisted in
+     * {@code UnifiedConfigManager.recording.rectifyStrength}; the same key is
+     * read by both ACC-on (recording) and ACC-off (surveillance) pipelines so
+     * one slider drives both flows.
+     *
+     * @param strength 0..100; clamped if outside.
+     */
+    public void setRectifyStrength(float strength) {
+        float clamped = Math.max(0f, Math.min(100f, strength));
+        float t = clamped / 100f;
+        // 3:1 split favours the primary term so mid-slider values stay
+        // visually similar to the prior single-parameter behaviour; the
+        // r⁴ term only becomes dominant near the corners at high slider
+        // values, which is exactly where the previous model under-
+        // corrected. Combined denominator at the corner (r²=2): up to
+        // 1 + 0.30·2 + 0.10·4 = 2.0 at slider==100 — a 50% radial pull-in
+        // before zoom-to-fill, vs 40% under the old single-parameter
+        // ceiling. Same maximum periphery crop (~32%) but with smoother
+        // corner-region geometry.
+        float k1 = 0.30f * t;
+        float k2 = 0.10f * t;
+        if (Float.compare(k1, this.rectifyK1) == 0
+                && Float.compare(k2, this.rectifyK2) == 0) return;
+        this.rectifyK1 = k1;
+        this.rectifyK2 = k2;
+        this.uniformsDirty.set(true);
+    }
+
+    /** Current primary dewarp coefficient (0.0 = off). */
+    public float getRectifyK1() { return rectifyK1; }
+    /** Current 4th-order dewarp coefficient (0.0 = off). */
+    public float getRectifyK2() { return rectifyK2; }
+
+    /**
+     * Sets the per-cam tile aspect ratio (tile_height / tile_width) used
+     * by the dewarp shader to compute true pixel-space radial distance.
+     *
+     * <p>Pipeline pushes this from the active camera profile at init:
+     * Seal/Atto = 1280×960 → 0.75; Tang = 1280×720 → 0.5625. Default 0.75.
+     * Identity-equivalent at any aspect when k1 = k2 = 0, so a wrong
+     * aspect at slider 0 produces zero visual difference. Clamped to a
+     * sane range [0.25, 1.0] to keep the inverse-aspect math stable.
+     */
+    public void setRectifyAspect(float aspect) {
+        float clamped = Math.max(0.25f, Math.min(1.0f, aspect));
+        if (Float.compare(clamped, this.rectifyAspect) == 0) return;
+        this.rectifyAspect = clamped;
+        this.uniformsDirty.set(true);
+    }
+    public float getRectifyAspect() { return rectifyAspect; }
 
     /**
      * Per-output-corner producer-corner remap for the DiLink 4 passthrough
@@ -1182,6 +1423,7 @@ public class GpuMosaicRecorder {
             if (left != null && left.length >= 2) {
                 producerCornerMap[6] = left[0]; producerCornerMap[7] = left[1];
             }
+            uniformsDirty.set(true);
         }
     }
 
@@ -1216,7 +1458,7 @@ public class GpuMosaicRecorder {
     public boolean needsReinit() {
         return needsReinit;
     }
-    
+
     /**
      * Clears the reinit flag after recovery is complete.
      */
@@ -1323,7 +1565,33 @@ public class GpuMosaicRecorder {
             // on uncalibrated cars where the dealer hasn't calibrated yet.
             "uniform float uRedMaskStrength;\n" +
             "uniform float uApaCenterInset;\n" +
+            // Two-parameter division-model dewarp coefficients. Identity at
+            // (0, 0); positive values straighten residual barrel curvature
+            // in the legacy 4-strip BYD HAL output. k1 is the primary r²
+            // term; k2 is the r⁴ corner-boost term. Only sampled in the
+            // uApaMode==0 branch — see comment near the dewarp block.
+            "uniform float uRectifyK1;\n" +
+            "uniform float uRectifyK2;\n" +
+            // Per-cam tile aspect ratio (height / width). 0.75 on Seal
+            // (1280×960), 0.5625 on Tang (1280×720). Used inside the
+            // dewarp block so the radial distance is computed in true
+            // pixel space — without this multiply the iso-distortion
+            // contour is elliptical (vertical content corrected less
+            // than horizontal content of the same physical length).
+            // Identity-equivalent at any aspect when k1 = k2 = 0.
+            "uniform float uRectifyAspect;\n" +
             "varying vec2 vTexCoord;\n" +
+            // NOTE: the previous revision of this file had a 4-tap
+            // Catmull-Rom bicubic sampler here, gated on uRectifyK1 > 0.
+            // It saturated the Adreno 610 command queue at 2560×1920 and
+            // pushed the encoder eglSwap into 65-80ms territory; the
+            // shared-EGL-group AiLaneGl pipeline's glClientWaitSync then
+            // crashed on KGSL-reaped fence handles. Reverted to the
+            // single-tap bilinear (the OES sampler's hardware filter)
+            // which has been stable for the entire pre-fisheye history.
+            // The 2-parameter division-model dewarp + aspect correction
+            // are kept; bicubic was a marginal sharpness gain that's not
+            // worth the GPU pressure.
             "void main() {\n" +
             "    vec2 samplePos;\n" +
             "    float frontOffset = %.5ff;\n" +
@@ -1379,9 +1647,66 @@ public class GpuMosaicRecorder {
             "        } else {\n" +
             "            stripOffsetX = gridPos.y < 0.5 ? rightOffset : leftOffset;\n" +
             "        }\n" +
-            "        float localX = mod(vTexCoord.x, 0.5) * 0.5;\n" +
-            "        float localY = mod(vTexCoord.y, 0.5) * 2.0;\n" +
-            "        samplePos = vec2(localX + stripOffsetX, localY);\n" +
+            "        float localX = mod(vTexCoord.x, 0.5) * 0.5;\n" +  // 0..0.25 in producer strip
+            "        float localY = mod(vTexCoord.y, 0.5) * 2.0;\n" +  // 0..1
+            // Two-parameter division-model dewarp:
+            //     samplePos = outputPos / (1 + k1·r² + k2·r⁴)
+            // Applied in per-CAMERA image space (treat the per-cam tile as
+            // a square 0..1 region) so the radial geometry isn't
+            // anisotropically squashed by the strip's 0.25-wide × 1.0-tall
+            // aspect.
+            //
+            // Why two terms: r² alone runs out of corner-correction power
+            // — at high strengths the centre keeps stretching but corners
+            // stop straightening proportionally. r⁴ grows 4× faster than
+            // r² between mid-radius and corner, so it disproportionately
+            // pulls corner samples in without affecting central pixels.
+            //
+            // Zoom-to-fill: post-divide we multiply by (1 + k1 + k2),
+            // which is exactly the corner denominator (r²=2 → 1+2k1+4k2,
+            // wait — that's not quite right; we want the corners of the
+            // rectified output to map to the corners of the source). The
+            // zoom factor is set so the rectified image fills the tile
+            // edge-to-edge instead of leaving a black ring. Trade-off:
+            // some peripheral pixels are cropped out at high slider
+            // values. Identity when k1 = k2 = 0 (zoom = 1, denom = 1, the
+            // formula collapses to samplePos = outputPos).
+            //
+            // Final clamp keeps samplePos strictly inside the camera's
+            // 0.25-wide column of the producer strip — a single-precision
+            // jitter at r² near 0 cannot push us into the neighbouring
+            // quadrant.
+            "        vec2 nxy = vec2(localX / 0.25, localY) * 2.0 - 1.0;\n" + // -1..+1 in tile units
+            // Aspect-correct radial: compute r² in true tile-pixel space
+            // by squashing the y-axis by the tile aspect (height / width
+            // < 1 for landscape). This keeps iso-distortion lines
+            // circular in pixel space; without it vertical content is
+            // under-corrected. Reuse `aspectY` for the inverse on the way
+            // out so the final UV mapping back to the strip is consistent.
+            "        vec2 nxyAspect = vec2(nxy.x, nxy.y * uRectifyAspect);\n" +
+            "        float r2 = dot(nxyAspect, nxyAspect);\n" +
+            "        float r4 = r2 * r2;\n" +
+            "        float invDenom = 1.0 / (1.0 + uRectifyK1 * r2 + uRectifyK2 * r4);\n" +
+            // Zoom factor: pick so the cardinal-axis edge midpoint of
+            // the SHORTER axis (Y on a 4:3 landscape tile) maps exactly
+            // to the source's Y edge. Using the longer-axis edge would
+            // leave a black band on top/bottom; using the corner would
+            // crop too aggressively. Shorter-axis fill is the standard
+            // "fill" projection — outer X content is cropped, content
+            // stretches to fill the full tile in both axes, no black
+            // borders. The Y-edge midpoint is at nxyAspect = (0, aspect)
+            // → r² = aspect², so the matching denominator is
+            // 1 + k1·aspect² + k2·aspect⁴.
+            "        float aspect2 = uRectifyAspect * uRectifyAspect;\n" +
+            "        float aspect4 = aspect2 * aspect2;\n" +
+            "        float zoom = 1.0 + uRectifyK1 * aspect2 + uRectifyK2 * aspect4;\n" +
+            // Apply the dewarp in aspect-squashed space, then invert the
+            // squash so the final UV is back in tile coords.
+            "        vec2 srcAspect = (nxyAspect * invDenom) * zoom;\n" +
+            "        vec2 srcTile = vec2(srcAspect.x, srcAspect.y / uRectifyAspect);\n" +
+            "        vec2 camUV = srcTile * 0.5 + 0.5;\n" +
+            "        camUV = clamp(camUV, vec2(0.0), vec2(1.0));\n" +
+            "        samplePos = vec2(stripOffsetX + camUV.x * 0.25, camUV.y);\n" +
             "    }\n" +
             "    vec4 src = texture2D(uCameraTex, samplePos);\n" +
             // Shared red-overlay suppression. See GlUtil.RED_MASK_GLSL.

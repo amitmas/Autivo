@@ -83,9 +83,23 @@ public class HardwareEventRecorderGpu {
     private int fps;
     private int bitrate;
     private String codecMimeType = MediaFormat.MIMETYPE_VIDEO_AVC;  // Default H.264
+
+    // KEY_OPERATING_RATE pin policy. Default true (legacy pano behaviour —
+    // pin at fps so the SoC governor can't downclock the encoder mid-segment
+    // and stall eglSwap). When two encoders run concurrently on the single
+    // SDM665 Venus H.264 block, both pinning at fps over-subscribes the
+    // firmware's frequency budget and produces the exact stalls the pin was
+    // meant to prevent. Secondary encoders (e.g. OEM dashcam alongside pano)
+    // should call setPinOperatingRate(false) before init() so only the
+    // primary encoder claims the frequency lock.
+    private boolean pinOperatingRate = true;
     
     // Encoder
-    private MediaCodec encoder;
+    // Volatile because release() (lifecycle thread) nulls this while the
+    // trigger thread reads it post-format-barrier and the drainer thread
+    // calls dequeueOutputBuffer on it. Same cross-thread-visibility class
+    // as savedFormat.
+    private volatile MediaCodec encoder;
     private Surface inputSurface;
     
     // Muxer
@@ -157,7 +171,38 @@ public class HardwareEventRecorderGpu {
     // tempFile -> outputPath, so the user never sees a half-written .mp4 with the
     // final extension. Reset whenever a new disk writer instance starts.
     private volatile boolean writerAbortedCorrupt = false;
-    private MediaFormat savedFormat = null;  // Save format for reuse
+    /** Latest disk-write error message captured by the disk-writer abort path.
+     *  Surfaces to UI status APIs so the user sees something more specific
+     *  than a stuck "Recording" badge. Cleared on the next successful start. */
+    private volatile String writerAbortedErrorMessage = null;
+
+    /** Optional callback invoked once when the disk writer aborts due to
+     *  consecutive write failures (typically SD-card unmount or a full
+     *  volume). Owners (OEM pipeline, sentry engine) wire this so they can
+     *  flip their {@code recording} flag and write a UCM {@code lastWriteError}
+     *  WITHOUT polling — the previous design left the pipeline reporting
+     *  "Recording" indefinitely while the muxer was already dead. */
+    public interface WriterAbortListener {
+        void onWriterAborted(String reason);
+    }
+    private volatile WriterAbortListener writerAbortListener = null;
+    public void setWriterAbortListener(WriterAbortListener listener) {
+        this.writerAbortListener = listener;
+    }
+    public boolean isWriterAborted() { return writerAbortedCorrupt; }
+    public String getWriterAbortedErrorMessage() { return writerAbortedErrorMessage; }
+    // Log throttle for the "encoder hasn't published format" spin path.
+    // The drainer's 16 ms cadence would spam this same line ~70 Hz on a
+    // wedged encoder; throttle to once per 30 s so the log captures the
+    // condition without burying everything else.
+    private volatile long lastNoFormatRotationLogMs = 0;
+    // Volatile because the drainer thread (writer at INFO_OUTPUT_FORMAT_CHANGED)
+    // and the trigger thread (reader in waitForFormat / triggerEventRecording's
+    // savedFormat barrier, plus isFormatAvailable's external pollers) live on
+    // different threads. Thread.sleep(50) is NOT a documented memory barrier;
+    // on weak-memory ARM cores the trigger could spin the full 2 s on a stale
+    // null even after the drainer published the format.
+    private volatile MediaFormat savedFormat = null;  // Save format for reuse
     
     // Pre-record ring buffer.
     // SOTA: byte-ring (single contiguous direct ByteBuffer) shared across encoder
@@ -217,6 +262,27 @@ public class HardwareEventRecorderGpu {
     // a needed pre-roll keyframe under burst.
     private static final double PRE_RECORD_IDR_OVERHEAD = 1.4;
     private H264ByteRingBuffer preRecordBuffer;  // Reference to shared buffer
+
+    // Per-instance pre-record arena. When {@code useInstancePreRecordBuffer}
+    // is true, init() allocates a private {@link H264ByteRingBuffer} owned
+    // by THIS encoder rather than wiring up to {@link #sharedPreRecordBuffer}.
+    //
+    // The shared static ring is single-producer by design (see
+    // {@link H264ByteRingBuffer}'s class javadoc — pano + OEM both writing
+    // would interleave SPS/PPS from two bitstreams and corrupt the flush).
+    // Pano keeps the static shared ring (cheaper memory peak across reinit
+    // cycles); OEM opts into a per-instance ring so it can have its own
+    // pre-roll without colliding with pano. The instance ring is freed on
+    // {@link #release} — cost is one direct allocation per OEM start, paid
+    // once per ACC cycle. */
+    private boolean useInstancePreRecordBuffer = false;
+    /** Tracks whether {@link #preRecordBuffer} on THIS instance is the
+     * exclusive owner of the byte arena (true) or just a borrowed reference
+     * to the static shared ring (false). Drives the release path: instance
+     * arenas get nulled (the JVM Cleaner reclaims the direct memory on next
+     * GC); shared references just get unhooked, leaving the static buffer
+     * alive for the next encoder. */
+    private boolean preRecordBufferIsInstance = false;
     // Volatile + accessed only under startStopLock for read-modify-write safety.
     // Concurrent triggerEventRecording calls (e.g., RecordingModeManager + the
     // deferred-format listener thread firing in the same window) used to both
@@ -859,8 +925,15 @@ public class HardwareEventRecorderGpu {
     private Runnable fileClosedCallback;
     
     // Streaming
-    private StreamCallback streamCallback;
-    private boolean streamHeadersSent = false;
+    // Volatile: setStreamCallback / clearStreamCallback run on the HTTP
+    // worker thread; the drainer thread reads `streamCallback != null &&
+    // streamHeadersSent` on every output buffer. Without volatile, a fresh
+    // callback set just after CSD publish can be invisible to the drainer
+    // (no SPS/PPS sent → late client gets a corrupt stream until the next
+    // IDR), and a `streamHeadersSent=false` reset can be missed (drainer
+    // keeps thinking headers were sent → never re-sends them).
+    private volatile StreamCallback streamCallback;
+    private volatile boolean streamHeadersSent = false;
     
     // Recording state
     // volatile: read by isRecording() from RecordingModeManager,
@@ -907,6 +980,21 @@ public class HardwareEventRecorderGpu {
     // holds startStopLock) and producing a near-empty middle segment with
     // bad PTS bookkeeping (firstFramePtsUs == -1 fallback).
     private static final long ROTATE_DEBOUNCE_MS = 1000L;
+    // Max wall-clock the segment rotation will spend writing the queued backlog
+    // into the OLD (about-to-be-finalized) muxer before giving up and dropping
+    // the remainder. This drain (in rotateSegmentLocked) runs on the DRAINER
+    // thread under muxerLock and does blocking writeSampleData calls; if a
+    // stalled USB/SD write makes them block, the drainer stops dequeuing the
+    // encoder, the encoder input Surface fills, the GL thread blocks in
+    // eglSwapBuffers, and the 3s GL watchdog (PanoramicCameraGpu
+    // GL_THREAD_TIMEOUT_MS) force-restarts the process — truncating the clip
+    // and leaving a .broken stub (the field-observed "records then stops after
+    // a few seconds while driving"). Capping the drain far below the 3s
+    // watchdog turns a storage stall into a sub-second gap at the 2-minute
+    // segment seam instead of a process kill. Healthy rotations drain a handful
+    // of frames in well under 1 ms, so this budget is never reached in normal
+    // operation.
+    private static final long ROTATE_DRAIN_BUDGET_MS = 200L;
     // CAS gate shared by every rotateSegment() caller (natural drainer tick +
     // forceSegmentRotation HTTP path). Whoever flips false→true does the
     // rotation; concurrent callers observe true and bail. Reset in finally
@@ -1000,6 +1088,20 @@ public class HardwareEventRecorderGpu {
      *
      * @param mimeType MIMETYPE_VIDEO_AVC (H.264) or MIMETYPE_VIDEO_HEVC (H.265)
      */
+    /**
+     * Skip KEY_OPERATING_RATE on this encoder. Call before {@link #init()}.
+     * Secondary encoders running concurrently with a primary one (e.g. OEM
+     * dashcam alongside pano) should disable this so the SDM665 Venus
+     * firmware doesn't over-subscribe the encoder block.
+     */
+    public void setPinOperatingRate(boolean pin) {
+        if (encoder != null) {
+            logger.warn("setPinOperatingRate after init — has no effect");
+            return;
+        }
+        this.pinOperatingRate = pin;
+    }
+
     public void setCodecMimeType(String mimeType) {
         if (encoder != null) {
             logger.warn("Cannot change codec after initialization - restart required");
@@ -1076,11 +1178,15 @@ public class HardwareEventRecorderGpu {
         //
         // Available since API 23 (we're targeting min 28). Wrapped in try
         // so non-Qualcomm or older platforms gracefully ignore it.
-        try {
-            format.setInteger(MediaFormat.KEY_OPERATING_RATE, fps);
-            logger.info("Encoder OPERATING_RATE pinned at " + fps);
-        } catch (Throwable t) {
-            logger.warn("Could not set OPERATING_RATE: " + t.getMessage());
+        if (pinOperatingRate) {
+            try {
+                format.setInteger(MediaFormat.KEY_OPERATING_RATE, fps);
+                logger.info("Encoder OPERATING_RATE pinned at " + fps);
+            } catch (Throwable t) {
+                logger.warn("Could not set OPERATING_RATE: " + t.getMessage());
+            }
+        } else {
+            logger.info("Encoder OPERATING_RATE pin skipped (secondary encoder)");
         }
         
         // H.265 specific optimizations for Snapdragon 665
@@ -1264,9 +1370,31 @@ public class HardwareEventRecorderGpu {
         // cheap field write. This eliminates the four-axis triplet reuse
         // logic the slot pool needed.
         if (usePreRecordBuffer) {
-            synchronized (bufferLock) {
-                int desiredSec = Math.max(1, Math.min(30, preRecordDurationSeconds));
-                int desiredBudget = computePreRecordBudgetBytes(desiredSec, bitrate);
+            int desiredSec = Math.max(1, Math.min(30, preRecordDurationSeconds));
+            int desiredBudget = computePreRecordBudgetBytes(desiredSec, bitrate);
+            if (useInstancePreRecordBuffer) {
+                // Per-instance arena. Skip the static shared ring entirely so
+                // OEM and pano never share a producer — see field doc on
+                // useInstancePreRecordBuffer for the corruption-by-interleave
+                // motivation. Allocation happens once per encoder start and
+                // is reclaimed on release(); steady-state memory cost is
+                // bounded by the configured budget (8–64 MB).
+                try {
+                    preRecordBuffer = new H264ByteRingBuffer(desiredBudget, desiredSec);
+                    preRecordBufferIsInstance = true;
+                    logger.info("Allocated per-instance pre-record byte ring: budget="
+                        + (desiredBudget / 1024 / 1024) + "MB, duration="
+                        + desiredSec + "s, bitrate=" + (bitrate / 1_000_000) + "Mbps");
+                } catch (OutOfMemoryError | RuntimeException oom) {
+                    logger.error("Per-instance pre-record byte ring allocation failed ("
+                        + oom.getMessage() + ") — running without pre-record. "
+                        + "Live recording unaffected.");
+                    preRecordBuffer = null;
+                    preRecordBufferIsInstance = false;
+                    usePreRecordBuffer = false;
+                    preRecordAllocFailed = true;
+                }
+            } else synchronized (bufferLock) {
                 if (sharedPreRecordBuffer == null
                         || desiredBudget > sharedPreRecordBudgetBytes) {
                     // First allocation, or the user has bumped pre-roll
@@ -1343,6 +1471,18 @@ public class HardwareEventRecorderGpu {
         // pipeline reinit) starts at the correct window even if the byte ring
         // has been freed.
         this.preRecordDurationSeconds = clamped;
+        // Per-instance arena: this method runs on the same thread family as
+        // the producer (encoder GL thread). The setMaxDurationUs call below
+        // is safe to invoke without bufferLock — the arena is owned by THIS
+        // encoder, not shared. Skip the static-shared path entirely.
+        if (preRecordBufferIsInstance && preRecordBuffer != null) {
+            long desiredUs = clamped * 1_000_000L;
+            if (preRecordBuffer.getMaxDurationUs() != desiredUs) {
+                preRecordBuffer.setMaxDurationUs(desiredUs);
+                logger.info("Per-instance pre-record duration updated to " + clamped + "s");
+            }
+            return;
+        }
         synchronized (bufferLock) {
             if (sharedPreRecordBuffer != null) {
                 long desiredUs = clamped * 1_000_000L;
@@ -1415,7 +1555,28 @@ public class HardwareEventRecorderGpu {
             logger.info("Pre-record buffer disabled (stream-only mode)");
         }
     }
-    
+
+    /**
+     * Opt this encoder into a per-instance pre-record byte ring instead of
+     * the static shared one. Required when more than one encoder instance
+     * is alive simultaneously (e.g. pano + OEM dashcam) — the static ring
+     * is single-producer by contract, so two writers would interleave
+     * SPS/PPS bytes and corrupt every flush. Pano keeps the shared ring;
+     * OEM calls this with {@code true} before {@link #init()}.
+     *
+     * <p>Cost: one direct allocation (8–64 MB depending on bitrate × pre-roll)
+     * per encoder lifetime, freed on {@link #release()}. Setting this AFTER
+     * init() is a no-op for the current session — the next reinit will
+     * pick it up.
+     */
+    public void setUseInstancePreRecordBuffer(boolean instanceOwned) {
+        this.useInstancePreRecordBuffer = instanceOwned;
+        if (instanceOwned) {
+            logger.info("Pre-record buffer marked per-instance (no static-shared sharing)");
+        }
+    }
+
+
     /**
      * Sets the streaming callback for H.264 packet distribution.
      * 
@@ -1818,6 +1979,10 @@ public class HardwareEventRecorderGpu {
             try {
                 Thread.sleep(50);
             } catch (InterruptedException e) {
+                // Preserve interrupt status so outer callers (lifecycle
+                // executor, stop coordinators) observe the cancellation
+                // signal instead of seeing only a `false` return.
+                Thread.currentThread().interrupt();
                 return false;
             }
         }
@@ -1854,6 +2019,31 @@ public class HardwareEventRecorderGpu {
      * @return true if started successfully, false otherwise
      */
     public boolean triggerEventRecording(String outputPath, long postRecordDurationMs) {
+        // Format barrier (LOCK-FREE): refuse to build a muxer until the encoder
+        // has published its OUTPUT_FORMAT_CHANGED. Run BEFORE startStopLock
+        // entry so a 2-s busy poll doesn't block concurrent stopEventRecording
+        // / forceSegmentRotation / OemDashcamApiHandler lifecycle work. Worst
+        // case: two concurrent callers both pass this check, then serialize on
+        // startStopLock and the second observes isWritingToFile == true and
+        // no-ops — same outcome as the pre-fix lock-only design.
+        //
+        // Without this barrier, a release build can race ahead (R8-inlined
+        // isFormatAvailable + stripped logger.info on the success path) and
+        // construct a MediaMuxer with no addTrack call. The deferred fallback
+        // in drainEncoderInternal occasionally rescues it, but if a stop
+        // arrives first (segment rotation, ACC bounce, lifecycle teardown)
+        // the muxer closes with trackIndex=-1 and zero samples — a ~168 KB
+        // file with no mvhd duration that players extrapolate as multi-minute
+        // garbage.
+        if (savedFormat == null) {
+            if (!waitForFormat(2000) || savedFormat == null) {
+                logger.error("triggerEventRecording: encoder hasn't published format "
+                    + "after 2s wait — refusing to build empty muxer (would produce "
+                    + "0-track .mp4 with corrupted duration)");
+                return false;
+            }
+        }
+
         // Hold startStopLock across the entire start path so two concurrent
         // callers can't both observe isWritingToFile == false and race ahead
         // to build two muxers. The work inside is dominated by a few mkdirs
@@ -1907,6 +2097,7 @@ public class HardwareEventRecorderGpu {
             ptsOriginUs = -1;
             lastAudioPtsUs = -1L;
             writerAbortedCorrupt = false;
+            writerAbortedErrorMessage = null;
             // Reset per-recording audio failure counter. Without this, the
             // every-100 log threshold would be a lifetime-of-object counter
             // and field logs would confuse a chronic-bad-recording symptom
@@ -1917,6 +2108,19 @@ public class HardwareEventRecorderGpu {
             // sidecar writer can include startLocation. Captured BEFORE the
             // muxer ctor so MediaMuxer.setLocation() can also use it.
             captureStartLocationSnapshot();
+
+            // savedFormat is guaranteed non-null here by the lock-free
+            // pre-barrier above. A concurrent stop between the barrier and
+            // here can't null savedFormat (it's only ever assigned, never
+            // cleared) — encoder release leaves the field pointing at the
+            // last-published format, harmless to addTrack against. encoder
+            // torn down during the wait is the real concern; check it.
+            if (encoder == null) {
+                logger.warn("triggerEventRecording: encoder torn down during format wait");
+                if (tempFile != null && tempFile.exists()) tempFile.delete();
+                tempFile = null;
+                return false;
+            }
 
             // Create muxer. Hold muxerLock so the disk writer never observes a
             // half-constructed muxer (e.g., started but trackIndex still -1).
@@ -1941,21 +2145,19 @@ public class HardwareEventRecorderGpu {
                         logger.warn("MediaMuxer.setLocation failed: " + geoErr.getMessage());
                     }
 
-                    // If we have a saved format, use it immediately
-                    if (savedFormat != null) {
-                        trackIndex = muxer.addTrack(savedFormat);
-                        // Add audio track BEFORE muxer.start() — MediaMuxer
-                        // rejects addTrack post-start. If audio is enabled
-                        // but the app's CSD-0 hasn't arrived yet, fall
-                        // through video-only; the muxer is fixed for the
-                        // life of this segment. The next rotation picks up
-                        // the audio track if the CSD has landed by then.
-                        audioTrackIndex = maybeAddAudioTrack(muxer);
-                        muxer.start();
-                        muxerStarted = true;
-                        logger.info("Muxer started with saved format (videoTrack="
-                            + trackIndex + ", audioTrack=" + audioTrackIndex + ")");
-                    }
+                    // savedFormat is guaranteed non-null by the barrier above —
+                    // unconditional addTrack + start(). Add audio track BEFORE
+                    // muxer.start(); MediaMuxer rejects addTrack post-start.
+                    // If audio is enabled but the app's CSD-0 hasn't arrived
+                    // yet, fall through video-only; the muxer is fixed for
+                    // the life of this segment. The next rotation picks up
+                    // the audio track if the CSD has landed by then.
+                    trackIndex = muxer.addTrack(savedFormat);
+                    audioTrackIndex = maybeAddAudioTrack(muxer);
+                    muxer.start();
+                    muxerStarted = true;
+                    logger.info("Muxer started with saved format (videoTrack="
+                        + trackIndex + ", audioTrack=" + audioTrackIndex + ")");
                     muxerOk = true;
                 } catch (Exception e) {
                     logger.error("MediaMuxer setup failed", e);
@@ -2463,6 +2665,18 @@ public class HardwareEventRecorderGpu {
                         logger.warn("onFileSaved error: " + e.getMessage());
                     }
 
+                    // Eagerly seed the H2 index so a /api/recordings call
+                    // immediately after stop sees the new row instead of
+                    // waiting on FileObserver (which can drop on FUSE-mounted
+                    // SD cards). upsert is idempotent — sidecar write below
+                    // races with this and the later sidecar-write hook will
+                    // re-upsert with full metadata.
+                    try {
+                        com.overdrive.app.server.RecordingsIndex.getInstance().upsert(finalFile);
+                    } catch (Throwable e) {
+                        logger.warn("Index upsert failed for " + finalFile.getName() + ": " + e.getMessage());
+                    }
+
                     try {
                         TelegramNotifier.notifyVideoRecorded(
                                 finalFile.getAbsolutePath(), null, (int) durationSec);
@@ -2759,20 +2973,23 @@ public class HardwareEventRecorderGpu {
             inputSurface = null;
         }
 
-        // Drop our reference to the shared byte ring. We deliberately do
-        // NOT clear() here — the next encoder's init() will clear() the
-        // shared buffer at the right moment (under bufferLock, with the
-        // new encoder's parameters known). Clearing here on every release
-        // had two harmful effects:
-        //   (a) bitrate-only reinit (which goes through reinitializeEncoder
-        //       → release → new encoder) wiped the entire pre-record window
-        //       even though the bytes are still valid for the new encoder.
-        //   (b) shutdown mid-flush left an orphaned cursor whose pinOffset
-        //       was retained because clear() didn't reset the pin (now fixed
-        //       in H264ByteRingBuffer.clear() too as belt-and-braces).
-        // The init reuse path is the canonical "boundary" between two
-        // encoder lifetimes; that's where stale-content rejection belongs.
+        // Drop our reference to the byte ring. Two paths:
+        //
+        //   (a) shared (default, pano case). We deliberately do NOT clear()
+        //       — the next encoder's init() will clear() the shared buffer
+        //       at the right moment (under bufferLock, with the new encoder's
+        //       parameters known). Clearing here on every release had two
+        //       harmful effects: bitrate-only reinit wiped the still-valid
+        //       pre-record window, and shutdown mid-flush left an orphaned
+        //       cursor pin. The init reuse path is the canonical boundary.
+        //
+        //   (b) per-instance (OEM case). The arena is owned by THIS encoder
+        //       — no other consumer references it. Drop the reference so
+        //       the JVM Cleaner can reclaim the direct ByteBuffer at the
+        //       next GC. clear() isn't needed because nothing else is going
+        //       to read from it.
         preRecordBuffer = null;
+        preRecordBufferIsInstance = false;
 
         // Drain the per-instance muxer packet pools. Without this drain,
         // a bitrate-only reinit (release → new encoder) leaves the old
@@ -2841,18 +3058,38 @@ public class HardwareEventRecorderGpu {
             // surface and producing the 207ms "mosaic+swap" outliers
             // observed in field logs. The blocking dequeue inside
             // drainEncoderInternal() now wakes us the instant a packet is
-            // ready — no idle time, no polling. The 4ms safety sleep below
-            // only fires when the encoder produces nothing for the full
-            // dequeue timeout window (rare during active recording).
+            // ready — no idle time, no polling.
+            //
+            // FIX H1: adaptive empty-drain backoff. The 10 ms blocking
+            // dequeue inside drainEncoderInternal() ALREADY paces idle
+            // ticks; an unconditional 4 ms sleep on top of it just stacks
+            // wakeups (~250 wakeups/s when the encoder is idle, e.g. when
+            // recording is paused but the pipeline is still running). When
+            // frames flow we want zero added sleep so the next iteration's
+            // 10 ms blocking dequeue is the only pacing knob. When no
+            // frames came out we add an exponentially backed off sleep up
+            // to 16 ms — at idle we converge to ~50 wakeups/s instead of
+            // ~250, halving CPU at idle while preserving sub-frame
+            // responsiveness when the encoder restarts producing.
+            long emptyDrainSleepMs = 4L;
+            final long minEmptySleepMs = 4L;
+            final long maxEmptySleepMs = 16L;
             while (drainerRunning) {
                 try {
-                    drainEncoderInternal();
-                    // Tiny yield only — the inner dequeue already blocks.
-                    // Without ANY sleep here, a stuck encoder (zero output)
-                    // would burn 100% CPU calling dequeueOutputBuffer in a
-                    // tight loop forever. 4 ms is below one frame's
-                    // perceptual threshold and prevents that pathology.
-                    Thread.sleep(4);
+                    int drained = drainEncoderInternal();
+                    if (drained > 0) {
+                        // Real work flowed — reset backoff and skip sleep.
+                        // Next iteration's 10 ms blocking dequeue paces us.
+                        emptyDrainSleepMs = minEmptySleepMs;
+                    } else {
+                        // No frames — back off. The 10 ms blocking dequeue
+                        // already absorbed up to 10 ms idle, so adding
+                        // (4..16) ms here keeps the upper-bound responsiveness
+                        // at ≈26 ms — well under one frame at 30 fps.
+                        Thread.sleep(emptyDrainSleepMs);
+                        emptyDrainSleepMs = Math.min(maxEmptySleepMs,
+                                emptyDrainSleepMs * 2L);
+                    }
                 } catch (InterruptedException e) {
                     break;
                 } catch (Throwable t) {
@@ -2979,6 +3216,7 @@ public class HardwareEventRecorderGpu {
         // close/rotate paths read it to decide whether to keep or quarantine the
         // current tempFile.
         writerAbortedCorrupt = false;
+        writerAbortedErrorMessage = null;
         // SD-unmount detection: if writes start failing repeatedly, the underlying
         // file descriptor is dead (typical when BYD/Android unmounts the SD card
         // mid-recording). The MP4's moov atom is written only on stopRecording, so
@@ -3069,6 +3307,7 @@ public class HardwareEventRecorderGpu {
                     logger.error("Disk writer error (#" + consecutiveWriteFailures[0]
                         + "): " + e.getMessage());
                     if (consecutiveWriteFailures[0] >= writeFailureAbortThreshold) {
+                        String reason = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
                         logger.error("Aborting recording: " + writeFailureAbortThreshold
                             + " consecutive write failures (likely SD card unmounted). "
                             + "Partial file at " + (tempFile != null ? tempFile.getAbsolutePath() : "unknown")
@@ -3078,6 +3317,18 @@ public class HardwareEventRecorderGpu {
                         // outputPath. The user must never see a final .mp4
                         // filename for a file whose moov was never written.
                         writerAbortedCorrupt = true;
+                        writerAbortedErrorMessage = reason;
+                        // Notify any registered listener — OEM uses this to flip
+                        // its `recording` flag and surface lastWriteError into
+                        // UCM so the UI status badge transitions from "recording"
+                        // to "errored" immediately, instead of lying until the
+                        // next user action.
+                        try {
+                            WriterAbortListener cb = writerAbortListener;
+                            if (cb != null) cb.onWriterAborted(reason);
+                        } catch (Throwable cbErr) {
+                            logger.warn("WriterAbortListener threw: " + cbErr.getMessage());
+                        }
                         // Drain queue and recycle so the writer loop exits
                         // promptly without leaking pooled buffers.
                         MuxerPacket drained;
@@ -3133,10 +3384,18 @@ public class HardwareEventRecorderGpu {
     /**
      * Internal drain method called by background thread.
      * Handles all encoder output and SD card I/O.
+     *
+     * @return number of encoded video/audio frames drained from the encoder
+     *         on this call. Used by the drainer loop's adaptive backoff
+     *         (Fix H1): zero means we can sleep before the next call;
+     *         non-zero means another packet may be immediately available
+     *         and we should re-enter without sleeping. Pre-record flush
+     *         packets and CODEC_CONFIG packets are NOT counted (they're
+     *         not new frames produced by the encoder this tick).
      */
-    private void drainEncoderInternal() {
+    private int drainEncoderInternal() {
         if (encoder == null) {
-            return;
+            return 0;
         }
         
         // SOTA: Process queued pre-record packets first (flush all at once).
@@ -3255,18 +3514,45 @@ public class HardwareEventRecorderGpu {
             logger.warn("Writer aborted — stopping recording, no rotation");
             isWritingToFile = false;
             recording = false;
-            return;
+            return 0;
         }
         if (isWritingToFile && segmentStartTime > 0 && drainerRunning && diskWriterRunning
                 && !writerAbortedCorrupt) {
             long elapsed = System.currentTimeMillis() - segmentStartTime;
             if (elapsed >= SEGMENT_DURATION_MS) {
-                logger.info("Segment duration reached (" + (elapsed / 1000) + "s), rotating to new file...");
-                rotateSegment();
+                if (savedFormat == null) {
+                    // Encoder hasn't published its format yet — no frames have
+                    // been encoded since segment start. Rotation would bail
+                    // inside rotateSegmentLocked, but it doesn't update
+                    // segmentStartTime on the bail-out path, so the drainer
+                    // would re-enter this branch on every loop iteration
+                    // (~16 ms cadence) and spam the log. Push the timer
+                    // forward by a small slice so we re-check in 5 s instead
+                    // of spinning. Real recovery is the rest of the audit:
+                    // figure out why frames aren't flowing.
+                    long now = System.currentTimeMillis();
+                    if (now - lastNoFormatRotationLogMs > 30_000) {
+                        logger.error("Segment duration reached (" + (elapsed / 1000)
+                            + "s) but encoder has not published format — frames are not flowing");
+                        lastNoFormatRotationLogMs = now;
+                    }
+                    segmentStartTime = now - SEGMENT_DURATION_MS + 5_000;
+                } else {
+                    logger.info("Segment duration reached (" + (elapsed / 1000) + "s), rotating to new file...");
+                    rotateSegment();
+                }
             }
         }
         
         MediaCodec.BufferInfo bufferInfo = reusableBufferInfo;
+
+        // FIX H1: track frames produced so the drainer's adaptive backoff
+        // can decide whether to skip the empty-tick sleep. We count any
+        // outputBufferIndex >= 0 with bufferInfo.size > 0 that is NOT a
+        // CODEC_CONFIG (i.e. real coded video/audio). Format-changes and
+        // CODEC_CONFIG packets don't count — they don't represent the
+        // encoder making forward progress on a frame queue we can drain.
+        int framesDrained = 0;
 
         // SOTA Tier-A: first dequeue uses a short blocking timeout so the
         // drainer wakes the moment the encoder produces a packet (no 16 ms
@@ -3365,6 +3651,8 @@ public class HardwareEventRecorderGpu {
                 }
 
                 if (outputBuffer != null && bufferInfo.size > 0) {
+                    // FIX H1: a real coded frame — count it for adaptive backoff.
+                    framesDrained++;
                     // ALWAYS add to circular buffer (for pre-record) - unless stream-only mode
                     if (usePreRecordBuffer && preRecordBuffer != null) {
                         preRecordBuffer.add(outputBuffer, bufferInfo);
@@ -3433,8 +3721,9 @@ public class HardwareEventRecorderGpu {
                 encoder.releaseOutputBuffer(outputBufferIndex, false);
             }
         }
+        return framesDrained;
     }
-    
+
     /**
      * Rotates to a new segment file.
      * 
@@ -3568,11 +3857,30 @@ public class HardwareEventRecorderGpu {
         synchronized (muxerLock) {
             // Drain remaining queue into the OLD muxer. These packets have
             // PTS values that belong to the old segment; writing them to the
-            // new muxer would break PTS monotonicity.
+            // new muxer would break PTS monotonicity, so the queue MUST be
+            // empty before the hot-swap below.
+            //
+            // BOUNDED: writing the backlog is blocking disk I/O on the drainer
+            // thread, and under storage backpressure the queue can hold up to
+            // MUXER_WRITE_QUEUE_CAPACITY packets, each writeSampleData stalling
+            // on the slow drive. Draining all of it synchronously here starves
+            // the encoder drain → GL eglSwapBuffers blocks → the 3s GL watchdog
+            // kills the process (see ROTATE_DRAIN_BUDGET_MS). So we write only
+            // until the time budget is spent, then DROP (recycle without
+            // writing) the remaining old-segment packets. Dropping — rather
+            // than leaving them queued — is mandatory: any packet left in the
+            // queue would be picked up by the disk writer AFTER the swap and
+            // written, with its old PTS, into the NEW muxer, corrupting that
+            // segment. A sub-second seam gap beats a process restart.
+            final long drainDeadlineNs =
+                System.nanoTime() + ROTATE_DRAIN_BUDGET_MS * 1_000_000L;
             MuxerPacket pkt;
             int drained = 0;
+            int dropped = 0;
+            boolean stopWriting = false;  // latches once budget spent or a write fails
             while ((pkt = muxerWriteQueue.poll()) != null) {
-                if (muxerStarted && muxer != null) {
+                if (!stopWriting && muxerStarted && muxer != null
+                        && System.nanoTime() < drainDeadlineNs) {
                     try {
                         pkt.rewindForWrite();
                         if (pkt.trackKind == TRACK_KIND_AUDIO) {
@@ -3591,14 +3899,30 @@ public class HardwareEventRecorderGpu {
                     } catch (Exception e) {
                         logger.warn("Rotation drain error: " + e.getMessage());
                         writerAbortedCorrupt = true;
+                        // Drop (don't leave queued) the rest, so nothing leaks
+                        // into the new muxer after the swap.
+                        stopWriting = true;
+                        dropped++;
                         releaseMuxerPacket(pkt);
-                        break;
+                        continue;
                     }
+                } else {
+                    // Budget exhausted (or muxer gone): latch and drop the
+                    // remaining backlog instead of stalling the drainer.
+                    stopWriting = true;
+                    dropped++;
                 }
                 releaseMuxerPacket(pkt);
             }
-            if (drained > 0) {
-                logger.debug("Rotation drained " + drained + " queued frames into old segment");
+            if (drained > 0 || dropped > 0) {
+                if (dropped > 0) {
+                    logger.warn("Rotation drained " + drained + " queued frames into old"
+                        + " segment, DROPPED " + dropped + " (drain budget "
+                        + ROTATE_DRAIN_BUDGET_MS + "ms exceeded — storage backpressure;"
+                        + " dropping seam frames to avoid a GL watchdog restart)");
+                } else {
+                    logger.debug("Rotation drained " + drained + " queued frames into old segment");
+                }
             }
 
             // Stash the old muxer + its stats so the background finalizer
@@ -3729,6 +4053,16 @@ public class HardwareEventRecorderGpu {
                             com.overdrive.app.storage.StorageManager.getInstance().onFileSaved(finalFile);
                         } catch (Exception e) {
                             logger.warn("onFileSaved error: " + e.getMessage());
+                        }
+
+                        // Same eager-seed pattern as the synchronous close
+                        // path — rotation produces a finalised .mp4 that
+                        // should appear in /api/recordings without waiting
+                        // on the FileObserver.
+                        try {
+                            com.overdrive.app.server.RecordingsIndex.getInstance().upsert(finalFile);
+                        } catch (Throwable e) {
+                            logger.warn("Index upsert failed for " + finalFile.getName() + ": " + e.getMessage());
                         }
 
                         // Geo sidecar for non-sentry rotated segments

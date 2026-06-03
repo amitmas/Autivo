@@ -63,6 +63,17 @@ public class TripRecord {
     public String telemetryFilePath;   // Path to .jsonl.gz
     public long routeId = -1;          // Route cluster ID for O(1) similar-trip lookups
 
+    // ── Storage accounting (server-internal) ─────────────────────────────
+    // Byte size of the .jsonl.gz telemetry file at finalize time. Stored
+    // so StorageManager.getTripsSize() can answer via SUM(size_bytes)
+    // instead of walking every trips dir + stat()ing every file via FUSE
+    // (which took 10-20 minutes on full storage). 0 = legacy row not yet
+    // backfilled; the size-backfill thread fills these on first run.
+    // sidecarSizeBytes is reserved for future trip sidecar files (gps trace
+    // etc.); current builds have no sidecars and leave it at 0.
+    public long sizeBytes;
+    public long sidecarSizeBytes;
+
     /**
      * Compute the overall Driving DNA score as the average of all 5 axis scores.
      */

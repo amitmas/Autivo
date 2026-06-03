@@ -69,6 +69,17 @@ public final class SidecarGeoUpdater {
         String base = dot > 0 ? name.substring(0, dot) : name;
         File sidecar = new File(parent, base + ".json");
         mergePlace(sidecar, place);
+
+        // Reflect the freshly-merged place_short / place_country into the
+        // H2 index so the /api/recordings place chip row updates without
+        // having to wait for FileObserver to notice the sidecar mtime
+        // change. Index upsert re-parses the sidecar internally.
+        try {
+            com.overdrive.app.server.RecordingsIndex.getInstance().upsert(mp4File);
+        } catch (Throwable t) {
+            logger.warn("Index upsert after geo merge failed for "
+                    + mp4File.getName() + ": " + t.getMessage());
+        }
     }
 
     private static JSONObject readSidecar(File f) {

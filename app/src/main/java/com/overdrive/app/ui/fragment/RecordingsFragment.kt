@@ -4,10 +4,13 @@ import android.content.res.Configuration
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.text.Editable
+import android.text.TextWatcher
 import android.text.format.Formatter
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import android.widget.EditText
 import android.widget.ImageButton
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -26,6 +29,7 @@ import com.google.android.material.datepicker.MaterialDatePicker
 import com.overdrive.app.R
 import com.overdrive.app.ui.model.RecordingFile
 import com.overdrive.app.ui.util.RecordingScanner
+import com.overdrive.app.ui.util.RecordingsApiClient
 import java.lang.ref.WeakReference
 import java.text.SimpleDateFormat
 import java.util.Calendar
@@ -88,6 +92,29 @@ class RecordingsFragment : Fragment() {
      * Empty until the first scan completes.
      */
     private var availablePlaces: List<String> = emptyList()
+
+    /**
+     * Free-text place search query (landscape header EditText). Stacks with
+     * the chip [placeFilter] — server applies both. Empty string disables
+     * the placeContains narrowing dimension. Updated via a 300ms debounce
+     * driven by [placeSearchRunnable] so per-keystroke the API isn't hit.
+     */
+    private var placeContainsQuery: String = ""
+
+    /**
+     * Pending debounce post for the place-search EditText. Cancelled in
+     * onDestroyView and on each new keystroke so only the final keystroke
+     * triggers an API roundtrip.
+     */
+    private var placeSearchRunnable: Runnable? = null
+
+    /**
+     * Pending warming-state poll. The daemon's H2 index can be rebuilding
+     * on cold start; we poll /api/recordings/stats every 2s while
+     * warming=true so the header counters land as soon as the index is
+     * ready. Cancelled in onDestroyView.
+     */
+    private var warmingRetryRunnable: Runnable? = null
 
     // -------- Date state --------
     private val calendar = Calendar.getInstance()
@@ -171,6 +198,7 @@ class RecordingsFragment : Fragment() {
             }
             dateNarrowed = state.getBoolean(KEY_DATE_NARROWED, false)
             playerFullscreen = state.getBoolean(KEY_PLAYER_FULLSCREEN, false)
+            placeContainsQuery = state.getString(KEY_PLACE_CONTAINS, "") ?: ""
         }
 
         metricsExecutor = Executors.newSingleThreadExecutor { r ->
@@ -182,6 +210,7 @@ class RecordingsFragment : Fragment() {
         setupSettingsAction(view)
         setupDateRow(view)
         setupChipFilters(view)
+        setupPlaceSearch(view)
         setupResetButton(view)
 
         updateDateHeader(view)
@@ -234,6 +263,7 @@ class RecordingsFragment : Fragment() {
         outState.putInt(KEY_DATE_D, selectedDay)
         outState.putBoolean(KEY_DATE_NARROWED, dateNarrowed)
         outState.putBoolean(KEY_PLAYER_FULLSCREEN, playerFullscreen)
+        outState.putString(KEY_PLACE_CONTAINS, placeContainsQuery)
     }
 
     override fun onDestroyView() {
@@ -241,6 +271,14 @@ class RecordingsFragment : Fragment() {
             pendingPosts.forEach { mainHandler.removeCallbacks(it) }
             pendingPosts.clear()
         }
+        // Cancel any pending place-search debounce + warming-state retry
+        // that's still queued on the main handler. Without this a delayed
+        // post could fire after the view is gone and either NPE or push a
+        // stale filter into a half-torn-down library fragment.
+        placeSearchRunnable?.let { mainHandler.removeCallbacks(it) }
+        placeSearchRunnable = null
+        warmingRetryRunnable?.let { mainHandler.removeCallbacks(it) }
+        warmingRetryRunnable = null
         metricsExecutor?.shutdownNow()
         metricsExecutor = null
         super.onDestroyView()
@@ -286,6 +324,25 @@ class RecordingsFragment : Fragment() {
         // tap.
         lib.onContentChanged = {
             refreshCounts()
+        }
+        // Empty-state CTA handler. The library's local actor/severity
+        // are already cleared inside the library; here we additionally
+        // reset every dimension the parent owns: type, place, and date.
+        lib.onClearAllFiltersRequested = {
+            actorClassFilter.clear()
+            severityFilter.clear()
+            dashcamTypes.clear()
+            placeFilter.clear()
+            placeContainsQuery = ""
+            dateNarrowed = false
+            view?.let {
+                syncChipChecks(it)
+                renderPlaceChips(it)
+                clearPlaceSearchInput(it)
+                updateDateHeader(it)
+                renderActiveFilterAffordances(it)
+                applyAllFiltersTo(lib)
+            }
         }
         applyAllFiltersTo(lib)
     }
@@ -355,7 +412,8 @@ class RecordingsFragment : Fragment() {
             day = selectedDay,
             extraSource = extra,
             narrowToDate = dateNarrowed,
-            places = placeFilter.toSet()
+            places = placeFilter.toSet(),
+            placeContains = placeContainsQuery.takeIf { it.isNotEmpty() }
         )
     }
 
@@ -704,23 +762,103 @@ class RecordingsFragment : Fragment() {
             severityFilter.clear()
             dashcamTypes.clear()
             placeFilter.clear()
+            placeContainsQuery = ""
             syncChipChecks(view)
             renderPlaceChips(view)
+            clearPlaceSearchInput(view)
             onFiltersChanged(view)
         }
     }
 
+    /**
+     * Wire up the landscape free-text place-search input. Null-safe because
+     * the EditText only exists in `layout-land/fragment_recordings.xml` —
+     * portrait users still use the chip row exclusively.
+     *
+     * Debounce strategy: 300ms via [mainHandler] postDelayed so the API
+     * isn't hit on every keystroke. Same Handler/Runnable pattern as the
+     * rest of this file (no coroutines).
+     */
+    private fun setupPlaceSearch(view: View) {
+        val editText = view.findViewById<EditText>(R.id.etPlaceSearch) ?: return
+        val clearBtn = view.findViewById<ImageButton>(R.id.btnClearPlaceSearch)
+
+        // Restore from saved state if we got rotated mid-search.
+        if (placeContainsQuery.isNotEmpty() && editText.text.toString() != placeContainsQuery) {
+            editText.setText(placeContainsQuery)
+            editText.setSelection(editText.text.length)
+        }
+
+        editText.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+            override fun afterTextChanged(s: Editable?) {
+                val raw = s?.toString().orEmpty().trim()
+                // Cancel any prior pending fire — only the most recent
+                // keystroke triggers an API call after the debounce.
+                placeSearchRunnable?.let { mainHandler.removeCallbacks(it) }
+                val pending = Runnable {
+                    placeSearchRunnable = null
+                    if (placeContainsQuery == raw) return@Runnable
+                    placeContainsQuery = raw
+                    val v = this@RecordingsFragment.view ?: return@Runnable
+                    renderActiveFilterAffordances(v)
+                    libraryFragment?.let { applyAllFiltersTo(it) }
+                    // Re-derive the chip set under the new search — server's
+                    // /api/recordings/places stacks placeContains on top of
+                    // type so the chips reflect the remaining set.
+                    refreshCounts()
+                }
+                placeSearchRunnable = pending
+                mainHandler.postDelayed(pending, PLACE_SEARCH_DEBOUNCE_MS)
+            }
+        })
+
+        clearBtn?.setOnClickListener {
+            // Tap-to-clear: kill the debounce, blank the field, push
+            // immediately so the user gets instant feedback.
+            placeSearchRunnable?.let { mainHandler.removeCallbacks(it) }
+            placeSearchRunnable = null
+            editText.setText("")
+            placeContainsQuery = ""
+            renderActiveFilterAffordances(view)
+            libraryFragment?.let { applyAllFiltersTo(it) }
+            refreshCounts()
+        }
+    }
+
+    /**
+     * Blank the landscape search EditText without re-triggering the
+     * TextWatcher's debounce path (we already cleared placeContainsQuery
+     * synchronously). Null-safe for portrait.
+     */
+    private fun clearPlaceSearchInput(view: View) {
+        val editText = view.findViewById<EditText>(R.id.etPlaceSearch) ?: return
+        if (editText.text.isNullOrEmpty()) return
+        editText.setText("")
+        // Cancel any pending debounce that's about to fire with the now-
+        // stale value — the caller has already mutated placeContainsQuery.
+        placeSearchRunnable?.let { mainHandler.removeCallbacks(it) }
+        placeSearchRunnable = null
+    }
+
     private fun renderActiveFilterAffordances(view: View) {
+        val searchActive = placeContainsQuery.isNotEmpty()
         val chipsActive = when (currentSource) {
-            Source.DASHCAM -> dashcamTypes.isNotEmpty() || placeFilter.isNotEmpty()
+            Source.DASHCAM -> dashcamTypes.isNotEmpty() || placeFilter.isNotEmpty() || searchActive
             Source.SURVEILLANCE -> actorClassFilter.isNotEmpty()
                 || severityFilter.isNotEmpty()
                 || placeFilter.isNotEmpty()
+                || searchActive
         }
         // Reset only governs chip filters now — the date has its own clear-X
         // on the date card.
         view.findViewById<MaterialButton>(R.id.btnFilterReset)?.visibility =
             if (chipsActive) View.VISIBLE else View.GONE
+        // Toggle the inline clear-X button on the search card so the user
+        // can wipe the search without manually backspacing every char.
+        view.findViewById<ImageButton>(R.id.btnClearPlaceSearch)?.visibility =
+            if (searchActive) View.VISIBLE else View.GONE
     }
 
     private fun onFiltersChanged(view: View) {
@@ -841,9 +979,16 @@ class RecordingsFragment : Fragment() {
     // -----------------------------------------------------------------
 
     /**
-     * Walk both recording directories on the metrics executor, then post
-     * the totals back to the UI. Lifecycle-safe: the executor is shut
-     * down in onDestroyView, and the UI post bails if the view is gone.
+     * Hit the daemon's H2-backed `/api/recordings/stats` + `/api/recordings/places`
+     * for the header counters and the segment-scoped place chip set.
+     * Falls back to the unified [RecordingScanner] (which itself tries the
+     * API first and only walks the FS as a last resort) if the daemon is
+     * unreachable.
+     *
+     * Lifecycle-safe: HTTP calls run on [metricsExecutor]; UI posts gated
+     * by [pendingPosts] so onDestroyView can drop them. While the daemon
+     * reports `warming=true` we poll every 2s so the header lights up as
+     * soon as the index lands.
      */
     private fun refreshCounts() {
         val ctx = context ?: return
@@ -856,122 +1001,212 @@ class RecordingsFragment : Fragment() {
         // chip that has no clips in the active segment and get an
         // empty list.
         val sourceAtDispatch = currentSource
+        val placeContainsAtDispatch = placeContainsQuery
 
         executor.execute {
-            val today0 = startOfTodayMillis()
-            // Use the unified scanner so the segment counts and the library
-            // list always agree on what counts as a "Dashcam" vs "Surveillance"
-            // recording (segmented continuations, legacy paths, etc).
-            val all = RecordingScanner.scanRecordings(ctx)
-            // Dashcam segment = continuous cam_* + proximity_* clips
-            // (both come off the dashcam encoder).
-            val dashcam = all.filter {
-                it.type == RecordingFile.RecordingType.NORMAL ||
-                    it.type == RecordingFile.RecordingType.PROXIMITY
-            }
-            val surveillance = all.filter { it.type == RecordingFile.RecordingType.SENTRY }
-            val dashcamStats = aggregate(dashcam, today0)
-            val surveillanceStats = aggregate(surveillance, today0)
+            // /api/recordings/stats — flat counters covering both segments.
+            val stats = try { RecordingsApiClient.fetchStats() } catch (_: Throwable) { null }
 
-            val totalCount = dashcamStats.total + surveillanceStats.total
-            val totalToday = dashcamStats.today + surveillanceStats.today
-            val totalBytes = dashcamStats.bytes + surveillanceStats.bytes
-
-            // Place chip set: derive from the unfiltered scan within
-            // the ACTIVE SEGMENT (Dashcam vs Surveillance). Without
-            // segment scoping a user on Dashcam could tap a chip whose
-            // only clips are sentry events and get an empty list. The
-            // "unfiltered" part is still relative to the place filter
-            // itself — applying a place filter doesn't shrink the chip
-            // row, but switching segments does (correctly).
-            val segmentClips = when (sourceAtDispatch) {
-                Source.DASHCAM -> dashcam
-                Source.SURVEILLANCE -> surveillance
-            }
-            data class PlaceBucket(var count: Int, var displayLabel: String, var newestTs: Long)
-            val placeBuckets = LinkedHashMap<String, PlaceBucket>()
-            for (rec in segmentClips) {
-                val raw = rec.placeShortLabel ?: continue
-                if (raw.isEmpty()) continue
-                val key = raw.lowercase()
-                val bucket = placeBuckets[key]
-                if (bucket == null) {
-                    placeBuckets[key] = PlaceBucket(1, raw, rec.timestamp)
-                } else {
-                    bucket.count++
-                    if (rec.timestamp > bucket.newestTs) {
-                        bucket.newestTs = rec.timestamp
-                        bucket.displayLabel = raw
-                    }
+            // Fallback path: the daemon couldn't be reached. Use the unified
+            // scanner (it owns its own API-then-FS fallback ladder) so we
+            // don't duplicate the FS walk here.
+            if (stats == null) {
+                val today0 = startOfTodayMillis()
+                val all = RecordingScanner.scanRecordings(ctx)
+                val dashcam = all.filter {
+                    it.type == RecordingFile.RecordingType.NORMAL ||
+                        it.type == RecordingFile.RecordingType.PROXIMITY ||
+                        it.type == RecordingFile.RecordingType.OEM_DASHCAM
                 }
-            }
-            // Sort by count desc, then alpha asc — stable across rescans.
-            val sortedPlaces = placeBuckets.entries
-                .sortedWith(
-                    compareByDescending<Map.Entry<String, PlaceBucket>> { it.value.count }
-                        .thenBy { it.key }
+                val surveillance = all.filter { it.type == RecordingFile.RecordingType.SENTRY }
+                val dashcamStats = aggregate(dashcam, today0)
+                val surveillanceStats = aggregate(surveillance, today0)
+                val totalCount = dashcamStats.total + surveillanceStats.total
+                val totalToday = dashcamStats.today + surveillanceStats.today
+                val totalBytes = dashcamStats.bytes + surveillanceStats.bytes
+                val segmentClips = when (sourceAtDispatch) {
+                    Source.DASHCAM -> dashcam
+                    Source.SURVEILLANCE -> surveillance
+                }
+                val sortedPlaces = derivePlaceLabelsFromScan(segmentClips)
+                postCountsToUi(
+                    viewRef = viewRef,
+                    dashcamCount = dashcamStats.total.toLong(),
+                    surveillanceCount = surveillanceStats.total.toLong(),
+                    totalCount = totalCount.toLong(),
+                    totalToday = totalToday.toLong(),
+                    totalBytes = totalBytes,
+                    sortedPlaces = sortedPlaces,
+                    warming = false
                 )
-                .take(MAX_PLACE_CHIPS)
-                .map { it.value.displayLabel }
+                return@execute
+            }
 
-            val post = object : Runnable {
-                override fun run() {
-                    synchronized(pendingPosts) { pendingPosts.remove(this) }
-                    val v = viewRef.get() ?: return
-                    val activeCtx = v.context ?: return
-                    val sizeText = Formatter.formatShortFileSize(activeCtx, totalBytes)
+            // Scope the chip set to the active segment + current search so
+            // the user sees only places that have clips matching their
+            // current view. Server stacks `type` and `placeContains` so we
+            // don't have to re-filter client-side.
+            val placesResult = try {
+                RecordingsApiClient.fetchPlaces(
+                    RecordingsApiClient.Filter(
+                        type = sourceAtDispatch.toApiType(),
+                        placeContains = placeContainsAtDispatch.takeIf { it.isNotEmpty() }
+                    )
+                )
+            } catch (_: Throwable) { null }
+            val sortedPlaces = placesResult
+                ?.map { it.label }
+                ?.take(MAX_PLACE_CHIPS)
+                ?: emptyList()
 
-                    v.findViewById<TextView>(R.id.tvRecordingsSummary)?.text =
-                        activeCtx.getString(
-                            R.string.recordings_summary_format,
-                            totalToday,
-                            totalCount,
-                            sizeText
-                        )
-                    v.findViewById<MaterialButton>(R.id.segmentDashcam)?.text =
-                        activeCtx.getString(
-                            R.string.recordings_segment_dashcam_count,
-                            dashcamStats.total
-                        )
-                    v.findViewById<MaterialButton>(R.id.segmentSurveillance)?.text =
-                        activeCtx.getString(
-                            R.string.recordings_segment_surveillance_count,
-                            surveillanceStats.total
-                        )
+            // Dashcam segment = NORMAL + PROXIMITY (both come off the AVM
+            // dashcam encoder). The /stats payload doesn't carry an
+            // oemDashcam counter explicitly, but server normalizes
+            // type=normal to include OEM clips so they're already inside
+            // normalCount. Sum normal + proximity for the segment badge.
+            val dashcamCount = stats.normalCount + stats.proximityCount
+            val surveillanceCount = stats.sentryCount
 
-                    availablePlaces = sortedPlaces
-                    // Drop any selected places that are no longer in the
-                    // available set (e.g. all clips for that place got
-                    // deleted). Otherwise the user sees an empty list with
-                    // an invisible filter blocking everything.
-                    //
-                    // Re-compute the stale set HERE on the main thread so a
-                    // chip clicked between scan-start and this post-arrival
-                    // is honoured. The set comprehension reads the current
-                    // `placeFilter` (just mutated by the click) and the
-                    // freshly-published `availablePlaces` — neither is the
-                    // executor-thread snapshot. Without this, a click that
-                    // selects "Cheras" milliseconds before the post lands
-                    // could be silently reverted because the executor's
-                    // sortedPlaces snapshot doesn't yet contain "cheras"
-                    // (the scan that produced the snapshot ran BEFORE the
-                    // newly-tagged clip showed up).
-                    val availableLower = availablePlaces
-                        .map { it.lowercase() }
-                        .toSet()
-                    val staleSelections = placeFilter
-                        .filter { it !in availableLower }
-                        .toList()
-                    if (staleSelections.isNotEmpty()) {
-                        placeFilter.removeAll(staleSelections.toSet())
-                        libraryFragment?.let { applyAllFiltersTo(it) }
+            postCountsToUi(
+                viewRef = viewRef,
+                dashcamCount = dashcamCount,
+                surveillanceCount = surveillanceCount,
+                totalCount = stats.totalCount,
+                totalToday = stats.totalToday,
+                totalBytes = stats.totalSize,
+                sortedPlaces = sortedPlaces,
+                warming = stats.warming
+            )
+        }
+    }
+
+    /**
+     * Map a [Source] to the API's `type` parameter. Server-side
+     * normalisation: type=normal includes oemDashcam clips, so the
+     * Dashcam segment passes "normal" plus we sum normalCount + proximityCount
+     * for the badge. Sentry is its own bucket.
+     */
+    private fun Source.toApiType(): String = when (this) {
+        Source.DASHCAM -> "normal"
+        Source.SURVEILLANCE -> "sentry"
+    }
+
+    /**
+     * Single UI-post path used by both the API-backed and FS-fallback
+     * branches of [refreshCounts]. Mirrors the original pendingPosts /
+     * stale-place-cleanup contract so cancellation in onDestroyView keeps
+     * working unchanged.
+     */
+    private fun postCountsToUi(
+        viewRef: WeakReference<View?>,
+        dashcamCount: Long,
+        surveillanceCount: Long,
+        totalCount: Long,
+        totalToday: Long,
+        totalBytes: Long,
+        sortedPlaces: List<String>,
+        warming: Boolean
+    ) {
+        val post = object : Runnable {
+            override fun run() {
+                synchronized(pendingPosts) { pendingPosts.remove(this) }
+                val v = viewRef.get() ?: return
+                val activeCtx = v.context ?: return
+                val sizeText = Formatter.formatShortFileSize(activeCtx, totalBytes)
+
+                val baseSummary = activeCtx.getString(
+                    R.string.recordings_summary_format,
+                    totalToday.toInt(),
+                    totalCount.toInt(),
+                    sizeText
+                )
+                v.findViewById<TextView>(R.id.tvRecordingsSummary)?.text =
+                    if (warming) "$baseSummary  ·  (building index)" else baseSummary
+
+                v.findViewById<TextView>(R.id.tvTitleCountBadge)?.let { badge ->
+                    if (totalCount > 0) {
+                        badge.visibility = View.VISIBLE
+                        badge.text = totalCount.toString()
+                    } else {
+                        badge.visibility = View.GONE
                     }
-                    renderPlaceChips(v)
+                }
+                v.findViewById<MaterialButton>(R.id.segmentDashcam)?.text =
+                    activeCtx.getString(
+                        R.string.recordings_segment_dashcam_count,
+                        dashcamCount.toInt()
+                    )
+                v.findViewById<MaterialButton>(R.id.segmentSurveillance)?.text =
+                    activeCtx.getString(
+                        R.string.recordings_segment_surveillance_count,
+                        surveillanceCount.toInt()
+                    )
+
+                availablePlaces = sortedPlaces
+                // Drop any selected places that are no longer in the
+                // available set (e.g. all clips for that place got
+                // deleted). Otherwise the user sees an empty list with
+                // an invisible filter blocking everything. Recomputed on
+                // the main thread so a chip click between dispatch and
+                // post-arrival is honoured.
+                val availableLower = availablePlaces.map { it.lowercase() }.toSet()
+                val staleSelections = placeFilter.filter { it !in availableLower }.toList()
+                if (staleSelections.isNotEmpty()) {
+                    placeFilter.removeAll(staleSelections.toSet())
+                    libraryFragment?.let { applyAllFiltersTo(it) }
+                }
+                renderPlaceChips(v)
+
+                // Schedule a follow-up poll while the index is rebuilding
+                // so the header lights up as soon as warming flips false.
+                // Single in-flight retry — we cancel the prior one so a
+                // burst of refreshCounts() calls (segment switch + onResume)
+                // doesn't fan out N parallel polls.
+                warmingRetryRunnable?.let { mainHandler.removeCallbacks(it) }
+                warmingRetryRunnable = null
+                if (warming) {
+                    val retry = Runnable {
+                        warmingRetryRunnable = null
+                        refreshCounts()
+                    }
+                    warmingRetryRunnable = retry
+                    mainHandler.postDelayed(retry, WARMING_POLL_INTERVAL_MS)
                 }
             }
-            synchronized(pendingPosts) { pendingPosts.add(post) }
-            mainHandler.post(post)
         }
+        synchronized(pendingPosts) { pendingPosts.add(post) }
+        mainHandler.post(post)
+    }
+
+    /**
+     * FS-fallback chip-set derivation — only used when the daemon is
+     * unreachable. Mirrors the legacy in-process bucket logic.
+     */
+    private fun derivePlaceLabelsFromScan(segmentClips: List<RecordingFile>): List<String> {
+        data class PlaceBucket(var count: Int, var displayLabel: String, var newestTs: Long)
+        val placeBuckets = LinkedHashMap<String, PlaceBucket>()
+        for (rec in segmentClips) {
+            val raw = rec.placeShortLabel ?: continue
+            if (raw.isEmpty()) continue
+            val key = raw.lowercase()
+            val bucket = placeBuckets[key]
+            if (bucket == null) {
+                placeBuckets[key] = PlaceBucket(1, raw, rec.timestamp)
+            } else {
+                bucket.count++
+                if (rec.timestamp > bucket.newestTs) {
+                    bucket.newestTs = rec.timestamp
+                    bucket.displayLabel = raw
+                }
+            }
+        }
+        return placeBuckets.entries
+            .sortedWith(
+                compareByDescending<Map.Entry<String, PlaceBucket>> { it.value.count }
+                    .thenBy { it.key }
+            )
+            .take(MAX_PLACE_CHIPS)
+            .map { it.value.displayLabel }
     }
 
     /**
@@ -1102,8 +1337,13 @@ class RecordingsFragment : Fragment() {
         private const val KEY_DATE_D = "recordings_date_day"
         private const val KEY_DATE_NARROWED = "recordings_date_narrowed"
         private const val KEY_PLAYER_FULLSCREEN = "recordings_player_fullscreen"
+        private const val KEY_PLACE_CONTAINS = "recordings_place_contains"
         private const val TAG_INLINE_PLAYER = "inline_player"
         /** Cap on chips to avoid sprawl after a long road trip. */
         private const val MAX_PLACE_CHIPS = 8
+        /** Debounce window for the landscape free-text place-search field. */
+        private const val PLACE_SEARCH_DEBOUNCE_MS = 300L
+        /** While the H2 index is warming, re-poll /api/stats at this cadence. */
+        private const val WARMING_POLL_INTERVAL_MS = 2_000L
     }
 }

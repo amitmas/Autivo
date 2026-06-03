@@ -2,6 +2,8 @@ package com.overdrive.app.ui.fragment
 
 import android.content.Intent
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import android.view.LayoutInflater
 import android.view.View
@@ -17,6 +19,7 @@ import com.overdrive.app.ui.adapter.RecordingAdapter
 import com.overdrive.app.ui.model.RecordingFile
 import com.overdrive.app.ui.util.RecordingScanner
 import com.overdrive.app.ui.util.RecordingSectionHeaderDecoration
+import com.overdrive.app.ui.util.RecordingsApiClient
 import com.google.android.material.bottomsheet.BottomSheetDialog
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.card.MaterialCardView
@@ -92,12 +95,17 @@ class RecordingLibraryFragment : Fragment() {
     private lateinit var tvEmptyState: TextView
     private var emptyStateContainer: LinearLayout? = null
 
-    // -------- Multi-select --------
-    private var selectToolbar: LinearLayout? = null
+    // -------- Multi-select (now a docked bottom action bar) --------
+    private var selectToolbar: View? = null
     private var tvSelectedCount: TextView? = null
     private var btnSelectAll: View? = null
     private var btnDeleteSelected: View? = null
     private var btnCancelSelect: View? = null
+    private var btnShareSelected: View? = null
+
+    // -------- Empty state CTA (filter clear) --------
+    private var btnEmptyClearFilters: View? = null
+    private var tvEmptyStateBody: TextView? = null
 
     // -------- Filter sheet (lazily inflated) --------
     private var filterSheet: BottomSheetDialog? = null
@@ -157,6 +165,66 @@ class RecordingLibraryFragment : Fragment() {
 
     // SOTA: Background executor for scanning operations
     private var scanExecutor = Executors.newSingleThreadExecutor()
+
+    // -----------------------------------------------------------------
+    // Paging — replaces the legacy "load every row at once" path with
+    // 30-row fetches against the daemon's H2-backed /api/recordings.
+    // -----------------------------------------------------------------
+
+    /**
+     * Per-mount paging state. Recreated on every [resetPaging] (filter
+     * change, post-delete refresh, fragment view recreate). Lives in the
+     * fragment so each onCreateView starts a fresh pager — rotation drops
+     * the loaded rows and re-fetches page 1 (acceptable for v1; if
+     * scrollback restoration becomes a complaint we can move state into
+     * onSaveInstanceState).
+     */
+    private inner class RecordingPagingState {
+        var currentFilter: RecordingsApiClient.Filter = RecordingsApiClient.Filter()
+        var page: Int = 1
+        val pageSize: Int = 30
+        var hasMore: Boolean = true
+        var loading: Boolean = false
+        var totalCount: Int = 0
+        val accumulated: MutableList<RecordingFile> = mutableListOf()
+
+        /** True once we've decided this load is fallback-mode (direct-FS). */
+        var fallbackActive: Boolean = false
+
+        /** Generation counter — bumped by resetPaging so any in-flight
+         *  background result whose gen doesn't match is silently dropped. */
+        var generation: Int = 0
+    }
+
+    private var pagingState: RecordingPagingState = RecordingPagingState()
+
+    /** True after we've installed [pagingScrollListener] on the recycler. */
+    private var pagingScrollListenerAttached: Boolean = false
+
+    /** Scroll listener that drives next-page fetches. Held in a field so
+     *  fallback mode can [RecyclerView.removeOnScrollListener] cleanly. */
+    private val pagingScrollListener = object : RecyclerView.OnScrollListener() {
+        override fun onScrolled(rv: RecyclerView, dx: Int, dy: Int) {
+            if (dy <= 0) return  // only react to forward scrolls
+            val lm = rv.layoutManager as? GridLayoutManager ?: return
+            val total = lm.itemCount
+            val lastVisible = lm.findLastVisibleItemPosition()
+            if (lastVisible == RecyclerView.NO_POSITION) return
+            if (lastVisible >= total - 5
+                && !pagingState.loading
+                && pagingState.hasMore
+                && !pagingState.fallbackActive) {
+                loadNextPage()
+            }
+        }
+    }
+
+    /** Main-thread handler for warming retries. Never holds the fragment
+     *  past onDestroyView — every posted runnable rechecks isAdded/view. */
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    /** Pending warmup-poll runnable so onDestroyView can cancel it. */
+    private var warmupPollRunnable: Runnable? = null
 
     enum class RecordingFilter {
         ALL, NORMAL, SENTRY, PROXIMITY
@@ -287,18 +355,56 @@ class RecordingLibraryFragment : Fragment() {
         // List
         recyclerRecordings = view.findViewById(R.id.recyclerRecordings)
         tvEmptyState = view.findViewById(R.id.tvEmptyState)
+        tvEmptyStateBody = view.findViewById(R.id.tvEmptyStateBody)
         emptyStateContainer = view.findViewById(R.id.emptyStateContainer)
+        btnEmptyClearFilters = view.findViewById(R.id.btnEmptyClearFilters)
 
-        // Multi-select
+        // Multi-select bottom action bar
         selectToolbar = view.findViewById(R.id.selectToolbar)
         tvSelectedCount = view.findViewById(R.id.tvSelectedCount)
         btnSelectAll = view.findViewById(R.id.btnSelectAll)
         btnDeleteSelected = view.findViewById(R.id.btnDeleteSelected)
         btnCancelSelect = view.findViewById(R.id.btnCancelSelect)
+        btnShareSelected = view.findViewById(R.id.btnShareSelected)
 
         btnSelectAll?.setOnClickListener { recordingAdapter.selectAll() }
         btnDeleteSelected?.setOnClickListener { confirmBatchDelete() }
         btnCancelSelect?.setOnClickListener { exitSelectMode() }
+        btnShareSelected?.setOnClickListener { shareSelectedRecordings() }
+
+        // Empty-state CTA: only meaningful when filters are narrowing the
+        // visible set. The parent owns chip/place/date state so we proxy
+        // via [onClearAllFiltersRequested]; standalone callers (no parent)
+        // get an in-fragment fallback that drops actor/severity/date.
+        btnEmptyClearFilters?.setOnClickListener { handleClearFiltersRequested() }
+    }
+
+    /**
+     * Optional: when the user taps the empty-state "Clear filters" CTA,
+     * the host fragment is notified so it can drop its own filters
+     * (segment/date/place chips) — this fragment's local actor/severity
+     * are cleared either way.
+     */
+    var onClearAllFiltersRequested: (() -> Unit)? = null
+
+    private fun handleClearFiltersRequested() {
+        // Always clear local state — even if a parent handler exists,
+        // the parent's clearAll covers actor/severity by re-pushing
+        // empty sets on the next applyAll. The local clear keeps the
+        // standalone case correct and avoids a redundant reload.
+        actorClassFilter.clear()
+        severityFilter.clear()
+        placeFilter.clear()
+        // Drop date narrowing too — the user's intent is "show me anything".
+        dateNarrowed = false
+        renderActiveFilters()
+        onClearAllFiltersRequested?.invoke()
+        // Standalone callers (no parent) need a manual reload; embedded
+        // mode reloads via the parent's applyAll() chain.
+        if (arguments?.getBoolean(ARG_HIDE_INTERNAL_FILTERS, false) != true) {
+            updateDateHeader()
+            loadRecordingsForSelectedDate()
+        }
     }
 
     /**
@@ -315,6 +421,13 @@ class RecordingLibraryFragment : Fragment() {
      * fragment commit). State is captured into fields synchronously; the
      * subsequent [onViewCreated] runs its own load with the captured state.
      */
+    /**
+     * v3 free-text place search. Passed through from the parent's
+     * search-box debounce; merged into the API filter as `placeContains`.
+     * Stacks with `placeFilter`: both must match server-side.
+     */
+    private var placeContainsQuery: String = ""
+
     fun applyAll(
         source: RecordingFilter,
         actorClasses: Set<String>,
@@ -324,7 +437,8 @@ class RecordingLibraryFragment : Fragment() {
         day: Int,
         extraSource: RecordingFilter? = null,
         narrowToDate: Boolean = false,
-        places: Set<String> = emptySet()
+        places: Set<String> = emptySet(),
+        placeContains: String? = null
     ) {
         currentFilter = source
         extraFilter = extraSource
@@ -334,6 +448,7 @@ class RecordingLibraryFragment : Fragment() {
         severityFilter.addAll(severity.map { it.uppercase() })
         placeFilter.clear()
         placeFilter.addAll(places.map { it.lowercase() })
+        placeContainsQuery = placeContains?.trim()?.lowercase() ?: ""
         calendar.set(year, month, 1)
         selectedDay = day
         // Caller decides whether to narrow. The parent flips this true only
@@ -634,7 +749,8 @@ class RecordingLibraryFragment : Fragment() {
         recordingAdapter = RecordingAdapter(
             onPlay = { recording -> playRecording(recording) },
             onDelete = { recording -> confirmDelete(recording) },
-            onSelectionChanged = { count -> onSelectionChanged(count) }
+            onSelectionChanged = { count -> onSelectionChanged(count) },
+            onShare = { recording -> shareSingleRecording(recording) }
         )
 
         recyclerRecordings.apply {
@@ -650,6 +766,14 @@ class RecordingLibraryFragment : Fragment() {
         val deco = RecordingSectionHeaderDecoration(requireContext()) { currentList }
         recyclerRecordings.addItemDecoration(deco)
         sectionHeaderDecoration = deco
+
+        // Attach the paging scroll listener once. Removed in onDestroyView /
+        // when fallback mode kicks in (direct-FS path is non-paged so the
+        // listener would just no-op).
+        if (!pagingScrollListenerAttached) {
+            recyclerRecordings.addOnScrollListener(pagingScrollListener)
+            pagingScrollListenerAttached = true
+        }
     }
 
     private fun onSelectionChanged(count: Int) {
@@ -659,35 +783,289 @@ class RecordingLibraryFragment : Fragment() {
         }
     }
 
+    /**
+     * Public entry point preserved for callers that previously triggered a
+     * full reload (delete, filter sheet apply, date change, post-resume).
+     * Now delegates to [resetPaging] + [loadFirstPage] so the paged path is
+     * always exercised. The function name is kept to avoid touching every
+     * call-site.
+     */
     private fun loadRecordingsForSelectedDate() {
-        val year = calendar.get(Calendar.YEAR)
-        val month = calendar.get(Calendar.MONTH)
+        resetPaging()
+        loadFirstPage()
+    }
 
-        Log.d(TAG, "Loading recordings for $year-${month+1}-$selectedDay")
+    /**
+     * Drop accumulated rows + bump generation so any in-flight page result
+     * is silently discarded. Cancels pending warmup polls. Called whenever
+     * filters / date / segment change so the user starts paging from page 1
+     * with the new criteria.
+     */
+    private fun resetPaging() {
+        pagingState.generation += 1
+        pagingState.page = 1
+        pagingState.hasMore = true
+        pagingState.loading = false
+        pagingState.totalCount = 0
+        pagingState.accumulated.clear()
+        pagingState.fallbackActive = false
+        warmupPollRunnable?.let { mainHandler.removeCallbacks(it) }
+        warmupPollRunnable = null
+    }
 
+    /**
+     * Translate the fragment's filter state ([currentFilter] / [extraFilter] /
+     * [actorClassFilter] / [severityFilter] / [placeFilter] / date narrowing)
+     * into the daemon's wire-level [RecordingsApiClient.Filter].
+     *
+     * Multi-type folding:
+     *  - When the parent's Dashcam segment requests NORMAL + PROXIMITY +
+     *    OEM_DASHCAM (extraFilter set), we send `types={normal, oemDashcam,
+     *    proximity}` so all three appear together. The server-side
+     *    `RecordingsApiHandler.buildFilter` honors the CSV list and uses
+     *    `type IN (...)`.
+     *  - Single-type queries (web events.html via `?type=normal`) still
+     *    auto-fold oemDashcam under "normal" on the server for back-compat.
+     *  - All other narrowing (severity / actor / place / date) maps directly.
+     */
+    private fun buildFilter(): RecordingsApiClient.Filter {
+        // Build the type set first — extraFilter is the second-type signal
+        // from the parent (Dashcam segment passes NORMAL + PROXIMITY).
+        val typeSet = mutableSetOf<String>()
+        fun addType(rf: RecordingFilter?) {
+            when (rf) {
+                RecordingFilter.NORMAL -> {
+                    typeSet.add("normal")
+                    typeSet.add("oemDashcam")
+                }
+                RecordingFilter.SENTRY -> typeSet.add("sentry")
+                RecordingFilter.PROXIMITY -> typeSet.add("proximity")
+                RecordingFilter.ALL, null -> { /* leave empty = no narrowing */ }
+            }
+        }
+        addType(currentFilter)
+        addType(extraFilter)
+        val typeStr: String?
+        val typesParam: Set<String>
+        if (typeSet.isEmpty()) {
+            typeStr = null
+            typesParam = emptySet()
+        } else if (typeSet.size == 1) {
+            // Single canonical type — use the legacy `type` field so the
+            // server's auto-fold kicks in (matches web behavior).
+            typeStr = typeSet.first()
+            typesParam = emptySet()
+        } else {
+            // Multi-type: use the CSV path. Server emits `type=a,b,c`.
+            typeStr = null
+            typesParam = typeSet.toSet()
+        }
+        val dateStr = if (dateNarrowed) {
+            String.format(
+                Locale.US,
+                "%04d-%02d-%02d",
+                calendar.get(Calendar.YEAR),
+                calendar.get(Calendar.MONTH) + 1,
+                selectedDay
+            )
+        } else null
+        val severitySet = severityFilter.toSet()  // already uppercased by applyAll
+        val placeStr = placeFilter.firstOrNull()  // server takes one exact label
+        return RecordingsApiClient.Filter(
+            type = typeStr,
+            types = typesParam,
+            date = dateStr,
+            classes = actorClassFilter.toSet(),  // already lowercased
+            severities = severitySet,
+            place = placeStr
+        )
+    }
+
+    /**
+     * Fetch page 1 with the current filter and render. Routes to fallback
+     * scanner only if the daemon is unreachable; warming responses spin up
+     * a poll loop that retries every 1.5s.
+     */
+    private fun loadFirstPage() {
         if (scanExecutor.isShutdown) return
+        if (pagingState.loading) return
+
+        val filter = buildFilter()
+        pagingState.currentFilter = filter
+        pagingState.page = 1
+        pagingState.loading = true
+        val gen = pagingState.generation
+        val pageNum = 1
+        val pageSize = pagingState.pageSize
+
+        Log.d(TAG, "loadFirstPage filter=$filter")
+
         scanExecutor.submit {
-            try {
-                val recordingsDir = RecordingScanner.getRecordingsDir(requireContext())
-                val sentryDir = RecordingScanner.getSentryEventsDir(requireContext())
-                val proximityDir = RecordingScanner.getProximityEventsDir(requireContext())
+            val page = try {
+                RecordingsApiClient.fetchRecordings(filter, pageNum, pageSize)
+            } catch (t: Throwable) {
+                Log.w(TAG, "fetchRecordings page=1 threw: ${t.message}")
+                null
+            }
 
-                Log.d(TAG, "Recordings dir: ${recordingsDir.absolutePath}, exists: ${recordingsDir.exists()}")
-                Log.d(TAG, "Sentry dir: ${sentryDir.absolutePath}, exists: ${sentryDir.exists()}")
-                Log.d(TAG, "Proximity dir: ${proximityDir.absolutePath}, exists: ${proximityDir.exists()}")
+            activity?.runOnUiThread {
+                if (!isAdded || view == null) return@runOnUiThread
+                if (gen != pagingState.generation) return@runOnUiThread  // stale
+                pagingState.loading = false
 
-                if (recordingsDir.exists()) {
-                    val files = recordingsDir.listFiles()
-                    Log.d(TAG, "Recordings dir files: ${files?.size ?: 0}")
-                    files?.take(5)?.forEach { Log.d(TAG, "  - ${it.name}") }
+                if (page == null) {
+                    // Daemon unreachable → fallback to direct-FS scan.
+                    loadFallback()
+                    return@runOnUiThread
                 }
 
+                if (page.warming) {
+                    // Show building-index skeleton; schedule a retry.
+                    showWarmingState(page.warmingDone, page.warmingTotal)
+                    scheduleWarmupRetry(gen)
+                    return@runOnUiThread
+                }
+
+                pagingState.totalCount = page.totalCount
+                pagingState.accumulated.clear()
+                pagingState.accumulated.addAll(page.recordings)
+                // Server tells us totalPages directly — no need to guess.
+                pagingState.hasMore = pageNum < page.totalPages
+                renderRecordings(pagingState.accumulated.toList())
+
+                // Server says it's reconciling (storage hot-plug, type-
+                // switch, etc.). Empty list now, but reconcile is in flight
+                // and the populated rows land in ~1.5s. Schedule a one-shot
+                // retry so the user doesn't have to manually pull-to-refresh.
+                // Capped by the same generation guard above so a filter
+                // change between fetch and retry properly cancels.
+                if (page.reconciling && page.recordings.isEmpty()) {
+                    mainHandler.postDelayed({
+                        if (gen == pagingState.generation && isAdded && view != null) {
+                            loadFirstPage()
+                        }
+                    }, page.retryAfterMs)
+                }
+            }
+        }
+    }
+
+    /**
+     * Fetch page N+1 and append. Guards against re-entry — the scroll
+     * listener may fire multiple times before the previous request lands.
+     */
+    private fun loadNextPage() {
+        if (scanExecutor.isShutdown) return
+        if (pagingState.loading || !pagingState.hasMore || pagingState.fallbackActive) return
+
+        pagingState.loading = true
+        val gen = pagingState.generation
+        val pageNum = pagingState.page + 1
+        val pageSize = pagingState.pageSize
+        val filter = pagingState.currentFilter
+
+        scanExecutor.submit {
+            val page = try {
+                RecordingsApiClient.fetchRecordings(filter, pageNum, pageSize)
+            } catch (t: Throwable) {
+                Log.w(TAG, "fetchRecordings page=$pageNum threw: ${t.message}")
+                null
+            }
+
+            activity?.runOnUiThread {
+                if (!isAdded || view == null) return@runOnUiThread
+                if (gen != pagingState.generation) return@runOnUiThread
+                pagingState.loading = false
+
+                if (page == null) {
+                    // Mid-paging transport failure: stop paging quietly,
+                    // keep what we have. Don't switch to fallback — that
+                    // would replace the visible list with a different
+                    // (possibly larger) set and reset the user's scroll.
+                    pagingState.hasMore = false
+                    return@runOnUiThread
+                }
+                if (page.warming) {
+                    // Mid-paging warmup is rare but possible (index rebuild
+                    // triggered while user was browsing). Stop appending,
+                    // keep current rows.
+                    pagingState.hasMore = false
+                    return@runOnUiThread
+                }
+
+                pagingState.page = pageNum
+                pagingState.totalCount = page.totalCount
+                pagingState.accumulated.addAll(page.recordings)
+                pagingState.hasMore = pageNum < page.totalPages
+                renderRecordings(pagingState.accumulated.toList())
+            }
+        }
+    }
+
+    /**
+     * Schedule a warming-state retry. Cancels any prior pending retry so
+     * we don't stack runnables on the main looper.
+     */
+    private fun scheduleWarmupRetry(gen: Int) {
+        warmupPollRunnable?.let { mainHandler.removeCallbacks(it) }
+        val r = Runnable {
+            if (!isAdded || view == null) return@Runnable
+            if (gen != pagingState.generation) return@Runnable
+            warmupPollRunnable = null
+            // Re-enter loadFirstPage; if still warming it'll re-schedule.
+            loadFirstPage()
+        }
+        warmupPollRunnable = r
+        mainHandler.postDelayed(r, 1500L)
+    }
+
+    /**
+     * Render the "Building library index" skeleton. Reuses the empty-state
+     * container so we don't add a separate widget — message + progress
+     * counter only. Hides the recycler.
+     */
+    private fun showWarmingState(done: Int, total: Int) {
+        currentList = emptyList()
+        recordingAdapter.submitList(emptyList())
+        recyclerRecordings.visibility = View.GONE
+        emptyStateContainer?.visibility = View.VISIBLE
+        tvEmptyState.visibility = View.VISIBLE
+        tvEmptyState.text = getString(R.string.recording_lib_building_index_title)
+        tvEmptyStateBody?.visibility = View.VISIBLE
+        tvEmptyStateBody?.text = if (total > 0) {
+            getString(R.string.recording_lib_building_index_progress, done, total)
+        } else {
+            getString(R.string.recording_lib_building_index_body)
+        }
+        btnEmptyClearFilters?.visibility = View.GONE
+        // Reset day-clip pill — it would otherwise show the previous count.
+        tvDayClipCount?.visibility = View.GONE
+    }
+
+    /**
+     * Direct-FS fallback. Mirrors the legacy behavior: scan everything,
+     * apply the same client-side filtering the API would have done, render
+     * a single non-paged list. Disables the scroll listener so spurious
+     * "near end" triggers don't try to fetch.
+     */
+    private fun loadFallback() {
+        if (scanExecutor.isShutdown) return
+        pagingState.fallbackActive = true
+        pagingState.hasMore = false
+
+        val year = calendar.get(Calendar.YEAR)
+        val month = calendar.get(Calendar.MONTH)
+        val gen = pagingState.generation
+
+        Log.d(TAG, "loadFallback (direct-FS) for $year-${month+1}-$selectedDay")
+
+        scanExecutor.submit {
+            try {
                 val allRecordings = if (dateNarrowed) {
                     RecordingScanner.getRecordingsForDate(requireContext(), year, month, selectedDay)
                 } else {
                     RecordingScanner.scanRecordings(requireContext())
                 }
-                Log.d(TAG, "Found ${allRecordings.size} recordings (narrowed=$dateNarrowed)")
 
                 val acceptedTypes = mutableSetOf<RecordingFile.RecordingType>()
                 fun include(f: RecordingFilter) {
@@ -696,8 +1074,14 @@ class RecordingLibraryFragment : Fragment() {
                             acceptedTypes += RecordingFile.RecordingType.NORMAL
                             acceptedTypes += RecordingFile.RecordingType.SENTRY
                             acceptedTypes += RecordingFile.RecordingType.PROXIMITY
+                            acceptedTypes += RecordingFile.RecordingType.OEM_DASHCAM
                         }
-                        RecordingFilter.NORMAL ->     acceptedTypes += RecordingFile.RecordingType.NORMAL
+                        RecordingFilter.NORMAL -> {
+                            // NORMAL filter (parent: Dashcam segment) folds in OEM
+                            // Dashcam clips so dvr_*.mp4 surfaces alongside cam_*.
+                            acceptedTypes += RecordingFile.RecordingType.NORMAL
+                            acceptedTypes += RecordingFile.RecordingType.OEM_DASHCAM
+                        }
                         RecordingFilter.SENTRY ->     acceptedTypes += RecordingFile.RecordingType.SENTRY
                         RecordingFilter.PROXIMITY ->  acceptedTypes += RecordingFile.RecordingType.PROXIMITY
                     }
@@ -712,25 +1096,10 @@ class RecordingLibraryFragment : Fragment() {
                     typeFiltered
                 } else {
                     typeFiltered.filter { rec ->
-                        // Clips with no sidecar (e.g. continuous Dashcam
-                        // captures) bypass actor/severity narrowing — there's
-                        // no signal to gate on, and excluding them entirely
-                        // would empty the Dashcam list whenever any chip is
-                        // active. This mirrors the events.html "no metadata =
-                        // pass through" rule.
                         val hasSidecar = rec.peakSeverity != null ||
                             rec.actorClasses.isNotEmpty()
-                        // Place is independent of "has sidecar" — a continuous
-                        // Dashcam clip can carry a place block when geocoding
-                        // is enabled. So we evaluate place gating BEFORE the
-                        // sidecar bypass, and let the sidecar bypass apply
-                        // only to actor/severity.
                         val placeOk = placeFilter.isEmpty() || run {
                             val short = rec.placeShortLabel?.lowercase()
-                            // Clips with no place tag are excluded when a
-                            // place chip is active — that's the entire point
-                            // of the chip (otherwise the user would see
-                            // unfiltered legacy clips mixed in).
                             short != null && short in placeFilter
                         }
                         if (!placeOk) return@filter false
@@ -743,15 +1112,16 @@ class RecordingLibraryFragment : Fragment() {
                     }
                 }
 
-                Log.d(TAG, "After filter (${currentFilter}, actor=$actorClassFilter, sev=$severityFilter, place=$placeFilter): ${recordings.size} recordings")
-
                 activity?.runOnUiThread {
-                    if (isAdded) {
-                        renderRecordings(recordings)
-                    }
+                    if (!isAdded || view == null) return@runOnUiThread
+                    if (gen != pagingState.generation) return@runOnUiThread
+                    pagingState.accumulated.clear()
+                    pagingState.accumulated.addAll(recordings)
+                    pagingState.totalCount = recordings.size
+                    renderRecordings(recordings)
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "Error loading recordings", e)
+                Log.e(TAG, "Fallback scan error", e)
             }
         }
     }
@@ -788,11 +1158,28 @@ class RecordingLibraryFragment : Fragment() {
             recyclerRecordings.visibility = View.GONE
             emptyStateContainer?.visibility = View.VISIBLE
             tvEmptyState.visibility = View.VISIBLE
-            tvEmptyState.text = when (currentFilter) {
-                RecordingFilter.ALL -> getString(R.string.recording_lib_no_recordings)
-                RecordingFilter.NORMAL -> "No normal recordings"
-                RecordingFilter.SENTRY -> "No sentry events"
-                RecordingFilter.PROXIMITY -> "No proximity events"
+
+            // Distinguish "filters too narrow" from "nothing on disk" so the
+            // empty-state body and CTA make sense.
+            //
+            // hasFilters = anything that could be narrowing the visible set.
+            // The segment selector itself (currentFilter) doesn't count —
+            // dropping that just sends the user to the other tab and the
+            // disk could still be empty there too.
+            val hasFilters = dateNarrowed
+                || actorClassFilter.isNotEmpty()
+                || severityFilter.isNotEmpty()
+                || placeFilter.isNotEmpty()
+            if (hasFilters) {
+                tvEmptyState.text = getString(R.string.recording_lib_empty_title)
+                tvEmptyStateBody?.visibility = View.VISIBLE
+                tvEmptyStateBody?.text = getString(R.string.recording_lib_empty_body)
+                btnEmptyClearFilters?.visibility = View.VISIBLE
+            } else {
+                tvEmptyState.text = getString(R.string.recording_lib_empty_disk_title)
+                tvEmptyStateBody?.visibility = View.VISIBLE
+                tvEmptyStateBody?.text = getString(R.string.recording_lib_empty_disk_body)
+                btnEmptyClearFilters?.visibility = View.GONE
             }
             recordingAdapter.submitList(emptyList())
         } else {
@@ -860,6 +1247,68 @@ class RecordingLibraryFragment : Fragment() {
             } catch (e2: Exception) {
                 Toast.makeText(context, getString(R.string.toast_cannot_play_video, e2.message ?: ""), Toast.LENGTH_SHORT).show()
             }
+        }
+    }
+
+    /**
+     * Per-tile share — invokes the system chooser with a single video URI
+     * vended through FileProvider so external apps (Telegram, Mail,
+     * messenger, etc.) can read the clip without a runtime grant.
+     */
+    private fun shareSingleRecording(recording: RecordingFile) {
+        val ctx = context ?: return
+        try {
+            val uri = recording.contentUri ?: FileProvider.getUriForFile(
+                ctx,
+                "${ctx.packageName}.fileprovider",
+                recording.file
+            )
+            val intent = Intent(Intent.ACTION_SEND).apply {
+                type = "video/mp4"
+                putExtra(Intent.EXTRA_STREAM, uri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            startActivity(Intent.createChooser(intent, getString(R.string.action_share)))
+        } catch (e: Exception) {
+            Log.e(TAG, "Share failed", e)
+            Toast.makeText(ctx, e.message ?: "share failed", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    /**
+     * Multi-select share — bulk dispatches the selected clips through
+     * ACTION_SEND_MULTIPLE so any chooser target can ingest the whole
+     * batch in one tap. Falls back gracefully if no app handles it.
+     */
+    private fun shareSelectedRecordings() {
+        val ctx = context ?: return
+        val selected = recordingAdapter.getSelectedRecordings()
+        if (selected.isEmpty()) return
+        try {
+            val uris = ArrayList<android.net.Uri>(selected.size)
+            for (rec in selected) {
+                val u = rec.contentUri ?: FileProvider.getUriForFile(
+                    ctx,
+                    "${ctx.packageName}.fileprovider",
+                    rec.file
+                )
+                uris.add(u)
+            }
+            val intent = Intent(Intent.ACTION_SEND_MULTIPLE).apply {
+                type = "video/mp4"
+                putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            startActivity(Intent.createChooser(intent, getString(R.string.action_share)))
+            Toast.makeText(
+                ctx,
+                getString(R.string.toast_share_recordings, selected.size),
+                Toast.LENGTH_SHORT
+            ).show()
+            exitSelectMode()
+        } catch (e: Exception) {
+            Log.e(TAG, "Bulk share failed", e)
+            Toast.makeText(ctx, e.message ?: "share failed", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -959,6 +1408,14 @@ class RecordingLibraryFragment : Fragment() {
         filterSheet = null
         sectionHeaderDecoration?.let { recyclerRecordings.removeItemDecoration(it) }
         sectionHeaderDecoration = null
+        if (pagingScrollListenerAttached) {
+            recyclerRecordings.removeOnScrollListener(pagingScrollListener)
+            pagingScrollListenerAttached = false
+        }
+        warmupPollRunnable?.let { mainHandler.removeCallbacks(it) }
+        warmupPollRunnable = null
+        // Bump generation so any in-flight background result lands as stale.
+        pagingState.generation += 1
         // shutdownNow so a stuck disk walk doesn't hold the fragment alive.
         scanExecutor.shutdownNow()
     }

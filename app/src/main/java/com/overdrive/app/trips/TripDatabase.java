@@ -68,6 +68,11 @@ public class TripDatabase {
                 createTables();
                 isInitialized = true;
                 logger.info("Trip Database initialized via H2 (Pure Java): " + DB_PATH);
+
+                // Kick off the one-shot size_bytes backfill for legacy
+                // rows. Runs on its own daemon thread, no-op when every
+                // row already has a size, never blocks init.
+                runBackfillIfNeeded();
                 return;
 
             } catch (Exception e) {
@@ -267,6 +272,22 @@ public class TripDatabase {
                 logger.debug("route_id migration: " + e.getMessage());
             }
 
+            // Migration: per-row file-size accounting. Lets StorageManager
+            // answer getTripsSize() via SUM(size_bytes) instead of walking
+            // every trips dir and stat()ing every .jsonl.gz file (which on
+            // full storage with FUSE-bridged SD took 10-20 min). DEFAULT 0
+            // is the cue for the one-shot backfill thread to fill the
+            // column for legacy rows. sidecar_size_bytes is reserved —
+            // current builds have no trip sidecars but the schema is
+            // ready when one is introduced.
+            try {
+                stmt.execute("ALTER TABLE trips ADD COLUMN IF NOT EXISTS size_bytes BIGINT DEFAULT 0");
+                stmt.execute("ALTER TABLE trips ADD COLUMN IF NOT EXISTS sidecar_size_bytes BIGINT DEFAULT 0");
+            } catch (Exception e) {
+                // Columns already exist or H2 version doesn't support IF NOT EXISTS
+                logger.debug("trips size column migration: " + e.getMessage());
+            }
+
             // Weekly rollups
             stmt.execute(
                 "CREATE TABLE IF NOT EXISTS weekly_rollups (" +
@@ -370,13 +391,15 @@ public class TripDatabase {
                 "anticipation_score, smoothness_score, speed_discipline_score, " +
                 "efficiency_score, consistency_score, micro_moments_json, telemetry_file_path, route_id, " +
                 "is_phev, fuel_pct_start, fuel_pct_end, litres_used, fuel_price_per_l, fuel_cost, " +
-                "electric_cost, ice_seconds) " +
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                "electric_cost, ice_seconds, size_bytes, sidecar_size_bytes) " +
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
         try (PreparedStatement pstmt = connection.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
             setTripParams(pstmt, trip);
             pstmt.setObject(33, trip.routeId > 0 ? trip.routeId : null);
             setTripFuelParams(pstmt, trip, 34);
+            pstmt.setLong(42, trip.sizeBytes);
+            pstmt.setLong(43, trip.sidecarSizeBytes);
             pstmt.executeUpdate();
 
             try (ResultSet keys = pstmt.getGeneratedKeys()) {
@@ -410,14 +433,16 @@ public class TripDatabase {
                 "efficiency_score=?, consistency_score=?, micro_moments_json=?, telemetry_file_path=?, " +
                 "route_id=?, " +
                 "is_phev=?, fuel_pct_start=?, fuel_pct_end=?, litres_used=?, fuel_price_per_l=?, " +
-                "fuel_cost=?, electric_cost=?, ice_seconds=? " +
+                "fuel_cost=?, electric_cost=?, ice_seconds=?, size_bytes=?, sidecar_size_bytes=? " +
                 "WHERE id=?";
 
         try (PreparedStatement pstmt = connection.prepareStatement(sql)) {
             setTripParams(pstmt, trip);
             pstmt.setObject(33, trip.routeId > 0 ? trip.routeId : null);
             setTripFuelParams(pstmt, trip, 34);
-            pstmt.setLong(42, trip.id);
+            pstmt.setLong(42, trip.sizeBytes);
+            pstmt.setLong(43, trip.sidecarSizeBytes);
+            pstmt.setLong(44, trip.id);
             pstmt.executeUpdate();
             logger.debug("Updated trip id=" + trip.id);
         } catch (Exception e) {
@@ -1211,6 +1236,10 @@ public class TripDatabase {
         try { trip.fuelCost       = rs.getDouble("fuel_cost"); }       catch (Exception e) { trip.fuelCost = 0; }
         try { trip.electricCost   = rs.getDouble("electric_cost"); }   catch (Exception e) { trip.electricCost = 0; }
         try { trip.iceSecondsAtomic.set(rs.getInt("ice_seconds")); } catch (Exception e) { trip.iceSecondsAtomic.set(0); }
+        // Storage accounting (added in size-backfill migration). 0 means
+        // "not yet backfilled" — see runBackfillIfNeeded().
+        try { trip.sizeBytes        = rs.getLong("size_bytes"); }         catch (Exception e) { trip.sizeBytes = 0; }
+        try { trip.sidecarSizeBytes = rs.getLong("sidecar_size_bytes"); } catch (Exception e) { trip.sidecarSizeBytes = 0; }
         return trip;
     }
 
@@ -1380,5 +1409,209 @@ public class TripDatabase {
      */
     public boolean isAvailable() {
         return isInitialized && connection != null;
+    }
+
+    // ==================== STORAGE ACCOUNTING ====================
+
+    /**
+     * Sum of telemetry + sidecar bytes across every trip row.
+     *
+     * <p>Drop-in replacement for the FUSE-walking
+     * {@code StorageManager.getTripsSize()} on full-storage devices where the
+     * filesystem walk took 10-20 minutes. H2 keeps the trips table in its
+     * 8MB CACHE_SIZE, so this is a sub-millisecond aggregate. Returns 0 on
+     * connection failure so the caller can fall back to the slow walk.
+     *
+     * <p>Authoritativeness: only accurate once {@link #isBackfillComplete()}
+     * is true. Until then, legacy rows still report 0 and a low total is
+     * returned. {@link com.overdrive.app.storage.StorageManager} is expected
+     * to gate on {@code isBackfillComplete()} before trusting this value.
+     */
+    public long getTotalSizeBytes() {
+        if (!ensureConnection()) return 0;
+
+        synchronized (this) {
+            String sql = "SELECT COALESCE(SUM(size_bytes + sidecar_size_bytes), 0) FROM trips";
+            try (PreparedStatement pstmt = connection.prepareStatement(sql);
+                 ResultSet rs = pstmt.executeQuery()) {
+                if (rs.next()) {
+                    return rs.getLong(1);
+                }
+            } catch (Exception e) {
+                logger.error("Failed to compute total trips size", e);
+                reconnect();
+            }
+        }
+        return 0;
+    }
+
+    /**
+     * True when every trips row has a non-zero {@code size_bytes}, i.e. the
+     * one-shot backfill has filled all legacy rows. Until this returns true
+     * {@link #getTotalSizeBytes()} undercounts and StorageManager should
+     * fall back to the slow filesystem walk (cached for 30s).
+     */
+    public boolean isBackfillComplete() {
+        if (!ensureConnection()) return false;
+
+        synchronized (this) {
+            // LIMIT 1 keeps this O(1) even with hundreds of legacy rows —
+            // we only need to know "any zero?", not the exact count.
+            String sql = "SELECT 1 FROM trips WHERE size_bytes = 0 LIMIT 1";
+            try (PreparedStatement pstmt = connection.prepareStatement(sql);
+                 ResultSet rs = pstmt.executeQuery()) {
+                return !rs.next();
+            } catch (Exception e) {
+                logger.error("Failed to check backfill completeness", e);
+                reconnect();
+                return false;
+            }
+        }
+    }
+
+    /**
+     * One-shot background backfill of {@code size_bytes} for legacy rows
+     * (rows inserted before the size-accounting migration). Idempotent —
+     * skipped entirely once every row has a non-zero size.
+     *
+     * <p>Runs on a single daemon thread named "TripsSizeBackfill". Each
+     * UPDATE acquires {@code synchronized(this)} so it interleaves cleanly
+     * with concurrent {@link #insertTrip} / {@link #updateTrip} calls
+     * coming from the trip detector — H2 embedded mode shares one
+     * connection across threads so the lock is required to keep the JDBC
+     * cursor state consistent. Processed in 100-row batches with a 50ms
+     * sleep between batches so the backfill never starves the API
+     * handler thread on a database with thousands of legacy rows.
+     *
+     * <p>All file I/O (the {@code File.length()} stat) happens OUTSIDE the
+     * lock so the FUSE walk doesn't block live insertTrip — this is the
+     * whole reason we're moving the size accounting off the request path
+     * in the first place.
+     */
+    private void runBackfillIfNeeded() {
+        Thread t = new Thread(() -> {
+            try {
+                if (isBackfillComplete()) {
+                    return; // No legacy rows; nothing to do.
+                }
+
+                long startedMs = System.currentTimeMillis();
+                logger.info("Trips size backfill starting");
+
+                int processed = 0;
+                int updated = 0;
+                final int batchSize = 100;
+                long lastId = -1;
+
+                while (true) {
+                    // Pull a page of legacy rows. Re-running the query each
+                    // batch (vs. holding one cursor open) lets us release
+                    // the connection between batches so foreground inserts
+                    // don't queue behind the backfill.
+                    List<long[]> batch = new ArrayList<>(batchSize);
+                    List<String> paths = new ArrayList<>(batchSize);
+
+                    synchronized (this) {
+                        if (!ensureConnection()) {
+                            logger.warn("Trips size backfill aborted — DB connection unavailable");
+                            return;
+                        }
+                        String sql = "SELECT id, telemetry_file_path FROM trips " +
+                                "WHERE size_bytes = 0 AND id > ? ORDER BY id ASC LIMIT ?";
+                        try (PreparedStatement pstmt = connection.prepareStatement(sql)) {
+                            pstmt.setLong(1, lastId);
+                            pstmt.setInt(2, batchSize);
+                            try (ResultSet rs = pstmt.executeQuery()) {
+                                while (rs.next()) {
+                                    long id = rs.getLong("id");
+                                    String path = rs.getString("telemetry_file_path");
+                                    batch.add(new long[]{id});
+                                    paths.add(path);
+                                    lastId = id;
+                                }
+                            }
+                        } catch (Exception e) {
+                            logger.error("Trips size backfill: batch fetch failed", e);
+                            return;
+                        }
+                    }
+
+                    if (batch.isEmpty()) break; // Done.
+
+                    // Stat files OUTSIDE the lock — FUSE / SD walks must
+                    // not block live inserts.
+                    long[] sizes = new long[batch.size()];
+                    for (int i = 0; i < batch.size(); i++) {
+                        String p = paths.get(i);
+                        long sz = 0;
+                        if (p != null && !p.isEmpty()) {
+                            try {
+                                java.io.File f = new java.io.File(p);
+                                if (f.exists() && f.isFile()) {
+                                    sz = f.length();
+                                }
+                            } catch (Throwable ignored) {
+                                // Permissions / FUSE blip — leave at 0 so
+                                // we retry on the next daemon start.
+                            }
+                        }
+                        sizes[i] = sz;
+                    }
+
+                    // Apply UPDATEs under the lock. We only write rows
+                    // where the stat succeeded (size > 0). Orphan trips
+                    // (file gone) stay at 0 and are skipped on every
+                    // future backfill run; the WHERE size_bytes = 0
+                    // pagination above means they'd be re-visited every
+                    // restart, so we walk past them via lastId rather
+                    // than re-statting on every iteration of the loop.
+                    synchronized (this) {
+                        if (!ensureConnection()) {
+                            logger.warn("Trips size backfill aborted mid-batch — DB unavailable");
+                            return;
+                        }
+                        try (PreparedStatement upd = connection.prepareStatement(
+                                "UPDATE trips SET size_bytes = ? WHERE id = ?")) {
+                            for (int i = 0; i < batch.size(); i++) {
+                                if (sizes[i] <= 0) continue; // orphan — leave at 0
+                                upd.setLong(1, sizes[i]);
+                                upd.setLong(2, batch.get(i)[0]);
+                                upd.executeUpdate();
+                                updated++;
+                            }
+                        } catch (Exception e) {
+                            logger.error("Trips size backfill: batch update failed", e);
+                            // Continue — partial progress is fine, next
+                            // restart will re-pick the un-updated rows.
+                        }
+                    }
+
+                    processed += batch.size();
+                    if (processed % 100 == 0 || processed < 100) {
+                        logger.info("Trips size backfill: " + processed + " rows scanned, "
+                                + updated + " updated");
+                    }
+
+                    // Tiny pause so the API handler thread always wins
+                    // contention against the backfill on a busy DB.
+                    try {
+                        Thread.sleep(50);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                }
+
+                long elapsedMs = System.currentTimeMillis() - startedMs;
+                logger.info("Trips size backfill complete in " + elapsedMs + "ms ("
+                        + processed + " scanned, " + updated + " updated)");
+            } catch (Throwable t2) {
+                // A backfill crash MUST NOT crash the daemon — the worst
+                // case is the slow FUSE walk falls back into use.
+                logger.error("Trips size backfill crashed", t2);
+            }
+        }, "TripsSizeBackfill");
+        t.setDaemon(true);
+        t.start();
     }
 }

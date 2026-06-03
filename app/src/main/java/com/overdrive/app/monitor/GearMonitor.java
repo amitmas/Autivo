@@ -34,8 +34,11 @@ public class GearMonitor {
     private static GearMonitor instance;
     
     private Context context;
-    private Object gearboxDevice;
-    private Method getGearMethod;
+    // Volatile because the poll thread reads these without holding the
+    // singleton's monitor; concurrent stop() (synchronized) nullifies them.
+    // Volatile gives the poll iteration a consistent snapshot per loop turn.
+    private volatile Object gearboxDevice;
+    private volatile Method getGearMethod;
     private Thread pollThread;
     private volatile boolean isRunning = false;
     private volatile int currentGear = GEAR_P;
@@ -74,13 +77,23 @@ public class GearMonitor {
     
     /**
      * Start monitoring gear changes via polling.
+     *
+     * <p>Synchronized: the round-3 RecordingModeManager change made
+     * {@code resyncFromHardware} call this every 30s when the monitor isn't
+     * running. Without this lock, two concurrent callers (resync ticker +
+     * cold-start retry) can both pass the {@code !isRunning} guard, both
+     * complete the reflection, and both spawn their own {@code GearPoll}
+     * thread — leaking a permanent second thread that double-reports every
+     * gear change. The duplicate {@code onGearChanged} deliveries then
+     * cancel each other in RMM (gear==currentGear short-circuit) but still
+     * waste CPU on every 200ms tick.
      */
-    public void start() {
+    public synchronized void start() {
         if (isRunning) {
             logger.warn("Already running");
             return;
         }
-        
+
         try {
             logger.info("Starting gear monitor...");
             
@@ -110,21 +123,28 @@ public class GearMonitor {
                     try {
                         Thread.sleep(POLL_INTERVAL_MS);
                         if (!isRunning) break;
-                        
+
                         int gear;
                         // Prefer TelemetryDataCollector's cached snapshot to avoid
                         // duplicate CAN bus reads when the overlay poller is running
                         com.overdrive.app.telemetry.TelemetryDataCollector src = telemetrySource;
-                        com.overdrive.app.telemetry.TelemetrySnapshot snap = 
+                        com.overdrive.app.telemetry.TelemetrySnapshot snap =
                             (src != null) ? src.getLatestSnapshot() : null;
                         if (snap != null && (System.currentTimeMillis() - snap.timestampMs) < 1000) {
                             // Snapshot is fresh (< 1 second old) — use its gear value
                             gear = snap.gearMode;
                         } else {
-                            // No fresh snapshot — poll device directly
-                            gear = (int) getGearMethod.invoke(gearboxDevice);
+                            // Snapshot the reflection refs to locals: stop() is
+                            // synchronized and nullifies these mid-iteration. Without
+                            // local snapshot, getGearMethod.invoke would NPE and
+                            // produce a bogus "Gear poll error: null" log on every
+                            // race. Cleanly exit the loop on null instead.
+                            Method getter = getGearMethod;
+                            Object device = gearboxDevice;
+                            if (getter == null || device == null) break;
+                            gear = (int) getter.invoke(device);
                         }
-                        
+
                         if (gear != currentGear) {
                             logger.info("Gear changed: " + gearToString(currentGear) + " -> " + gearToString(gear));
                             currentGear = gear;
@@ -157,11 +177,11 @@ public class GearMonitor {
     /**
      * Stop monitoring.
      */
-    public void stop() {
+    public synchronized void stop() {
         if (!isRunning) {
             return;
         }
-        
+
         isRunning = false;
         if (pollThread != null) {
             pollThread.interrupt();

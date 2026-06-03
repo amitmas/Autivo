@@ -90,8 +90,31 @@ public final class NotificationApiHandler {
             byte[] auth = android.util.Base64.decode(keys.getString("auth"),
                     android.util.Base64.URL_SAFE | android.util.Base64.NO_PADDING | android.util.Base64.NO_WRAP);
             String label = j.optString("label", null);
+            // The client explicitly opts in to "re-enable a previously-removed
+            // device" by setting force=true. Any other path (silent resubscribe
+            // from pwa-init.js, an enable click that re-uses a stale browser
+            // sub) honors the tombstone and gets 410.
+            boolean force = j.optBoolean("force", false);
 
             String id = SubscriptionStore.idForEndpoint(endpoint);
+
+            // Tombstone gate. Without this, any path that POSTs /subscribe
+            // (e.g. an enable click after the user just removed the row,
+            // or the silent self-heal in pwa-init.js when the browser
+            // still has a live PushSubscription) would silently re-create
+            // the row the user just deleted — exactly the "notifications
+            // keep flowing" symptom.
+            if (!force && subStore.isTombstoned(id)) {
+                JSONObject err = new JSONObject();
+                err.put("success", false);
+                err.put("error", "subscription was removed; pass force=true to re-enable");
+                err.put("tombstoned", true);
+                HttpResponse.sendJson(out, 410, err.toString());
+                return true;
+            }
+            // Force path: clear the tombstone so the next /unsubscribe in this
+            // session is the authoritative source of truth again.
+            if (force) subStore.clearTombstone(id);
 
             PushSubscription existing = subStore.get(id);
             PushSubscription sub;

@@ -137,8 +137,9 @@ public class ProximityGuardController implements ProximityRadarMonitor.TriggerCa
         if (currentState == State.RECORDING || currentState == State.POST_RECORD) {
             cancelPostRecordTimer();
             recordingHandler.stopRecording();
+            com.overdrive.app.recording.OemDashcamMirror.onPanoRecordingStopped();
         }
-        
+
         transitionTo(State.IDLE);
     }
     
@@ -175,6 +176,7 @@ public class ProximityGuardController implements ProximityRadarMonitor.TriggerCa
                 // Start new recording. (RED-tracking handled at method top.)
                 transitionTo(State.RECORDING);
                 recordingHandler.startRecording(level);
+                com.overdrive.app.recording.OemDashcamMirror.onPanoRecordingStarted();
                 break;
 
             case POST_RECORD:
@@ -285,6 +287,7 @@ public class ProximityGuardController implements ProximityRadarMonitor.TriggerCa
                     logger.info("Post-record timer expired (after " + countdownSeconds
                             + "s) - stopping recording");
                     recordingHandler.stopRecording();
+                    com.overdrive.app.recording.OemDashcamMirror.onPanoRecordingStopped();
                     transitionTo(State.MONITORING);
                 }
             }

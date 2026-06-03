@@ -131,8 +131,13 @@ public final class PushSink implements NotificationBus.Sink {
                 result = PushTransport.send(sub.endpoint, jwt, pubKey, encoded.body, TTL_SECONDS);
 
                 if (result.expired()) {
+                    // Push service told us the sub is gone at the browser
+                    // end — this is NOT a user-driven removal, so don't
+                    // tombstone (which would block silent self-heal in
+                    // pwa-init.js for 30 minutes). Use removeExpired so
+                    // the next page load can re-register cleanly.
                     logger.info("subscription expired (" + result.status + "), removing: " + sub.id);
-                    subs.remove(sub.id);
+                    subs.removeExpired(sub.id);
                     return;
                 }
                 if (result.ok()) break;
@@ -152,7 +157,11 @@ public final class PushSink implements NotificationBus.Sink {
                         + ": " + result.body);
                 return;
             }
-            sub.lastSeenAt = System.currentTimeMillis();
+            // Persist via touchLastSeen — debounced so we don't IO every
+            // send. Direct assignment to sub.lastSeenAt would never reach
+            // disk (the previous behavior), so the device list always
+            // showed the createdAt across daemon restart.
+            subs.touchLastSeen(sub.id, System.currentTimeMillis());
         } catch (Exception e) {
             logger.error("send failed for " + sub.id + ": " + e.getMessage());
         }

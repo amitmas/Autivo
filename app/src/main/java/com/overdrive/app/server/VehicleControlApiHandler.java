@@ -190,6 +190,22 @@ public class VehicleControlApiHandler {
         // field-verified for lock state; if a single-door bench test on a
         // real car shows rear lock state arriving with the same asymmetric
         // pattern, swap [2]↔[3] back to SDK order ([2]=lr, [3]=rr).
+        // Lock state — three layers, in priority order:
+        //
+        //   1. OTA fast-path: BYDAutoOtaDevice.getLFDoorLockState(). LF only,
+        //      verified live ACC=OFF on DiLink 3.0 with ~1.5s latency.
+        //      Overlays SDK and cloud for the LF cell.
+        //   2. Cloud snapshot: full 4-door state via MQTT (fills RF/LR/RR).
+        //      Lags 1-2s vs OTA on this trim, so for LF the OTA value wins
+        //      when both are available.
+        //   3. Local SDK device array (data.doorLockStatus[]): typically all
+        //      INVALID(0) ACC=OFF on this trim. Kept as the base layer in
+        //      case some firmware exposes any door state.
+        //
+        // The web UI consumes 1=locked, 2=unlocked, -1=unknown. Cloud's raw
+        // semantics (1=unlocked, 2=locked) are inverted via cloudLockToApi.
+        // The OTA layer reports SDK semantics (1=UNLOCK, 2=LOCK) which we
+        // also invert on output.
         JSONObject doors = new JSONObject();
         if (data.doorLockStatus != null && data.doorLockStatus.length >= 7) {
             doors.put("rf", data.doorLockStatus[0]);
@@ -200,6 +216,36 @@ public class VehicleControlApiHandler {
             doors.put("hood", data.doorLockStatus[5]);
             doors.put("overall", data.doorLockStatus[6]);
         }
+
+        // Track which source authoritatively set LF so we can derive `overall`
+        // correctly when cloud is missing. -1 = no authoritative LF yet.
+        int otaLf = -1;
+        int cloudOverall = -1;
+        boolean cloudAvailable = false;
+
+        // Layer 1: OTA LF fast-path. Reads via the same readLfLockStateFromOta
+        // contract used by the lock-gate poller — see CameraDaemon.readDoorLockStatus.
+        try {
+            android.content.Context ctx = com.overdrive.app.daemon.CameraDaemon.getAppContext();
+            if (ctx != null) {
+                Object otaDevice = com.overdrive.app.byd.BydDeviceHelper.getDevice(
+                    "android.hardware.bydauto.ota.BYDAutoOtaDevice", ctx);
+                if (otaDevice != null) {
+                    Object v = com.overdrive.app.byd.BydDeviceHelper.callGetter(
+                        otaDevice, "getLFDoorLockState");
+                    if (v instanceof Number) {
+                        int sdkState = ((Number) v).intValue();
+                        // 1=UNLOCK, 2=LOCK in SDK convention → API: 2=unlocked, 1=locked.
+                        if (sdkState == 2) otaLf = 1;       // LOCKED → API=1
+                        else if (sdkState == 1) otaLf = 2;  // UNLOCKED → API=2
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            logger.debug("ota-lock overlay failed: " + t.getMessage());
+        }
+
+        // Layer 2: cloud overlay (full 4-door).
         try {
             com.overdrive.app.byd.cloud.BydCloudDataProvider provider =
                     com.overdrive.app.byd.cloud.BydCloudDataProvider.getInstance();
@@ -210,9 +256,7 @@ public class VehicleControlApiHandler {
             new Thread(provider::refreshLockStateIfStale, "CloudLockRefresh").start();
             com.overdrive.app.byd.cloud.VehicleCloudSnapshot cs = provider.getSnapshot();
             if (cs != null && cs.hasValidLockState()) {
-                // Cloud snapshot semantics:
-                //   leftFrontDoorLock etc.: 1=UNLOCKED, 2=LOCKED (per pyBYD)
-                // API contract semantics: 1=locked, 2=unlocked (inverted).
+                cloudAvailable = true;
                 int lf = cloudLockToApi(cs.leftFrontDoorLock);
                 int rf = cloudLockToApi(cs.rightFrontDoorLock);
                 int lr = cloudLockToApi(cs.leftRearDoorLock);
@@ -221,15 +265,30 @@ public class VehicleControlApiHandler {
                 if (rf != -1) doors.put("rf", rf);
                 if (lr != -1) doors.put("lr", lr);
                 if (rr != -1) doors.put("rr", rr);
-                int overall;
-                if (cs.isAnyUnlocked()) overall = 2;
-                else if (cs.isAllLocked()) overall = 1;
-                else overall = -1;
-                if (overall != -1) doors.put("overall", overall);
+                if (cs.isAnyUnlocked()) cloudOverall = 2;
+                else if (cs.isAllLocked()) cloudOverall = 1;
+                if (cloudOverall != -1) doors.put("overall", cloudOverall);
                 doors.put("source", "cloud");
             }
         } catch (Exception e) {
             logger.debug("cloud-lock overlay failed: " + e.getMessage());
+        }
+
+        // Layer 3 (top of stack): OTA LF wins for the LF cell. Computed
+        // last so it overrides both cloud and SDK.
+        if (otaLf != -1) {
+            doors.put("lf", otaLf);
+            // If cloud was unavailable, we still want a meaningful `overall`
+            // when at least the LF state is known — surveillance arming uses
+            // overall, and the LF door is the dominant signal in practice.
+            if (!cloudAvailable) {
+                doors.put("overall", otaLf);
+            } else if (otaLf != cloudOverall && cloudOverall != -1) {
+                // Cloud is fresh AND disagrees with OTA LF (cloud might have
+                // RF/LR/RR contradicting LF). We stick with cloud's overall
+                // because it sees all 4 doors; otaLf overlays only the LF cell.
+            }
+            doors.put("source", cloudAvailable ? "ota+cloud" : "ota");
         }
         response.put("doors", doors);
 

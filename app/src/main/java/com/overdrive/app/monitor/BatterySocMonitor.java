@@ -129,19 +129,29 @@ public class BatterySocMonitor extends BaseDeviceMonitor<BatterySocData> {
         @Override
         public void onElecPercentageChanged(double percentage) {
             log("SOC changed: " + percentage + "%");
-            
+
             try {
                 BatterySocData oldData = cachedData.get();
                 BatterySocData newData = new BatterySocData(percentage);
-                
+
                 cachedData.set(newData);
-                
+
                 if (newData.isCritical) {
                     log("CRITICAL: Battery SOC is critically low (" + percentage + "%)!");
                 } else if (newData.isLow && (oldData == null || !oldData.isLow)) {
                     log("WARNING: Battery SOC is low (" + percentage + "%)");
                 }
-                
+
+                // Fan out to SocCutoffMonitor (acc_sentry-process voluntary
+                // cutoff). Same-process hand-off; the listener that hangs off
+                // BYDAutoStatisticDevice properly subclasses AbsBYDAutoStatisticListener
+                // (this class), so we get true callback granularity here unlike
+                // the broken Proxy path. No-op when SocCutoffMonitor is not running.
+                try {
+                    com.overdrive.app.power.SocCutoffMonitor
+                            .notifyElecPercentage(percentage);
+                } catch (Throwable ignored) {}
+
             } catch (Exception e) {
                 logError("Failed to process SOC change", e);
             }

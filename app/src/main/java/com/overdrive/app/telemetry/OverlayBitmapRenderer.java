@@ -227,7 +227,11 @@ public class OverlayBitmapRenderer {
             x += belt2W;
 
             // TIMESTAMP
-            reusableDate.setTime(snap.timestampMs);
+            // Read wall clock directly rather than the snapshot's polled timestamp.
+            // Telemetry snapshots are now published only on field-change (telemetry
+            // optimization in TelemetryDataCollector), so a static cabin would freeze
+            // the burned-in overlay clock for seconds at a time.
+            reusableDate.setTime(System.currentTimeMillis());
             timePaint.setTextSize(16);
             c.drawText(dateFmt.format(reusableDate), x, 34, timePaint);
             timePaint.setTextSize(20);

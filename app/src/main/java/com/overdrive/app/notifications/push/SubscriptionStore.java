@@ -26,6 +26,27 @@ public final class SubscriptionStore {
     private final Map<String, PushSubscription> byId = new LinkedHashMap<>();
     private final AtomicBoolean loaded = new AtomicBoolean(false);
 
+    /**
+     * Recently-unsubscribed ids → expiry epoch ms. Stops a subscribe POST from
+     * silently re-creating a row the user just removed. Without this, the
+     * user's removal is undone the next time the device's PWA does anything
+     * that calls /api/push/subscribe (Enable click, requestAndSubscribe, etc.)
+     * because the live PushSubscription on the browser is still valid.
+     */
+    private final Map<String, Long> tombstones = new LinkedHashMap<>();
+    public static final long TOMBSTONE_WINDOW_MS = 30L * 60 * 1000;
+    private static final int MAX_TOMBSTONES = 200;
+    /**
+     * Debounced lastSeenAt persistence. {@link #touchLastSeen} updates the
+     * in-memory field on every call but only schedules a flush at most once
+     * per {@link #LAST_SEEN_FLUSH_INTERVAL_MS}. Without this, the previous
+     * pattern (mutate sub.lastSeenAt without persisting) lost the timestamp
+     * across daemon restart; persisting on every send would put a file write
+     * in the push hot path.
+     */
+    private static final long LAST_SEEN_FLUSH_INTERVAL_MS = 60_000L;
+    private long lastSeenLastFlushMs = 0;
+
     public SubscriptionStore(File file) {
         this.file = file;
     }
@@ -37,13 +58,40 @@ public final class SubscriptionStore {
         if (!file.exists() || file.length() == 0) return;
         try (FileInputStream fis = new FileInputStream(file)) {
             byte[] bytes = readAll(fis);
-            JSONArray arr = new JSONArray(new String(bytes, "UTF-8"));
-            for (int i = 0; i < arr.length(); i++) {
-                try {
-                    PushSubscription sub = PushSubscription.fromJson(arr.getJSONObject(i));
-                    byId.put(sub.id, sub);
-                } catch (Exception e) {
-                    // skip corrupt entry, continue loading the rest
+            String raw = new String(bytes, "UTF-8");
+            // The on-disk format used to be a bare JSONArray of subscriptions.
+            // We now wrap as {subs, tombstones} so a single file holds both.
+            // Detect by first non-whitespace char and migrate transparently.
+            int i = 0;
+            while (i < raw.length() && Character.isWhitespace(raw.charAt(i))) i++;
+            char first = i < raw.length() ? raw.charAt(i) : '\0';
+            JSONArray subsArr = null;
+            JSONObject tombObj = null;
+            if (first == '[') {
+                // legacy bare-array
+                subsArr = new JSONArray(raw);
+            } else if (first == '{') {
+                JSONObject root = new JSONObject(raw);
+                subsArr = root.optJSONArray("subs");
+                tombObj = root.optJSONObject("tombstones");
+            }
+            if (subsArr != null) {
+                for (int k = 0; k < subsArr.length(); k++) {
+                    try {
+                        PushSubscription sub = PushSubscription.fromJson(subsArr.getJSONObject(k));
+                        byId.put(sub.id, sub);
+                    } catch (Exception e) {
+                        // skip corrupt entry, continue loading the rest
+                    }
+                }
+            }
+            if (tombObj != null) {
+                long now = System.currentTimeMillis();
+                java.util.Iterator<String> it = tombObj.keys();
+                while (it.hasNext()) {
+                    String id = it.next();
+                    long expiry = tombObj.optLong(id, 0);
+                    if (expiry > now) tombstones.put(id, expiry);
                 }
             }
         } catch (Exception ignored) {}
@@ -65,16 +113,94 @@ public final class SubscriptionStore {
         persist();
     }
 
+    /**
+     * User-driven removal — POSTed via /api/push/unsubscribe. Adds a
+     * tombstone so silent self-heal paths (pwa-init.js init() with a live
+     * browser PushSubscription) can't immediately resurrect the row.
+     */
     public synchronized boolean remove(String id) {
+        if (!loaded.get()) load();
+        boolean removed = byId.remove(id) != null;
+        if (removed) {
+            tombstones.put(id, System.currentTimeMillis() + TOMBSTONE_WINDOW_MS);
+            evictExcessTombstones();
+            persist();
+        }
+        return removed;
+    }
+
+    /**
+     * System-driven removal — push service told us the subscription is
+     * gone (404/410 from FCM/Mozilla). The user did NOT ask to disable;
+     * the browser dropped its sub for unrelated reasons (Samsung Internet
+     * across app updates, FCM token refresh on Chrome, etc.). We must NOT
+     * tombstone — pwa-init.js's silent self-heal needs to be able to
+     * subscribe again immediately. Tombstoning here would lock the user
+     * into a 30-minute "permission granted, no sub" hole.
+     */
+    public synchronized boolean removeExpired(String id) {
         if (!loaded.get()) load();
         boolean removed = byId.remove(id) != null;
         if (removed) persist();
         return removed;
     }
 
+    /**
+     * Server-side guard against re-subscribe immediately after the user
+     * removed a device. Returns true while the tombstone is active.
+     * Auto-expires after {@link #TOMBSTONE_WINDOW_MS}.
+     */
+    public synchronized boolean isTombstoned(String id) {
+        if (!loaded.get()) load();
+        Long expiry = tombstones.get(id);
+        if (expiry == null) return false;
+        if (expiry > System.currentTimeMillis()) return true;
+        // Lazy expiry — drop and persist next mutation.
+        tombstones.remove(id);
+        return false;
+    }
+
+    /** Discard the tombstone — used when the user explicitly re-enables. */
+    public synchronized void clearTombstone(String id) {
+        if (!loaded.get()) load();
+        if (tombstones.remove(id) != null) persist();
+    }
+
+    /**
+     * Update {@code lastSeenAt} on the in-memory entry. Persists at most once
+     * per {@link #LAST_SEEN_FLUSH_INTERVAL_MS} so we don't put a file write
+     * in the push hot path. Daemon restart in the gap forfeits the unsynced
+     * delta, which is acceptable — lastSeenAt is informational only.
+     */
+    public synchronized void touchLastSeen(String id, long whenMs) {
+        if (!loaded.get()) load();
+        PushSubscription s = byId.get(id);
+        if (s == null) return;
+        s.lastSeenAt = whenMs;
+        if (whenMs - lastSeenLastFlushMs >= LAST_SEEN_FLUSH_INTERVAL_MS) {
+            lastSeenLastFlushMs = whenMs;
+            persist();
+        }
+    }
+
     public synchronized int size() {
         if (!loaded.get()) load();
         return byId.size();
+    }
+
+    /**
+     * Bound the tombstone map. Without this, a user that repeatedly
+     * subscribes + removes can grow the file unboundedly. We keep the most
+     * recent {@link #MAX_TOMBSTONES} entries — old ones expire naturally
+     * via {@link #TOMBSTONE_WINDOW_MS} anyway.
+     */
+    private void evictExcessTombstones() {
+        if (tombstones.size() <= MAX_TOMBSTONES) return;
+        java.util.Iterator<Map.Entry<String, Long>> it = tombstones.entrySet().iterator();
+        while (tombstones.size() > MAX_TOMBSTONES && it.hasNext()) {
+            it.next();
+            it.remove();
+        }
     }
 
     // ==================== INTERNAL ====================
@@ -86,9 +212,34 @@ public final class SubscriptionStore {
         JSONArray arr = new JSONArray();
         for (PushSubscription sub : byId.values()) arr.put(sub.toJson());
 
+        // v2 format: {subs, tombstones}. Older daemons that pre-date this
+        // change parse the new file as JSONObject and the legacy bare-array
+        // branch in load() now handles both. Forward-compatible.
+        JSONObject root = new JSONObject();
+        try {
+            root.put("subs", arr);
+            // Drop expired tombstones before writing so the file doesn't
+            // accumulate stale ids across many remove cycles.
+            long now = System.currentTimeMillis();
+            JSONObject tombObj = new JSONObject();
+            java.util.Iterator<Map.Entry<String, Long>> it = tombstones.entrySet().iterator();
+            while (it.hasNext()) {
+                Map.Entry<String, Long> e = it.next();
+                if (e.getValue() <= now) {
+                    it.remove();
+                    continue;
+                }
+                tombObj.put(e.getKey(), e.getValue());
+            }
+            if (tombObj.length() > 0) root.put("tombstones", tombObj);
+        } catch (Exception e) {
+            // JSON construction failed — fall back to the bare-array shape
+            // so we never leave the file unreadable.
+        }
+
         File tmp = new File(file.getAbsolutePath() + ".tmp");
         try (FileOutputStream fos = new FileOutputStream(tmp)) {
-            fos.write(arr.toString().getBytes("UTF-8"));
+            fos.write(root.toString().getBytes("UTF-8"));
             fos.getFD().sync();
         } catch (Exception e) {
             // Couldn't even write the tmp; leave the existing file intact.

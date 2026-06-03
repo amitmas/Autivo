@@ -64,6 +64,18 @@ public class EGLCore {
      *         (AI lane never feeds MediaCodec).
      */
     public static EGLCore createShared(EGLCore parent) {
+        return createShared(parent, false);
+    }
+
+    /**
+     * As {@link #createShared(EGLCore)} but with explicit control over
+     * the {@code EGL_RECORDABLE_ANDROID} bit. Pass {@code true} when the
+     * shared context will be used to drive a MediaCodec encoder Surface
+     * (the OEM dashcam pipeline does this when sharing context with
+     * pano's camera EGL); pass {@code false} for non-encoder consumers
+     * (AI-lane PBO/fence-sync, etc.).
+     */
+    public static EGLCore createShared(EGLCore parent, boolean recordable) {
         if (parent == null) throw new IllegalArgumentException("parent EGLCore is null");
         if (parent.eglContext == EGL14.EGL_NO_CONTEXT) {
             throw new IllegalStateException("parent EGL context is not initialized");
@@ -74,7 +86,7 @@ public class EGLCore {
         // requested-version field still reads 3 — and asking the child
         // for GLES3 against a GLES2 parent produces a cross-version share
         // group that most Adreno drivers refuse with EGL_NO_CONTEXT.
-        return new EGLCore(parent.getActualGlesVersion(), false, parent);
+        return new EGLCore(parent.getActualGlesVersion(), recordable, parent);
     }
 
     /**
@@ -338,9 +350,14 @@ public class EGLCore {
     public void destroySurface(EGLSurface surface) {
         if (surface != null && surface != EGL14.EGL_NO_SURFACE) {
             EGL14.eglDestroySurface(eglDisplay, surface);
-            // Don't throw on EGL_BAD_SURFACE (0x3008) - surface may already be destroyed
+            // Tolerate EGL_BAD_SURFACE (already destroyed) and
+            // EGL_BAD_DISPLAY (parent terminated the shared display
+            // before this child's release reached destroySurface).
             int error = EGL14.eglGetError();
-            if (error != EGL14.EGL_SUCCESS && error != 0x3008) {
+            if (error != EGL14.EGL_SUCCESS
+                    && error != EGL14.EGL_BAD_SURFACE
+                    && error != EGL14.EGL_BAD_DISPLAY
+                    && error != EGL14.EGL_NOT_INITIALIZED) {
                 logger.warn("destroySurface: EGL error 0x" + Integer.toHexString(error));
             }
         }
@@ -354,15 +371,31 @@ public class EGLCore {
      */
     public void release() {
         if (eglDisplay != EGL14.EGL_NO_DISPLAY) {
-            // Unbind current context
+            // Unbind current context. When this is a shared (child) core
+            // whose parent already eglTerminate'd the display, this call
+            // returns EGL_BAD_DISPLAY or EGL_NOT_INITIALIZED. Both are
+            // expected when the parent went first — silence them, log
+            // anything else.
             EGL14.eglMakeCurrent(eglDisplay,
                     EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT);
+            int err = EGL14.eglGetError();
+            if (err != EGL14.EGL_SUCCESS
+                    && err != EGL14.EGL_BAD_DISPLAY
+                    && err != EGL14.EGL_NOT_INITIALIZED) {
+                logger.warn(String.format("release: eglMakeCurrent error 0x%x", err));
+            }
 
             // Destroy our own context. The display itself is only torn down by
             // the owner — child cores in the same share group must NOT call
             // eglTerminate or the parent's textures/programs disappear too.
             if (eglContext != EGL14.EGL_NO_CONTEXT) {
                 EGL14.eglDestroyContext(eglDisplay, eglContext);
+                int err2 = EGL14.eglGetError();
+                if (err2 != EGL14.EGL_SUCCESS
+                        && err2 != EGL14.EGL_BAD_DISPLAY
+                        && err2 != EGL14.EGL_NOT_INITIALIZED) {
+                    logger.warn(String.format("release: eglDestroyContext error 0x%x", err2));
+                }
                 eglContext = EGL14.EGL_NO_CONTEXT;
             }
 

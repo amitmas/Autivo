@@ -474,6 +474,22 @@ public class StatusOverlayService extends Service {
         if (!running.get()) return;
 
         executor.execute(() -> {
+            // FIX M4: a single forceReload at the top of the tick replaces
+            // four separate forceReload() calls scattered through
+            // refreshAudioConfig / parseStatus / updateUI. Each forceReload
+            // re-reads /data/local/tmp/overdrive_config.json and re-parses
+            // the JSON; doing it 4× per 3 s tick was ~12 disk reads + 4
+            // JSON parses for the same file mtime. The cache is now
+            // consistent across the four downstream reads in this tick;
+            // they each call loadConfig()/getOemDashcam()/etc. and hit the
+            // freshly-warmed cache without re-doing the I/O.
+            try {
+                com.overdrive.app.config.UnifiedConfigManager.forceReload();
+            } catch (Throwable t) {
+                // Tolerate transient I/O — the downstream reads will fall
+                // back to the prior cached snapshot if forceReload didn't
+                // refresh.
+            }
             try {
                 JSONObject status = fetchStatus();
                 if (status != null) {
@@ -585,14 +601,12 @@ public class StatusOverlayService extends Service {
      */
     private void refreshAudioConfig() {
         try {
-            // forceReload() rather than loadConfig() — the daemon (different
-            // UID from the app) may have just rewritten the config file.
-            // loadConfig()'s mtime cache is per-process; without the explicit
-            // reload, the app-side cached snapshot can stay stale even after
-            // the file has been replaced. forceReload drops the cache and
-            // re-reads from disk.
+            // FIX M4: pollStatus() does ONE forceReload at the top of the
+            // tick to defeat the daemon-cross-UID stale cache. From here
+            // we use loadConfig() which is mtime-gated and free when the
+            // tick's earlier forceReload already refreshed.
             org.json.JSONObject recCfg =
-                com.overdrive.app.config.UnifiedConfigManager.forceReload()
+                com.overdrive.app.config.UnifiedConfigManager.loadConfig()
                     .optJSONObject("recording");
             audioEnabledConfig = recCfg != null
                 && recCfg.optBoolean("audioEnabled", false);
@@ -682,13 +696,11 @@ public class StatusOverlayService extends Service {
                 accOn = status.optBoolean("acc", false);
                 
                 // Read configured mode from UnifiedConfigManager.
-                // forceReload() rather than loadConfig() — the daemon
-                // (different UID from the app) writes this file; the
-                // app-side mtime cache is per-process and can stay stale
-                // across UID boundaries (see feedback_unified_config_force_reload).
+                // FIX M4: pollStatus() forceReloads once at the top of the
+                // tick; the cache is hot here so loadConfig() is free.
                 try {
                     JSONObject recording =
-                        com.overdrive.app.config.UnifiedConfigManager.forceReload()
+                        com.overdrive.app.config.UnifiedConfigManager.loadConfig()
                             .optJSONObject("recording");
                     if (recording != null) {
                         configuredMode = recording.optString("mode", "NONE");
@@ -708,13 +720,11 @@ public class StatusOverlayService extends Service {
                 tripActive = tripStatus.optBoolean("tripActive", false);
             } else {
                 // Fallback: read trip config from UnifiedConfigManager.
-                // forceReload() rather than loadConfig() — the daemon (different
-                // UID) writes this file; the app-side mtime cache is per-process
-                // and can stay stale across UID boundaries
-                // (see feedback_unified_config_force_reload).
+                // FIX M4: pollStatus() forceReloads once at the top of the
+                // tick; the cache is hot here so loadConfig() is free.
                 try {
                     JSONObject tripCfg =
-                        com.overdrive.app.config.UnifiedConfigManager.forceReload()
+                        com.overdrive.app.config.UnifiedConfigManager.loadConfig()
                             .optJSONObject("tripAnalytics");
                     if (tripCfg != null) {
                         tripEnabled = tripCfg.optBoolean("enabled", false);
@@ -742,13 +752,10 @@ public class StatusOverlayService extends Service {
         boolean cameraOverlayEnabled = true;
         boolean tripOverlayEnabled = true;
         try {
-            // forceReload() rather than loadConfig() — these toggles flip
-            // from the web UI / Settings (daemon UID) and the app-side
-            // mtime cache is per-process; without the explicit reload we
-            // can keep showing/hiding chips based on a stale snapshot
-            // (see feedback_unified_config_force_reload).
+            // FIX M4: pollStatus() forceReloads once at the top of the
+            // tick; the cache is hot here so loadConfig() is free.
             JSONObject statusOverlayCfg =
-                com.overdrive.app.config.UnifiedConfigManager.forceReload()
+                com.overdrive.app.config.UnifiedConfigManager.loadConfig()
                     .optJSONObject("statusOverlay");
             if (statusOverlayCfg != null) {
                 cameraOverlayEnabled = statusOverlayCfg.optBoolean("cameraVisible", true);

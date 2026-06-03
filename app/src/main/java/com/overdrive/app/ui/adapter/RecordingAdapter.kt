@@ -29,7 +29,8 @@ import kotlinx.coroutines.withContext
 class RecordingAdapter(
     private val onPlay: (RecordingFile) -> Unit,
     private val onDelete: (RecordingFile) -> Unit,
-    private val onSelectionChanged: ((Int) -> Unit)? = null
+    private val onSelectionChanged: ((Int) -> Unit)? = null,
+    private val onShare: ((RecordingFile) -> Unit)? = null
 ) : ListAdapter<RecordingFile, RecordingAdapter.RecordingViewHolder>(RecordingDiffCallback()) {
     
     // Cache for thumbnails — size-bounded LRU. The cap is set in BYTES so a
@@ -96,9 +97,11 @@ class RecordingAdapter(
         private val tvDuration: TextView = itemView.findViewById(R.id.tvDuration)
         private val tvSize: TextView = itemView.findViewById(R.id.tvSize)
         private val btnDelete: ImageButton = itemView.findViewById(R.id.btnDelete)
+        private val btnShare: ImageButton? = itemView.findViewById(R.id.btnShare)
         private val cbSelect: CheckBox = itemView.findViewById(R.id.cbSelect)
         private val tvFilename: TextView? = itemView.findViewById(R.id.tvFilename)
         private val tvSeverity: TextView? = itemView.findViewById(R.id.tvSeverity)
+        private val tvTypeBadge: TextView? = itemView.findViewById(R.id.tvTypeBadge)
         private val tvActorSummary: TextView? = itemView.findViewById(R.id.tvActorSummary)
         private val severityStripe: View? = itemView.findViewById(R.id.severityStripe)
         private val tvLocation: TextView? = itemView.findViewById(R.id.tvLocation)
@@ -109,6 +112,24 @@ class RecordingAdapter(
             tvDuration.text = if (recording.durationMs > 0) recording.formattedDuration else "--:--"
             tvSize.text = recording.formattedSize
             tvFilename?.text = recording.file.name
+
+            // Type badge — short prefix label corresponding to the on-disk
+            // filename group. Always visible so the user can map a tile back
+            // to its file group at a glance (cam_/event_/dvr_/proximity_).
+            tvTypeBadge?.let { badge ->
+                val ctx = badge.context
+                badge.text = when (recording.type) {
+                    RecordingFile.RecordingType.NORMAL ->
+                        ctx.getString(R.string.recording_lib_type_normal)
+                    RecordingFile.RecordingType.SENTRY ->
+                        ctx.getString(R.string.recording_lib_type_event)
+                    RecordingFile.RecordingType.PROXIMITY ->
+                        ctx.getString(R.string.recording_lib_type_proximity)
+                    RecordingFile.RecordingType.OEM_DASHCAM ->
+                        ctx.getString(R.string.recording_lib_type_oem)
+                }
+                badge.visibility = View.VISIBLE
+            }
 
             // Severity badge + stripe (item 7) — only when v3 sidecar provided severity
             when (recording.peakSeverity?.uppercase()) {
@@ -176,6 +197,7 @@ class RecordingAdapter(
                 cbSelect.setOnCheckedChangeListener(null)
                 cbSelect.isChecked = recording.path in selectedItems
                 btnDelete.visibility = View.GONE
+                btnShare?.visibility = View.GONE
 
                 cbSelect.setOnCheckedChangeListener { _, isChecked ->
                     if (isChecked) selectedItems.add(recording.path)
@@ -194,6 +216,16 @@ class RecordingAdapter(
                 btnDelete.visibility = View.VISIBLE
 
                 btnDelete.setOnClickListener { onDelete(recording) }
+                // Per-tile share — only wired when the host fragment opted
+                // into the share callback. Hidden otherwise so the tile
+                // footer doesn't show a dead button.
+                if (onShare != null) {
+                    btnShare?.visibility = View.VISIBLE
+                    btnShare?.setOnClickListener { onShare.invoke(recording) }
+                } else {
+                    btnShare?.visibility = View.GONE
+                    btnShare?.setOnClickListener(null)
+                }
                 // Tile body opens the player. Long-press = enter multi-select.
                 itemView.setOnClickListener { onPlay(recording) }
                 itemView.setOnLongClickListener {

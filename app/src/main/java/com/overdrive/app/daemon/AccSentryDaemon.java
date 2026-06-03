@@ -2,6 +2,7 @@ package com.overdrive.app.daemon;
 
 import android.content.Context;
 import android.hardware.bydauto.bodywork.AbsBYDAutoBodyworkListener;
+import android.hardware.bydauto.power.AbsBYDAutoPowerListener;
 import android.hardware.bydauto.power.BYDAutoPowerDevice;
 import android.os.IBinder;
 import android.os.Looper;
@@ -86,14 +87,24 @@ public class AccSentryDaemon {
     // MCU wake timestamp (for voltage-triggered wake cooldown)
     private static volatile long lastMcuWakeTime = 0;
     
-    // ==================== ACTIVE VOLTAGE RECOVERY ====================
-    // Thread handle for the active charging loop
-    private static Thread mcuChargingThread = null;
-    // Pulse interval during active charging (45s keeps MCU awake without flooding CAN bus)
-    private static final long MCU_CHARGE_PULSE_INTERVAL_MS = 45000;
+    // ==================== ACTIVE VOLTAGE RECOVERY (REPLACED) ====================
+    //
+    // Replaced by com.overdrive.app.power.BatteryVoltageMonitorV2 +
+    // com.overdrive.app.power.McuPowerHal. The 45 s "wake the MCU on every
+    // pulse" model was net-negative on a parked car — no alternator load,
+    // and each pulse drew the 12 V it was meant to preserve. The new model
+    // gates MCU wake/sleep on a 12.0 V / 12.5 V hysteresis with a 60 s
+    // re-arm and a 15 min sleep-defer window.
+    //
+    // Kept as commented references only; no live code paths use these.
+    // private static Thread mcuChargingThread = null;
+    // private static final long MCU_CHARGE_PULSE_INTERVAL_MS = 45000;
 
     // Context for BYD device access
     private static Context appContext;
+
+    /** Process-local app context. Returns null before main() initialises it. */
+    public static Context getAppContext() { return appContext; }
 
     // WakeLock for guaranteed CPU cycles
     private static PowerManager.WakeLock wakeLock;
@@ -239,20 +250,24 @@ public class AccSentryDaemon {
     /**
      * Toggles the "Remote Surveillance" power flags in the Gateway/BCM.
      * Matches Diplus C1310c implementation exactly:
-     * 
+     *
      * DISABLE path:
      *   - SpecialDevice 782237711 = 0 (sentry keep-alive OFF)
      *   - SpecialDevice 782237728 = 2 (allow sleep — value is 2, NOT 0)
      *   - PowerDevice  -1442840502 = 0 (release power hold)
-     * 
+     *
      * ENABLE path (MCU status 1 or 10):
      *   - SpecialDevice 782237711 = 1 (sentry keep-alive ON)
      *   - SpecialDevice 782237728 = 1 (wake request ON)
-     *   - PowerDevice  -1442840502 is NOT set (it's a release-only signal)
-     * 
+     *   - PowerDevice  -1442840502 = 1 ON dilink4 ONLY — esco kh/C6861d.java:344
+     *     writes this on its sentry wake path. Without it the byd_apa MCU
+     *     drops the AVM/ISP rail seconds after ACC OFF and any subsequent
+     *     AVMCamera frames are all-zero. Legacy DiPlus path skips this write
+     *     (untouched, bit-exact 90% fleet behaviour).
+     *
      * ENABLE path (MCU needs wake):
-     *   - wakeUpMcu() loop — signals are NOT set until MCU is ready
-     * 
+     *   - wakeUpMcu() loop, then signals + dilink4 power hold are set when MCU is ready.
+     *
      * @param enable true to keep peripherals powered, false to restore stock behavior
      */
     private static void configurePeripheralPower(boolean enable) {
@@ -273,8 +288,8 @@ public class AccSentryDaemon {
                 // MCU is in normal standby — use signal-based path
                 setSpecialConfig(SPECIAL_CONFIG_REMOTE_POWER_MODE, 1);  // Sentry keep-alive ON
                 setSpecialConfig(SPECIAL_CONFIG_DATA_MODULE_POWER, 1);  // Wake request ON
-                // NOTE: -1442840502 is NOT set to 1 here — it's a release-only signal
                 applyEscoSentrySpecialConfig(true);                    // dilink4-only esco-parity enable
+                applyEscoMcuPowerHold(true);                           // dilink4-only McuStatus=1
             } else {
                 // MCU needs active wake — use wakeUpMcu() then retry
                 log("MCU not ready (status=" + mcuStatus + "), waking up and retrying...");
@@ -288,6 +303,7 @@ public class AccSentryDaemon {
                         setSpecialConfig(SPECIAL_CONFIG_REMOTE_POWER_MODE, 1);
                         setSpecialConfig(SPECIAL_CONFIG_DATA_MODULE_POWER, 1);
                         applyEscoSentrySpecialConfig(true);
+                        applyEscoMcuPowerHold(true);
                     } else {
                         // One more attempt
                         wakeUpMcu();
@@ -295,11 +311,38 @@ public class AccSentryDaemon {
                         setSpecialConfig(SPECIAL_CONFIG_REMOTE_POWER_MODE, 1);
                         setSpecialConfig(SPECIAL_CONFIG_DATA_MODULE_POWER, 1);
                         applyEscoSentrySpecialConfig(true);
+                        applyEscoMcuPowerHold(true);
                         log("Forced peripheral power enable after second wake attempt");
                     }
                 }).start();
             }
         }
+    }
+
+    // ==================== ESCO-PARITY MCU POWER HOLD (DILINK 4) ====================
+
+    // PowerDevice eventId 0xAA00004A = -1442840502. On byd_apa firmware the
+    // MCU governs the AVM/ISP power rail; without this set=1 write on the
+    // sentry-wake path the rail collapses post ACC OFF and the AVMCamera
+    // handle delivers all-zero buffers (size <= 1.9 KB encoded H.264).
+    //
+    // Esco kh/C6861d.java m30178I (line 344) writes intValue=1 on wake and
+    // m30176G writes intValue=0 on sleep. We already write 0 on disable
+    // (configurePeripheralPower DISABLE branch). The matching set=1 was
+    // missing on the enable branches, by mistake.
+    //
+    // Gated to dilink4 — legacy DiPlus path stays bit-exact unchanged.
+    private static final int ESCO_MCU_POWER_HOLD_ID = -1442840502;
+
+    private static void applyEscoMcuPowerHold(boolean enable) {
+        if (!isDilink4CameraMode()) return;
+        if (enable) {
+            log("[esco-parity] McuStatus = ON (PowerDevice -1442840502 = 1)");
+            setPowerConfig(ESCO_MCU_POWER_HOLD_ID, 1);
+        }
+        // Disable path is already covered in configurePeripheralPower's
+        // DISABLE branch via setPowerConfig(-1442840502, 0); no separate
+        // call needed here. Kept symmetric for future callers.
     }
 
     // ==================== ESCO-PARITY SENTRY KEYS (DILINK 4) ====================
@@ -430,7 +473,7 @@ public class AccSentryDaemon {
         if (Looper.myLooper() == null) {
             Looper.prepare();
         }
-        
+
         // Create handler for periodic status checks
         statusHandler = new android.os.Handler(Looper.myLooper());
 
@@ -513,6 +556,26 @@ public class AccSentryDaemon {
             }
             if (!registered) {
                 log("Bodywork listener failed after retries - ACC monitoring unavailable");
+            }
+
+            // Esco-parity: ALSO register BYDAutoPowerDevice
+            // onPowerCtlStatusChanged listener for event id 0x99000037
+            // (= -1728053193). Esco's sentry/camera pipeline gates on this
+            // signal (esco bk/C1478c.java:71-75 and p111dh/C4995i.java
+            // FlameoutService). The bodywork onPowerLevelChanged signal is
+            // different in timing/state from the power-ctl signal on
+            // byd_apa firmware. Both listeners fan into the same
+            // idempotent enterSentryMode/exitSentryMode — whichever
+            // fires first wins, the other is a no-op.
+            //
+            // Gated to dilink4 — legacy fleet keeps the bodywork-only
+            // path bit-exact unchanged.
+            if (isDilink4CameraMode()) {
+                try {
+                    registerPowerListener(context);
+                } catch (Throwable t) {
+                    log("BYDAutoPowerDevice listener registration failed: " + t.getMessage());
+                }
             }
 
             log("Daemon running, entering persistence loop...");
@@ -786,23 +849,31 @@ public class AccSentryDaemon {
         log("Applying data-cache whitelist for " + pkg + " (uid=" + appUid + ")");
 
         Context permissiveContext = new PermissionBypassContext(appContext);
-        boolean useNewService = android.os.Build.VERSION.SDK_INT >= 31;
+        // Probe both services — esco gates on SDK_INT >= 31, but some BYD
+        // ROMs (DiLink 4 on Android 11 base, build markers report SDK 30
+        // even though the BYD branding says "DiLink 4") expose
+        // byd_datacached without bumping SDK_INT. Try the new service
+        // unconditionally and only fall through to the legacy service when
+        // it returns null. Removes the false negative we hit when SDK is
+        // exactly 30 but byd_datacached IS available.
+        log("Data-cache whitelist: SDK_INT=" + android.os.Build.VERSION.SDK_INT
+            + " — probing byd_datacached first regardless");
 
-        if (useNewService) {
-            try {
-                Object service = permissiveContext.getSystemService(SERVICE_BYD_DATACACHE());
-                if (service != null) {
-                    Method m = service.getClass().getMethod("setAppStartupData", String.class, Integer.TYPE);
-                    m.invoke(service, uidStr, 0);
-                    log("setAppStartupData OK (uid=" + appUid + ")");
-                    return;
-                }
-                log("byd_datacached service unavailable");
-            } catch (java.lang.reflect.InvocationTargetException ite) {
-                log("setAppStartupData rejected: " + ite.getCause());
-            } catch (Exception e) {
-                log("setAppStartupData failed: " + e.getMessage());
+        try {
+            Object service = permissiveContext.getSystemService(SERVICE_BYD_DATACACHE());
+            if (service != null) {
+                Method m = service.getClass().getMethod("setAppStartupData", String.class, Integer.TYPE);
+                m.invoke(service, uidStr, 0);
+                log("setAppStartupData OK (uid=" + appUid + ")");
+                return;
             }
+            log("byd_datacached service unavailable — falling through to bg_datacache");
+        } catch (java.lang.reflect.InvocationTargetException ite) {
+            log("setAppStartupData rejected: " + ite.getCause());
+        } catch (NoSuchMethodException nsme) {
+            log("setAppStartupData method not on this ROM: " + nsme.getMessage());
+        } catch (Exception e) {
+            log("setAppStartupData failed: " + e.getMessage());
         }
 
         try {
@@ -893,6 +964,72 @@ public class AccSentryDaemon {
         }
     }
 
+    // ==================== ESCO-PARITY POWER LISTENER ====================
+
+    /** BYD power-ctl event id 0x99000037 = -1728053193, value 0=ACC OFF,
+     *  value 1=ACC ON. Source: esco bk/C1478c.java:71-75. */
+    private static final int POWER_CTL_EVENT_ACC = -1728053193;
+
+    /** Register esco-style BYDAutoPowerDevice.onPowerCtlStatusChanged
+     *  listener via reflection. Runs in parallel with the bodywork
+     *  listener; whichever fires first wins. */
+    private static boolean registerPowerListener(Context context) {
+        if (context == null) return false;
+        try {
+            log("Registering BYDAutoPowerDevice listener (esco-parity)...");
+
+            Class<?> deviceClass = Class.forName(
+                "android.hardware.bydauto.power.BYDAutoPowerDevice");
+            Method getInstance = deviceClass.getMethod("getInstance", Context.class);
+            Object device = getInstance.invoke(null, context);
+            if (device == null) {
+                log("BYDAutoPowerDevice.getInstance returned null");
+                return false;
+            }
+
+            Class<?> listenerClass = Class.forName(
+                "android.hardware.bydauto.power.AbsBYDAutoPowerListener");
+            Method registerListener = deviceClass.getMethod(
+                "registerListener", listenerClass);
+
+            // SDK stub for AbsBYDAutoPowerListener is in our tree at
+            // android/hardware/bydauto/power/AbsBYDAutoPowerListener.java
+            // — at runtime BYD's bmmcamera.jar provides the real class.
+            // Subclass directly; if the runtime class signature differs
+            // we'll catch via the outer try/catch.
+            registerListener.invoke(device, new EscoStylePowerListener());
+            log("BYDAutoPowerDevice listener registered (esco-parity)");
+            return true;
+        } catch (ClassNotFoundException cnf) {
+            log("BYDAutoPowerDevice classes not on this ROM: " + cnf.getMessage());
+            return false;
+        } catch (Exception e) {
+            log("registerPowerListener failed: " + e.getMessage());
+            return false;
+        }
+    }
+
+    /** Concrete subclass of AbsBYDAutoPowerListener that drives the
+     *  same enterSentryMode/exitSentryMode as the bodywork listener.
+     *  Mirrors esco bk/C1478c.java:65-77. The bytecode is loaded by the
+     *  daemon process against BYD's runtime class via the SDK stub. */
+    private static class EscoStylePowerListener
+        extends AbsBYDAutoPowerListener {
+        @Override
+        public void onPowerCtlStatusChanged(int eventId, int value) {
+            if (eventId == POWER_CTL_EVENT_ACC) {
+                log(">>> POWER CTL: " + (value == 0 ? "ACC OFF" : "ACC ON")
+                    + " (event=0x" + Integer.toHexString(eventId)
+                    + ", value=" + value + ")");
+                if (value == 0) {
+                    enterSentryMode();
+                } else if (value == 1) {
+                    exitSentryMode();
+                }
+            }
+        }
+    }
+
     private static class AccListener extends AbsBYDAutoBodyworkListener {
         @Override
         public void onPowerLevelChanged(int level) {
@@ -964,13 +1101,14 @@ public class AccSentryDaemon {
         }
     }
 
-    // ==================== VOLTAGE HYSTERESIS STATE ====================
-    // Tracks whether we're in a charging cycle (voltage-based MCU wake)
-    private static volatile boolean isVoltageChargingCycle = false;
-    
-    // Hysteresis thresholds for MCU wake/sleep decisions
-    private static final double LOW_VOLTAGE_THRESHOLD = 12.1;      // Wake Trigger (Volts)
-    private static final double HEALTHY_VOLTAGE_THRESHOLD = 12.8;  // Sleep Trigger (Volts)
+    // ==================== VOLTAGE HYSTERESIS STATE (REPLACED) ====================
+    //
+    // Replaced by BatteryVoltageMonitorV2 (12.0/12.5 V thresholds, 15 min
+    // sleep-defer). The local copy is kept commented as a reference only.
+    //
+    // private static volatile boolean isVoltageChargingCycle = false;
+    // private static final double LOW_VOLTAGE_THRESHOLD = 12.1;      // Wake Trigger (Volts)
+    // private static final double HEALTHY_VOLTAGE_THRESHOLD = 12.8;  // Sleep Trigger (Volts)
     
     // VehicleDataMonitor listener for voltage-based MCU control
     private static VehicleDataListener vehicleDataListener = null;
@@ -1047,7 +1185,26 @@ public class AccSentryDaemon {
                 
                 // 5. Start the keep-alive loop (maintains the wake state)
                 startSystemKeepAlive();
-                
+
+                // 5a. Schedule the V2 voltage monitor to start 35 s after ACC=OFF.
+                // Sibling-app trace: gives the head unit time to settle before
+                // we start polling MCU sleep/wake decisions. The monitor
+                // owns the new "RemoteMonitorWakeLock" + 12.0/12.5 V hysteresis
+                // model that replaces our old 45 s pulse loop.
+                scheduleBatteryVoltageMonitorV2();
+
+                // 5b. Start the SoC-based voluntary cutoff watcher. Listens
+                // to BYDAutoStatisticDevice.onElecPercentageChanged and
+                // self-shuts-down at <=10% SoC after a 60 s grace.
+                // Wrap appContext in PermissionBypassContext per the same
+                // pattern the rest of the daemon uses for BYD HAL access.
+                try {
+                    Context socCtx = new PermissionBypassContext(appContext);
+                    com.overdrive.app.power.SocCutoffMonitor.startMonitor(socCtx);
+                } catch (Throwable t) {
+                    log("SocCutoffMonitor start failed: " + t.getMessage());
+                }
+
                 // 6. Another small delay to let power stabilize before surveillance
                 try { Thread.sleep(500); } catch (InterruptedException ignored) {}
                 
@@ -1128,9 +1285,23 @@ public class AccSentryDaemon {
         // Stop Telegram daemon if it was auto-started
         stopTelegramDaemonIfAutoStarted();
         
-        // Stop active charging maintenance if running
+        // Stop active charging maintenance (NO-OP — kept for symmetry).
         stopChargingMaintenance();
-        
+
+        // Stop the V2 voltage monitor that owns the new MCU sleep/wake loop.
+        try {
+            com.overdrive.app.power.BatteryVoltageMonitorV2.stopMonitor();
+        } catch (Throwable t) {
+            log("BatteryVoltageMonitorV2 stop failed: " + t.getMessage());
+        }
+
+        // Stop the SoC-based cutoff monitor.
+        try {
+            com.overdrive.app.power.SocCutoffMonitor.stopMonitor();
+        } catch (Throwable t) {
+            log("SocCutoffMonitor stop failed: " + t.getMessage());
+        }
+
         // Stop VehicleDataMonitor listener
         stopVehicleDataMonitor();
         
@@ -1536,35 +1707,29 @@ public class AccSentryDaemon {
      * 
      * Tries multiple field names that BYD might use across firmware versions.
      * 
-     * @return The correct GO_TO_SLEEP_REASON code (9 for older, 13 for newer)
+     * @return The correct GO_TO_SLEEP_REASON code (9 for older, 13 for SDK 32+).
      */
     private static int getSystemSleepReasonCode() {
-        // List of possible field names BYD might use across different firmware versions
-        String[] possibleFieldNames = {
-            "GO_TO_SLEEP_REASON_ACCOFF",      // Primary BYD constant
-            "GO_TO_SLEEP_REASON_ACC_OFF",     // Alternative naming
-            "GO_TO_SLEEP_REASON_POWER_OFF",   // Generic power off
-            "GO_TO_SLEEP_REASON_DEVICE_ADMIN" // Android 10+ constant (value 13)
-        };
-        
-        for (String fieldName : possibleFieldNames) {
-            try {
-                java.lang.reflect.Field field = PowerManager.class.getDeclaredField(fieldName);
-                field.setAccessible(true);
-                int value = field.getInt(null);
-                // Only log on first successful discovery (cache this ideally)
-                // log("Found sleep reason code: " + fieldName + " = " + value);
-                return value;
-            } catch (NoSuchFieldException e) {
-                // Field doesn't exist, try next
-            } catch (Exception e) {
-                // Access error, try next
-            }
+        // esco (p111dh/C5006t.java:152-156) and DiPlus (p010b0/C1569m.java:33)
+        // both probe ONLY GO_TO_SLEEP_REASON_ACCOFF (BYD's added constant) and
+        // fall back to the SDK_INT >= 32 ? 13 : 9 literal. The previous
+        // multi-name probe was a foot-gun: GO_TO_SLEEP_REASON_DEVICE_ADMIN is
+        // value 1 in AOSP (NOT 13), so the probe order could return 1 on
+        // ROMs without GO_TO_SLEEP_REASON_ACCOFF — wildly wrong.
+        try {
+            java.lang.reflect.Field field =
+                PowerManager.class.getDeclaredField("GO_TO_SLEEP_REASON_ACCOFF");
+            field.setAccessible(true);
+            return field.getInt(null);
+        } catch (NoSuchFieldException ignored) {
+            // BYD's constant isn't in this PowerManager — fall through to
+            // the AOSP-version literal.
+        } catch (Exception ignored) {
+            // Access error — same fall-through.
         }
-        
-        // Fallback strategy: Android 10+ (SDK 29) uses 13, older uses 9
-        // This matches AOSP GO_TO_SLEEP_REASON_DEVICE_ADMIN (13) vs legacy (9)
-        return android.os.Build.VERSION.SDK_INT >= 29 ? 13 : 9;
+        // SDK_INT >= 32 → 13 (modern), else 9 (legacy). Matches esco
+        // C5006t.m22831g and DiPlus C1563g.m1723l exactly.
+        return android.os.Build.VERSION.SDK_INT >= 32 ? 13 : 9;
     }
 
     /**
@@ -1774,6 +1939,23 @@ public class AccSentryDaemon {
                             && !isDilink4CameraMode()
                             && !isCameraPipelineActive()) {
                         setBacklightState(false);
+                    }
+
+                    // DiLink 4 AVC keep-alive (June 2026 reversal). The
+                    // AVM HAL only delivers mosaic content into our
+                    // panoramic producer surface while another consumer is
+                    // attached to the same vendor.byd.avm daemon — AVC is
+                    // exactly that consumer. If BYD's reaper kills AVC
+                    // post-ACC-OFF our frames go all-zero. ensureAvcAlive
+                    // is a cheap pidof + (only if absent) am start. No-op
+                    // when AVC is already running. Red overlay is masked
+                    // cosmetically by the GL red-mask shader.
+                    if (isDilink4CameraMode()) {
+                        try {
+                            com.overdrive.app.camera.AvcHalWarmup.ensureAvcAlive();
+                        } catch (Throwable t) {
+                            log("AVC keep-alive tick failed: " + t.getMessage());
+                        }
                     }
 
                     // 4. Maintenance Cycle Interval (10 seconds)
@@ -2193,59 +2375,64 @@ public class AccSentryDaemon {
     // ==================== ACTIVE VOLTAGE RECOVERY ====================
     
     /**
-     * Starts the Active Charging Maintenance routine.
-     * Launches a background thread that repeatedly pulses the MCU to keep the
-     * DC-DC converter active until the target voltage is reached.
-     * 
-     * This prevents the "Limbo State" where MCU times out and sleeps before
-     * the battery has fully recovered.
+     * Schedule the V2 voltage monitor to start 35 s after ACC=OFF.
+     * 35 s mirrors the sibling-app entry timer — gives the head unit time
+     * to finish its own ACC-OFF housekeeping before we start writing
+     * MCU sleep/wake events.
+     *
+     * <p>Uses {@link java.util.concurrent.ScheduledExecutorService} rather
+     * than {@code Handler.postDelayed} because this daemon runs in
+     * {@code app_process} with no main Looper —
+     * {@code Looper.getMainLooper()} returns null and the Handler
+     * constructor NPE'd. The executor is a single-shot, daemon thread.
+     */
+    private static void scheduleBatteryVoltageMonitorV2() {
+        java.util.concurrent.ScheduledExecutorService exec =
+            java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "BatteryV2-Schedule");
+                t.setDaemon(true);
+                return t;
+            });
+        exec.schedule(() -> {
+            try {
+                if (!inSentryMode) {
+                    log("scheduleBatteryVoltageMonitorV2: exited sentry before delay — abort");
+                    return;
+                }
+                com.overdrive.app.power.BatteryVoltageMonitorV2.startMonitor(appContext);
+            } catch (Throwable t) {
+                log("BatteryVoltageMonitorV2 start failed: " + t.getMessage());
+            } finally {
+                exec.shutdown();
+            }
+        }, 35_000L, java.util.concurrent.TimeUnit.MILLISECONDS);
+        log("scheduleBatteryVoltageMonitorV2: in 35 s");
+    }
+
+    /**
+     * REPLACED — superseded by {@link com.overdrive.app.power.BatteryVoltageMonitorV2}.
+     * The old 45 s MCU-pulse loop drained the 12 V faster than it preserved
+     * it on a parked car (no alternator load). Calls are now no-ops; the
+     * V2 monitor is what does MCU sleep/wake hysteresis.
      */
     private static void startChargingMaintenance() {
-        if (isVoltageChargingCycle && mcuChargingThread != null && mcuChargingThread.isAlive()) {
-            return; // Already actively charging
-        }
-        
-        log("Starting Active Voltage Recovery (Target: " + HEALTHY_VOLTAGE_THRESHOLD + "V)...");
-        isVoltageChargingCycle = true;
-        
-        mcuChargingThread = new Thread(() -> {
-            while (isVoltageChargingCycle && running && inSentryMode) {
-                try {
-                    // Trigger the DC-DC Converter
-                    forceMcuWakeUp();
-                    
-                    // Wait before the next pulse.
-                    // 45s is aggressive enough to prevent MCU sleep (usually 1-5 min timeout)
-                    // but relaxed enough to avoid flooding the CAN bus.
-                    Thread.sleep(MCU_CHARGE_PULSE_INTERVAL_MS);
-                    
-                } catch (InterruptedException e) {
-                    log("Charging maintenance interrupted");
-                    break;
-                } catch (Exception e) {
-                    log("Charging loop error: " + e.getMessage());
-                }
-            }
-            log("Active Voltage Recovery stopped.");
-        }, "McuChargeLoop");
-        
-        mcuChargingThread.start();
+        log("startChargingMaintenance: NO-OP (replaced by BatteryVoltageMonitorV2)");
+        // Original body retained for reference:
+        //   if (isVoltageChargingCycle && mcuChargingThread != null && mcuChargingThread.isAlive()) return;
+        //   log("Starting Active Voltage Recovery (Target: " + HEALTHY_VOLTAGE_THRESHOLD + "V)...");
+        //   isVoltageChargingCycle = true;
+        //   mcuChargingThread = new Thread(() -> { while (isVoltageChargingCycle && running && inSentryMode) { try { forceMcuWakeUp(); Thread.sleep(MCU_CHARGE_PULSE_INTERVAL_MS); } catch (...) {} } }, "McuChargeLoop");
+        //   mcuChargingThread.start();
     }
-    
-    /**
-     * Stops the Active Charging Maintenance routine.
-     * Called when voltage has recovered to healthy levels.
-     */
+
+    /** REPLACED — see {@link #startChargingMaintenance}. */
     private static void stopChargingMaintenance() {
-        if (!isVoltageChargingCycle) return;
-        
-        log("Target voltage reached. Stopping Active Recovery.");
-        isVoltageChargingCycle = false;
-        
-        if (mcuChargingThread != null) {
-            mcuChargingThread.interrupt();
-            mcuChargingThread = null;
-        }
+        log("stopChargingMaintenance: NO-OP (replaced by BatteryVoltageMonitorV2)");
+        // Original body retained for reference:
+        //   if (!isVoltageChargingCycle) return;
+        //   log("Target voltage reached. Stopping Active Recovery.");
+        //   isVoltageChargingCycle = false;
+        //   if (mcuChargingThread != null) { mcuChargingThread.interrupt(); mcuChargingThread = null; }
     }
 
     // ==================== VEHICLE DATA MONITOR INTEGRATION ====================
@@ -2278,41 +2465,26 @@ public class AccSentryDaemon {
                 
                 @Override
                 public void onBatteryPowerChanged(BatteryPowerData data) {
-                    // This is the actual voltage from BYDAutoOtaDevice
-                    if (!inSentryMode || data == null) return;
-                    
-                    double voltage = data.voltageVolts;
-                    
-                    // OUT-OF-RANGE CHECK: Wake MCU if voltage is outside valid bounds (9.0-16.0V)
-                    // This catches both critically low AND abnormally high readings
-                    if (!data.isValidRange()) {
-                        log("VOLTAGE OUT OF RANGE (" + String.format("%.2f", voltage) + "V) - Triggering MCU wake");
-                        forceMcuWakeUp();
-                    }
-                    
-                    // HYSTERESIS LOGIC WITH ACTIVE MAINTENANCE
-                    if (isVoltageChargingCycle) {
-                        // We are currently forcing the MCU to stay awake to charge.
-                        // CHECK: Have we reached the healthy threshold?
-                        if (voltage >= HEALTHY_VOLTAGE_THRESHOLD) {
-                            log("Voltage recovered (" + String.format("%.2f", voltage) + "V).");
-                            stopChargingMaintenance();
-                            // Result: MCU is finally allowed to sleep.
-                        }
-                    } else {
-                        // We are passively monitoring. The MCU is likely sleeping.
-                        // CHECK: Has voltage dropped below critical?
-                        if (voltage <= LOW_VOLTAGE_THRESHOLD) {
-                            log("LOW VOLTAGE (" + String.format("%.2f", voltage) + "V) DETECTED!");
-                            startChargingMaintenance();
-                            // Result: Starts the loop that wakes MCU every 45s.
-                        }
-                    }
-                    
-                    // Critical safety check - disable surveillance to conserve power
-                    if (data.isCritical && surveillanceEnabled) {
-                        log("CRITICAL VOLTAGE (" + String.format("%.2f", voltage) + "V) - Disabling surveillance");
-                        disableSurveillance();
+                    // REPLACED — voltage hysteresis is now owned by
+                    // BatteryVoltageMonitorV2 (12.0V wake / 12.5V sleep,
+                    // 15-min defer). The 12V isCritical < 10.5V kill switch
+                    // is also dropped — the new SoC-driven cutoff
+                    // (SocCutoffMonitor, HV battery, default 10%) is the
+                    // primary safety net. The replaced body remains for
+                    // reference only:
+                    //
+                    //   if (!inSentryMode || data == null) return;
+                    //   double voltage = data.voltageVolts;
+                    //   if (!data.isValidRange()) { forceMcuWakeUp(); }
+                    //   if (isVoltageChargingCycle) {
+                    //       if (voltage >= HEALTHY_VOLTAGE_THRESHOLD) stopChargingMaintenance();
+                    //   } else {
+                    //       if (voltage <= LOW_VOLTAGE_THRESHOLD) startChargingMaintenance();
+                    //   }
+                    //   if (data.isCritical && surveillanceEnabled) disableSurveillance();
+                    if (data != null) {
+                        log("onBatteryPowerChanged " + String.format("%.2f", data.voltageVolts)
+                                + "V (handled by BatteryVoltageMonitorV2)");
                     }
                 }
                 
@@ -2356,8 +2528,8 @@ public class AccSentryDaemon {
                 vehicleDataListener = null;
             }
             
-            isVoltageChargingCycle = false;
-            
+            // isVoltageChargingCycle = false;  // (state replaced — see V2 monitor)
+
             log("VehicleDataMonitor listener removed");
             
         } catch (Exception e) {
@@ -2889,7 +3061,7 @@ public class AccSentryDaemon {
             Object at = cur.invoke(null);
             if (at != null) return at;
         } catch (Exception ignored) {}
-        
+
         final Object[] result = new Object[1];
         try {
             Thread t = new Thread(() -> {
@@ -2913,7 +3085,7 @@ public class AccSentryDaemon {
                 return result[0];
             }
         } catch (Exception ignored) {}
-        
+
         try {
             try { android.os.Looper.prepareMainLooper(); } catch (Exception ignored) {}
             java.lang.reflect.Constructor<?> ctor = activityThreadClass.getDeclaredConstructor();
@@ -2929,7 +3101,7 @@ public class AccSentryDaemon {
         } catch (Exception e) {
             log("resolveActivityThread: manual creation failed: " + e.getMessage());
         }
-        
+
         return null;
     }
     
@@ -3222,7 +3394,8 @@ public class AccSentryDaemon {
                     log("  InSentryMode: " + inSentryMode);
                     log("  Running: " + running);
                     log("  KeepAlive thread: " + (systemKeepAliveThread != null && systemKeepAliveThread.isAlive()));
-                    log("  Charging thread: " + (mcuChargingThread != null && mcuChargingThread.isAlive()));
+                    // Charging thread replaced by BatteryVoltageMonitorV2 — handler-thread, no liveness probe needed.
+                    // log("  Charging thread: " + (mcuChargingThread != null && mcuChargingThread.isAlive()));
                     log("  Surveillance: " + surveillanceEnabled);
                     log("  Last power level: " + powerLevelToString(lastPowerLevel));
                     log("  Last MCU status: " + lastMcuStatus);

@@ -34,7 +34,14 @@ data class RecordingFile(
     val placeCountryCode: String? = null,   // ISO 3166-1 alpha-2, lowercased
     val placeSource: String? = null,        // "cache" / "nominatim" / "safezone" / "android-geocoder"
     val startLat: Double? = null,           // Recording-start GPS — used by "show on map"
-    val startLng: Double? = null
+    val startLng: Double? = null,
+    // ---- Server-derived section header ----
+    // Pre-formatted "Today" / "Yesterday" / "MMM d, yyyy" string emitted by
+    // RecordingsIndex.bucketLabelFor(ts). Lets the section-header decoration
+    // skip its own date math when results come from the API. Null when the
+    // row originated from the direct-FS fallback path — decoration falls
+    // back to its in-process grouping in that case.
+    val bucketLabel: String? = null
 ) {
     // Secondary constructor for MediaStore results
     constructor(
@@ -86,9 +93,10 @@ data class RecordingFile(
         }
     
     enum class RecordingType {
-        NORMAL,     // Regular recordings (cam_*.mp4)
-        SENTRY,     // Sentry event recordings (event_*.mp4)
-        PROXIMITY   // Proximity guard recordings (proximity_*.mp4)
+        NORMAL,         // Regular recordings (cam_*.mp4)
+        SENTRY,         // Sentry event recordings (event_*.mp4)
+        PROXIMITY,      // Proximity guard recordings (proximity_*.mp4)
+        OEM_DASHCAM     // OEM forward-sensor dashcam recordings (dvr_*.mp4)
     }
     
     companion object {
@@ -101,6 +109,8 @@ data class RecordingFile(
         private val EVENT_FILENAME_PATTERN = Regex("""event_(\d{8})_(\d{6})(?:_\d+)?\.mp4""")
         // proximity_20251224_132630.mp4 or proximity_20251224_132630_2.mp4
         private val PROXIMITY_FILENAME_PATTERN = Regex("""proximity_(\d{8})_(\d{6})(?:_\d+)?\.mp4""")
+        // dvr_20251224_132630.mp4 or dvr_20251224_132630_2.mp4 — OEM forward-sensor dashcam
+        private val OEM_DASHCAM_FILENAME_PATTERN = Regex("""dvr_(\d{8})_(\d{6})(?:_\d+)?\.mp4""")
 
         /**
          * Parses the writer's `yyyyMMdd_HHmmss` filename stamp.
@@ -129,8 +139,9 @@ data class RecordingFile(
                 RecordingType.NORMAL -> parseNormalRecording(file)
                 RecordingType.SENTRY -> parseSentryRecording(file)
                 RecordingType.PROXIMITY -> parseProximityRecording(file)
+                RecordingType.OEM_DASHCAM -> parseOemDashcamRecording(file)
             }
-            
+
             // If type-specific parsing failed, try fallback parsing
             // This handles any .mp4 file that doesn't match expected patterns
             return result ?: parseFallbackRecording(file, type)
@@ -139,10 +150,38 @@ data class RecordingFile(
         /**
          * Fallback parser for .mp4 files that don't match expected patterns.
          * Uses file modification time as timestamp.
+         *
+         * <p>Reject files whose name prefix BELONGS to a different known type.
+         * Without this guard, calling {@code fromFile(dvr_*.mp4, NORMAL)}
+         * would land here (regex miss) and emit a NORMAL row for the file —
+         * the SAME file would also be added by the OEM_DASHCAM scan pass,
+         * producing a 2× double-count with corrupt metadata. The scanner
+         * loops over all four types against {@code allRecordingsDirs}; only
+         * fall back when the filename prefix doesn't claim a different type.
          */
         private fun parseFallbackRecording(file: File, type: RecordingType): RecordingFile? {
             if (!file.name.endsWith(".mp4")) return null
-            
+
+            // Reject mismatched prefixes. A file whose name claims a known
+            // prefix is owned by THAT type — don't silently retag it as the
+            // caller's type. Use prefix-only checks symmetrically across all
+            // four types: previously the cam branch additionally required
+            // CAM_FILENAME_PATTERN.matches, which let malformed cam-prefixed
+            // files (cam.mp4, camcorder.mp4) fall through and get tagged
+            // under whichever type the scanner asked for, double-counting
+            // them across the NORMAL+OEM_DASHCAM passes over allRecordingsDirs.
+            val name = file.name
+            val matchedPrefix = when {
+                name.startsWith("cam_") || name.matches(Regex("""cam\d+_.*""")) -> RecordingType.NORMAL
+                name.startsWith("event_") -> RecordingType.SENTRY
+                name.startsWith("proximity_") -> RecordingType.PROXIMITY
+                name.startsWith("dvr_") -> RecordingType.OEM_DASHCAM
+                else -> null
+            }
+            if (matchedPrefix != null && matchedPrefix != type) {
+                return null
+            }
+
             return RecordingFile(
                 file = file,
                 cameraId = 0,
@@ -200,7 +239,7 @@ data class RecordingFile(
             } catch (e: Exception) {
                 file.lastModified()
             }
-            
+
             return RecordingFile(
                 file = file,
                 cameraId = 0,  // Proximity events are mosaic recordings
@@ -208,6 +247,25 @@ data class RecordingFile(
                 durationMs = 0,
                 sizeBytes = file.length(),
                 type = RecordingType.PROXIMITY
+            )
+        }
+
+        private fun parseOemDashcamRecording(file: File): RecordingFile? {
+            val match = OEM_DASHCAM_FILENAME_PATTERN.matchEntire(file.name) ?: return null
+            val dateStr = "${match.groupValues[1]}_${match.groupValues[2]}"
+            val timestamp = try {
+                newDateFormat().parse(dateStr)?.time ?: file.lastModified()
+            } catch (e: Exception) {
+                file.lastModified()
+            }
+
+            return RecordingFile(
+                file = file,
+                cameraId = 0,  // Single forward sensor; cameraId field is for AVM quadrant
+                timestamp = timestamp,
+                durationMs = 0,
+                sizeBytes = file.length(),
+                type = RecordingType.OEM_DASHCAM
             )
         }
         

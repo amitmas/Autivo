@@ -41,6 +41,75 @@ public class PanoramicCameraGpu {
     private static final DaemonLogger logger = DaemonLogger.getInstance(TAG);
     private static final int PHYSICAL_CAMERA_ID = 1;
     private static final int MAX_CAMERA_ID = 5;     // Probe camera IDs 0-5
+
+    // ==================== DILINK 4 POST-ACC-OFF OPEN GATE ====================
+    //
+    // Global hold on AVMCamera.open() during the post-ACC-OFF transition
+    // window. esco hardcodes a 60 s grace before opening AVMCamera
+    // (FlameoutService p111dh/C4995i.java:407 m22726w(60_000L)). Earlier
+    // open races the MCU/ISP power-down and yields all-zero frames forever.
+    //
+    // We previously implemented the grace as a local timer in
+    // CameraDaemon.onAccStateChanged(true), but that was bypassable: a
+    // user-issued GET /api/stream/view/N during ACC OFF spawns its own
+    // pano.start() via StreamingApiHandler.ensurePanoStartedNonBlocking,
+    // which doesn't consult the timer. Same for RecordingModeManager and
+    // OemDashcam open paths.
+    //
+    // The gate now lives at the lowest-level open point
+    // ({@link #startCameraViaAvmReflection}) — every caller transparently
+    // sleeps until the grace expires. Cleared on ACC ON.
+    //
+    // Legacy fleet: gate is never armed (only set from dilink4 paths).
+    private static volatile long dilink4OpenAllowedAfterMs = 0L;
+
+    /**
+     * Arm the post-ACC-OFF open gate. Call from the dilink4 ACC-OFF
+     * handler with durationMs = 60_000 (esco-parity).
+     */
+    public static void armDilink4PostAccOffGrace(long durationMs) {
+        if (durationMs <= 0) {
+            dilink4OpenAllowedAfterMs = 0L;
+            return;
+        }
+        dilink4OpenAllowedAfterMs = System.currentTimeMillis() + durationMs;
+        logger.info("dilink4 open gate armed for " + durationMs + " ms");
+    }
+
+    /** Clear the gate immediately. Used on ACC ON. */
+    public static void clearDilink4PostAccOffGrace() {
+        if (dilink4OpenAllowedAfterMs != 0L) {
+            logger.info("dilink4 open gate cleared");
+            dilink4OpenAllowedAfterMs = 0L;
+        }
+    }
+
+    /**
+     * Block the calling thread until the dilink4 grace expires.
+     * Returns immediately if the gate isn't armed or the camera mode is
+     * not dilink4. Safe to call from any thread.
+     */
+    private static void waitForDilink4OpenGate() {
+        long until = dilink4OpenAllowedAfterMs;
+        if (until == 0L) return;
+        long now = System.currentTimeMillis();
+        long waitMs = until - now;
+        if (waitMs <= 0) {
+            // Stale gate — already passed.
+            dilink4OpenAllowedAfterMs = 0L;
+            return;
+        }
+        logger.info("dilink4 open gate active — sleeping " + waitMs + " ms before AVMCamera.open");
+        try {
+            Thread.sleep(waitMs);
+        } catch (InterruptedException ie) {
+            // Re-arm interrupt and proceed; if the caller cancelled the
+            // open it'll surface elsewhere.
+            Thread.currentThread().interrupt();
+            logger.warn("dilink4 open gate interrupted — proceeding anyway");
+        }
+        dilink4OpenAllowedAfterMs = 0L;
+    }
     
     // AVMCamera surface mode — 0 works on Seal, Atto 1 may need different value
     // Set via setCameraSurfaceMode() before start() for per-model override.
@@ -161,8 +230,13 @@ public class PanoramicCameraGpu {
     // Consumers
     private GpuMosaicRecorder recorder;
     private HardwareEventRecorderGpu encoder;  // Direct encoder reference for draining
-    private com.overdrive.app.streaming.GpuStreamScaler streamScaler;  // Stream scaler (optional)
-    private HardwareEventRecorderGpu streamEncoder;  // Stream encoder (optional)
+    // Volatile so the GL render loop's snapshot read at drawFrame's
+    // top-of-loop sees stream-disable's null-write atomically. Without
+    // volatile, the GL thread can cache a stale ref past the disable
+    // and call drawFrame on a released scaler (EGL surface destroyed,
+    // program deleted) — undefined behaviour on Adreno.
+    private volatile com.overdrive.app.streaming.GpuStreamScaler streamScaler;  // Stream scaler (optional)
+    private volatile HardwareEventRecorderGpu streamEncoder;  // Stream encoder (optional)
     private GpuDownscaler downscaler;
     /** Lazy-allocated full-resolution sampler for the camera-mapping dialog.
      *  Lives on the GL handler; allocates GL resources on first use. */
@@ -195,12 +269,16 @@ public class PanoramicCameraGpu {
     private long lastFrameTime = 0;
     private volatile long lastCameraStartTime = 0;
     // DiLink 4: track last error-restart so we can throttle tight reopen
-    // loops when the HAL keeps emitting event=8 within 30 s. Without this,
-    // a stuck preview-surface state burns the CAN bus and battery for
-    // nothing. Only consulted on USE_ESCO_SURFACE_TEXTURE_PATH; legacy
-    // cars hit the existing immediate-restart branch unchanged.
+    // loops when the HAL keeps emitting event=8. esco-parity: 60 s, not 30 s.
+    // The AVM HAL daemon (vendor.byd.avm) needs ~60 s after a
+    // DAEMON_DIED/SERVER_DIED event to (1) respawn, (2) re-handshake the MCU/
+    // ISP rail, (3) re-allocate gralloc pool. Reopens inside that window catch
+    // the daemon mid-respawn — accept the open, hand back a buffer, but the
+    // calibration isn't done yet, so frames are black/garbage. Esco hardcodes
+    // 60_000L in p290le/C7340b.java:595 (m32197w aka tryRestart). Only
+    // consulted on USE_ESCO_SURFACE_TEXTURE_PATH; legacy cars unchanged.
     private volatile long lastErrorRestartTime = 0;
-    private static final long DILINK4_ERROR_RESTART_MIN_INTERVAL_MS = 30_000L;
+    private static final long DILINK4_ERROR_RESTART_MIN_INTERVAL_MS = 60_000L;
     private long startTime = 0;
     
     // Watchdog for GL thread hang detection
@@ -475,10 +553,11 @@ public class PanoramicCameraGpu {
                     // torn down by another consumer (com.byd.avc, backlight
                     // sleep, etc.). Restarting that fast just churns the
                     // CAN bus and battery without ever stabilising. Skip
-                    // restarts that fire within 30 s of the last error; the
-                    // frame-stall watchdog will catch a genuine permanent
-                    // failure later. Legacy fleet (USE_ESCO_SURFACE_TEXTURE_PATH
-                    // == false) keeps the prior immediate-restart behaviour.
+                    // restarts that fire within 60 s of the last error
+                    // (esco-parity, p290le/C7340b.java:595); the frame-stall
+                    // watchdog will catch a genuine permanent failure later.
+                    // Legacy fleet (USE_ESCO_SURFACE_TEXTURE_PATH == false)
+                    // keeps the prior immediate-restart behaviour.
                     if (USE_ESCO_SURFACE_TEXTURE_PATH) {
                         long now = System.currentTimeMillis();
                         long timeSinceLastError = now - lastErrorRestartTime;
@@ -498,7 +577,17 @@ public class PanoramicCameraGpu {
                     }
                 }
             });
-            cameraCoordinator.register();
+            // Esco-parity: skip IBYDCameraService binder registration on
+            // dilink4 (byd_apa). Esco never touches the bydcameramanager
+            // service — it opens AVMCamera directly. The arbitration
+            // protocol may require an IBYDCameraUser.onYield ack we never
+            // send; the HAL can stay in "waiting for user-ack" state and
+            // refuse to stream frames. See audit Top-5 #5.
+            if (!USE_ESCO_SURFACE_TEXTURE_PATH) {
+                cameraCoordinator.register();
+            } else {
+                logger.info("dilink4: skipping IBYDCameraService registration (esco-parity)");
+            }
         }
         
         // Start GL thread
@@ -1238,6 +1327,16 @@ public class PanoramicCameraGpu {
      * with native apps (reverse camera, dashcam, AVM parking view).
      */
     private void startCameraViaAvmReflection(int cameraId) throws Exception {
+        // Block here if the dilink4 post-ACC-OFF grace gate is armed.
+        // Esco-parity 60 s wall-clock wait before AVMCamera.open. All
+        // open paths (StreamingApiHandler, RecordingModeManager,
+        // CameraDaemon.onAccStateChanged, OemDashcam) funnel through
+        // this method so one gate covers them all. No-op when the gate
+        // isn't armed (legacy mode or already-cleared by ACC ON).
+        if (USE_ESCO_SURFACE_TEXTURE_PATH) {
+            waitForDilink4OpenGate();
+        }
+
         // Notify camera service we're about to open
         if (cameraCoordinator != null) {
             cameraCoordinator.notifyPreOpenCamera();
@@ -1614,7 +1713,178 @@ public class PanoramicCameraGpu {
         lastAcceptedPtsNs = candidate;
         currentFrameTimestampNs = candidate;
         cameraFrameSeq.incrementAndGet();
+
+        // dilink4 black-frame probe: every 30 frames, render a 4x4 region
+        // of the OES texture into a 1x1 RGBA8 FBO and read back the pixel.
+        // Tells us whether the buffer the HAL handed us has actual content
+        // or is uniform/zero. Zero overhead for legacy fleet (gated on
+        // USE_ESCO_SURFACE_TEXTURE_PATH).
+        if (USE_ESCO_SURFACE_TEXTURE_PATH) {
+            probeOesPixel();
+        }
         return true;
+    }
+
+    // ==================== DILINK 4 PIXEL PROBE ====================
+    //
+    // Read one pixel from the OES texture every 30 frames to disambiguate
+    // black-frame causes. Logs RGB. The probe samples (0.5, 0.5) of the
+    // producer surface — middle of the configured strip. If the HAL is
+    // delivering buffers with real content, R/G/B will vary frame to
+    // frame. If the HAL is delivering all-zero buffers, R=G=B=0 forever.
+    // If the HAL froze on a stale frame, R/G/B will be constant non-zero.
+
+    private int probeFbo = 0;
+    private int probeColorTex = 0;
+    private int probeProgram = 0;
+    private int probeAPosLoc = -1;
+    private int probeATexLoc = -1;
+    private int probeUTexSamplerLoc = -1;
+    private int probeUTexMatrixLoc = -1;
+    private final java.nio.FloatBuffer probeQuadVerts =
+        java.nio.ByteBuffer.allocateDirect(16 * 4)
+            .order(java.nio.ByteOrder.nativeOrder())
+            .asFloatBuffer();
+    private final java.nio.ByteBuffer probeReadBuffer =
+        java.nio.ByteBuffer.allocateDirect(4)
+            .order(java.nio.ByteOrder.nativeOrder());
+    private long probeFrameCount = 0L;
+    private long probeNonZeroFrames = 0L;
+    private long probeLastLogMs = 0L;
+    private static final long PROBE_LOG_INTERVAL_MS = 5_000L;
+    private static final int PROBE_EVERY_N_FRAMES = 30;
+
+    private static final String PROBE_VS =
+        "attribute vec2 aPos;\n" +
+        "attribute vec2 aTex;\n" +
+        "uniform mat4 uTexMatrix;\n" +
+        "varying vec2 vTex;\n" +
+        "void main() {\n" +
+        "  gl_Position = vec4(aPos, 0.0, 1.0);\n" +
+        "  vTex = (uTexMatrix * vec4(aTex, 0.0, 1.0)).xy;\n" +
+        "}";
+
+    private static final String PROBE_FS =
+        "#extension GL_OES_EGL_image_external : require\n" +
+        "precision mediump float;\n" +
+        "uniform samplerExternalOES uTex;\n" +
+        "varying vec2 vTex;\n" +
+        "void main() {\n" +
+        "  gl_FragColor = texture2D(uTex, vTex);\n" +
+        "}";
+
+    private boolean ensureProbeResources() {
+        if (probeFbo != 0) return true;
+        try {
+            // 1x1 RGBA8 color attachment.
+            int[] tex = new int[1];
+            android.opengl.GLES20.glGenTextures(1, tex, 0);
+            probeColorTex = tex[0];
+            android.opengl.GLES20.glBindTexture(android.opengl.GLES20.GL_TEXTURE_2D, probeColorTex);
+            android.opengl.GLES20.glTexImage2D(android.opengl.GLES20.GL_TEXTURE_2D, 0,
+                android.opengl.GLES20.GL_RGBA, 1, 1, 0,
+                android.opengl.GLES20.GL_RGBA, android.opengl.GLES20.GL_UNSIGNED_BYTE, null);
+            android.opengl.GLES20.glTexParameteri(android.opengl.GLES20.GL_TEXTURE_2D,
+                android.opengl.GLES20.GL_TEXTURE_MIN_FILTER, android.opengl.GLES20.GL_LINEAR);
+            android.opengl.GLES20.glTexParameteri(android.opengl.GLES20.GL_TEXTURE_2D,
+                android.opengl.GLES20.GL_TEXTURE_MAG_FILTER, android.opengl.GLES20.GL_LINEAR);
+            android.opengl.GLES20.glBindTexture(android.opengl.GLES20.GL_TEXTURE_2D, 0);
+
+            int[] fbo = new int[1];
+            android.opengl.GLES20.glGenFramebuffers(1, fbo, 0);
+            probeFbo = fbo[0];
+            android.opengl.GLES20.glBindFramebuffer(android.opengl.GLES20.GL_FRAMEBUFFER, probeFbo);
+            android.opengl.GLES20.glFramebufferTexture2D(android.opengl.GLES20.GL_FRAMEBUFFER,
+                android.opengl.GLES20.GL_COLOR_ATTACHMENT0,
+                android.opengl.GLES20.GL_TEXTURE_2D, probeColorTex, 0);
+            int status = android.opengl.GLES20.glCheckFramebufferStatus(android.opengl.GLES20.GL_FRAMEBUFFER);
+            android.opengl.GLES20.glBindFramebuffer(android.opengl.GLES20.GL_FRAMEBUFFER, 0);
+            if (status != android.opengl.GLES20.GL_FRAMEBUFFER_COMPLETE) {
+                logger.warn("probe FBO not complete: " + status);
+                return false;
+            }
+
+            probeProgram = GlUtil.createProgram(PROBE_VS, PROBE_FS);
+            probeAPosLoc = android.opengl.GLES20.glGetAttribLocation(probeProgram, "aPos");
+            probeATexLoc = android.opengl.GLES20.glGetAttribLocation(probeProgram, "aTex");
+            probeUTexSamplerLoc = android.opengl.GLES20.glGetUniformLocation(probeProgram, "uTex");
+            probeUTexMatrixLoc = android.opengl.GLES20.glGetUniformLocation(probeProgram, "uTexMatrix");
+
+            // Full-screen quad. NDC pos + UV (0..1).
+            probeQuadVerts.put(new float[]{
+                -1f, -1f,  0f, 0f,
+                 1f, -1f,  1f, 0f,
+                -1f,  1f,  0f, 1f,
+                 1f,  1f,  1f, 1f,
+            }).position(0);
+
+            logger.info("dilink4 OES pixel probe initialized");
+            return true;
+        } catch (Throwable t) {
+            logger.warn("ensureProbeResources failed: " + t.getMessage());
+            probeFbo = 0;
+            return false;
+        }
+    }
+
+    private void probeOesPixel() {
+        probeFrameCount++;
+        if (probeFrameCount % PROBE_EVERY_N_FRAMES != 0) return;
+        if (!ensureProbeResources()) return;
+        if (cameraTextureId == 0) return;
+
+        try {
+            android.opengl.GLES20.glBindFramebuffer(android.opengl.GLES20.GL_FRAMEBUFFER, probeFbo);
+            android.opengl.GLES20.glViewport(0, 0, 1, 1);
+            android.opengl.GLES20.glClearColor(0f, 0f, 0f, 1f);
+            android.opengl.GLES20.glClear(android.opengl.GLES20.GL_COLOR_BUFFER_BIT);
+
+            android.opengl.GLES20.glUseProgram(probeProgram);
+
+            android.opengl.GLES20.glActiveTexture(android.opengl.GLES20.GL_TEXTURE0);
+            android.opengl.GLES20.glBindTexture(android.opengl.GLES11Ext.GL_TEXTURE_EXTERNAL_OES, cameraTextureId);
+            android.opengl.GLES20.glUniform1i(probeUTexSamplerLoc, 0);
+            android.opengl.GLES20.glUniformMatrix4fv(probeUTexMatrixLoc, 1, false, currentTexMatrix, 0);
+
+            probeQuadVerts.position(0);
+            android.opengl.GLES20.glVertexAttribPointer(probeAPosLoc, 2, android.opengl.GLES20.GL_FLOAT, false, 16, probeQuadVerts);
+            probeQuadVerts.position(2);
+            android.opengl.GLES20.glVertexAttribPointer(probeATexLoc, 2, android.opengl.GLES20.GL_FLOAT, false, 16, probeQuadVerts);
+            android.opengl.GLES20.glEnableVertexAttribArray(probeAPosLoc);
+            android.opengl.GLES20.glEnableVertexAttribArray(probeATexLoc);
+
+            android.opengl.GLES20.glDrawArrays(android.opengl.GLES20.GL_TRIANGLE_STRIP, 0, 4);
+
+            android.opengl.GLES20.glDisableVertexAttribArray(probeAPosLoc);
+            android.opengl.GLES20.glDisableVertexAttribArray(probeATexLoc);
+
+            probeReadBuffer.position(0);
+            android.opengl.GLES20.glReadPixels(0, 0, 1, 1,
+                android.opengl.GLES20.GL_RGBA,
+                android.opengl.GLES20.GL_UNSIGNED_BYTE, probeReadBuffer);
+
+            int r = probeReadBuffer.get(0) & 0xFF;
+            int g = probeReadBuffer.get(1) & 0xFF;
+            int b = probeReadBuffer.get(2) & 0xFF;
+            int a = probeReadBuffer.get(3) & 0xFF;
+
+            if (r != 0 || g != 0 || b != 0) probeNonZeroFrames++;
+
+            long now = System.currentTimeMillis();
+            if (now - probeLastLogMs >= PROBE_LOG_INTERVAL_MS) {
+                probeLastLogMs = now;
+                long sampled = probeFrameCount / PROBE_EVERY_N_FRAMES;
+                logger.info("OES-PROBE: frame=" + cameraFrameSeq.get()
+                    + " sampled=" + sampled
+                    + " nonZero=" + probeNonZeroFrames
+                    + " last RGBA=(" + r + "," + g + "," + b + "," + a + ")");
+            }
+        } catch (Throwable t) {
+            // Non-fatal — don't take down the render loop on a probe error.
+            logger.warn("probeOesPixel error: " + t.getMessage());
+        } finally {
+            android.opengl.GLES20.glBindFramebuffer(android.opengl.GLES20.GL_FRAMEBUFFER, 0);
+        }
     }
 
     /** First-frame diagnostic on the SurfaceTexture path. SurfaceTexture
@@ -1826,7 +2096,14 @@ public class PanoramicCameraGpu {
             synchronized (frameSync) {
                 if (!imagePending && !stFramePending) {
                     try {
-                        frameSync.wait(100);  // Timeout to check running flag
+                        // FIX H4: 250 ms timeout (was 100 ms). The watchdog
+                        // owns frame-stall detection at its own 5 s cadence;
+                        // the timeout here only paces how often we re-check
+                        // running.get(). 100 ms produced ~10 idle wakeups/s
+                        // when the camera HAL was paused (e.g. during ACC-off
+                        // teardown latency); 250 ms cuts that to ~4/s with no
+                        // user-visible behaviour change.
+                        frameSync.wait(250);
                     } catch (InterruptedException e) {
                         // Continue
                     }
