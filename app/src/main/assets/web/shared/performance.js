@@ -2243,21 +2243,26 @@ BYD.performance = {
                 percentEl.textContent = BYD.i18n.t('soh.set_battery_capacity_prompt') || '—';
             }
             if (fallbackEl) { fallbackEl.hidden = true; fallbackEl.textContent = ''; }
-        } else if (displaySource === 'live' && displaySoh > 0) {
-            if (percentEl) {
-                percentEl.style.display = '';
-                percentEl.textContent = displaySoh.toFixed(1) + '%';
-            }
-            if (fallbackEl) { fallbackEl.hidden = true; fallbackEl.textContent = ''; }
-        } else if (displaySource === 'calibration' && displaySoh > 0) {
+        } else if (displaySoh > 0 && displaySource !== 'unavailable') {
+            // Any priority-chain source with a real value renders the same
+            // way: show the percent. Sources we currently emit on PHEV are
+            // 'frame_anchor' (peak-charge), 'capacity_ah' (BMS coulomb),
+            // 'live' (derived formula), 'calibration' (charge-session anchor).
+            // Source-specific captions handled below — calibration shows the
+            // verified date, every other source hides the fallback caption.
             if (percentEl) {
                 percentEl.style.display = '';
                 percentEl.textContent = displaySoh.toFixed(1) + '%';
             }
             if (fallbackEl) {
-                var capPct = (calSoh > 0 ? calSoh : displaySoh).toFixed(1);
-                fallbackEl.textContent = BYD.i18n.t('soh.fallback_caption', {pct: capPct, date: calDateStr});
-                fallbackEl.hidden = false;
+                if (displaySource === 'calibration') {
+                    var capPct = (calSoh > 0 ? calSoh : displaySoh).toFixed(1);
+                    fallbackEl.textContent = BYD.i18n.t('soh.fallback_caption', {pct: capPct, date: calDateStr});
+                    fallbackEl.hidden = false;
+                } else {
+                    fallbackEl.hidden = true;
+                    fallbackEl.textContent = '';
+                }
             }
         } else {
             if (percentEl) {

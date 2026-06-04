@@ -209,6 +209,14 @@
     <uses-permission android:name="android.permission.BYD" />
     <uses-permission android:name="android.permission.DEVICE_ACC" />
     <uses-permission android:name="android.permission.DEVICE_POWER" />
+
+    <!-- DiCarServer ContentProvider — local property bus.
+         protectionLevel=normal, auto-granted on install. The provider
+         exposes read/write to ICarPropertyService over Binder. We can
+         query non-sigperm properties; signature-protected writes
+         (BYDAUTO_BODYWORK_SET et al) will be denied by DiCarServer
+         since our APK isn't signed with the BYD platform key. -->
+    <uses-permission android:name="com.byd.car.server.PROVIDER" />
     <!-- Data cache (for ACC whitelist) -->
     <uses-permission android:name="android.permission.ACCESS_APPOPSDATA" />
     
@@ -223,6 +231,7 @@
         android:theme="@style/Theme.Overdrive.M3"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"
+        android:persistent="true"
         android:requestLegacyExternalStorage="true"
         android:usesCleartextTraffic="true">
 

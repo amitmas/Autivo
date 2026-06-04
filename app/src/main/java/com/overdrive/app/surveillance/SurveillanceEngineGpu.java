@@ -4717,10 +4717,14 @@ public class SurveillanceEngineGpu {
         oemEventOwned = false;
         oemEventOwnedGeneration = -1;
         try {
-            org.json.JSONObject oem = com.overdrive.app.config.UnifiedConfigManager
-                .getOemDashcam();
-            org.json.JSONObject oemSurv = oem.optJSONObject("surveillance");
-            boolean oemSurvEnabled = oemSurv != null && oemSurv.optBoolean("enabled", false);
+            // Read surveillanceMode directly — the legacy nested
+            // oemDashcam.surveillance.enabled boolean is a one-way mirror of
+            // surveillanceMode != off, kept in sync by the POST handler and the
+            // migration. Reading the mode-tier accessor is the authoritative
+            // path and survives any future drift between mirror and mode.
+            String oemSurvMode = com.overdrive.app.config.UnifiedConfigManager
+                .getOemSurveillanceMode();
+            boolean oemSurvEnabled = !"off".equals(oemSurvMode);
             if (oemSurvEnabled) {
                 com.overdrive.app.camera.OemDashcamPipeline oemPipe =
                     com.overdrive.app.daemon.CameraDaemon.getOemDashcamPipeline();

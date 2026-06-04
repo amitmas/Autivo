@@ -706,6 +706,16 @@ public class HttpServer {
         if (path.startsWith("/api/debug/autoservice")) {
             return AutoServiceDebugApiHandler.handle(method, path, body, out);
         }
+
+        // CarPropertyBridge debug — read/write DiCarServer's
+        // ICarPropertyService via the local CarServiceProvider, no cloud
+        // round-trip. Writes still gate on per-property permissions, so
+        // sigperm-protected actuators (BYDAUTO_BODYWORK_SET et al) won't
+        // succeed without a platform-signed APK; reads of non-sigperm
+        // properties work fine.
+        if (path.startsWith("/api/debug/car-property")) {
+            return CarPropertyDebugApiHandler.handle(method, path, body, out);
+        }
         
         // Performance API
         if (path.startsWith("/api/performance")) {
@@ -893,8 +903,11 @@ public class HttpServer {
             
             com.overdrive.app.monitor.SocHistoryDatabase socDb = com.overdrive.app.monitor.SocHistoryDatabase.getInstance();
             com.overdrive.app.abrp.SohEstimator sohEst = socDb != null ? socDb.getSohEstimator() : null;
-            if (sohEst != null && sohEst.hasEstimate()) {
-                soh.put("percent", Math.round(sohEst.getCurrentSoh() * 10) / 10.0);
+            if (sohEst != null && sohEst.hasDisplaySoh()) {
+                // Headline chain (frame_anchor > capacity_ah > live >
+                // calibration on PHEV) — keeps the left-nav chip in sync
+                // with the detail card / battery-health card.
+                soh.put("percent", Math.round(sohEst.getDisplaySoh() * 10) / 10.0);
                 soh.put("estimatedCapacityKwh", Math.round(sohEst.getEstimatedCapacityKwh() * 10) / 10.0);
                 soh.put("nominalCapacityKwh", sohEst.getNominalCapacityKwh());
                 hasSoh = true;

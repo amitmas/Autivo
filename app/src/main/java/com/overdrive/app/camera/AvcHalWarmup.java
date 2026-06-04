@@ -95,14 +95,21 @@ public class AvcHalWarmup {
     public boolean warmupAndWait() {
         boolean dilink4 = isDilink4Mode();
         if (dilink4) {
-            logger.info("Warming up camera HAL via com.byd.avc on dilink4 — "
-                + "AVC stays alive as a multi-consumer of the AVM daemon "
-                + "(red overlay suppressed by GL red-mask shader).");
-        } else {
-            logger.info("Warming up camera HAL via com.byd.avc (waiting " +
-                HAL_WARMUP_DELAY_MS + "ms)...");
+            // ESCO-PARITY: esco does NOT launch com.byd.avc anywhere in its
+            // panorama-camera flow. The 4 s blocking sleep + `am start
+            // com.byd.avc/.MainActivity` was OverDrive-specific and
+            // suspected of stealing the HAL's mosaic mode (PANORAMA_OUTPUT_STATE=7).
+            // Skip the warmup entirely on dilink4. ensureAvcAlive() (pidof +
+            // conditional am start, no sleep) still runs separately for the
+            // multi-consumer keep-alive case; that's the closest behaviour
+            // esco's environment naturally provides without an explicit
+            // launch.
+            logger.info("dilink4: skipping warmupAndWait (esco-parity — esco never launches com.byd.avc explicitly)");
+            return true;
         }
 
+        logger.info("Warming up camera HAL via com.byd.avc (waiting " +
+            HAL_WARMUP_DELAY_MS + "ms)...");
         launchAvc();
 
         try {
@@ -146,11 +153,15 @@ public class AvcHalWarmup {
                 // Double-check conditions before poking
                 if (!active) break;
 
-                // Re-poke com.byd.avc to keep the camera HAL alive.
-                // Runs regardless of ACC state — when the head unit stays
-                // awake during ACC OFF (charging, sentry mode), the system
-                // still reaps com.byd.avc and the HAL goes cold. The owning
-                // pipeline (CameraDaemon) calls stopKeepAlive() on shutdown.
+                // ESCO-PARITY: on dilink4 do NOT launch com.byd.avc.
+                // esco never launches AVC. ensureAvcAlive() (pidof check +
+                // optional non-launching am start) is sufficient as a
+                // presence probe; an explicit launch is suspected of
+                // stealing the HAL's mosaic mode.
+                if (isDilink4Mode()) {
+                    logger.info("Keep-alive tick (dilink4): skipping AVC re-launch (esco-parity)");
+                    continue;
+                }
                 logger.info("Keep-alive: re-launching com.byd.avc (accOn=" +
                     AccMonitor.isAccOn() + ")");
                 launchAvc();
@@ -260,6 +271,23 @@ public class AvcHalWarmup {
      * method assumes you've decided AVC must stay up.
      */
     public static boolean ensureAvcAlive() {
+        // ESCO-PARITY: esco never launches com.byd.avc. On dilink4 we make
+        // this a presence-check-only — no `am start`, no relaunch. If AVC
+        // is dead, it's dead; we report state and move on. The HAL on
+        // calibrated dilink4 firmware delivers mosaic frames without AVC
+        // being a live consumer. Suspect cause of black frames in field
+        // logs is exactly the AVC `am start` flipping HAL out of mosaic
+        // mode (PANORAMA_OUTPUT_STATE=7).
+        if (isDilink4Mode()) {
+            int pid = probeAvcPid();
+            if (pid > 0) {
+                return false;
+            }
+            logger.info("AVC keep-alive (dilink4): pidof returned 0 — NOT relaunching (esco-parity)");
+            return false;
+        }
+
+        // Legacy fleet: original behaviour — relaunch if absent.
         int pid = probeAvcPid();
         if (pid > 0) {
             return false;

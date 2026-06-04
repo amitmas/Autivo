@@ -311,7 +311,17 @@ public final class RecordingsIndex {
 
         Row row = parse(mp4);
         if (row == null) return false;
+        return upsertRow(row);
+    }
 
+    /**
+     * Single-row MERGE using a pre-parsed {@link Row}. Used by the warmup
+     * pipeline (parser pool produces Rows, single writer drains them) so
+     * the parse cost runs concurrently while writes stay serialised on
+     * one JDBC connection.
+     */
+    synchronized boolean upsertRow(Row row) {
+        if (!initialized || row == null) return false;
         String sql =
             "MERGE INTO recordings KEY(filename) VALUES (" +
             "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
@@ -344,7 +354,7 @@ public final class RecordingsIndex {
             ps.executeUpdate();
             return true;
         } catch (Exception e) {
-            logger.warn("upsert failed for " + mp4.getName() + ": " + e.getMessage());
+            logger.warn("upsertRow failed for " + row.filename + ": " + e.getMessage());
             return false;
         }
     }
@@ -404,6 +414,26 @@ public final class RecordingsIndex {
 
         Thread t = new Thread(() -> {
             try {
+                // Fast path: a previous daemon already walked every file and
+                // wrote `warmup_state=complete` to recordings_meta. If the row
+                // count in the index still matches what's on disk (within a
+                // small tolerance for in-flight writes), we skip the full
+                // re-walk and run reconcile() instead — that's an O(N) stat()
+                // pass with no JSON parse, typically <500 ms even on a 2k-clip
+                // library. The user-visible /api/recordings call therefore
+                // returns indexed rows immediately on second-and-later boots
+                // instead of seeing `warming=true` for 60 s.
+                if (canFastPathWarmup()) {
+                    warmupComplete.set(true);
+                    logger.info("Warmup fast-path: persisted complete + count match, running reconcile");
+                    try {
+                        reconcile();
+                    } catch (Throwable thr) {
+                        logger.warn("Fast-path reconcile failed: " + thr.getMessage());
+                    }
+                    return;
+                }
+
                 runWarmup();
                 // Only mark complete on a clean run. A crash mid-warmup
                 // would otherwise leave the index partial while the API
@@ -412,6 +442,7 @@ public final class RecordingsIndex {
                 // totalCount==0). Leaving complete=false lets a later
                 // warmupAsync() retry.
                 warmupComplete.set(true);
+                persistWarmupComplete();
             } catch (Throwable thr) {
                 logger.error("Warmup crashed: " + thr.getMessage(), thr);
             } finally {
@@ -422,9 +453,97 @@ public final class RecordingsIndex {
         t.start();
     }
 
+    /**
+     * Persisted-warmup fast path. Returns true when the previous daemon
+     * already walked every file and the index row count is still close to
+     * the on-disk file count. "Close" here means ±2: a couple of in-flight
+     * writes between the previous shutdown and this boot are tolerated
+     * because reconcile() will pick them up. A larger drift (user manually
+     * deleted clips through a file manager, SD card swapped) drops back to
+     * the full walk so we don't gloss over a real mismatch.
+     */
+    private boolean canFastPathWarmup() {
+        if (!initialized) return false;
+        String state = readMeta("warmup_state");
+        if (!"complete".equals(state)) return false;
+        int indexedCount = countIndexedRows();
+        if (indexedCount <= 0) return false;
+        int diskCount = countDiskFiles();
+        // Allow ±2 drift for in-flight writes during the previous shutdown.
+        // Anything bigger forces a full re-walk.
+        if (Math.abs(diskCount - indexedCount) > 2) {
+            logger.info("Warmup fast-path skipped: disk=" + diskCount
+                    + " indexed=" + indexedCount + " (diff > 2)");
+            return false;
+        }
+        return true;
+    }
+
+    private int countIndexedRows() {
+        try (PreparedStatement ps = connection.prepareStatement(
+                "SELECT COUNT(*) FROM recordings");
+             ResultSet rs = ps.executeQuery()) {
+            return rs.next() ? rs.getInt(1) : 0;
+        } catch (Exception e) {
+            logger.warn("countIndexedRows failed: " + e.getMessage());
+            return -1;
+        }
+    }
+
+    /**
+     * Cheap on-disk file count across all recordings/surveillance/proximity
+     * dirs. Uses {@link StorageManager#listMp4Files} (FUSE shell-fallback
+     * compatible). Names are deduped so mirror dirs don't double-count.
+     */
+    private int countDiskFiles() {
+        StorageManager sm = StorageManager.getInstance();
+        Set<String> names = new HashSet<>();
+        scanDirNames(names, sm.getAllRecordingsDirs());
+        scanDirNames(names, sm.getAllSurveillanceDirs());
+        scanDirNames(names, sm.getAllProximityDirs());
+        return names.size();
+    }
+
+    private synchronized void persistWarmupComplete() {
+        writeMeta("warmup_state", "complete");
+        writeMeta("warmup_indexed_count", String.valueOf(countIndexedRows()));
+        writeMeta("warmup_completed_ts", String.valueOf(System.currentTimeMillis()));
+    }
+
+    private synchronized String readMeta(String key) {
+        if (!initialized) return null;
+        try (PreparedStatement ps = connection.prepareStatement(
+                "SELECT meta_value FROM recordings_meta WHERE meta_key = ?")) {
+            ps.setString(1, key);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getString(1) : null;
+            }
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private synchronized void writeMeta(String key, String value) {
+        if (!initialized) return;
+        try (PreparedStatement ps = connection.prepareStatement(
+                "MERGE INTO recordings_meta KEY(meta_key) VALUES (?, ?)")) {
+            ps.setString(1, key);
+            ps.setString(2, value);
+            ps.executeUpdate();
+        } catch (Exception e) {
+            logger.warn("writeMeta(" + key + ") failed: " + e.getMessage());
+        }
+    }
+
     private void runWarmup() {
         long t0 = System.currentTimeMillis();
         StorageManager sm = StorageManager.getInstance();
+
+        // Invalidate the persisted "complete" flag at the start of a full
+        // re-walk. If we crash partway through and a future daemon reads the
+        // meta row, the fast-path must NOT short-circuit on a stale flag —
+        // the index can be in any state right now.
+        writeMeta("warmup_state", "in_progress");
 
         // Phase 1: enumerate every candidate file across every dir.
         // Done in one pass so we have an honest total for progress.
@@ -458,20 +577,131 @@ public final class RecordingsIndex {
 
         logger.info("Warmup starting: " + unique.size() + " candidate files");
 
-        // Phase 2: upsert. Serial — H2 doesn't benefit from parallel
-        // single-row writes inside one connection, and parallel parsing
-        // would just trade one bottleneck for another.
-        int parsed = 0;
-        for (File f : unique) {
-            if (upsert(f)) parsed++;
-            int done = warmupDone.incrementAndGet();
-            if (done % 100 == 0) {
-                logger.info("Warmup progress: " + done + "/" + unique.size());
+        // Phase 2: parallel parse + batched single-thread upsert.
+        //
+        // The dominant warmup cost is per-file `parse()` — sidecar JSON read +
+        // metadata parse averages ~30 ms/file on the SD card. Single-thread
+        // serial walk takes ~60 s on a 1844-clip library.
+        //
+        // Strategy: a small fixed pool parses files concurrently and pushes
+        // pre-parsed Row objects into a bounded queue; one writer thread
+        // drains the queue and runs the upserts inside a JDBC transaction
+        // (ALL-OR-NOTHING is fine here — we re-write the meta state on
+        // success). H2 single-row writes through one connection do NOT
+        // benefit from parallel writers, so we keep the writer single-
+        // threaded; the parser pool is what cuts wall-time.
+        //
+        // 4 parser threads matches the typical low-power head-unit (Adreno
+        // 610 = quad-A55). More threads contend on the SD card's FUSE
+        // mount; fewer leaves CPU idle.
+        final int parsers = 4;
+        final java.util.concurrent.BlockingQueue<Object> queue =
+                new java.util.concurrent.LinkedBlockingQueue<>(parsers * 8);
+        final Object POISON = new Object();
+
+        java.util.concurrent.atomic.AtomicInteger parsed =
+                new java.util.concurrent.atomic.AtomicInteger(0);
+
+        // Writer: drains the queue and runs MERGE per row. We deliberately
+        // keep the connection in its default autoCommit=true state instead
+        // of batching N rows in one transaction. Three reasons:
+        //  1) The connection is shared with query threads
+        //     (queryRecordings/queryStats/queryDates/queryPlaces/queryCount)
+        //     and FileObserver-driven `upsert(File)` callers. Holding an
+        //     open transaction here would force every concurrent caller
+        //     to either join our transaction (silent durability bug — a
+        //     "saved" recording disappears on crash) or block on the
+        //     `synchronized (this)` monitor for the entire warmup window.
+        //  2) H2's per-row commit overhead is small (the redo log is
+        //     mmap'd) — the warmup walltime is dominated by parse(), not
+        //     the JDBC writes.
+        //  3) Crash safety: SIGKILL during warmup leaves whatever rows
+        //     made it through fully durable; the persisted
+        //     warmup_state=in_progress flag keeps the next boot from
+        //     fast-pathing on the partial state.
+        // upsertRow is `synchronized (this)` so its executeUpdate doesn't
+        // race a concurrent SELECT on the shared connection.
+        Thread writer = new Thread(() -> {
+            try {
+                while (true) {
+                    try {
+                        Object item = queue.take();
+                        if (item == POISON) break;
+                        Row r = (Row) item;
+                        if (upsertRow(r)) parsed.incrementAndGet();
+                        int done = warmupDone.incrementAndGet();
+                        if (done % 100 == 0) {
+                            logger.info("Warmup progress: " + done + "/" + unique.size());
+                        }
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    } catch (Throwable t) {
+                        // Catch unchecked throwables (Error, RuntimeException,
+                        // ClassCastException-from-bad-queue-item) so the
+                        // writer keeps draining. If the writer dies silently
+                        // here, parsers block forever on the bounded queue
+                        // and the daemon shutdown join (futures.get without
+                        // timeout) deadlocks.
+                        logger.error("Writer iteration failed: " + t.getMessage(), t);
+                    }
+                }
+            } finally {
+                // Belt-and-braces: if we exit the loop for any reason other
+                // than POISON (interrupt, an Error escaping the inner
+                // catch), drain any pending Row items so the parser
+                // threads' queue.put() calls unblock and the parser pool
+                // can shut down cleanly.
+                queue.clear();
             }
+        }, "RecordingsIndexWriter");
+        writer.setDaemon(true);
+        writer.start();
+
+        // Parser pool: each worker pulls files from a shared iterator and
+        // pushes parsed Rows into the queue. Failed parses are silently
+        // dropped (parse() returns null) — same behaviour as the legacy
+        // serial path.
+        java.util.concurrent.ExecutorService pool =
+                java.util.concurrent.Executors.newFixedThreadPool(parsers, r -> {
+                    Thread t = new Thread(r, "RecordingsIndexParser");
+                    t.setDaemon(true);
+                    return t;
+                });
+        try {
+            java.util.concurrent.atomic.AtomicInteger cursor =
+                    new java.util.concurrent.atomic.AtomicInteger(0);
+            java.util.List<java.util.concurrent.Future<?>> futures = new ArrayList<>(parsers);
+            for (int i = 0; i < parsers; i++) {
+                futures.add(pool.submit(() -> {
+                    while (true) {
+                        int idx = cursor.getAndIncrement();
+                        if (idx >= unique.size()) return;
+                        File f = unique.get(idx);
+                        try {
+                            Row r = parse(f);
+                            if (r != null) queue.put(r);
+                            else warmupDone.incrementAndGet();  // count skipped
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                            return;
+                        } catch (Throwable ignored) {
+                            warmupDone.incrementAndGet();
+                        }
+                    }
+                }));
+            }
+            for (java.util.concurrent.Future<?> fu : futures) {
+                try { fu.get(); } catch (Exception ignored) {}
+            }
+        } finally {
+            pool.shutdown();
+            try { queue.put(POISON); } catch (InterruptedException ignored) {}
+            try { writer.join(); } catch (InterruptedException ignored) {}
         }
 
         long ms = System.currentTimeMillis() - t0;
-        logger.info("Warmup complete: " + parsed + "/" + unique.size()
+        logger.info("Warmup complete: " + parsed.get() + "/" + unique.size()
                 + " indexed in " + ms + "ms");
     }
 

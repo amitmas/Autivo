@@ -261,15 +261,22 @@ public class TcpCommandServer {
             case "enableSurveillance":
                 com.overdrive.app.config.UnifiedConfigManager.setSurveillanceEnabled(true);
                 if (!com.overdrive.app.monitor.AccMonitor.isAccOn()) {
-                    CameraDaemon.enableSurveillance();
+                    CameraDaemon.enableSurveillance();   // fires OEM recalc
+                } else {
+                    // OEM resolver: survSuppressed depends on master toggle.
+                    try { com.overdrive.app.server.OemDashcamApiHandler.scheduleLifecycleRecalc(); }
+                    catch (Throwable ignored) {}
                 }
                 response.put("status", "ok");
                 response.put("surveillance", CameraDaemon.getSurveillanceStatus());
                 break;
 
             case "disableSurveillance":
-                CameraDaemon.disableSurveillance();
+                CameraDaemon.disableSurveillance();   // fires OEM recalc
                 com.overdrive.app.config.UnifiedConfigManager.setSurveillanceEnabled(false);
+                // Second recalc post-write so resolver sees the new master toggle.
+                try { com.overdrive.app.server.OemDashcamApiHandler.scheduleLifecycleRecalc(); }
+                catch (Throwable ignored) {}
                 response.put("status", "ok");
                 response.put("surveillance", CameraDaemon.getSurveillanceStatus());
                 break;

@@ -30,7 +30,16 @@ BYD.recording = {
             triggerLevel: 'RED',
             preRecordSeconds: 5,
             postRecordSeconds: 10
-        }
+        },
+        // OEM dashcam recording mode mirror — 'off' | 'continuous' | 'smart'.
+        // Hydrated by loadOemDashcam() and committed via the oem-tab branch
+        // in saveSettings() so the picker waits for Apply, not the click.
+        oemRecordingMode: 'off',
+        // Lens-dewarp strength (Fitzgibbon division model). 0..100, 0=off.
+        // Shared with surveillance page via UnifiedConfigManager
+        // recording.rectifyStrength. Default 0 here so the dirty-diff
+        // baseline is a real number even before loadConfig() fires.
+        rectifyStrength: 0
     },
     storageInfo: {
         sdCardAvailable: false,
@@ -52,18 +61,20 @@ BYD.recording = {
     lastConfigTimestamp: 0,  // Track config file timestamp for sync
 
     async init() {
+        // loadConfig already chains into loadStorageSettings (line 245);
+        // calling it again here was a redundant /api/settings/storage
+        // round-trip on every page load. The remaining six loaders are
+        // idempotent reads that don't touch this.config, so they run in
+        // parallel — first-paint goes from ~8 sequential RTTs to ~2.
         await this.loadConfig();
-        // Pull recordingsLimitMb / recordingsStorageType from the server
-        // BEFORE the savedConfig snapshot — otherwise savedConfig captures
-        // the JS in-memory defaults (limit=500, type=INTERNAL) and the
-        // storage-tab dirty diff sees the slider as already-edited the
-        // moment loadStorageSettings() runs later, which leaves Apply
-        // either always-on or always-off depending on the server value.
-        await this.loadStorageSettings();
-        await this.loadStorageStats();
-        await this.loadTelemetryOverlay();
-        await this.loadAudioRecording();
-        await this.loadGeocoding();
+        await Promise.all([
+            this.loadStorageStats(),
+            this.loadTelemetryOverlay(),
+            this.loadAudioRecording(),
+            this.loadGeocoding(),
+            this.loadNativeDvr(),
+            this.loadOemDashcam(),
+        ]);
         this.savedConfig = JSON.parse(JSON.stringify(this.config));
         this.updateUI();
         
@@ -96,10 +107,20 @@ BYD.recording = {
 
         // Re-evaluate Apply enabled-state when the bottom tab changes —
         // markChanged() reads the active tab id each call so the button
-        // reflects only the visible tab's dirty state.
+        // reflects only the visible tab's dirty state. Mirroring
+        // surveillance.js: also re-hydrate the OEM card on tab activation
+        // so the picker never lingers in its hard-coded {aria-busy="true"}
+        // dim state if init's first loadOemDashcam was superseded
+        // mid-flight (token race) or hit a transient daemon-not-ready.
         var self = this;
-        document.addEventListener('ot-tabs:active-changed', function () {
+        document.addEventListener('ot-tabs:active-changed', function (ev) {
             self.markChanged();
+            try {
+                if (ev && ev.detail && ev.detail.id === 'oem') {
+                    self.loadOemDashcam();
+                    self.loadNativeDvr();
+                }
+            } catch (_) {}
         });
     },
     
@@ -150,7 +171,25 @@ BYD.recording = {
                 if (proxData.config.recording && proxData.config.recording.mode) {
                     this.config.recordingMode = proxData.config.recording.mode;
                 }
-                
+                // Lens-dewarp slider (shared with surveillance page).
+                // The initial loadConfig() reads this; the periodic reload
+                // MUST re-read it too — otherwise a change made on the
+                // surveillance page won't reflect here until a full
+                // navigation / reload of the recording page.
+                if (proxData.config.recording &&
+                    typeof proxData.config.recording.rectifyStrength === 'number') {
+                    var rsRefresh = proxData.config.recording.rectifyStrength;
+                    if (rsRefresh < 0) rsRefresh = 0;
+                    if (rsRefresh > 100) rsRefresh = 100;
+                    this.config.rectifyStrength = rsRefresh;
+                }
+                // Hide rectify card on dilink4 — same gate as initial load.
+                try {
+                    var modeRefresh = proxData.config.camera && proxData.config.camera.cameraMode;
+                    var cardRefresh = document.getElementById('rectifyCard');
+                    if (cardRefresh) cardRefresh.style.display = (modeRefresh === 'dilink4') ? 'none' : '';
+                } catch (_) {}
+
                 // Merge proximity guard with defaults
                 if (proxData.config.proximityGuard) {
                     const serverConfig = proxData.config.proximityGuard;
@@ -169,7 +208,14 @@ BYD.recording = {
         // Reload telemetry overlay state
         await this.loadTelemetryOverlay();
         await this.loadAudioRecording();
-        
+        // Re-hydrate the OEM Dashcam card on every reload so:
+        // (a) a camera-mapping dialog change visible on next visibilitychange,
+        // (b) the pipeline status row updates as applyLifecycle settles,
+        // (c) toggling between tabs picks up daemon-side state drift.
+        // Surveillance.js's reloadConfig already does this for its OEM row;
+        // recording.js was missing the symmetric call.
+        await this.loadOemDashcam();
+
         // Update UI with all reloaded settings
         this.savedConfig = JSON.parse(JSON.stringify(this.config));
         this.updateUI();
@@ -215,7 +261,25 @@ BYD.recording = {
                     this.config.recordingMode = proxData.config.recording.mode;
                     console.log('Loaded recording mode from unified:', this.config.recordingMode);
                 }
-                
+                // Lens-dewarp strength (shared by recording + surveillance).
+                // 0 default keeps the prior behaviour (raw HAL output).
+                if (proxData.config.recording &&
+                    typeof proxData.config.recording.rectifyStrength === 'number') {
+                    var rs = proxData.config.recording.rectifyStrength;
+                    if (rs < 0) rs = 0; if (rs > 100) rs = 100;
+                    this.config.rectifyStrength = rs;
+                } else {
+                    this.config.rectifyStrength = 0;
+                }
+                // Hide the slider entirely on dilink4 cars: the legacy-mode
+                // shader branch isn't on their hot path, so the slider would
+                // be a no-op control. Mode is mirrored from `camera.cameraMode`.
+                try {
+                    var mode = proxData.config.camera && proxData.config.camera.cameraMode;
+                    var card = document.getElementById('rectifyCard');
+                    if (card) card.style.display = (mode === 'dilink4') ? 'none' : '';
+                } catch (_) {}
+
                 // Merge proximity guard with defaults to handle missing fields
                 if (proxData.config.proximityGuard) {
                     const serverConfig = proxData.config.proximityGuard;
@@ -277,24 +341,77 @@ BYD.recording = {
                 const usedEl = document.getElementById('storageUsed');
                 const limitEl = document.getElementById('storageLimit');
                 const fillEl = document.getElementById('storageFill');
-                
-                if (usedEl) usedEl.textContent = BYD.i18n.t('recording.storage_used', {size: data.normalSizeFormatted});
+
+                // Prefer the structured byType block; fall back to legacy
+                // flat fields so a stale daemon still renders correctly.
+                const counts = data.byType ? {
+                    normal: data.byType.normal || {},
+                    proximity: data.byType.proximity || {}
+                } : {
+                    normal: {
+                        count: data.normalCount,
+                        bytes: data.normalSize,
+                        bytesFormatted: data.normalSizeFormatted,
+                        todayCount: data.normalTodayCount
+                    },
+                    proximity: {
+                        count: data.proximityCount,
+                        bytes: data.proximitySize,
+                        bytesFormatted: data.proximitySizeFormatted,
+                        todayCount: data.proximityTodayCount
+                    }
+                };
+
+                const normalBytesFormatted = counts.normal.bytesFormatted || data.normalSizeFormatted;
+                if (usedEl) usedEl.textContent = BYD.i18n.t('recording.storage_used', {size: normalBytesFormatted});
 
                 const limitMb = this.config.recordingsLimitMb || 500;
                 if (limitEl) limitEl.textContent = BYD.i18n.t('recording.storage_limit_mb', {mb: limitMb});
-                
+
                 // Calculate percentage
-                const usedBytes = data.normalSize || 0;
+                const usedBytes = counts.normal.bytes || 0;
                 const limitBytes = limitMb * 1024 * 1024;
                 const percent = Math.min(100, Math.round(usedBytes * 100 / limitBytes));
                 if (fillEl) fillEl.style.width = percent + '%';
-                
+
                 // Update Recordings Today count
                 const recTodayEl = document.getElementById('recToday');
                 if (recTodayEl) {
                     // Include normal + proximity recordings for today
-                    const todayCount = (data.normalTodayCount || 0) + (data.proximityTodayCount || 0);
+                    const todayCount = (counts.normal.todayCount || 0) + (counts.proximity.todayCount || 0);
                     recTodayEl.textContent = todayCount + ' →';
+                }
+
+                // Daemon's recording index is still building — repurpose the
+                // storage-card "used" line to surface progress so the user
+                // doesn't see a stale 0 MB while H2 catches up. Self-refresh
+                // until indexState disappears from the payload.
+                // Single in-flight timer + exponential backoff (2s → 4s →
+                // 8s → 10s cap). Page revisits / segment switches stack
+                // independent polling chains otherwise.
+                if (this._warmingPollTimer) {
+                    clearTimeout(this._warmingPollTimer);
+                    this._warmingPollTimer = null;
+                }
+                if (data.indexState && data.indexState.warming) {
+                    const done = data.indexState.done || 0;
+                    const total = data.indexState.total || 0;
+                    const pct = total > 0 ? Math.round(done * 100 / total) : 0;
+                    const tmpl = BYD.i18n.t('recording.storage_indexing', {done: done, total: total, pct: pct});
+                    const text = (tmpl && tmpl !== 'recording.storage_indexing')
+                        ? tmpl
+                        : 'Indexing — ' + done + ' / ' + total + ' (' + pct + '%)';
+                    if (usedEl) usedEl.textContent = text;
+                    var self = this;
+                    var attempt = Math.min(this._warmingPollAttempt || 0, 8);
+                    var delay = Math.min(2000 * Math.pow(2, attempt), 10000);
+                    this._warmingPollAttempt = (this._warmingPollAttempt || 0) + 1;
+                    this._warmingPollTimer = setTimeout(function () {
+                        self._warmingPollTimer = null;
+                        if (self.loadStorageStats) self.loadStorageStats();
+                    }, delay);
+                } else {
+                    this._warmingPollAttempt = 0;
                 }
             }
         } catch (e) {
@@ -666,6 +783,53 @@ BYD.recording = {
     },
 
     /**
+     * Lens-dewarp slider (0..100). Updates the displayed label and marks
+     * the quality tab dirty — Apply persists via /api/settings/unified
+     * which fires UnifiedConfigManager listeners; the active recorder picks
+     * up the new value within one frame, no segment rotation needed.
+     *
+     * Also lightly debounced live-pushes to the daemon so users get
+     * immediate visual confirmation without having to hit Apply for every
+     * slider tweak. Apply is still required to persist across daemon
+     * restart (the live POST already calls updateSection so this is
+     * actually idempotent — keeping markChanged for the Apply UX).
+     */
+    updateRectifyStrength(value) {
+        var v = parseInt(value);
+        if (isNaN(v)) v = 0;
+        if (v < 0) v = 0;
+        if (v > 100) v = 100;
+        this.config.rectifyStrength = v;
+        var label = document.getElementById('rectifyValue');
+        if (label) {
+            // i18n.t can return the key itself if the catalog hasn't loaded
+            // yet; fall back to a literal "Off" so the label never reads as
+            // a raw key like "recording.rectify_off" or empty string.
+            var offTxt = (BYD.i18n && typeof BYD.i18n.t === 'function')
+                ? BYD.i18n.t('recording.rectify_off') : null;
+            if (!offTxt || offTxt === 'recording.rectify_off') offTxt = 'Off';
+            label.textContent = (v === 0) ? offTxt : (v + '%');
+        }
+        this.markChanged();
+        // Debounced live POST so the recorder applies the new value as the
+        // user drags. Avoids hammering the daemon on every input event.
+        if (this._rectifyDebounce) clearTimeout(this._rectifyDebounce);
+        var self = this;
+        this._rectifyDebounce = setTimeout(function () {
+            try {
+                fetch('/api/settings/unified', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        section: 'recording',
+                        data: { rectifyStrength: v }
+                    })
+                });
+            } catch (_) { /* live preview is best-effort */ }
+        }, 200);
+    },
+
+    /**
      * Per-tab dirty diff. Recording page tabs:
      *   capture  — recordingMode, proximityGuard
      *   quality  — recordingQuality, recordingCodec, cameraFps
@@ -676,7 +840,8 @@ BYD.recording = {
      */
     _recTabFieldMap: {
         capture: ['recordingMode', 'proximityGuard'],
-        quality: ['recordingQuality', 'recordingCodec', 'cameraFps'],
+        quality: ['recordingQuality', 'recordingCodec', 'cameraFps', 'rectifyStrength'],
+        oem:     ['oemRecordingMode'],
         storage: ['recordingsLimitMb', 'recordingsStorageType']
     },
 
@@ -757,7 +922,22 @@ BYD.recording = {
             postValue.textContent = BYD.i18n.t('recording.unit_seconds', {n: postSlider.value});
             document.getElementById('timelinePost').textContent = BYD.i18n.t('recording.unit_seconds', {n: postSlider.value});
         }
-        
+
+        // Lens-dewarp slider (shared with surveillance flow).
+        var rectifySlider = document.getElementById('rectifySlider');
+        var rectifyLabel = document.getElementById('rectifyValue');
+        if (rectifySlider) {
+            var rs = (typeof this.config.rectifyStrength === 'number')
+                ? this.config.rectifyStrength : 0;
+            rectifySlider.value = rs;
+            if (rectifyLabel) {
+                var offTxt = (BYD.i18n && typeof BYD.i18n.t === 'function')
+                    ? BYD.i18n.t('recording.rectify_off') : null;
+                if (!offTxt || offTxt === 'recording.rectify_off') offTxt = 'Off';
+                rectifyLabel.textContent = (rs === 0) ? offTxt : (rs + '%');
+            }
+        }
+
         this.updateStorageLimitUI();
         this.updateStorageTypeUI();
         // File size estimate is now rendered by renderActiveEstimate() (called
@@ -988,6 +1168,13 @@ BYD.recording = {
                 // that read from there see the new values. Note: legacy
                 // `bitrate` key is no longer written; the single `quality`
                 // tier (ECONOMY..MAX) is the source of truth.
+                // rectifyStrength rides the same POST so Apply persists the
+                // slider value alongside codec/tier — debounced live POSTs
+                // already pushed to the daemon, this is the durable write.
+                var rectifyToSave = (typeof this.config.rectifyStrength === 'number')
+                    ? this.config.rectifyStrength : 0;
+                if (rectifyToSave < 0) rectifyToSave = 0;
+                if (rectifyToSave > 100) rectifyToSave = 100;
                 await fetch('/api/settings/unified', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -996,7 +1183,8 @@ BYD.recording = {
                         data: {
                             codec: this.config.recordingCodec,
                             quality: this.config.recordingQuality,
-                            recordingQuality: this.config.recordingQuality
+                            recordingQuality: this.config.recordingQuality,
+                            rectifyStrength: rectifyToSave
                         }
                     })
                 });
@@ -1034,6 +1222,30 @@ BYD.recording = {
                 });
                 if (!storageResp.ok) throw new Error('storage ' + storageResp.status);
                 storageData = await storageResp.json();
+            } else if (activeTab === 'oem') {
+                const oemMode = this.config.oemRecordingMode || 'off';
+                let oemErr = null;
+                try {
+                    const oemResp = await fetch('/api/oem-dashcam/config', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ recordingMode: oemMode })
+                    });
+                    if (!oemResp.ok) throw new Error('oem ' + oemResp.status);
+                    const oemData = await oemResp.json();
+                    if (oemData && oemData.success === false) {
+                        throw new Error(oemData.error || 'OEM save rejected');
+                    }
+                } catch (e) {
+                    oemErr = e;
+                }
+                // Always re-hydrate so the radio reflects the daemon's
+                // actual mode (whether the POST succeeded or not). Without
+                // this, a rejected mode change leaves the picker showing a
+                // value the server refused to accept.
+                if (!oemErr && oemMode !== 'off') this._pollOemDashcamUntilSettled();
+                else { try { await this.loadOemDashcam(); } catch (_) {} }
+                if (oemErr) throw oemErr;
             } else {
                 // Status tab is read-only (declared readOnly: true in the
                 // OT_TABS manifest), so app-tabs.js hides the Apply button
@@ -1290,6 +1502,465 @@ BYD.recording = {
         if (result && result.advanced) {
             input.value = result.advanced.customNominatimBase || '';
         }
+    },
+
+    // ==================== Native DVR (com.byd.cdr) ====================
+    //
+    // Toggles the factory dashcam package. When disabled, our OEM Dashcam
+    // pipeline owns the AVMCamera without contention. The card is hidden
+    // entirely when the package isn't installed (state === 'not_installed')
+    // — distinguishes "no DVR sensor on this vehicle" from "DVR present but
+    // currently active".
+
+    _renderNativeDvrCard(state) {
+        const card = document.getElementById('nativeDvrCard');
+        const label = document.getElementById('nativeDvrStatusLabel');
+        const btn = document.getElementById('nativeDvrToggleBtn');
+        if (!card || !label || !btn) return;
+        if (state === 'not_installed') {
+            card.style.display = 'none';
+            return;
+        }
+        // If the OEM run has already gated the card hidden because the
+        // camera id isn't configured, don't resurrect it from a parallel
+        // /api/oem-dashcam/native-dvr/status load that came back after
+        // loadOemDashcam.
+        if (this._oemIdUnset !== true) {
+            card.style.display = '';
+        }
+        if (state === 'disabled') {
+            label.setAttribute('data-i18n', 'oem_dashcam.native_dvr_status_disabled');
+            label.textContent = (BYD.i18n && BYD.i18n.t)
+                ? BYD.i18n.t('oem_dashcam.native_dvr_status_disabled')
+                : 'Status: Disabled by OverDrive';
+            btn.setAttribute('data-i18n', 'oem_dashcam.native_dvr_enable');
+            btn.textContent = (BYD.i18n && BYD.i18n.t)
+                ? BYD.i18n.t('oem_dashcam.native_dvr_enable')
+                : 'Re-enable native DVR';
+            // Re-enable is a benign action — keep the primary visual treatment.
+            btn.classList.remove('btn-danger');
+            btn.classList.add('btn-primary');
+            btn.dataset.action = 'enable';
+        } else {
+            // 'enabled' (default)
+            label.setAttribute('data-i18n', 'oem_dashcam.native_dvr_status_enabled');
+            label.textContent = (BYD.i18n && BYD.i18n.t)
+                ? BYD.i18n.t('oem_dashcam.native_dvr_status_enabled')
+                : 'Status: Enabled';
+            btn.setAttribute('data-i18n', 'oem_dashcam.native_dvr_disable');
+            btn.textContent = (BYD.i18n && BYD.i18n.t)
+                ? BYD.i18n.t('oem_dashcam.native_dvr_disable')
+                : 'Disable native DVR';
+            btn.classList.remove('btn-primary');
+            btn.classList.add('btn-danger');
+            btn.dataset.action = 'disable';
+        }
+    },
+
+    async loadNativeDvr() {
+        try {
+            const resp = await fetch('/api/oem-dashcam/native-dvr/status');
+            const data = await resp.json();
+            if (data && data.success) {
+                this._renderNativeDvrCard(data.state || 'enabled');
+            }
+        } catch (e) {
+            console.warn('Failed to load native DVR state:', e);
+        }
+    },
+
+    async toggleNativeDvr() {
+        const btn = document.getElementById('nativeDvrToggleBtn');
+        if (!btn) return;
+        const action = btn.dataset.action === 'enable' ? 'enable' : 'disable';
+        const url = '/api/oem-dashcam/native-dvr/' + action;
+        // Disable the button mid-shell to prevent double-click double-pm.
+        btn.disabled = true;
+        try {
+            const resp = await fetch(url, { method: 'POST' });
+            const data = await resp.json();
+            const newState = (data && data.state) || 'enabled';
+            this._renderNativeDvrCard(newState);
+            if (BYD.utils && BYD.utils.toast) {
+                if (data && data.success) {
+                    const key = action === 'disable'
+                        ? 'oem_dashcam.native_dvr_disable_toast'
+                        : 'oem_dashcam.native_dvr_enable_toast';
+                    BYD.utils.toast(BYD.i18n.t(key), 'success');
+                } else {
+                    BYD.utils.toast(
+                        (data && data.error) || BYD.i18n.t('common.error'),
+                        'error');
+                }
+            }
+        } catch (e) {
+            console.warn('Native DVR toggle failed:', e);
+            if (BYD.utils && BYD.utils.toast) {
+                BYD.utils.toast(BYD.i18n.t('common.error'), 'error');
+            }
+        } finally {
+            btn.disabled = false;
+        }
+    },
+
+    /**
+     * OEM Dashcam settings card. Hidden until /api/settings/quality reports
+     * an `oemDashcam.oemDashcamCameraId >= 0` (i.e. the user has picked a
+     * camera id in the camera-mapping dialog). When visible, the user can
+     * toggle the feature and set ACC-off behaviour. Settings persist to the
+     * `oemDashcam` UCM section; the daemon-side pipeline lifecycle reads
+     * them at boot/start.
+     *
+     * Until Phase B (daemon-side pipeline lifecycle) lands, the toggle
+     * persists config and shows a "pipeline not yet available" hint so the
+     * user knows the recorder isn't actually running yet.
+     */
+    async loadOemDashcam() {
+        // Token-based dedup so concurrent loads (visibilitychange +
+        // 10s reload + post-toggle poll's terminal refresh) can't
+        // race: only the most-recently-started load mutates DOM.
+        const myToken = (this._oemLoadToken || 0) + 1;
+        this._oemLoadToken = myToken;
+        const cardForBusy = document.getElementById('oemDashcamCard');
+        const selectorForBusy = cardForBusy ? cardForBusy.querySelector('.mode-selector') : null;
+        if (selectorForBusy) {
+            selectorForBusy.setAttribute('aria-busy', 'true');
+            selectorForBusy.setAttribute('data-hydrating', 'true');
+        }
+        // Captured by the finally so the badge clobber path can
+        // distinguish "this run early-returned because the camera id
+        // is unset" (badge MUST stay hidden) from "this run completed
+        // a normal hydration" (badge re-armed and visible).
+        let runIsIdUnset = false;
+        try {
+            // First fetch is the gate (oemDashcamCameraId < 0 ⇒ early
+            // return). Once we know the card is rendered, fire the two
+            // independent fetches (config + telemetry overlay) in parallel
+            // — they have no read-order dependency.
+            const qres = await fetch('/api/settings/quality');
+            const qdata = await qres.json();
+            if (this._oemLoadToken !== myToken) return;   // superseded
+            const oem = qdata && qdata.oemDashcam;
+            const card = document.getElementById('oemDashcamCard');
+            if (!card) return;
+            const idUnset = !oem
+                || typeof oem.oemDashcamCameraId !== 'number'
+                || oem.oemDashcamCameraId < 0;
+            // Cached on `this` so the parallel _renderNativeDvrCard()
+            // race-in (loadNativeDvr's fetch resolves AFTER this run
+            // hides the card) and the loadOemDashcam catch path can
+            // both observe the latest id-unset state.
+            this._oemIdUnset = idUnset;
+            const idUnsetRow = document.getElementById('oemDashcamIdUnsetRow');
+            if (idUnsetRow) idUnsetRow.style.display = idUnset ? '' : 'none';
+            const modeRow = document.getElementById('oemRecordingModeRow');
+            const modeSelector = card.querySelector('.mode-selector');
+            const telRow = document.getElementById('oemTelemetryOverlayRow');
+            const statusRow = document.getElementById('oemPipelineStatusRow');
+            [modeRow, modeSelector, telRow, statusRow].forEach(el => {
+                if (el) el.style.display = idUnset ? 'none' : '';
+            });
+            // Native DVR card hides when there's no OEM camera id — the
+            // factory dashcam disable is meaningless without an OEM
+            // pipeline to take its place.
+            const nativeDvrCard = document.getElementById('nativeDvrCard');
+            if (nativeDvrCard && idUnset) nativeDvrCard.style.display = 'none';
+            // Status badge is meaningless when no camera id is configured —
+            // hide it so the card-header doesn't show a stale "Idle" green
+            // pill next to "Camera ID not configured".
+            const idUnsetBadge = document.getElementById('oemPipelineBadge');
+            if (idUnsetBadge) idUnsetBadge.style.display = idUnset ? 'none' : '';
+            if (idUnset) { runIsIdUnset = true; return; }
+
+            const [sdata, tdata] = await Promise.all([
+                fetch('/api/oem-dashcam/config').then(r => r.json()).catch(() => ({})),
+                fetch('/api/settings/telemetry-overlay').then(r => r.json()).catch(() => ({})),
+            ]);
+            if (this._oemLoadToken !== myToken) return;   // superseded
+            // Validate the server-reported mode against the known set;
+            // fall back to 'off' so a typo / older daemon never leaves
+            // the radio group with NO selection (which is the visual
+            // "default not selected" the user reported).
+            let mode = (sdata && sdata.recordingMode) ? String(sdata.recordingMode).toLowerCase() : 'off';
+            if (mode !== 'off' && mode !== 'continuous' && mode !== 'smart') mode = 'off';
+            // Mirror onto this.config so the dirty diff has a stable key
+            // to compare against. The savedConfig snapshot is updated too
+            // so a fresh load doesn't immediately mark the OEM tab dirty.
+            this.config.oemRecordingMode = mode;
+            if (this.savedConfig) this.savedConfig.oemRecordingMode = mode;
+            // Clear any prior checked state so we don't end up with two
+            // radios pretending to be selected (paranoia — radio groups
+            // already enforce one-of, but explicit reset survives DOM
+            // clones / replaceChild churn).
+            document.querySelectorAll('input[name="oemRecordingMode"]').forEach(function (r) {
+                r.checked = (r.value === mode);
+                const card = r.closest('.mode-option').querySelector('.mode-card');
+                if (card) card.classList.toggle('mode-card-active', r.checked);
+            });
+            // Hydrated — drop the dim/busy state.
+            const selector = card.querySelector('.mode-selector');
+            if (selector) {
+                selector.removeAttribute('aria-busy');
+                selector.removeAttribute('data-hydrating');
+            }
+
+            const telCb = document.getElementById('oemTelemetryOverlay');
+            if (telCb) telCb.checked = !!(tdata && tdata.oemDashcamEnabled);
+
+            // Surface pipeline + recording state. Status badge + status row
+            // both reflect the same source so the user sees one consistent
+            // truth.
+            const statusEl = document.getElementById('oemPipelineStatus');
+            const statusHint = document.getElementById('oemPipelineStatusHint');
+            const badge = document.getElementById('oemPipelineBadge');
+            const off = mode === 'off';
+            const running = !!(sdata && sdata.pipelineRunning);
+            const recording = !!(sdata && sdata.recording);
+            // Off mode masks the error state — when the user has
+            // explicitly disabled the pipeline, a previous lastStartError
+            // is stale and shouldn't paint the badge red. Errored is
+            // also mutually exclusive with active/inactive below. Two
+            // distinct sources: lastStartError (failed to come up) and
+            // lastWriteError (disk writer aborted mid-clip — SD unmount /
+            // full volume). Either one paints the badge red so the user
+            // doesn't see "Recording" while the muxer is dead.
+            const startErr = !!(sdata && sdata.lastStartError && !running && !recording && !off);
+            const writeErr = !!(sdata && sdata.lastWriteError && !off);
+            const errored = startErr || writeErr;
+            const errorMsg = (sdata && sdata.lastWriteError) || (sdata && sdata.lastStartError) || '';
+            if (badge) {
+                // Compute exactly one of {errored, active, inactive} so
+                // the toggles can never end up with two classes set
+                // (which would let CSS specificity pick the wrong color).
+                const isActive = !off && (running || recording);
+                const isInactive = !errored && !isActive;
+                badge.classList.toggle('errored', errored);
+                badge.classList.toggle('active', isActive);
+                badge.classList.toggle('inactive', isInactive);
+                // Track the localized key on data-i18n so a later
+                // language switch (which re-runs i18n.applyTranslations
+                // over every [data-i18n] node) finds the CURRENT key
+                // instead of the stale "status_idle" sitting in the
+                // markup. Without this, switching languages mid-session
+                // resets the badge to "Idle" regardless of true state.
+                const badgeKey = errored ? 'oem_dashcam.status_error'
+                    : off ? 'oem_dashcam.status_idle'
+                    : recording ? 'oem_dashcam.status_recording'
+                    : running ? 'oem_dashcam.status_armed'
+                    : 'oem_dashcam.status_starting';
+                badge.setAttribute('data-i18n', badgeKey);
+                badge.textContent = BYD.i18n.t(badgeKey);
+                // Reveal post-hydration so the localized text appears
+                // without flashing the English "Idle" inline default.
+                // Use opacity (not visibility) so the badge stays in
+                // the a11y tree even before hydration.
+                badge.style.opacity = '';
+            }
+            if (statusEl) {
+                if (errored) {
+                    // Concatenated string — strip data-i18n so a language
+                    // switch's mass re-translate doesn't overwrite the
+                    // appended dynamic error suffix.
+                    const prefixKey = writeErr
+                        ? 'oem_dashcam.write_error_prefix'
+                        : 'oem_dashcam.start_error_prefix';
+                    statusEl.removeAttribute('data-i18n');
+                    statusEl.textContent = BYD.i18n.t(prefixKey) + errorMsg;
+                    // Toast once per distinct error string. visibilitychange
+                    // + 10s reload would otherwise re-fire the same error
+                    // toast every poll, drowning legitimate notifications.
+                    if (errorMsg !== this._lastShownOemError) {
+                        this._lastShownOemError = errorMsg;
+                        if (BYD.utils && BYD.utils.toast) BYD.utils.toast(statusEl.textContent, 'error');
+                    }
+                } else {
+                    // Any non-error terminal state — clear the dedup
+                    // marker so a future error re-toasts once.
+                    this._lastShownOemError = null;
+                    const statusKey = off ? 'oem_dashcam.status_idle'
+                        : recording ? 'oem_dashcam.status_recording'
+                        : running ? 'oem_dashcam.status_armed'
+                        : 'oem_dashcam.status_starting';
+                    statusEl.setAttribute('data-i18n', statusKey);
+                    statusEl.textContent = BYD.i18n.t(statusKey);
+                }
+            }
+            if (statusHint) {
+                const hintKey = off ? 'oem_dashcam.status_hint_off'
+                    : (mode === 'continuous'
+                        ? 'oem_dashcam.status_hint_continuous_recording'
+                        : 'oem_dashcam.status_hint_smart_recording');
+                statusHint.setAttribute('data-i18n', hintKey);
+                statusHint.textContent = BYD.i18n.t(hintKey);
+            }
+            // Mark that this run completed a real hydration. The catch
+            // path below uses this to decide whether to clobber the
+            // badge to "Idle" — if we've ever hydrated, a transient
+            // /api/settings/quality blip should NOT regress the visible
+            // state, since the real status is more useful than a hard
+            // reset to idle.
+            this._oemEverHydrated = true;
+        } catch (e) {
+            console.warn('Failed to load OEM dashcam settings:', e);
+            // Only reset badge if WE are still the most-recent load
+            // AND we've never successfully hydrated. Once we have a
+            // real status painted, leave it alone — a transient fetch
+            // blip shouldn't visually downgrade to "Idle".
+            if (this._oemLoadToken === myToken && !this._oemEverHydrated) {
+                const b = document.getElementById('oemPipelineBadge');
+                if (b) {
+                    b.classList.remove('errored', 'active');
+                    b.classList.add('inactive');
+                    // BYD.i18n is guaranteed loaded by init order — the
+                    // shell hydrates i18n before mounting recording.js.
+                    b.textContent = BYD.i18n.t('oem_dashcam.status_idle');
+                }
+            }
+        } finally {
+            // The dim-clear is unconditional — even a superseded run (token
+            // bumped by a concurrent reload) must lift the busy state on
+            // its way out. Without this, a network blip during init's call
+            // followed by an immediately-superseding visibilitychange call
+            // could leave aria-busy="true" sticky if the second call also
+            // fails. Costs nothing to clear it twice; costs a permanently
+            // un-clickable picker to clear it never.
+            if (selectorForBusy) {
+                selectorForBusy.removeAttribute('aria-busy');
+                selectorForBusy.removeAttribute('data-hydrating');
+            }
+            // Only the winner reveals the badge.
+            // Older loads that lost the token race must not reveal a badge
+            // whose text the newer load hasn't yet written. Also clear
+            // inline display:'none' from any prior id-unset run so a
+            // successful re-load actually shows the badge.
+            if (this._oemLoadToken === myToken) {
+                const _b = document.getElementById('oemPipelineBadge');
+                if (_b) {
+                    _b.style.opacity = '';
+                    // Only re-reveal the badge when the run completed a
+                    // real hydration AND the cached id-unset gate
+                    // hasn't flipped on us. runIsIdUnset is local-per
+                    // call so a fetch failure mid-run leaves it false;
+                    // this._oemIdUnset survives the catch and prevents
+                    // a finally-block reveal from undoing a prior
+                    // id-unset hide.
+                    if (!runIsIdUnset && this._oemIdUnset !== true) _b.style.display = '';
+                }
+            }
+        }
+    },
+
+    /**
+     * Poll /api/oem-dashcam/config until pipelineRunning flips true or
+     * lastStartError is recorded. Refreshes the recording.html OEM card on
+     * every transition. Backs off geometrically and gives up after a hard
+     * ceiling so a wedged daemon doesn't loop forever.
+     *
+     * Cancellable: a second call (e.g. user toggles off then on again)
+     * cancels the in-flight poll via the _oemPollToken epoch.
+     */
+    _pollOemDashcamUntilSettled() {
+        const token = (this._oemPollToken || 0) + 1;
+        this._oemPollToken = token;
+        // 0.5s, 1s, 2s, 3s, 4s, 5s, 5s, 5s — total ~25s ceiling. Most
+        // starts settle by 6-9s; the long tail covers slow HALs.
+        const delays = [500, 1000, 2000, 3000, 4000, 5000, 5000, 5000];
+        let prevSerialized = null;
+        const tick = async (i) => {
+            if (this._oemPollToken !== token) return;       // cancelled
+            if (i >= delays.length) {
+                // Hard ceiling reached without pipelineRunning or
+                // lastStartError. Re-hydrate the UI so the badge can't
+                // sit on a stale "Starting…" forever, and surface the
+                // timeout to the user with a toast.
+                try { await this.loadOemDashcam(); } catch (_) {}
+                if (BYD.utils && BYD.utils.toast) {
+                    BYD.utils.toast(BYD.i18n.t('oem_dashcam.start_timeout'), 'warn');
+                }
+                return;
+            }
+            await new Promise(r => setTimeout(r, delays[i]));
+            if (this._oemPollToken !== token) return;
+            try {
+                const r = await fetch('/api/oem-dashcam/config');
+                const d = await r.json();
+                // Post-fetch token check — without this a superseded
+                // poll's terminal tick whose fetch resolves AFTER the
+                // user toggled off would still call loadOemDashcam and
+                // overwrite the new state.
+                if (this._oemPollToken !== token) return;
+                if (!d || !d.success) {
+                    if (d && d.starting === false) {
+                        // Permanent rejection from the daemon — stop
+                        // polling and refresh the card so the user
+                        // sees the terminal state immediately.
+                        await this.loadOemDashcam();
+                        return;
+                    }
+                    return tick(i + 1);
+                }
+                if (d.pipelineRunning || d.lastStartError) {
+                    await this.loadOemDashcam();
+                    return;
+                }
+                // Mid-startup state changes (e.g. encoder→muxer→writer)
+                // each emit a distinct config payload. Refresh the
+                // badge whenever the snapshot changes so the user sees
+                // progress, not a stuck "Starting…" pill.
+                const serialized = JSON.stringify(d);
+                if (serialized !== prevSerialized) {
+                    prevSerialized = serialized;
+                    try { await this.loadOemDashcam(); } catch (_) {}
+                    if (this._oemPollToken !== token) return;
+                }
+                return tick(i + 1);
+            } catch (e) {
+                return tick(i + 1);
+            }
+        };
+        tick(0);
+    },
+
+    async toggleOemTelemetryOverlay() {
+        const cb = document.getElementById('oemTelemetryOverlay');
+        if (!cb) return;
+        const enabled = !!cb.checked;
+        try {
+            // Write only the OEM-specific key. Pano's panoEnabled stays at
+            // whatever the user set elsewhere — that's the entire point of
+            // the per-pipeline split.
+            const resp = await fetch('/api/settings/telemetry-overlay', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ oemDashcamEnabled: enabled })
+            });
+            const data = await resp.json();
+            if (!data || !data.success) {
+                cb.checked = !enabled;
+                if (BYD.utils && BYD.utils.toast) {
+                    BYD.utils.toast(BYD.i18n.t('common.error'), 'error');
+                }
+            }
+        } catch (e) {
+            cb.checked = !enabled;
+            console.warn('OEM telemetry overlay toggle failed:', e);
+            // Surface the failure to the user — a silent revert of the
+            // checkbox state would feel like the click was ignored.
+            if (BYD.utils && BYD.utils.toast) {
+                BYD.utils.toast(BYD.i18n.t('common.error'), 'error');
+            }
+        }
+    },
+
+    setOemRecordingMode(mode) {
+        if (mode !== 'off' && mode !== 'continuous' && mode !== 'smart') return;
+        this.config.oemRecordingMode = mode;
+        document.querySelectorAll('input[name="oemRecordingMode"]').forEach(function (r) {
+            r.checked = (r.value === mode);
+            const card = r.closest('.mode-option').querySelector('.mode-card');
+            if (card) card.classList.toggle('mode-card-active', r.value === mode);
+        });
+        this.markChanged();
     }
 };
 

@@ -57,7 +57,18 @@ BYD.surveillance = {
         // ACC-OFF mode: 'smart' (motion + AI events, default) | 'continuous'
         // (plain rolling 4-cam recording, no motion, no AI). Backward-compat:
         // installs that pre-date this key see the smart default.
-        accOffMode: 'smart'
+        accOffMode: 'smart',
+        // OEM dashcam surveillance mode mirror — 'off' | 'continuous' | 'smart'.
+        // Hydrated by loadOemDashcam() from /api/oem-dashcam/config and
+        // pushed back to the same endpoint on Apply (oem-tab branch in
+        // applySettings()). Lives on the surveillance config object so the
+        // dirty diff has a stable key to compare.
+        oemSurveillanceMode: 'off',
+        // Lens-dewarp strength (Fitzgibbon division model). 0..100, 0=off.
+        // Shared with the recording page through UnifiedConfigManager
+        // recording.rectifyStrength. Default 0 here so the dirty-diff
+        // baseline is a real number even before loadConfig() fires.
+        rectifyStrength: 0
     },
     storageInfo: {
         sdCardAvailable: false,
@@ -124,6 +135,11 @@ BYD.surveillance = {
         await this.loadStorageStats();
         await this.loadCameraFps();
         await this.loadGeocoding();
+        // Dedicated OEM Dashcam tab — load the mode picker, telemetry
+        // toggle, status badge, and native DVR control on init so the
+        // user can land directly on the OEM tab and find populated state.
+        await this.loadOemDashcam();
+        await this.loadOemNativeDvr();
         this.savedConfig = JSON.parse(JSON.stringify(this.config));
         this.updateUI();
         this.startClock();
@@ -168,9 +184,20 @@ BYD.surveillance = {
         // Re-evaluate Apply enabled-state + unsaved markers whenever the
         // user swaps bottom tabs — markChanged() reads the active tab id
         // each call, so the visible button reflects only the visible tab.
+        // Also re-hydrate the OEM card on tab activation so the picker
+        // never lingers in its hard-coded {aria-busy="true"} dim state if
+        // init's first loadOemDashcam was superseded mid-flight (token
+        // race) or hit a transient daemon-not-ready window. Mirrors what
+        // visibilitychange already does — same idempotent reload.
         var self = this;
-        document.addEventListener('ot-tabs:active-changed', function () {
+        document.addEventListener('ot-tabs:active-changed', function (ev) {
             self.markChanged();
+            try {
+                if (ev && ev.detail && ev.detail.id === 'oem') {
+                    self.loadOemDashcam();
+                    self.loadOemNativeDvr();
+                }
+            } catch (_) {}
         });
     },
     
@@ -209,6 +236,39 @@ BYD.surveillance = {
         // Re-probe Telegram pairing on every reload — newly-paired bots
         // should un-grey the tier toggles without a page refresh.
         this.refreshTelegramAvailability();
+        // Re-hydrate the OEM Dashcam tab. The user may have picked a
+        // camera id via the Android camera-mapping dialog while this
+        // page was hidden; reloadConfig fires on visibilitychange so
+        // the cards re-evaluate without a page reload.
+        this.loadOemDashcam();
+        this.loadOemNativeDvr();
+        // Lens-dewarp slider lives in unified-config recording.* (shared
+        // with the dashcam page). /api/surveillance/config doesn't surface
+        // it, so re-read it here so a change made on the recording page
+        // reflects without a full reload.
+        try {
+            const uResp = await fetch('/api/settings/unified');
+            const uData = await uResp.json();
+            if (uData.success && uData.config && uData.config.recording &&
+                typeof uData.config.recording.rectifyStrength === 'number') {
+                var rsRefresh = uData.config.recording.rectifyStrength;
+                if (rsRefresh < 0) rsRefresh = 0;
+                if (rsRefresh > 100) rsRefresh = 100;
+                if (rsRefresh !== this.config.rectifyStrength) {
+                    this.config.rectifyStrength = rsRefresh;
+                    if (this.savedConfig) this.savedConfig.rectifyStrength = rsRefresh;
+                    var slider = document.getElementById('survRectifySlider');
+                    var label  = document.getElementById('survRectifyValue');
+                    if (slider) slider.value = rsRefresh;
+                    if (label) {
+                        var offTxt = (BYD.i18n && typeof BYD.i18n.t === 'function')
+                            ? BYD.i18n.t('recording.rectify_off') : null;
+                        if (!offTxt || offTxt === 'recording.rectify_off') offTxt = 'Off';
+                        label.textContent = (rsRefresh === 0) ? offTxt : (rsRefresh + '%');
+                    }
+                }
+            }
+        } catch (_) {}
     },
     
     async loadStorageSettings() {
@@ -253,23 +313,71 @@ BYD.surveillance = {
                 const usedEl = document.getElementById('survStorageUsed');
                 const limitEl = document.getElementById('survStorageLimit');
                 const fillEl = document.getElementById('survStorageFill');
-                
-                if (usedEl) usedEl.textContent = BYD.i18n.t('surveillance.size_used', {size: data.sentrySizeFormatted});
+
+                // Prefer the structured byType block; fall back to legacy
+                // flat fields so a stale daemon still renders correctly.
+                const counts = data.byType ? {
+                    sentry: data.byType.sentry || {}
+                } : {
+                    sentry: {
+                        count: data.sentryCount,
+                        bytes: data.sentrySize,
+                        bytesFormatted: data.sentrySizeFormatted,
+                        todayCount: data.sentryTodayCount
+                    }
+                };
+
+                const sentryBytesFormatted = counts.sentry.bytesFormatted || data.sentrySizeFormatted;
+                if (usedEl) usedEl.textContent = BYD.i18n.t('surveillance.size_used', {size: sentryBytesFormatted});
 
                 const limitMb = this.config.surveillanceLimitMb || 500;
                 if (limitEl) limitEl.textContent = BYD.i18n.t('surveillance.size_limit_mb', {mb: limitMb});
-                
+
                 // Calculate percentage
-                const usedBytes = data.sentrySize || 0;
+                const usedBytes = counts.sentry.bytes || 0;
                 const limitBytes = limitMb * 1024 * 1024;
                 const percent = Math.min(100, Math.round(usedBytes * 100 / limitBytes));
                 if (fillEl) fillEl.style.width = percent + '%';
-                
+
                 // Update Events Today count
                 const eventsTodayEl = document.getElementById('eventsToday');
                 if (eventsTodayEl) {
-                    const todayCount = data.sentryTodayCount || 0;
+                    const todayCount = counts.sentry.todayCount || 0;
                     eventsTodayEl.textContent = todayCount + ' →';
+                }
+
+                // Daemon's recording index is still building — surface a
+                // progress line on the storage card so the user doesn't see
+                // a stale 0 MB while H2 catches up. Self-refresh until
+                // indexState disappears from the payload.
+                // Single in-flight timer + exponential backoff (2s → 4s →
+                // 8s → 10s cap). Page revisits / segment switches stack
+                // independent polling chains otherwise — each scheduled
+                // setTimeout fires its own loadStorageStats which schedules
+                // another one, multiplying daemon HTTP load.
+                if (this._warmingPollTimer) {
+                    clearTimeout(this._warmingPollTimer);
+                    this._warmingPollTimer = null;
+                }
+                if (data.indexState && data.indexState.warming) {
+                    const done = data.indexState.done || 0;
+                    const total = data.indexState.total || 0;
+                    const pct = total > 0 ? Math.round(done * 100 / total) : 0;
+                    const tmpl = BYD.i18n.t('surveillance.storage_indexing', {done: done, total: total, pct: pct});
+                    const text = (tmpl && tmpl !== 'surveillance.storage_indexing')
+                        ? tmpl
+                        : 'Indexing — ' + done + ' / ' + total + ' (' + pct + '%)';
+                    if (usedEl) usedEl.textContent = text;
+                    var self = this;
+                    var attempt = Math.min(this._warmingPollAttempt || 0, 8);
+                    var delay = Math.min(2000 * Math.pow(2, attempt), 10000);
+                    this._warmingPollAttempt = (this._warmingPollAttempt || 0) + 1;
+                    this._warmingPollTimer = setTimeout(function () {
+                        self._warmingPollTimer = null;
+                        if (self.loadStorageStats) self.loadStorageStats();
+                    }, delay);
+                } else {
+                    this._warmingPollAttempt = 0;
                 }
             }
         } catch (e) {
@@ -299,28 +407,15 @@ BYD.surveillance = {
         }
     },
     
-    async setFps(fps) {
-        this.config.cameraFps = fps;
+    setFps(fps) {
+        this.config.cameraFps = parseInt(fps, 10);
         document.querySelectorAll('#survFpsBtns .btn-toggle').forEach(btn =>
             btn.classList.toggle('active', btn.dataset.value === String(fps)));
-
-        // Save immediately via quality API (shared with recording page)
-        try {
-            await fetch('/api/settings/quality', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ cameraFps: fps })
-            });
-            if (BYD.utils && BYD.utils.toast) {
-                BYD.utils.toast(BYD.i18n.t('surveillance.fps_set', {fps: fps}), 'success');
-            }
-            // Refetch the per-tier options so qualityEquivalent (which shifts
-            // with FPS) and the active-tier subtitle reflect the new rate.
-            this.refetchQualityOptions();
-        } catch (e) {
-            console.error('Failed to save FPS:', e);
-            if (BYD.utils && BYD.utils.toast) BYD.utils.toast(BYD.i18n.t('surveillance.fps_save_failed'), 'error');
-        }
+        // FPS shifts the per-tier qualityEquivalent labels — re-render so
+        // the user sees the change before pressing Apply. Persistence is
+        // routed through applySettings() (recording-tab branch below).
+        this.renderActiveEstimate();
+        this.markChanged();
     },
 
     /** Pull a fresh /api/settings/quality and update the local tier table +
@@ -730,6 +825,32 @@ BYD.surveillance = {
             console.warn('Failed to load config:', e);
         }
 
+        // Pull rectifyStrength from the unified-config recording section.
+        // The surveillance API doesn't surface it (it lives under recording.*
+        // since both flows share one slider value), so we read it directly
+        // and also use the camera section to gate visibility on dilink4.
+        try {
+            const uResp = await fetch('/api/settings/unified');
+            const uData = await uResp.json();
+            if (uData.success && uData.config) {
+                if (uData.config.recording &&
+                    typeof uData.config.recording.rectifyStrength === 'number') {
+                    var rs = uData.config.recording.rectifyStrength;
+                    if (rs < 0) rs = 0; if (rs > 100) rs = 100;
+                    this.config.rectifyStrength = rs;
+                } else {
+                    this.config.rectifyStrength = 0;
+                }
+                try {
+                    var mode = uData.config.camera && uData.config.camera.cameraMode;
+                    var card = document.getElementById('survRectifyCard');
+                    if (card) card.style.display = (mode === 'dilink4') ? 'none' : '';
+                } catch (_) {}
+            }
+        } catch (e) {
+            console.warn('Failed to load rectifyStrength: ' + (e && e.message));
+        }
+
         // Load storage settings
         await this.loadStorageSettings();
     },
@@ -847,6 +968,21 @@ BYD.surveillance = {
         document.querySelectorAll('#survFpsBtns .btn-toggle').forEach(btn =>
             btn.classList.toggle('active', btn.dataset.value === String(this.config.cameraFps || 15)));
 
+        // Lens-dewarp slider (shared across recording + surveillance).
+        var rectifySlider = document.getElementById('survRectifySlider');
+        var rectifyLabel  = document.getElementById('survRectifyValue');
+        if (rectifySlider) {
+            var rs = (typeof this.config.rectifyStrength === 'number')
+                ? this.config.rectifyStrength : 0;
+            rectifySlider.value = rs;
+            if (rectifyLabel) {
+                var offTxt = (BYD.i18n && typeof BYD.i18n.t === 'function')
+                    ? BYD.i18n.t('recording.rectify_off') : null;
+                if (!offTxt || offTxt === 'recording.rectify_off') offTxt = 'Off';
+                rectifyLabel.textContent = (rs === 0) ? offTxt : (rs + '%');
+            }
+        }
+
         // Active estimate (per-tier subtitles removed — info is summarised below).
         this.renderActiveEstimate();
 
@@ -932,6 +1068,45 @@ BYD.surveillance = {
         document.getElementById('postLabel').textContent = BYD.i18n.t('surveillance.after_seconds', {n: value});
         document.getElementById('timelinePost').style.flex = value / 20;
         this.markChanged();
+    },
+
+    /**
+     * Lens-dewarp slider (0..100). Mirrors the slider on the recording page
+     * — same UnifiedConfigManager key (recording.rectifyStrength), same
+     * effect on the active recorder. Editing here also affects ACC-on
+     * dashcam recordings (and vice versa).
+     *
+     * Live debounced POST so the recorder picks up the change as the user
+     * drags; Apply persists it durably alongside other recording-tab fields.
+     */
+    updateRectifyStrength(value) {
+        var v = parseInt(value);
+        if (isNaN(v)) v = 0;
+        if (v < 0) v = 0;
+        if (v > 100) v = 100;
+        this.config.rectifyStrength = v;
+        var label = document.getElementById('survRectifyValue');
+        if (label) {
+            var offTxt = (BYD.i18n && typeof BYD.i18n.t === 'function')
+                ? BYD.i18n.t('recording.rectify_off') : null;
+            if (!offTxt || offTxt === 'recording.rectify_off') offTxt = 'Off';
+            label.textContent = (v === 0) ? offTxt : (v + '%');
+        }
+        this.markChanged();
+        if (this._rectifyDebounce) clearTimeout(this._rectifyDebounce);
+        var self = this;
+        this._rectifyDebounce = setTimeout(function () {
+            try {
+                fetch('/api/settings/unified', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        section: 'recording',
+                        data: { rectifyStrength: v }
+                    })
+                });
+            } catch (_) { /* live preview is best-effort */ }
+        }, 200);
     },
 
     setRecordingQuality(tier) {
@@ -1575,9 +1750,15 @@ BYD.surveillance = {
         var gridCols = data.gridCols || 10;
         var gridRows = data.gridRows || 7;
 
-        // viewMode: 0=Mosaic, 1=Front, 2=Right, 3=Rear, 4=Left
+        // viewMode: 0=Mosaic, 1=Front, 2=Right, 3=Rear, 4=Left, 5=Raw, 6=OEM Dashcam
         var viewMode = data.viewMode || 0;
-        
+
+        // Views 5 (raw debug) and 6 (OEM Dashcam) have no AVM
+        // surveillance/heatmap pipeline behind them. Skip the overlay
+        // entirely so we don't paint stale AVM quadrant data on top of
+        // the raw / DVR stream — the canvas was already cleared above.
+        if (viewMode === 5 || viewMode === 6) return;
+
         // Map viewMode to quadrant ID: 1→0(front), 2→1(right), 3→3(rear), 4→2(left)
         var viewModeToQuadrant = { 1: 0, 2: 1, 3: 3, 4: 2 };
         var singleQuadrant = (viewMode > 0) ? viewModeToQuadrant[viewMode] : -1;
@@ -1939,17 +2120,34 @@ BYD.surveillance = {
             'quadrantOverrides',
             'detectPerson', 'detectCar', 'detectBike',
             'aiConfidence', 'minObjectSize',
-            'flashImmunity'
+            'flashImmunity',
+            // Folded in from the (removed) Advanced tab — these motion-
+            // detection diagnostics belong with detection.
+            'motionHeatmap', 'filterDebugLog'
         ],
         recording: [
             // Backend reads these EXACT names — preRecordSeconds (no "ing"),
             // recordingQuality / recordingCodec (with the "recording" prefix).
             // recordingQuality is the consolidated tier (ECONOMY..MAX) that
             // replaces the legacy recordingBitrate (LOW/MEDIUM/HIGH).
-            // cameraFps does NOT live here — it's owned by the Quality
-            // Settings handler (/api/settings/quality).
+            // cameraFps now flows through Apply too — branch in applySettings()
+            // POSTs the trio (recordingQuality + recordingCodec + cameraFps)
+            // to /api/settings/quality before merging the rest into
+            // /api/surveillance/config.
+            // rectifyStrength is shared with the recording page; saving here
+            // also drives ACC-on dashcam dewarp via the unified config key
+            // (recording.rectifyStrength).
             'preRecordSeconds', 'postRecordSeconds',
-            'recordingQuality', 'recordingCodec'
+            'recordingQuality', 'recordingCodec', 'cameraFps',
+            'rectifyStrength'
+        ],
+        oem: [
+            // OEM tab is a sentinel — applySettings() branches off to
+            // /api/oem-dashcam/config when the active tab is `oem`. The
+            // dirty diff still has to compare _something_, so we list the
+            // mirrored config field that setOemSurveillanceMode() updates
+            // on `this.config`.
+            'oemSurveillanceMode'
         ],
         storage: [
             // Sentinel — branches the Apply flow to /api/settings/storage.
@@ -1958,9 +2156,6 @@ BYD.surveillance = {
             // are what actually drive Apply enablement on the storage tab.
             '_storage_endpoint',
             'surveillanceLimitMb', 'surveillanceStorageType'
-        ],
-        advanced: [
-            'motionHeatmap', 'filterDebugLog'
         ]
     },
 
@@ -2017,6 +2212,121 @@ BYD.surveillance = {
                 // pressing Apply on the Storage tab only needs to write the
                 // surveillance storage limit + storage-type pair above; the
                 // CDR retention sliders are already persisted live.
+            } else if (activeTab === 'oem') {
+                // OEM tab — write the chosen OEM surveillance mode through
+                // the dedicated endpoint. recording.html owns the OEM
+                // telemetry burn-in toggle; this page only flips the mode.
+                let oemErr = null;
+                try {
+                    const oemResp = await fetch('/api/oem-dashcam/config', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ surveillanceMode: this.config.oemSurveillanceMode || 'off' })
+                    });
+                    if (!oemResp.ok) throw new Error('OEM save failed: ' + oemResp.status);
+                    const oemData = await oemResp.json();
+                    if (oemData && oemData.success === false) {
+                        throw new Error(oemData.error || 'OEM save rejected');
+                    }
+                } catch (e) {
+                    oemErr = e;
+                }
+                // Always re-hydrate from the server — success or failure.
+                // On success this paints the new state via the normal poll;
+                // on failure it re-syncs the radio + savedConfig back to
+                // the server's actual mode so the UI doesn't lie about a
+                // value the daemon refused to accept.
+                if (!oemErr && (this.config.oemSurveillanceMode || 'off') !== 'off') {
+                    this._pollOemDashcamUntilSettled();
+                } else {
+                    try { await this.loadOemDashcam(); } catch (_) {}
+                }
+                if (oemErr) throw oemErr;
+            } else if (activeTab === 'recording') {
+                // Recording tab — quality/codec/fps belong to the shared
+                // /api/settings/quality endpoint; pre/post-record buffers
+                // remain on the surveillance config writer. Sequential
+                // POSTs with per-endpoint savedConfig commit so a partial
+                // failure (e.g. /api/settings/quality 500 while
+                // /api/surveillance/config would have succeeded) leaves
+                // the dirty diff accurate: the half that DID land migrates
+                // into savedConfig; the half that failed stays dirty so
+                // the Apply button correctly reflects "still has unsaved
+                // changes". Without this, parallel posts could promote
+                // savedConfig optimistically and leave divergent state
+                // with no recovery short of a full reload.
+                const qualityKeys = ['recordingQuality', 'recordingCodec', 'cameraFps'];
+                const survKeys = ['preRecordSeconds', 'postRecordSeconds'];
+                const committed = {};
+                let firstError = null;
+
+                try {
+                    const qResp = await fetch('/api/settings/quality', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            recordingQuality: this.config.recordingQuality,
+                            recordingCodec: this.config.recordingCodec,
+                            cameraFps: this.config.cameraFps
+                        })
+                    });
+                    if (!qResp.ok) throw new Error('Quality save failed: ' + qResp.status);
+                    qualityKeys.forEach(k => { committed[k] = true; });
+                } catch (e) {
+                    firstError = e;
+                }
+                try {
+                    const sResp = await fetch('/api/surveillance/config', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            preRecordSeconds: this.config.preRecordSeconds,
+                            postRecordSeconds: this.config.postRecordSeconds
+                        })
+                    });
+                    if (!sResp.ok) throw new Error('Config save failed: ' + sResp.status);
+                    survKeys.forEach(k => { committed[k] = true; });
+                } catch (e) {
+                    if (firstError == null) firstError = e;
+                }
+                // rectifyStrength lives in unified-config recording.* (shared
+                // with the dashcam page slider). Persist via /api/settings/unified
+                // so the live listener fires and any reload of the recording
+                // page reads the same value.
+                try {
+                    var rs = (typeof this.config.rectifyStrength === 'number')
+                        ? this.config.rectifyStrength : 0;
+                    if (rs < 0) rs = 0; if (rs > 100) rs = 100;
+                    const uResp = await fetch('/api/settings/unified', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            section: 'recording',
+                            data: { rectifyStrength: rs }
+                        })
+                    });
+                    if (!uResp.ok) throw new Error('Rectify save failed: ' + uResp.status);
+                    committed['rectifyStrength'] = true;
+                } catch (e) {
+                    if (firstError == null) firstError = e;
+                }
+
+                // Promote only the keys whose POST succeeded. Stamp the
+                // saved baseline directly so subsequent _tabDirty() runs
+                // see the failed-half still dirty. The blanket
+                // `savedConfig = JSON.parse(JSON.stringify(config))` below
+                // would clobber the dirty signal — skip it for this branch
+                // and short-circuit by re-throwing if we had any failure.
+                if (!this.savedConfig) this.savedConfig = {};
+                Object.keys(committed).forEach(k => {
+                    this.savedConfig[k] = this.config[k];
+                });
+                if (qualityKeys.some(k => committed[k])) this.refetchQualityOptions();
+                if (firstError) throw firstError;
+                // Mark this branch as having handled savedConfig so the
+                // generic "savedConfig = clone(config)" below doesn't
+                // overwrite our partial commit.
+                this._skipSavedConfigSnapshot = true;
             } else {
                 // Build a partial body containing only the active tab's fields.
                 // The daemon's surveillance config endpoint is a partial-merge
@@ -2034,7 +2344,13 @@ BYD.surveillance = {
                 if (!configResp.ok) throw new Error('Config save failed: ' + configResp.status);
             }
 
-            this.savedConfig = JSON.parse(JSON.stringify(this.config));
+            // Recording-tab branch handles per-key savedConfig promotion
+            // already; skip the blanket snapshot so a partial failure
+            // doesn't get overwritten with a clean copy.
+            if (!this._skipSavedConfigSnapshot) {
+                this.savedConfig = JSON.parse(JSON.stringify(this.config));
+            }
+            this._skipSavedConfigSnapshot = false;
             this.hasUnsavedChanges = false;
             this.markChanged();
             // Re-render so the "saved → pending" arrow disappears now that
@@ -2690,6 +3006,345 @@ BYD.surveillance = {
         });
         if (result && result.advanced) {
             input.value = result.advanced.customNominatimBase || '';
+        }
+    },
+
+    // ==================== OEM Dashcam tab ====================
+    //
+    // Surveillance.html has a dedicated "OEM Dashcam" tab with the
+    // surveillanceMode picker (Off | Continuous | Smart), status badge,
+    // and native DVR control. The burn-in telemetry toggle lives only
+    // on recording.html (it stamps speed/GPS/timestamp into dvr_*.mp4
+    // for active dashcam recording, not parked surveillance clips).
+    // Both pages use the same i18n keys under "oem_dashcam.*" — the
+    // only difference is which mode field is written (recordingMode
+    // vs surveillanceMode) and which one drives Apply on each page.
+
+    async loadOemDashcam() {
+        // Token-based dedup — see recording.js mirror.
+        const myToken = (this._oemLoadToken || 0) + 1;
+        this._oemLoadToken = myToken;
+        const cardForBusy = document.getElementById('oemDashcamMainCard');
+        const selectorForBusy = cardForBusy ? cardForBusy.querySelector('.mode-selector') : null;
+        if (selectorForBusy) {
+            selectorForBusy.setAttribute('aria-busy', 'true');
+            selectorForBusy.setAttribute('data-hydrating', 'true');
+        }
+        // Track id-unset early-return so the finally doesn't clobber
+        // the badge's hidden state — see recording.js mirror.
+        let runIsIdUnset = false;
+        try {
+            const qres = await fetch('/api/settings/quality');
+            const qdata = await qres.json();
+            if (this._oemLoadToken !== myToken) return;   // superseded
+            const oem = qdata && qdata.oemDashcam;
+            const card = document.getElementById('oemDashcamMainCard');
+            if (!card) return;
+            const idUnset = !oem
+                || typeof oem.oemDashcamCameraId !== 'number'
+                || oem.oemDashcamCameraId < 0;
+            // Cached on `this` so the parallel _renderOemNativeDvrCard()
+            // race-in (loadOemNativeDvr's fetch resolves AFTER this run
+            // hides the card) and the loadOemDashcam catch path can
+            // both observe the latest id-unset state.
+            this._oemIdUnset = idUnset;
+            const idUnsetRow = document.getElementById('oemDashcamIdUnsetRow');
+            if (idUnsetRow) idUnsetRow.style.display = idUnset ? '' : 'none';
+            const modeRow = document.getElementById('oemSurvModeRow');
+            const modeSelector = card.querySelector('.mode-selector');
+            const statusRow = document.getElementById('oemPipelineStatusRow');
+            [modeRow, modeSelector, statusRow].forEach(el => {
+                if (el) el.style.display = idUnset ? 'none' : '';
+            });
+            // Hide the native DVR card when there's no OEM id configured
+            // (disable-factory-DVR is meaningless without an OEM pipeline
+            // to take over).
+            const oemNativeDvrCard = document.getElementById('oemNativeDvrCard');
+            if (oemNativeDvrCard && idUnset) oemNativeDvrCard.style.display = 'none';
+            const idUnsetBadge = document.getElementById('oemPipelineBadge');
+            if (idUnsetBadge) idUnsetBadge.style.display = idUnset ? 'none' : '';
+            if (idUnset) { runIsIdUnset = true; return; }
+
+            // Telemetry burn-in lives only on recording.html now, so we
+            // pull just the OEM config here. Single fetch keeps first-paint
+            // latency lower than the prior parallel pair.
+            let sdata = {};
+            try {
+                const r = await fetch('/api/oem-dashcam/config');
+                sdata = await r.json();
+            } catch (_) {}
+            if (this._oemLoadToken !== myToken) return;   // superseded
+            let mode = (sdata && sdata.surveillanceMode) ? String(sdata.surveillanceMode).toLowerCase() : 'off';
+            if (mode !== 'off' && mode !== 'continuous' && mode !== 'smart') mode = 'off';
+            // Mirror onto this.config so the dirty diff has a stable key
+            // to compare against. The savedConfig snapshot is updated too
+            // so a fresh load doesn't immediately mark the OEM tab dirty.
+            this.config.oemSurveillanceMode = mode;
+            if (this.savedConfig) this.savedConfig.oemSurveillanceMode = mode;
+            document.querySelectorAll('input[name="oemSurveillanceMode"]').forEach(function (r) {
+                r.checked = (r.value === mode);
+                const c = r.closest('.mode-option').querySelector('.mode-card');
+                if (c) c.classList.toggle('mode-card-active', r.checked);
+            });
+            // Hydrated — drop the dim/busy state.
+            const selector = card.querySelector('.mode-selector');
+            if (selector) {
+                selector.removeAttribute('aria-busy');
+                selector.removeAttribute('data-hydrating');
+            }
+
+            const statusEl = document.getElementById('oemPipelineStatus');
+            const statusHint = document.getElementById('oemPipelineStatusHint');
+            const badge = document.getElementById('oemPipelineBadge');
+            const off = mode === 'off';
+            const running = !!(sdata && sdata.pipelineRunning);
+            const recording = !!(sdata && sdata.recording);
+            // Off mode masks the error state — see recording.js mirror.
+            // Two distinct error sources: lastStartError (pipeline failed
+            // to come up) and lastWriteError (disk writer aborted mid-clip,
+            // typically SD unmount). Either one paints the badge red so
+            // the user doesn't see "Recording" while the muxer is dead.
+            const startErr = !!(sdata && sdata.lastStartError && !running && !recording && !off);
+            const writeErr = !!(sdata && sdata.lastWriteError && !off);
+            const errored = startErr || writeErr;
+            const errorMsg = (sdata && sdata.lastWriteError) || (sdata && sdata.lastStartError) || '';
+            if (badge) {
+                // Mutually-exclusive class state — see recording.js mirror.
+                const isActive = !off && (running || recording);
+                const isInactive = !errored && !isActive;
+                badge.classList.toggle('errored', errored);
+                badge.classList.toggle('active', isActive);
+                badge.classList.toggle('inactive', isInactive);
+                // Mirror data-i18n to the live key — see recording.js
+                // mirror. Without this, a language switch resets the
+                // badge to whatever static "status_idle" was on the
+                // markup at page-load, regardless of true state.
+                const badgeKey = errored ? 'oem_dashcam.status_error'
+                    : off ? 'oem_dashcam.status_idle'
+                    : recording ? 'oem_dashcam.status_recording'
+                    : running ? 'oem_dashcam.status_armed'
+                    : 'oem_dashcam.status_starting';
+                badge.setAttribute('data-i18n', badgeKey);
+                badge.textContent = BYD.i18n.t(badgeKey);
+                // Reveal post-hydration. Use opacity (not visibility) so
+                // the badge stays in the a11y tree before hydration.
+                badge.style.opacity = '';
+            }
+            if (statusEl) {
+                if (errored) {
+                    // Concatenated string — strip data-i18n so a
+                    // language switch doesn't blow away the appended
+                    // dynamic suffix. See recording.js mirror.
+                    const prefixKey = writeErr
+                        ? 'oem_dashcam.write_error_prefix'
+                        : 'oem_dashcam.start_error_prefix';
+                    statusEl.removeAttribute('data-i18n');
+                    statusEl.textContent = BYD.i18n.t(prefixKey) + errorMsg;
+                    if (errorMsg !== this._lastShownOemError) {
+                        this._lastShownOemError = errorMsg;
+                        if (BYD.utils && BYD.utils.toast) BYD.utils.toast(statusEl.textContent, 'error');
+                    }
+                } else {
+                    this._lastShownOemError = null;
+                    const statusKey = off ? 'oem_dashcam.status_idle'
+                        : recording ? 'oem_dashcam.status_recording'
+                        : running ? 'oem_dashcam.status_armed'
+                        : 'oem_dashcam.status_starting';
+                    statusEl.setAttribute('data-i18n', statusKey);
+                    statusEl.textContent = BYD.i18n.t(statusKey);
+                }
+            }
+            if (statusHint) {
+                const hintKey = off ? 'oem_dashcam.status_hint_off'
+                    : (mode === 'continuous'
+                        ? 'oem_dashcam.status_hint_continuous_surveillance'
+                        : 'oem_dashcam.status_hint_smart_surveillance');
+                statusHint.setAttribute('data-i18n', hintKey);
+                statusHint.textContent = BYD.i18n.t(hintKey);
+            }
+            // See recording.js mirror — mark hydrated so transient
+            // catch-path clobbers can't regress the badge to Idle.
+            this._oemEverHydrated = true;
+        } catch (e) {
+            console.warn('Failed to load OEM surveillance mode:', e);
+            if (this._oemLoadToken === myToken && !this._oemEverHydrated) {
+                const b = document.getElementById('oemPipelineBadge');
+                if (b) {
+                    b.classList.remove('errored', 'active');
+                    b.classList.add('inactive');
+                    // BYD.i18n is guaranteed loaded by init order.
+                    b.textContent = BYD.i18n.t('oem_dashcam.status_idle');
+                }
+            }
+        } finally {
+            // The dim-clear is unconditional — even a superseded run (token
+            // bumped by a concurrent reload) must lift the busy state on
+            // its way out. Without this, a network blip during init's call
+            // followed by an immediately-superseding visibilitychange call
+            // could leave aria-busy="true" sticky if the second call also
+            // fails. Costs nothing to clear it twice; costs a permanently
+            // un-clickable picker to clear it never.
+            if (selectorForBusy) {
+                selectorForBusy.removeAttribute('aria-busy');
+                selectorForBusy.removeAttribute('data-hydrating');
+            }
+            // Only the winner clears badge state — see recording.js mirror.
+            if (this._oemLoadToken === myToken) {
+                const _b = document.getElementById('oemPipelineBadge');
+                if (_b) {
+                    _b.style.opacity = '';
+                    // Don't resurrect the badge when this run was an
+                    // id-unset early-return, OR when the cached
+                    // id-unset gate fired in any prior run that the
+                    // current call didn't reach (fetch failed before
+                    // updating runIsIdUnset). See recording.js mirror.
+                    if (!runIsIdUnset && this._oemIdUnset !== true) _b.style.display = '';
+                }
+            }
+        }
+    },
+
+    _pollOemDashcamUntilSettled() {
+        const token = (this._oemPollToken || 0) + 1;
+        this._oemPollToken = token;
+        const delays = [500, 1000, 2000, 3000, 4000, 5000, 5000, 5000];
+        let prevSerialized = null;
+        const tick = async (i) => {
+            if (this._oemPollToken !== token) return;
+            if (i >= delays.length) {
+                // Hard ceiling — see recording.js mirror.
+                try { await this.loadOemDashcam(); } catch (_) {}
+                if (BYD.utils && BYD.utils.toast) {
+                    BYD.utils.toast(BYD.i18n.t('oem_dashcam.start_timeout'), 'warn');
+                }
+                return;
+            }
+            await new Promise(r => setTimeout(r, delays[i]));
+            if (this._oemPollToken !== token) return;
+            try {
+                const r = await fetch('/api/oem-dashcam/config');
+                const d = await r.json();
+                // Post-fetch token check — supersedes prevents a stale
+                // tick's terminal branch overwriting fresh state.
+                if (this._oemPollToken !== token) return;
+                if (!d || !d.success) {
+                    if (d && d.starting === false) {
+                        // Permanent rejection — see recording.js mirror.
+                        await this.loadOemDashcam();
+                        return;
+                    }
+                    return tick(i + 1);
+                }
+                if (d.pipelineRunning || d.lastStartError) {
+                    await this.loadOemDashcam();
+                    return;
+                }
+                // Refresh on snapshot change — see recording.js mirror.
+                const serialized = JSON.stringify(d);
+                if (serialized !== prevSerialized) {
+                    prevSerialized = serialized;
+                    try { await this.loadOemDashcam(); } catch (_) {}
+                    if (this._oemPollToken !== token) return;
+                }
+                return tick(i + 1);
+            } catch (e) {
+                return tick(i + 1);
+            }
+        };
+        tick(0);
+    },
+
+    setOemSurveillanceMode(mode) {
+        if (mode !== 'off' && mode !== 'continuous' && mode !== 'smart') return;
+        // Repaint highlights immediately so the click feels instant; the
+        // actual /api/oem-dashcam/config POST waits for Apply.
+        this.config.oemSurveillanceMode = mode;
+        document.querySelectorAll('input[name="oemSurveillanceMode"]').forEach(function (r) {
+            r.checked = (r.value === mode);
+            const c = r.closest('.mode-option').querySelector('.mode-card');
+            if (c) c.classList.toggle('mode-card-active', r.value === mode);
+        });
+        this.markChanged();
+    },
+
+    // ==================== Native DVR (com.byd.cdr) ====================
+
+    _renderOemNativeDvrCard(state) {
+        const card = document.getElementById('oemNativeDvrCard');
+        const label = document.getElementById('oemNativeDvrStatusLabel');
+        const btn = document.getElementById('oemNativeDvrToggleBtn');
+        if (!card || !label || !btn) return;
+        if (state === 'not_installed') {
+            card.style.display = 'none';
+            return;
+        }
+        // If the OEM run has already hidden the card because the camera
+        // id isn't configured, don't resurrect it from a parallel
+        // /api/oem-dashcam/native-dvr/status load that came back later.
+        if (this._oemIdUnset !== true) {
+            card.style.display = '';
+        }
+        if (state === 'disabled') {
+            label.setAttribute('data-i18n', 'oem_dashcam.native_dvr_status_disabled');
+            label.textContent = BYD.i18n.t('oem_dashcam.native_dvr_status_disabled');
+            btn.setAttribute('data-i18n', 'oem_dashcam.native_dvr_enable');
+            btn.textContent = BYD.i18n.t('oem_dashcam.native_dvr_enable');
+            btn.classList.remove('btn-danger');
+            btn.classList.add('btn-primary');
+            btn.dataset.action = 'enable';
+        } else {
+            label.setAttribute('data-i18n', 'oem_dashcam.native_dvr_status_enabled');
+            label.textContent = BYD.i18n.t('oem_dashcam.native_dvr_status_enabled');
+            btn.setAttribute('data-i18n', 'oem_dashcam.native_dvr_disable');
+            btn.textContent = BYD.i18n.t('oem_dashcam.native_dvr_disable');
+            btn.classList.remove('btn-primary');
+            btn.classList.add('btn-danger');
+            btn.dataset.action = 'disable';
+        }
+    },
+
+    async loadOemNativeDvr() {
+        try {
+            const resp = await fetch('/api/oem-dashcam/native-dvr/status');
+            const data = await resp.json();
+            if (data && data.success) {
+                this._renderOemNativeDvrCard(data.state || 'enabled');
+            }
+        } catch (e) {
+            console.warn('Failed to load native DVR state:', e);
+        }
+    },
+
+    async toggleOemNativeDvr() {
+        const btn = document.getElementById('oemNativeDvrToggleBtn');
+        if (!btn) return;
+        const action = btn.dataset.action === 'enable' ? 'enable' : 'disable';
+        const url = '/api/oem-dashcam/native-dvr/' + action;
+        btn.disabled = true;
+        try {
+            const resp = await fetch(url, { method: 'POST' });
+            const data = await resp.json();
+            const newState = (data && data.state) || 'enabled';
+            this._renderOemNativeDvrCard(newState);
+            if (BYD.utils && BYD.utils.toast) {
+                if (data && data.success) {
+                    const key = action === 'disable'
+                        ? 'oem_dashcam.native_dvr_disable_toast'
+                        : 'oem_dashcam.native_dvr_enable_toast';
+                    BYD.utils.toast(BYD.i18n.t(key), 'success');
+                } else {
+                    BYD.utils.toast(
+                        (data && data.error) || BYD.i18n.t('common.error'),
+                        'error');
+                }
+            }
+        } catch (e) {
+            console.warn('Native DVR toggle failed:', e);
+            if (BYD.utils && BYD.utils.toast) {
+                BYD.utils.toast(BYD.i18n.t('common.error'), 'error');
+            }
+        } finally {
+            btn.disabled = false;
         }
     }
 };

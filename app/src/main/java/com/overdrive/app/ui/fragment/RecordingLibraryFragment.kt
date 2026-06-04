@@ -57,6 +57,20 @@ class RecordingLibraryFragment : Fragment() {
     companion object {
         private const val TAG = "RecordingLibrary"
 
+        /**
+         * Initial delay for warming-state poll (first retry). Doubles per
+         * attempt up to {@link #WARMING_POLL_CAP_MS}.
+         */
+        private const val WARMING_POLL_INITIAL_MS: Long = 2_000L
+        /** Hard cap so we never sleep more than 10 s between probes. */
+        private const val WARMING_POLL_CAP_MS: Long = 10_000L
+        /**
+         * Max shift exponent — at 2 s base this still saturates the cap.
+         * Prevents `Long << attempt` from rolling over on extreme attempt
+         * counts (only matters if the warmup never finishes).
+         */
+        private const val WARMING_POLL_MAX_ATTEMPTS_FOR_BACKOFF = 8
+
         /** When true, the fragment hides its internal filter bar — used when a
          *  parent (RecordingsFragment) drives the filter via its own segmented
          *  control. */
@@ -225,6 +239,15 @@ class RecordingLibraryFragment : Fragment() {
 
     /** Pending warmup-poll runnable so onDestroyView can cancel it. */
     private var warmupPollRunnable: Runnable? = null
+
+    /**
+     * Exponential-backoff counter for the warming-state poll. Resets to
+     * zero whenever loadFirstPage runs to a non-warming response. Each
+     * successive warming response doubles the next poll delay up to the
+     * cap below — protects the daemon from a 60+ s warmup hammering the
+     * HTTP server with one request every 1.5 s on every connected client.
+     */
+    private var warmupRetryAttempt: Int = 0
 
     enum class RecordingFilter {
         ALL, NORMAL, SENTRY, PROXIMITY
@@ -925,6 +948,11 @@ class RecordingLibraryFragment : Fragment() {
                     scheduleWarmupRetry(gen)
                     return@runOnUiThread
                 }
+                // Warmup is done — reset the exponential-backoff counter
+                // so a future warmup window (storage hot-plug rebuild)
+                // starts from the 2 s base again instead of continuing
+                // at the 10 s cap from the prior cycle.
+                warmupRetryAttempt = 0
 
                 pagingState.totalCount = page.totalCount
                 pagingState.accumulated.clear()
@@ -1004,10 +1032,16 @@ class RecordingLibraryFragment : Fragment() {
 
     /**
      * Schedule a warming-state retry. Cancels any prior pending retry so
-     * we don't stack runnables on the main looper.
+     * we don't stack runnables on the main looper. Uses exponential backoff
+     * (2 s → 4 s → 8 s → 10 s cap) so a long warmup (60+ s on a 2 k clip
+     * library) doesn't hammer the daemon HTTP server with one request
+     * per 1.5 s per connected client.
      */
     private fun scheduleWarmupRetry(gen: Int) {
         warmupPollRunnable?.let { mainHandler.removeCallbacks(it) }
+        val attempt = warmupRetryAttempt.coerceAtMost(WARMING_POLL_MAX_ATTEMPTS_FOR_BACKOFF)
+        val delay = (WARMING_POLL_INITIAL_MS shl attempt).coerceAtMost(WARMING_POLL_CAP_MS)
+        warmupRetryAttempt++
         val r = Runnable {
             if (!isAdded || view == null) return@Runnable
             if (gen != pagingState.generation) return@Runnable
@@ -1016,7 +1050,7 @@ class RecordingLibraryFragment : Fragment() {
             loadFirstPage()
         }
         warmupPollRunnable = r
-        mainHandler.postDelayed(r, 1500L)
+        mainHandler.postDelayed(r, delay)
     }
 
     /**

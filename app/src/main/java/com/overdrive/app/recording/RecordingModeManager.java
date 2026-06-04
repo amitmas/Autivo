@@ -889,20 +889,29 @@ public class RecordingModeManager {
                 gearMonitorRetryFailures = 0;
 
                 if (currentMode == Mode.NONE) {
-                    // CRITICAL: don't bare-return here. Sentry/Surveillance can
-                    // leave the pipeline running across ACC OFF→ON: pipeline.onAccOn()
-                    // (called by CameraDaemon.onAccStateChanged before this method)
-                    // disables surveillance mode and reopens the camera, but it
-                    // does NOT stop the pipeline. Without an explicit teardown the
-                    // camera + GL + encoder stay allocated indefinitely with no
-                    // recording in flight, burning ~70% CPU until the user toggles
-                    // a mode on then off again.
+                    // ESCO-PARITY: on dilink4 the pipeline is started at daemon
+                    // boot (CameraDaemon Dilink4BootPipelineStart) and must
+                    // STAY ALIVE across the entire daemon lifetime — esco's
+                    // PanoCameraRecordService never gets stopped on any ACC
+                    // edge. Suppressing the legacy "tear down on mode=NONE"
+                    // path here.
                     //
-                    // activateMode(Mode.NONE) is the canonical "tear down" path —
-                    // it calls pipeline.stop() + stopAvcKeepAlive() and clears
-                    // modeActive. Idempotent if pipeline isn't running.
-                    logger.info("ACC ON with mode=NONE — ensuring pipeline is stopped");
-                    stopPipelineOnAccOn = true;
+                    // Legacy fleet keeps the original tear-down because the
+                    // pipeline is only started on demand and must release
+                    // its camera+GL+encoder when no mode is active.
+                    boolean dilink4 = false;
+                    try {
+                        dilink4 = com.overdrive.app.daemon.CameraDaemon.isDilink4ModeActiveStatic();
+                    } catch (Throwable ignored) {}
+                    if (dilink4) {
+                        logger.info("ACC ON with mode=NONE — keeping pipeline alive (dilink4 esco-parity)");
+                    } else {
+                        // CRITICAL legacy path: don't bare-return — without an
+                        // explicit teardown, camera+GL+encoder stay allocated
+                        // indefinitely with no recording, burning ~70% CPU.
+                        logger.info("ACC ON with mode=NONE — ensuring pipeline is stopped");
+                        stopPipelineOnAccOn = true;
+                    }
                 } else {
                     modeToActivate = currentMode;
                 }
@@ -920,16 +929,58 @@ public class RecordingModeManager {
         }
 
         if (shouldStopAccOff) {
-            // ACC turned OFF — always stop the pipeline regardless of mode.
-            // Recording modes only operate when ACC is ON. Surveillance (if enabled)
-            // will be started separately by CameraDaemon.onAccStateChanged.
-            //
             // stopAvcKeepAlive runs unconditionally (even if pipeline isn't
             // running, the keep-alive watchdog might be) — preserve that.
-            // Route the pipeline teardown through runActivateGuarded(NONE)
-            // so it honors the shuttingDown abort flag and shares the
-            // activate/deactivate centralization.
             CameraDaemon.stopAvcKeepAlive();
+
+            // ESCO-PARITY DILINK4 PATH (esco MainService.java:677-689 +
+            // FlameoutService p111dh/C4995i.java:371-411): esco never closes
+            // AVMCamera on ACC-OFF, period. PanoCameraRecord stays alive
+            // for the entire MainService lifetime. ACC-OFF only schedules
+            // the secondary auto-sentry-record consumer (separate C5920a)
+            // 60 s later via mTaskExecutor — non-blocking, doesn't touch
+            // the live camera handle.
+            //
+            // For dilink4, ALWAYS take the keep-alive path. Drop every
+            // surveillance / safe-zone / schedule gate the prior wiring
+            // had — none of those gates exist in esco. If the user has
+            // surveillance off, esco still keeps the camera open for the
+            // user's preview path; OverDrive must do the same.
+            //
+            // Legacy mode (non-dilink4) keeps the original teardown
+            // behaviour — the close+reopen race is dilink4-firmware-
+            // specific.
+            boolean dilink4 = false;
+            try {
+                dilink4 = com.overdrive.app.daemon.CameraDaemon.isDilink4ModeActiveStatic();
+            } catch (Throwable t) {
+                logger.warn("dilink4 mode probe failed: " + t.getMessage());
+            }
+
+            if (dilink4) {
+                if (pipeline.isRunning()) {
+                    logger.info("ACC OFF (dilink4) — finalize recording, keep camera alive (esco-parity, unconditional)");
+                    try {
+                        pipeline.stopRecording();
+                    } catch (Throwable t) {
+                        logger.warn("dilink4 stopRecording failed: " + t.getMessage());
+                    }
+                } else {
+                    // Pipeline not running yet at ACC-OFF: nothing to keep
+                    // alive here. CameraDaemon's boot path / onAccStateChanged
+                    // will start it; we just record state.
+                    logger.info("ACC OFF (dilink4) — pipeline not running, deferring to CameraDaemon");
+                }
+                // Mark mode=NONE so the manager state machine matches
+                // "no active recording mode". Pipeline keeps running.
+                synchronized (this) {
+                    currentMode = Mode.NONE;
+                }
+                return;
+            }
+
+            // Legacy fleet (non-dilink4): route teardown through
+            // runActivateGuarded(NONE) — original behaviour preserved.
             runActivateGuarded(Mode.NONE, "acc-off", () -> !accIsOn);
             return;
         }
@@ -1180,9 +1231,20 @@ public class RecordingModeManager {
         // already disabled by CameraDaemon.onAccOn() before this thread runs,
         // and CONTINUOUS/DRIVE_MODE recording hasn't started yet — there is no
         // active recording state to lose.
-        if (mode != Mode.NONE && pipeline.isFpsConfigStale()) {
+        // ESCO-PARITY: skip the FPS-stale teardown on dilink4. esco only
+        // restarts the camera for resolution/quality changes (config-diff
+        // at PanoCameraRecordService.m19844Z); FPS changes don't close the
+        // AVMCamera. On dilink4 we live with stale FPS until the next
+        // legitimate restart (process exit / fatal HAL event).
+        boolean dilink4FpsSkip = false;
+        try {
+            dilink4FpsSkip = com.overdrive.app.daemon.CameraDaemon.isDilink4ModeActiveStatic();
+        } catch (Throwable ignored) {}
+        if (mode != Mode.NONE && pipeline.isFpsConfigStale() && !dilink4FpsSkip) {
             logger.info("Camera FPS config changed — restarting pipeline to apply");
             pipeline.stop();
+        } else if (mode != Mode.NONE && pipeline.isFpsConfigStale() && dilink4FpsSkip) {
+            logger.info("Camera FPS config stale — keeping pipeline alive (dilink4 esco-parity)");
         }
 
         switch (mode) {
@@ -1196,11 +1258,20 @@ public class RecordingModeManager {
                 if (proximityController != null) {
                     proximityController.stop();
                 }
-                // Stop pipeline to save resources
-                if (pipeline.isRunning()) {
-                    logger.info("Stopping pipeline for NONE mode (resource saving)");
-                    pipeline.stop();
-                    CameraDaemon.stopAvcKeepAlive();
+                // ESCO-PARITY: dilink4 keeps pipeline alive on user-initiated
+                // mode=NONE; only legacy tears down for resource saving.
+                {
+                    boolean dilink4None = false;
+                    try {
+                        dilink4None = com.overdrive.app.daemon.CameraDaemon.isDilink4ModeActiveStatic();
+                    } catch (Throwable ignored) {}
+                    if (pipeline.isRunning() && !dilink4None) {
+                        logger.info("Stopping pipeline for NONE mode (resource saving)");
+                        pipeline.stop();
+                        CameraDaemon.stopAvcKeepAlive();
+                    } else if (dilink4None) {
+                        logger.info("NONE mode requested — keeping pipeline alive (dilink4 esco-parity)");
+                    }
                 }
                 modeActive = false;
                 break;
@@ -1302,11 +1373,23 @@ public class RecordingModeManager {
         modeActive = false;
 
         // Check if surveillance should be preserved — don't stop pipeline during ACC OFF
-        // (surveillance/sentry mode needs the pipeline running)
-        boolean keepPipelineRunning = !accIsOn;
-        
+        // (surveillance/sentry mode needs the pipeline running).
+        //
+        // ESCO-PARITY: dilink4 keeps the pipeline alive across user mode-
+        // switch deactivations (CONTINUOUS → other, PROXIMITY_GUARD → other).
+        // esco's mode toggles never close the AVMCamera handle.
+        boolean dilink4Persistent = false;
+        try {
+            dilink4Persistent = com.overdrive.app.daemon.CameraDaemon.isDilink4ModeActiveStatic();
+        } catch (Throwable ignored) {}
+        boolean keepPipelineRunning = !accIsOn || dilink4Persistent;
+
         if (keepPipelineRunning) {
-            logger.info("ACC is OFF — keeping pipeline running for surveillance");
+            if (dilink4Persistent && accIsOn) {
+                logger.info("dilink4 + ACC ON — keeping pipeline alive across deactivate (esco-parity)");
+            } else {
+                logger.info("ACC is OFF — keeping pipeline running for surveillance");
+            }
         }
         
         switch (mode) {

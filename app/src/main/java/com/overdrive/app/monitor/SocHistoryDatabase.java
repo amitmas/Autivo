@@ -960,10 +960,15 @@ public class SocHistoryDatabase {
                 if (liveKwh > 0) livePoint.put("kwh", Math.round(liveKwh * 10) / 10.0);
                 
                 com.overdrive.app.abrp.SohEstimator sohEst = getSohEstimator();
-                if (sohEst != null && sohEst.hasEstimate()) {
-                    livePoint.put("soh", Math.round(sohEst.getCurrentSoh() * 10) / 10.0);
+                if (sohEst != null && sohEst.hasDisplaySoh()) {
+                    // Use the headline display chain (frame_anchor > capacity_ah
+                    // > live > calibration on PHEV) so this last "live" point
+                    // matches the chip / detail card the user sees, instead
+                    // of the raw live formula that often diverges from the
+                    // higher-priority anchors on PHEV trims.
+                    livePoint.put("soh", Math.round(sohEst.getDisplaySoh() * 10) / 10.0);
                 }
-                
+
                 history.put(livePoint);
             }
             
@@ -1212,8 +1217,13 @@ public class SocHistoryDatabase {
             }
             
             com.overdrive.app.abrp.SohEstimator sohEst = getSohEstimator();
-            if (sohEst != null && sohEst.hasEstimate()) {
-                current.put("soh", Math.round(sohEst.getCurrentSoh() * 10) / 10.0);
+            if (sohEst != null && sohEst.hasDisplaySoh()) {
+                // Headline display chain (frame_anchor > capacity_ah > live >
+                // calibration on PHEV) — keeps the battery-health card and
+                // the SoH detail card in lockstep instead of showing two
+                // different numbers on PHEV trims where capacity_ah outranks
+                // the live formula.
+                current.put("soh", Math.round(sohEst.getDisplaySoh() * 10) / 10.0);
                 current.put("estimatedCapacityKwh", Math.round(sohEst.getEstimatedCapacityKwh() * 10) / 10.0);
                 current.put("nominalCapacityKwh", sohEst.getNominalCapacityKwh());
             } else {

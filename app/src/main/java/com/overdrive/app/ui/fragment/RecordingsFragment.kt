@@ -110,11 +110,17 @@ class RecordingsFragment : Fragment() {
 
     /**
      * Pending warming-state poll. The daemon's H2 index can be rebuilding
-     * on cold start; we poll /api/recordings/stats every 2s while
-     * warming=true so the header counters land as soon as the index is
-     * ready. Cancelled in onDestroyView.
+     * on cold start; we re-poll /api/recordings/stats with exponential
+     * backoff while warming=true so the header counters land as soon as
+     * the index is ready without hammering the HTTP server during a long
+     * warmup window. Cancelled in onDestroyView.
      */
     private var warmingRetryRunnable: Runnable? = null
+    /**
+     * Exponential-backoff counter for the warming-state stats poll. Resets
+     * to zero whenever a non-warming response lands.
+     */
+    private var warmingRetryAttempt: Int = 0
 
     // -------- Date state --------
     private val calendar = Calendar.getInstance()
@@ -1161,16 +1167,27 @@ class RecordingsFragment : Fragment() {
                 // so the header lights up as soon as warming flips false.
                 // Single in-flight retry — we cancel the prior one so a
                 // burst of refreshCounts() calls (segment switch + onResume)
-                // doesn't fan out N parallel polls.
+                // doesn't fan out N parallel polls. Exponential backoff
+                // (2 s → 4 s → 8 s → 10 s cap) so a 60+ s warmup doesn't
+                // pile 30 redundant requests on the daemon.
                 warmingRetryRunnable?.let { mainHandler.removeCallbacks(it) }
                 warmingRetryRunnable = null
                 if (warming) {
+                    val attempt = warmingRetryAttempt
+                            .coerceAtMost(WARMING_POLL_MAX_ATTEMPTS_FOR_BACKOFF)
+                    val delay = (WARMING_POLL_INTERVAL_MS shl attempt)
+                            .coerceAtMost(WARMING_POLL_CAP_MS)
+                    warmingRetryAttempt++
                     val retry = Runnable {
                         warmingRetryRunnable = null
                         refreshCounts()
                     }
                     warmingRetryRunnable = retry
-                    mainHandler.postDelayed(retry, WARMING_POLL_INTERVAL_MS)
+                    mainHandler.postDelayed(retry, delay)
+                } else {
+                    // Index ready — reset attempt counter so a future
+                    // warmup window starts at 2 s, not at the cap.
+                    warmingRetryAttempt = 0
                 }
             }
         }
@@ -1343,7 +1360,14 @@ class RecordingsFragment : Fragment() {
         private const val MAX_PLACE_CHIPS = 8
         /** Debounce window for the landscape free-text place-search field. */
         private const val PLACE_SEARCH_DEBOUNCE_MS = 300L
-        /** While the H2 index is warming, re-poll /api/stats at this cadence. */
-        private const val WARMING_POLL_INTERVAL_MS = 2_000L
+        /**
+         * Initial delay (and minimum) for warming-state stats poll.
+         * Doubles per retry up to {@link #WARMING_POLL_CAP_MS}.
+         */
+        private const val WARMING_POLL_INTERVAL_MS: Long = 2_000L
+        /** Hard cap so we never sleep more than 10 s between probes. */
+        private const val WARMING_POLL_CAP_MS: Long = 10_000L
+        /** Max shift exponent for backoff doubling — saturates the cap. */
+        private const val WARMING_POLL_MAX_ATTEMPTS_FOR_BACKOFF = 8
     }
 }

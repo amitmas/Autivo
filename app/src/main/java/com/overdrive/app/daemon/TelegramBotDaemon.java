@@ -1239,6 +1239,16 @@ public class TelegramBotDaemon {
             return;
         }
 
+        // Honor the connectivity-updates toggle: the startup greeting is
+        // semantically a connectivity event (bot just came online, same
+        // flavor as "Tunnel back online" at notifyTunnel). Skipping before
+        // the throttle stamp so a disabled toggle doesn't consume the
+        // 1-hour window and silently suppress a future re-enable.
+        if (!connectivityAlertsEnabled) {
+            log("Startup greeting skipped — connectivity updates disabled");
+            return;
+        }
+
         // Bypass throttle when this restart was caused by an app update —
         // the user just installed a new version and DOES want the
         // bot-online confirmation, even if a prior greeting fired within

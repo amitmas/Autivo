@@ -1505,6 +1505,80 @@ public class SohEstimator {
     // ==================== GETTERS ====================
 
     public double getCurrentSoh() { return currentSoh; }
+
+    /**
+     * Headline-displayed SoH percent — same priority chain as
+     * {@link #getStatus()}'s {@code displaySoh} field. Returns the highest-
+     * priority real value across all available sources, so chip / dashboard
+     * / battery-health UIs read a consistent number with the detail card.
+     *
+     * <p>Priority order:
+     * <ul>
+     *   <li>PHEV: frame_anchor &gt; capacity_ah (when not disabled) &gt;
+     *       live &gt; calibration</li>
+     *   <li>BEV: live &gt; calibration &gt; capacity_ah (final fallback,
+     *       when not disabled)</li>
+     * </ul>
+     *
+     * <p>Returns {@code -1} when no source has a real value yet.
+     *
+     * <p>This method intentionally mirrors the JSON priority chain in
+     * {@link #getStatus()} — keep them in sync. PHEV gating is read from
+     * {@link com.overdrive.app.byd.BydDataCollector}; the lookup is best-
+     * effort, falling back to BEV behaviour when the collector isn't ready.
+     */
+    public double getDisplaySoh() {
+        // Look up PHEV status *outside* autoDetectLock — BydDataCollector has
+        // its own internal locking and isPhevPublic() can ultimately call back
+        // into other subsystems. Acquiring autoDetectLock around an external
+        // call invites deadlock if those subsystems ever need this estimator.
+        boolean phev = false;
+        try {
+            com.overdrive.app.byd.BydDataCollector col =
+                com.overdrive.app.byd.BydDataCollector.getInstance();
+            if (col != null && col.isInitialized()) phev = col.isPhevPublic();
+        } catch (Throwable ignored) {}
+
+        // Snapshot all six fields under autoDetectLock so the priority chain
+        // sees a mutually consistent view. The fields aren't volatile (writers
+        // hold this same lock), so without acquiring here a cross-thread reader
+        // could see torn or stale values — e.g. currentSoh from before init
+        // while capacityAhSoh has already been written by the auto-detect path.
+        double frameSoh, curSoh, capAh, calSoh;
+        boolean capAhDisabled;
+        synchronized (autoDetectLock) {
+            frameSoh = getFrameAnchorSohLocked();
+            curSoh = currentSoh;
+            capAh = capacityAhSoh;
+            capAhDisabled = capacityAhDisabled;
+            calSoh = calibrationSoh;
+        }
+
+        if (phev && frameSoh > 0) return frameSoh;
+        if (phev && capAh > 0 && !capAhDisabled) return capAh;
+        if (curSoh > 0) return curSoh;
+        if (calSoh > 0) return calSoh;
+        if (capAh > 0 && !capAhDisabled) return capAh;
+        return -1;
+    }
+
+    /**
+     * Lock-held variant of {@link #getFrameAnchorSoh()} for callers that have
+     * already acquired {@code autoDetectLock} and need a consistent snapshot
+     * with sibling fields. Identical formula — see that method for behavior.
+     */
+    private double getFrameAnchorSohLocked() {
+        if (peakRemainKwhAtFull <= 0 || nominalCapacityKwh <= 0) return -1;
+        if (peakRemainKwhSamples < PEAK_REMAIN_KWH_REQUIRED_SAMPLES) return -1;
+        double soh = (peakRemainKwhAtFull / nominalCapacityKwh) * 100.0;
+        if (soh < 60.0) return 60.0;
+        if (soh > 110.0) return 110.0;
+        return soh;
+    }
+
+    /** True when {@link #getDisplaySoh()} would return a real value. */
+    public boolean hasDisplaySoh() { return getDisplaySoh() > 0; }
+
     public double getCalibrationSoh() { return calibrationSoh; }
     public long getCalibrationTimestampMs() { return calibrationTimestampMs; }
     public double getCapacityAhSoh() { return capacityAhSoh; }

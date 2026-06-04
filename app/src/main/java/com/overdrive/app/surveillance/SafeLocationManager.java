@@ -241,12 +241,26 @@ public class SafeLocationManager {
         // otherwise have its recording torn down here.
         com.overdrive.app.surveillance.GpuSurveillancePipeline pipeline = CameraDaemon.getGpuPipeline();
         if (pipeline != null && pipeline.isSurveillanceMode()) {
-            // Don't call disableSurveillance() through CameraDaemon — that clears
-            // the user's preference. Just disable the sentry component and stop
-            // the pipeline. The preference stays enabled so surveillance
-            // auto-restarts when leaving the zone or on the next ACC OFF.
+            // ESCO-PARITY: dilink4 keeps the pipeline alive on safe-zone
+            // entry — only flip sentry off. esco has no safe-zone feature
+            // but its analogous "pause sentry" logic never closes the
+            // AVMCamera. Closing the camera here triggers the same
+            // close+reopen race that produces all-zero frames on byd_apa.
+            //
+            // disableSurveillance() (GpuSurveillancePipeline) only sets
+            // sentry.disable() + currentMode=Mode.IDLE; it does not touch
+            // the camera handle. The pipeline stays alive; the next
+            // safe-zone exit re-arms sentry on the live pipeline.
             pipeline.disableSurveillance();
-            pipeline.stop();
+            boolean dilink4 = false;
+            try {
+                dilink4 = com.overdrive.app.daemon.CameraDaemon.isDilink4ModeActiveStatic();
+            } catch (Throwable ignored) {}
+            if (!dilink4) {
+                pipeline.stop();
+            } else {
+                CameraDaemon.log(TAG + ": dilink4 esco-parity — keeping pipeline alive on safe-zone entry");
+            }
             CameraDaemon.setSafeZoneSuppressed(true);
         } else {
             // Pipeline is busy with continuous / drive recording, or idle. Just
@@ -254,6 +268,15 @@ public class SafeLocationManager {
             // would have armed sentry, CameraDaemon's ACC-OFF handler skips it.
             CameraDaemon.setSafeZoneSuppressed(true);
         }
+        // OEM Dashcam: surv-axis suppression just changed. The OEM resolver
+        // reads SafeLocationManager.isInSafeZone() into survSuppressed, so
+        // a recalc will re-evaluate keepWarmSurv / surv=continuous and tear
+        // down the pipeline here if surveillance was the only consumer.
+        // Recording-axis (rec=continuous/smart) is unaffected by safe zones,
+        // matching pano dashcam recording behavior.
+        try {
+            com.overdrive.app.server.OemDashcamApiHandler.scheduleLifecycleRecalc();
+        } catch (Throwable ignored) {}
     }
 
     private void onLeftSafeZone() {
@@ -262,9 +285,18 @@ public class SafeLocationManager {
             CameraDaemon.setSafeZoneSuppressed(false);
             // Check persisted config — only restart if user actually wants surveillance
             if (com.overdrive.app.config.UnifiedConfigManager.isSurveillanceEnabled()) {
-                CameraDaemon.enableSurveillance();
+                CameraDaemon.enableSurveillance();   // fires OEM recalc internally
             }
         }
+        // OEM Dashcam: SAME recalc that onEnteredSafeZone does, regardless of
+        // whether enableSurveillance fired (it early-returns when ACC is ON or
+        // master toggle is off). Symmetric with the entered-zone path so the
+        // OEM resolver is guaranteed to re-evaluate inSafeZone on every
+        // boundary crossing — driving out of zone with ACC still ON would
+        // otherwise leave OEM resolver state stale until the next ACC OFF.
+        try {
+            com.overdrive.app.server.OemDashcamApiHandler.scheduleLifecycleRecalc();
+        } catch (Throwable ignored) {}
     }
 
     // ========================================================================

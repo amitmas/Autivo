@@ -7,6 +7,7 @@ import com.overdrive.app.logging.DaemonLogger;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
+import java.util.concurrent.CopyOnWriteArraySet;
 
 /**
  * Reflective port of esco's il.C6498a (BYDApaHelper).
@@ -78,16 +79,34 @@ public final class BydApaViewpointHelper {
     private static final int FEATURE_PANORAMA_OUTPUT_STATE = 1329598480;
 
     private static final Object LOCK = new Object();
-    private static volatile boolean enabled = false;
     private static volatile Object autoManagerInstance = null;
     private static volatile Object listenerProxy = null;
 
+    /** Token-based observer set. Mirrors esco C6498a observerSet
+     *  (CopyOnWriteArraySet<Object>). The set transitions 0→1 trigger
+     *  viewpoint=2012 + enableDevice + listener register; 1→0 transitions
+     *  trigger viewpoint=0 + listener unregister + disableDevice. While
+     *  size > 0 the helper is "enabled" — additional acquires are no-ops
+     *  beyond a viewpoint re-issue (idempotent recovery for HAL resets). */
+    private static final CopyOnWriteArraySet<Object> observerSet = new CopyOnWriteArraySet<>();
+
     private BydApaViewpointHelper() {}
 
-    /** Apply the panoramic viewpoint write. Called BEFORE AVMCamera.open()
-     *  on the GL thread. Idempotent — if the device is already enabled we
-     *  just re-issue the viewpoint write to recover from any HAL reset. */
-    public static void enableForPanoramic() {
+    /** Acquire a viewpoint hold under {@code token}. First holder writes
+     *  viewpoint=2012 + enables the panorama device + registers the
+     *  PANORAMA_OUTPUT_STATE listener. Subsequent holders re-issue the
+     *  viewpoint write (idempotent) but don't touch device/listener state.
+     *
+     *  ACC-OFF flow uses this to STRADDLE a session boundary: acquire a
+     *  fresh "sentry" token before releasing the active "pano" token, so
+     *  the set never goes 1→0 and the HAL never sees a viewpoint=0 write
+     *  during the camera close. Mirrors esco's C7340b sentry restart not
+     *  unregistering its observer until after the new C5319i registers.
+     *
+     *  Token must be a stable Object reference — a per-instance Object()
+     *  is fine. {@code release} must be called with the same token. */
+    public static void acquire(Object token) {
+        if (token == null) return;
         synchronized (LOCK) {
             try {
                 Object mgr = ensureAutoManager();
@@ -95,51 +114,111 @@ public final class BydApaViewpointHelper {
                     logger.warn("BYDAutoManager unavailable — skipping viewpoint write");
                     return;
                 }
-                if (!enabled) {
+                boolean wasEmpty = observerSet.isEmpty();
+                if (!observerSet.add(token)) {
+                    // Already held by this token — re-issue viewpoint as
+                    // an HAL-reset recovery, mirroring the prior idempotent
+                    // call site (PANORAMA_OUTPUT_STATE=1 → re-apply).
+                    int rc = invokeSetIntArray(mgr, DEVICE_PANORAMA,
+                        PANO_VIEWPOINT_SET_FEATURES,
+                        new int[]{ 7, 0, 1, 0, 0 });
+                    logger.info("Viewpoint re-applied (vp=" + VIEWPOINT_ON
+                        + ", rc=" + rc + ", token=" + token + ", set=" + observerSet.size() + ")");
+                    return;
+                }
+                if (wasEmpty) {
+                    // Mirror esco C6498a.m28930h size==1 branch (il/C6498a.java:176-178):
+                    // enableDevice + listener register + viewpoint=2012 fire ONLY on
+                    // 0→1 transition. Subsequent holders register silently; the
+                    // listener's PANORAMA_OUTPUT_STATE=1 handler is the recovery
+                    // path for HAL resets, not a per-add re-issue.
                     invokeEnableDevice(mgr, DEVICE_PANORAMA, PANORAMA_LISTENER_FEATURES);
                     registerListener(mgr);
-                    enabled = true;
+                    int rc = invokeSetIntArray(mgr, DEVICE_PANORAMA,
+                        PANO_VIEWPOINT_SET_FEATURES,
+                        new int[]{ 7, 0, 1, 0, 0 });
+                    logger.info("Viewpoint acquire 0→1 (vp=" + VIEWPOINT_ON
+                        + ", rc=" + rc + ", token=" + token + ")");
+                } else {
+                    logger.info("Viewpoint acquire (additional holder, no HAL write, token="
+                        + token + ", set=" + observerSet.size() + ")");
                 }
-                int rc = invokeSetIntArray(mgr, DEVICE_PANORAMA,
-                    PANO_VIEWPOINT_SET_FEATURES,
-                    new int[]{ 7, 0, 1, 0, 0 });
-                logger.info("Viewpoint set ON (vp=" + VIEWPOINT_ON + ", rc=" + rc + ")");
             } catch (Throwable t) {
                 if (isDeadBinder(t)) {
-                    logger.warn("enableForPanoramic hit dead binder — recovering on next call");
+                    logger.warn("acquire hit dead binder — recovering on next call");
                     invalidateAutoManagerInstance();
                 } else {
-                    logger.warn("enableForPanoramic failed: " + t.getMessage());
+                    logger.warn("acquire failed: " + t.getMessage());
                 }
             }
         }
     }
 
-    /** Reset viewpoint and release the panorama device. Called AFTER camera close. */
-    public static void disable() {
+    /** Release {@code token}. If this was the last holder, write viewpoint=0,
+     *  unregister the listener, and disableDevice. Otherwise no HAL writes.
+     *
+     *  Mirrors esco C6498a.m28933k (line 217-226): on observerSet emptiness
+     *  it calls m28932j(0) + processMonitor.m28941d() + panoStateMonitor.m28937d();
+     *  otherwise it just removes the entry silently. */
+    public static void release(Object token) {
+        if (token == null) return;
         synchronized (LOCK) {
-            if (!enabled) return;
+            if (!observerSet.remove(token)) {
+                logger.info("release: token not held (token=" + token
+                    + ", set=" + observerSet.size() + ")");
+                return;
+            }
+            if (!observerSet.isEmpty()) {
+                logger.info("release: holders remain (token=" + token
+                    + ", set=" + observerSet.size() + ") — keeping viewpoint=ON");
+                return;
+            }
             try {
                 Object mgr = autoManagerInstance;
                 if (mgr != null) {
                     int rc = invokeSetIntArray(mgr, DEVICE_PANORAMA,
                         PANO_VIEWPOINT_SET_FEATURES,
                         new int[]{ 2, 0, 1, 0, 0 });
-                    logger.info("Viewpoint set OFF (vp=" + VIEWPOINT_OFF + ", rc=" + rc + ")");
+                    logger.info("Viewpoint release (vp=" + VIEWPOINT_OFF
+                        + ", rc=" + rc + ", token=" + token + ", set=0)");
                     unregisterListener(mgr);
                     invokeDisableDevice(mgr, DEVICE_PANORAMA);
                 }
             } catch (Throwable t) {
                 if (isDeadBinder(t)) {
-                    logger.warn("disable hit dead binder — invalidating cached BYDAutoManager");
+                    logger.warn("release hit dead binder — invalidating cached BYDAutoManager");
                     invalidateAutoManagerInstance();
                 } else {
-                    logger.warn("disable failed: " + t.getMessage());
+                    logger.warn("release failed: " + t.getMessage());
                 }
-            } finally {
-                enabled = false;
             }
         }
+    }
+
+    /** Snapshot of the active holder count — for diagnostic logs only. */
+    public static int holderCount() {
+        return observerSet.size();
+    }
+
+    /** Legacy wrapper: per-process singleton token used by the existing
+     *  startCameraViaAvmReflection callsite. Equivalent to esco's
+     *  C5920a.mo26750v register call (single C5920a instance per camera
+     *  open). New code paths (sentry straddle) should allocate their own
+     *  token so the observerSet semantics work as designed. */
+    private static final Object PIPELINE_TOKEN = new Object() {
+        @Override public String toString() { return "pipeline"; }
+    };
+
+    /** @deprecated use {@link #acquire(Object)} with a per-instance token. */
+    @Deprecated
+    public static void enableForPanoramic() {
+        acquire(PIPELINE_TOKEN);
+    }
+
+    /** @deprecated use {@link #release(Object)} with the matching token. */
+    @Deprecated
+    public static void disable() {
+        release(PIPELINE_TOKEN);
     }
 
     /** Detect DeadObjectException in any reflective wrapper layer. The
@@ -156,13 +235,20 @@ public final class BydApaViewpointHelper {
         return false;
     }
 
-    /** Drop the cached BYDAutoManager and listener proxy. Next
-     *  enableForPanoramic will call ensureAutoManager again, getting a fresh
-     *  binder proxy from the system service. */
+    /** Drop the cached BYDAutoManager and listener proxy. Next acquire()
+     *  will call ensureAutoManager again, getting a fresh binder proxy
+     *  from the system service. The observerSet stays — it tracks intent,
+     *  not binder state — so once the manager comes back the next acquire()
+     *  branch (wasEmpty? false) will re-issue the viewpoint write. The
+     *  enableDevice + listener register path is one-shot per holder count
+     *  transition; we lose listener registration here but on dead-binder
+     *  recovery the manager is fresh and the next acquire() will re-register
+     *  via the size 0→1 path the next time the set fully empties first.
+     *  Acceptable: dead binder is rare and listener loss is recovered on
+     *  next session boundary. */
     private static void invalidateAutoManagerInstance() {
         autoManagerInstance = null;
         listenerProxy = null;
-        enabled = false;
     }
 
     private static Object ensureAutoManager() {
@@ -220,11 +306,11 @@ public final class BydApaViewpointHelper {
                         logger.info("PANORAMA_OUTPUT_STATE=" + v);
                         if (v == 1) {
                             // HAL came back online — re-apply mosaic viewpoint.
-                            // Hold LOCK + check enabled to avoid racing disable().
+                            // Hold LOCK + check observerSet to avoid racing release().
                             // The listener fires on a BYDAutoManager binder thread;
-                            // disable() runs on whichever thread closes the camera.
+                            // release() runs on whichever thread closes the camera.
                             synchronized (LOCK) {
-                                if (!enabled) return null;  // disable() already ran
+                                if (observerSet.isEmpty()) return null;  // last release() already ran
                                 try {
                                     int rc = invokeSetIntArray(mgr, DEVICE_PANORAMA,
                                         PANO_VIEWPOINT_SET_FEATURES,

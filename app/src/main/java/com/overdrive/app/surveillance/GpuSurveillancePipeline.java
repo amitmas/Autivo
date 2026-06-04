@@ -1079,7 +1079,21 @@ public class GpuSurveillancePipeline {
             }
             camera.setCameraSurfaceMode(resolvedCamera.getPanoSurfaceMode());
             camera.setAutoProbeCameras(false);
-            camera.setSkipFrameValidation(false);
+            // ESCO-PARITY: dilink4 trusts the HAL camera-id resolution
+            // unconditionally — esco's gl/C5920a static-init resolves the
+            // camera ID via BmmCameraInfo and never re-probes. Frame-50
+            // black-pixel re-probe (PanoramicCameraGpu.java:2233-2251)
+            // would call closeCameraForPath + recreateCameraSurface on
+            // first-boot — the same close+reopen race we've eliminated
+            // everywhere else. Skip frame validation on dilink4.
+            boolean dilink4Cam = false;
+            try {
+                dilink4Cam = com.overdrive.app.daemon.CameraDaemon.isDilink4ModeActiveStatic();
+            } catch (Throwable ignored) {}
+            camera.setSkipFrameValidation(dilink4Cam);
+            if (dilink4Cam) {
+                logger.info("dilink4: skipping frame-50 auto-probe re-validation (esco-parity)");
+            }
         }
 
         // Register probe callback — only used when manual probe is triggered via API
@@ -1327,9 +1341,14 @@ public class GpuSurveillancePipeline {
                 }
             });
             
-            // Wait for camera to fully initialize and GL context to be ready
-            // Increased timeout to ensure recorder can be initialized
-            Thread.sleep(1500);  // Increased from 1000ms to 1500ms
+            // Wait for camera to fully initialize and GL context to be ready.
+            // This isn't an esco-parity concern — the sleep gives MediaCodec
+            // time to consume the first encoder input frame so the
+            // INFO_OUTPUT_FORMAT_CHANGED callback fires and the encoder format
+            // is saved for reuse. Field log (camera_daemon_20260604_120145.log)
+            // showed every startRecording() returning formatAvailable=false
+            // when this sleep was skipped on dilink4 — recording never started.
+            Thread.sleep(1500);
             
             // Set callback to start recording when recorder is ready
             if (autoStartRecording) {
@@ -1354,8 +1373,11 @@ public class GpuSurveillancePipeline {
             if (camera.getEglCore() != null) {
                 camera.initRecorderOnGlThread(recorder, encoder);
                 logger.info( "Recorder initialization scheduled on GL thread");
-                
-                // Wait for recorder to initialize before continuing
+                // Wait for recorder GL bind to complete on the GL thread —
+                // initRecorderOnGlThread schedules the bind via glHandler.post,
+                // and a downstream startRecording() before the bind completes
+                // fails with formatAvailable=false. Removing this sleep on
+                // dilink4 broke recording in the field log.
                 Thread.sleep(500);
             }
             
@@ -1981,16 +2003,28 @@ public class GpuSurveillancePipeline {
             stopRecording();
         }
 
-        // CRITICAL: Reopen camera to let BYD native app get video frames.
-        // During ACC OFF the daemon holds the camera exclusively for surveillance.
-        // The native camera app starts on ACC ON but can't get frames because we
-        // already have the primary slot. Briefly releasing and reopening the camera
-        // lets the native app grab it first, then we get added as secondary consumer.
-        if (camera != null && running) {
+        // ESCO-PARITY: dilink4 never closes the AVMCamera handle. esco's
+        // PanoCameraRecord stays alive across ACC ON; the BYD native AVC app
+        // attaches as a co-consumer of the AVM HAL daemon (gl/C5920a.java
+        // observerSet) and shares the producer surface naturally.
+        // reopenCamera() does a full close+reopen of our AVMCamera handle,
+        // which on byd_apa firmware drops mosaic mode and leaves the next
+        // open with all-zero frames — exactly what the user reports.
+        //
+        // Legacy fleet keeps the original "release and reopen as secondary
+        // consumer" behaviour because that's how non-byd_apa HALs share.
+        boolean dilink4 = false;
+        try {
+            dilink4 = com.overdrive.app.daemon.CameraDaemon.isDilink4ModeActiveStatic();
+        } catch (Throwable ignored) {}
+        if (camera != null && running && !dilink4) {
             camera.reopenCamera();
+            logger.info("ACC ON transition complete - all recordings finalized, camera reopened");
+        } else if (dilink4) {
+            logger.info("ACC ON transition complete - dilink4 keeps camera alive (esco-parity, no reopen)");
+        } else {
+            logger.info("ACC ON transition complete - all recordings finalized");
         }
-
-        logger.info("ACC ON transition complete - all recordings finalized, camera reopened");
     }
     
     /**
@@ -2277,7 +2311,20 @@ public class GpuSurveillancePipeline {
                             //     down between trigger windows and the next event would
                             //     silently no-op against a null recorder.
                             boolean pendingRec = pendingRecordingDir != null;
-                            if (mode == Mode.IDLE && !recordingActive && !pendingRec && !keepAlive && running) {
+                            // ESCO-PARITY: dilink4 keeps the pipeline alive
+                            // unconditionally — esco's PanoCameraRecord is
+                            // started at boot and never stopped on stream-
+                            // client idle. The auto-stop here is a legacy
+                            // resource-saving optimisation that breaks the
+                            // "always-on camera for parked preview" model.
+                            boolean dilink4Persistent = false;
+                            try {
+                                dilink4Persistent = com.overdrive.app.daemon.CameraDaemon
+                                    .isDilink4ModeActiveStatic();
+                            } catch (Throwable ignored) {}
+                            if (dilink4Persistent) {
+                                logger.info("Pipeline kept alive (dilink4 esco-parity — never auto-stop on WS idle)");
+                            } else if (mode == Mode.IDLE && !recordingActive && !pendingRec && !keepAlive && running) {
                                 logger.info("No recording consumers active - stopping pipeline to save resources");
                                 self.stop();
                             } else {
@@ -2297,7 +2344,17 @@ public class GpuSurveillancePipeline {
         wsStreamServer.start();
         logger.info("WebSocket server started, setting stream callback...");
         streamEncoder.setStreamCallback(wsStreamServer);
-        
+
+        // Force an IDR keyframe at session start so the first packet sent to
+        // any WebSocket client is decodable on its own. Without this, the
+        // first NAL after a fresh stream encoder is often a P-frame
+        // referencing an I-frame the client never received → decoders show
+        // one frame and stall until the next GOP boundary (~2 s later).
+        // Field-reported as "subsequent stream sessions show single frame"
+        // after the prior session's stream encoder was torn down by the
+        // WS-idle path.
+        streamEncoder.requestSyncFrame();
+
         streamingEnabled = true;
         logger.info("H.264 streaming enabled (WebSocket port 8887)");
     }

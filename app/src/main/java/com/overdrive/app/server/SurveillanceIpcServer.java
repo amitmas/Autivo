@@ -133,20 +133,26 @@ public class SurveillanceIpcServer implements Runnable {
                     // Start surveillance (from Telegram /start command)
                     com.overdrive.app.config.UnifiedConfigManager.setSurveillanceEnabled(true);
                     if (!com.overdrive.app.monitor.AccMonitor.isAccOn()) {
-                        CameraDaemon.enableSurveillance();
+                        CameraDaemon.enableSurveillance();   // fires OEM recalc
                         logger.info("Surveillance started via Telegram IPC");
                     } else {
                         logger.info("Surveillance preference saved via Telegram — will activate on ACC OFF");
+                        // OEM resolver reads isSurveillanceEnabled into survSuppressed
+                        try { com.overdrive.app.server.OemDashcamApiHandler.scheduleLifecycleRecalc(); }
+                        catch (Throwable ignored) {}
                     }
                     response.put("success", true);
                     response.put("enabled", true);
                     response.put("message", "Surveillance enabled");
                     break;
-                    
+
                 case "STOP":
                     // Stop surveillance (from Telegram /stop command)
-                    CameraDaemon.disableSurveillance();
+                    CameraDaemon.disableSurveillance();   // fires OEM recalc
                     com.overdrive.app.config.UnifiedConfigManager.setSurveillanceEnabled(false);
+                    // Second recalc post-write so resolver sees the new master toggle.
+                    try { com.overdrive.app.server.OemDashcamApiHandler.scheduleLifecycleRecalc(); }
+                    catch (Throwable ignored) {}
                     logger.info("Surveillance stopped via Telegram IPC");
                     response.put("success", true);
                     response.put("enabled", false);
@@ -172,15 +178,18 @@ public class SurveillanceIpcServer implements Runnable {
                 case "ENABLE_SURVEILLANCE":
                     // Persist preference only — surveillance will auto-start on next ACC OFF
                     com.overdrive.app.config.UnifiedConfigManager.setSurveillanceEnabled(true);
+                    // OEM resolver: survSuppressed depends on master toggle.
+                    try { com.overdrive.app.server.OemDashcamApiHandler.scheduleLifecycleRecalc(); }
+                    catch (Throwable ignored) {}
                     logger.info("Surveillance preference set to ENABLED (will activate on ACC OFF)");
                     response.put("success", true);
                     response.put("enabled", true);
                     break;
-                    
+
                 case "DISABLE_SURVEILLANCE":
                     // Persist preference and stop if currently running
                     com.overdrive.app.config.UnifiedConfigManager.setSurveillanceEnabled(false);
-                    CameraDaemon.disableSurveillance();
+                    CameraDaemon.disableSurveillance();   // fires OEM recalc internally
                     logger.info("Surveillance preference set to DISABLED and stopped");
                     response.put("success", true);
                     response.put("enabled", false);
@@ -534,13 +543,15 @@ public class SurveillanceIpcServer implements Runnable {
                     // RACE CONDITION FIX: Only enable surveillance if ACC is actually OFF.
                     // AccSentryDaemon's retry loop may send this IPC after ACC turned ON.
                     if (!com.overdrive.app.monitor.AccMonitor.isAccOn()) {
-                        CameraDaemon.enableSurveillance();
+                        CameraDaemon.enableSurveillance();   // fires OEM recalc
                         logger.info("Surveillance enabled via IPC");
                     } else {
                         logger.info("Surveillance preference saved via IPC — but ACC is ON, not activating");
+                        try { com.overdrive.app.server.OemDashcamApiHandler.scheduleLifecycleRecalc(); }
+                        catch (Throwable ignored) {}
                     }
                 } else {
-                    CameraDaemon.disableSurveillance();
+                    CameraDaemon.disableSurveillance();   // fires OEM recalc
                     logger.info("Surveillance disabled via IPC");
                 }
             }

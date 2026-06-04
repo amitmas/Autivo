@@ -196,6 +196,13 @@ public class CameraDaemon {
 
     // ==================== TRIP ANALYTICS ====================
     private static volatile com.overdrive.app.trips.TripAnalyticsManager tripAnalyticsManager;
+    private static volatile java.util.concurrent.CompletableFuture<Void> tripAnalyticsInitFuture;
+
+    // ==================== DATA LAYER (RecordingsIndex parallel kick) ====================
+    // Completes when the parallel RecordingsIndex.init() + warmupAsync kick
+    // returns. shutdown() and any caller that needs a guaranteed-open index
+    // joins on this so we don't tear down a half-initialised DB.
+    private static volatile java.util.concurrent.CompletableFuture<Void> dataLayerInitFuture;
 
     // ==================== TELEMETRY DATA COLLECTOR ====================
     private static volatile com.overdrive.app.telemetry.TelemetryDataCollector telemetryDataCollector;
@@ -453,10 +460,14 @@ public class CameraDaemon {
         // never opted in or the package isn't on this trim. We're already
         // running as UID shell so pm calls succeed directly.
         com.overdrive.app.server.OemDashcamApiHandler.enforceStickyDisableIfRequested();
-        // OEM Dashcam pipeline: if the user had it enabled on a previous run,
-        // restart it now. Async — pipeline.start() blocks on AVC warmup +
-        // AVMCamera open and we don't want to delay daemon boot.
-        com.overdrive.app.server.OemDashcamApiHandler.enforceStickyEnableIfRequested();
+        // OEM Dashcam pipeline: sticky enable is INTENTIONALLY deferred until
+        // after the ACC hardware probe at line ~794. The two-axis resolver
+        // gates each axis on AccMonitor.isAccOn(), and AccMonitor defaults to
+        // accOn=false at boot. If we run the resolver here, a daemon respawn
+        // mid-drive (ACC actually ON) would be misclassified as parked and
+        // would arm the surveillance axis on top of an actively-driving car.
+        // Move sticky-enable below probeAccState so the resolver sees the
+        // real ACC state on its first run.
         // Concurrent-AVM probe: write camera.concurrentAvmSupported once
         // when both pano and OEM ids are known. The probe opens both
         // AVMCameras for ~2-5s to verify HAL allows simultaneous clients.
@@ -514,7 +525,53 @@ public class CameraDaemon {
         // was recording. Cost: one directory walk every 30s; the threshold
         // check exits early if usage is below 90%.
         storageManager.startPeriodicCleanup();
-        
+
+        // Data-layer kickoff. RecordingsIndex's H2 open + warmup walk is
+        // independent of GPU / ABRP / MQTT / TripDB and dominated user-
+        // visible "Recordings page takes 5+ min" because it used to run
+        // last in the serial init chain. Move it to a dedicated thread
+        // that races initSurveillance() — the index is ready before the
+        // GPU pipeline is armed in 99% of cases. File watchers wired in
+        // the same block so they observe writes that begin during
+        // initSurveillance().
+        //
+        // dataLayerInitFuture lets shutdown() join cleanly without
+        // serializing the GPU init behind it. start() wrapped in try/
+        // catch so an OOM/Security exception at thread spawn doesn't
+        // leave the future forever pending.
+        dataLayerInitFuture = new java.util.concurrent.CompletableFuture<>();
+        try {
+            Thread dataLayerThread = new Thread(() -> {
+                try {
+                    log("Initializing RecordingsIndex (parallel)...");
+                    long t0 = System.currentTimeMillis();
+                    boolean idxOk = com.overdrive.app.server.RecordingsIndex.getInstance().init();
+                    if (idxOk) {
+                        log("RecordingsIndex initialized in "
+                                + (System.currentTimeMillis() - t0) + "ms — kicking off async warmup");
+                        com.overdrive.app.server.RecordingsIndex.getInstance().warmupAsync();
+                        try {
+                            RecordingsIndexFileWatcher.getInstance().start();
+                        } catch (Throwable t) {
+                            log("RecordingsIndexFileWatcher start error: "
+                                    + t.getClass().getSimpleName() + ": " + t.getMessage());
+                        }
+                    } else {
+                        log("RecordingsIndex init returned false — API will fall back to direct-FS");
+                    }
+                } catch (Exception e) {
+                    log("RecordingsIndex init error: " + e.getMessage());
+                } finally {
+                    dataLayerInitFuture.complete(null);
+                }
+            }, "RecordingsIndexInit");
+            dataLayerThread.setDaemon(true);
+            dataLayerThread.start();
+        } catch (Throwable t) {
+            log("RecordingsIndex thread spawn failed: " + t.getMessage());
+            dataLayerInitFuture.complete(null);
+        }
+
         // Note: we deliberately don't seed the version file here. The
         // updater writes it after a successful install with the actual
         // GitHub release string (e.g. "alpha-v15.6"). Until the user has
@@ -622,6 +679,87 @@ public class CameraDaemon {
             log("SohEstimator init error: " + e.getMessage());
         }
 
+        // Initialize Trip Analytics on its own thread, kicked HERE so it
+        // races initVehicleDataMonitor() (which on long-running installs
+        // pays a 100+ s background SOC migration) plus ABRP / MQTT init.
+        // The H2 trip database open + orphan-trip cleanup + size_bytes
+        // backfill takes ~3-5 s and writes nothing the UI depends on
+        // until the user actually shifts out of P, by which point this
+        // future is long completed.
+        // GearMonitor.getCurrentGear() returns GEAR_P when not yet
+        // started (initVehicleDataMonitor wires it later), so the
+        // auto-start branch correctly no-ops at boot.
+        // tripAnalyticsInitFuture lets shutdown() join cleanly.
+        final SohEstimator sohEstSnapshot = sohEstimator;
+        tripAnalyticsInitFuture = new java.util.concurrent.CompletableFuture<>();
+        try {
+            Thread tripAnalyticsThread = new Thread(() -> {
+                try {
+                    log("Initializing Trip Analytics (parallel)...");
+                    long t0 = System.currentTimeMillis();
+                    com.overdrive.app.trips.TripAnalyticsManager tam =
+                            new com.overdrive.app.trips.TripAnalyticsManager();
+                    tam.init(sharedAppContext, telemetryDataCollector, sohEstSnapshot);
+                    tripAnalyticsManager = tam;
+                    // initSurveillance() runs synchronously on the main
+                    // thread BEFORE this thread is spawned, so
+                    // telemetryDataCollector is already published. Re-read
+                    // the volatile and forward defensively in case a future
+                    // refactor moves the parallel kick earlier — the
+                    // setTelemetryDataCollector call is idempotent.
+                    com.overdrive.app.telemetry.TelemetryDataCollector tdc = telemetryDataCollector;
+                    if (tdc != null) {
+                        try { tam.setTelemetryDataCollector(tdc); }
+                        catch (Throwable ignored) {}
+                    }
+                    log("Trip Analytics initialized in "
+                            + (System.currentTimeMillis() - t0) + "ms (enabled="
+                            + tam.isEnabled() + ")");
+
+                    // ONE-TIME migration: clear poisoned consumption buckets
+                    // if this is a PHEV and the migration hasn't been done.
+                    java.io.File bucketMigrationMarker = new java.io.File("/data/local/tmp/overdrive_bucket_migration_done");
+                    if (sohEstSnapshot != null && sohEstSnapshot.getNominalCapacityKwh() > 0
+                            && sohEstSnapshot.getNominalCapacityKwh() < 30.0
+                            && tam.getDatabase() != null
+                            && !bucketMigrationMarker.exists()) {
+                        tam.getDatabase().clearConsumptionBuckets();
+                        log("One-time PHEV bucket migration: cleared poisoned consumption data");
+                        try {
+                            new java.io.FileWriter(bucketMigrationMarker).close();
+                        } catch (Exception e) {
+                            log("WARNING: Could not write bucket migration marker: " + e.getMessage());
+                        }
+                    }
+
+                    // AUTO-START: if gear is non-P, start trip recording
+                    // (handles mid-drive daemon restart).
+                    if (tam.isEnabled()) {
+                        try {
+                            int currentGear = com.overdrive.app.monitor.GearMonitor.getInstance().getCurrentGear();
+                            if (currentGear != com.overdrive.app.monitor.GearMonitor.GEAR_P) {
+                                log("Trip Analytics: non-P gear detected at startup (gear="
+                                        + com.overdrive.app.monitor.GearMonitor.gearToString(currentGear)
+                                        + ") — auto-starting trip recording");
+                                tam.onGearChanged(currentGear);
+                            }
+                        } catch (Exception e) {
+                            log("Trip Analytics gear probe error: " + e.getMessage());
+                        }
+                    }
+                } catch (Exception e) {
+                    log("Trip Analytics init error: " + e.getMessage());
+                } finally {
+                    tripAnalyticsInitFuture.complete(null);
+                }
+            }, "TripAnalyticsInit");
+            tripAnalyticsThread.setDaemon(true);
+            tripAnalyticsThread.start();
+        } catch (Throwable t) {
+            log("Trip Analytics thread spawn failed: " + t.getMessage());
+            tripAnalyticsInitFuture.complete(null);
+        }
+
         // Initialize Vehicle Data Monitor + BydDataCollector
         initVehicleDataMonitor();
 
@@ -695,86 +833,12 @@ public class CameraDaemon {
             log("Cloud MQTT subscriber start failed: " + e.getMessage());
         }
 
-        // Initialize Trip Analytics
-        try {
-            log("Initializing Trip Analytics...");
-            tripAnalyticsManager = new com.overdrive.app.trips.TripAnalyticsManager();
-            tripAnalyticsManager.init(sharedAppContext, telemetryDataCollector, sohEstimator);
-            log("Trip Analytics initialized (enabled=" + tripAnalyticsManager.isEnabled() + ")");
-
-            // ONE-TIME migration: Clear poisoned consumption buckets if this is a PHEV
-            // and the migration hasn't been done yet. Old trips may have been recorded
-            // with wrong nominal capacity (e.g., 60 kWh BEV default instead of 18.3 kWh PHEV).
-            // This must only run ONCE — running it every startup wipes all accumulated
-            // consumption data, which makes the personalized range estimator return null
-            // until enough new trips rebuild the buckets (minimum 3 samples per bucket).
-            java.io.File bucketMigrationMarker = new java.io.File("/data/local/tmp/overdrive_bucket_migration_done");
-            if (sohEstimator != null && sohEstimator.getNominalCapacityKwh() > 0
-                    && sohEstimator.getNominalCapacityKwh() < 30.0
-                    && tripAnalyticsManager.getDatabase() != null
-                    && !bucketMigrationMarker.exists()) {
-                tripAnalyticsManager.getDatabase().clearConsumptionBuckets();
-                log("One-time PHEV bucket migration: cleared poisoned consumption data");
-                try {
-                    new java.io.FileWriter(bucketMigrationMarker).close();
-                } catch (Exception e) {
-                    log("WARNING: Could not write bucket migration marker: " + e.getMessage());
-                }
-            }
-
-            // AUTO-START: If gear is already in a driving position (not P), start trip
-            // recording immediately. This handles the case where CameraDaemon restarts
-            // mid-drive (e.g., EGL crash watchdog, manual restart) or starts after the
-            // driver has already shifted out of P.
-            if (tripAnalyticsManager.isEnabled()) {
-                try {
-                    int currentGear = com.overdrive.app.monitor.GearMonitor.getInstance().getCurrentGear();
-                    if (currentGear != com.overdrive.app.monitor.GearMonitor.GEAR_P) {
-                        log("Trip Analytics: non-P gear detected at startup (gear="
-                                + com.overdrive.app.monitor.GearMonitor.gearToString(currentGear)
-                                + ") — auto-starting trip recording");
-                        tripAnalyticsManager.onGearChanged(currentGear);
-                    }
-                } catch (Exception e) {
-                    log("Trip Analytics gear probe error: " + e.getMessage());
-                }
-            }
-        } catch (Exception e) {
-            log("Trip Analytics init error: " + e.getMessage());
-        }
-
-        // Initialize RecordingsIndex (H2-backed) — supersedes the legacy
-        // in-memory RECORDING_CACHE in RecordingsApiHandler. init() opens
-        // the H2 file at /data/local/tmp/overdrive_recordings_h2 (daemon
-        // UID 2000 owns it; cross-UID reads happen via /api/recordings,
-        // not direct JDBC). warmupAsync() walks every dir on a background
-        // thread so the first user-visible /api/recordings call doesn't
-        // block. Live updates flow through RecordingsIndexFileWatcher
-        // below; the 1-hour reconcile registered in
-        // startPeriodicMemoryLogging() is the FUSE-drop backstop.
-        try {
-            log("Initializing RecordingsIndex...");
-            boolean idxOk = com.overdrive.app.server.RecordingsIndex.getInstance().init();
-            if (idxOk) {
-                log("RecordingsIndex initialized — kicking off async warmup");
-                com.overdrive.app.server.RecordingsIndex.getInstance().warmupAsync();
-                // FileObservers AFTER warmup is dispatched — start() returns
-                // immediately, the warmup thread races independently.
-                // Wrapping in try/catch here too: a kernel that refuses to
-                // arm inotify on the SD card mount must not tank daemon
-                // bring-up.
-                try {
-                    RecordingsIndexFileWatcher.getInstance().start();
-                } catch (Throwable t) {
-                    log("RecordingsIndexFileWatcher start error: "
-                            + t.getClass().getSimpleName() + ": " + t.getMessage());
-                }
-            } else {
-                log("RecordingsIndex init returned false — API will fall back to direct-FS");
-            }
-        } catch (Exception e) {
-            log("RecordingsIndex init error: " + e.getMessage());
-        }
+        // Trip Analytics + RecordingsIndex init were both kicked in parallel
+        // earlier in main() — see dataLayerInitFuture (after StorageManager)
+        // and tripAnalyticsInitFuture (after sohEstimator.init). By the time
+        // execution reaches here, both inits are almost always already done;
+        // the recordings-index warmup keeps running on its own thread and
+        // clients see warming=true responses until it finishes.
 
         // Initialize OdometerReader for trip distance
         try {
@@ -799,6 +863,13 @@ public class CameraDaemon {
         } catch (Exception e) {
             log("ACC hardware probe error: " + e.getMessage());
         }
+
+        // Now that AccMonitor has been seeded by the hardware probe, the OEM
+        // resolver can produce the right desired-state for the current ACC
+        // phase. enforceStickyEnableIfRequested submits the recalc to the
+        // dedicated lifecycle executor; it runs async so daemon boot isn't
+        // blocked by AVC warmup + AVMCamera open inside the OEM pipeline.
+        com.overdrive.app.server.OemDashcamApiHandler.enforceStickyEnableIfRequested();
 
         log("Daemon ready on TCP:" + TCP_PORT + " HTTP:" + HTTP_PORT);
 
@@ -1135,6 +1206,12 @@ public class CameraDaemon {
         }
     }
 
+    /** Public alias for cross-class callers (RecordingModeManager,
+     *  GpuSurveillancePipeline, SafeLocationManager). */
+    public static boolean isDilink4ModeActiveStatic() {
+        return isDilink4ModeActive();
+    }
+
     private static void publishCameraActiveLease() {
         try {
             org.json.JSONObject patch = new org.json.JSONObject();
@@ -1321,7 +1398,25 @@ public class CameraDaemon {
         try { com.overdrive.app.monitor.PerformanceMonitor.getInstance().stop(); } catch (Exception ignored) {}
         try { com.overdrive.app.monitor.SocHistoryDatabase.getInstance().stop(); } catch (Exception ignored) {}
         
-        // Stop services
+        // Stop services. Both the trip analytics + recordings index inits
+        // run on parallel threads (see main()); join with a short timeout
+        // before tearing down so we don't close a half-opened H2
+        // connection. 5 s comfortably exceeds measured init time (~3-5 s
+        // for trips, ~1 s for index open).
+        try {
+            if (tripAnalyticsInitFuture != null) {
+                tripAnalyticsInitFuture.get(5, java.util.concurrent.TimeUnit.SECONDS);
+            }
+        } catch (Exception e) {
+            log("Trip analytics init join error: " + e.getMessage());
+        }
+        try {
+            if (dataLayerInitFuture != null) {
+                dataLayerInitFuture.get(5, java.util.concurrent.TimeUnit.SECONDS);
+            }
+        } catch (Exception e) {
+            log("Data layer init join error: " + e.getMessage());
+        }
         if (tripAnalyticsManager != null) tripAnalyticsManager.shutdown();
         // Tear down RecordingsIndex AFTER trips so any in-flight upserts
         // from the recorder have already drained. stop() the watcher
@@ -1645,7 +1740,20 @@ public class CameraDaemon {
                     com.overdrive.app.monitor.SocHistoryDatabase.getInstance().stop();
                 } catch (Exception e) { /* may not be initialized */ }
                 
-                // 5. Stop services (MQTT, ABRP, Trip Analytics)
+                // 5. Stop services (MQTT, ABRP, Trip Analytics).
+                // Trip Analytics + RecordingsIndex were inited on parallel
+                // threads — join briefly so we don't tear down a half-opened
+                // H2 connection. 5 s exceeds measured init time.
+                try {
+                    if (tripAnalyticsInitFuture != null) {
+                        tripAnalyticsInitFuture.get(5, java.util.concurrent.TimeUnit.SECONDS);
+                    }
+                } catch (Exception e) { /* ignore */ }
+                try {
+                    if (dataLayerInitFuture != null) {
+                        dataLayerInitFuture.get(5, java.util.concurrent.TimeUnit.SECONDS);
+                    }
+                } catch (Exception e) { /* ignore */ }
                 try {
                     if (mqttConnectionManager != null) mqttConnectionManager.stopAll();
                 } catch (Exception e) { /* ignore */ }
@@ -2122,48 +2230,61 @@ public class CameraDaemon {
         // because it's updated synchronously by onAccStateChanged() on the IPC thread.
         if (com.overdrive.app.monitor.AccMonitor.isAccOn()) {
             log("enableSurveillance() REJECTED — ACC is ON (race condition guard)");
-            return;
+            return;  // No recalc — resolver will fire from the ACC transition.
         }
-        
-        if (gpuPipeline == null) {
-            log("GPU pipeline not ready — queuing surveillance enable for when pipeline initializes");
-            pendingAccOff = true;
-            return;
-        }
-        
-        // SOTA: Safe Location check — don't start camera if parked at safe zone
-        com.overdrive.app.surveillance.SafeLocationManager safeMgr =
-            com.overdrive.app.surveillance.SafeLocationManager.getInstance();
-        if (safeMgr.isInSafeZone()) {
-            log("SAFE ZONE: Surveillance suppressed — " + safeMgr.getCurrentZoneName()
-                + " (dist=" + Math.round(safeMgr.getDistanceToNearestZone()) + "m)");
-            surveillanceEnabled = true;   // Mark intent so it auto-starts when leaving zone
-            safeZoneSuppressed = true;
-            return;  // Camera never opens. Zero resources.
-        }
-        
-        log("Enabling GPU surveillance (pipeline=" + (gpuPipeline != null) + 
-            ", running=" + (gpuPipeline != null && gpuPipeline.isRunning()) +
-            ", sentry=" + (gpuPipeline != null && gpuPipeline.getSentry() != null) + ")");
-        surveillanceEnabled = true;
-        safeZoneSuppressed = false;
-        
+
+        // OEM Dashcam: every non-ACC-rejected exit path of this method must
+        // fire a recalc, because the user-facing surveillance state may have
+        // changed (suppression cleared, schedule window opened, lock-gate
+        // armed, etc.) and the resolver re-evaluates survSuppressed +
+        // keepWarmSurv from the latest UCM/safe-zone/schedule state. The
+        // try/finally guarantees the recalc fires even when an exception
+        // propagates out of the surveillance start path.
         try {
-            if (!gpuPipeline.isRunning()) {
-                log("Pipeline not running — starting...");
-                gpuPipeline.start();
+            if (gpuPipeline == null) {
+                log("GPU pipeline not ready — queuing surveillance enable for when pipeline initializes");
+                pendingAccOff = true;
+                return;
             }
-            // Enable surveillance mode (motion detection)
-            gpuPipeline.enableSurveillance();
-            // AVC keep-alive: same 60s `am start com.byd.avc` poke we use on
-            // the ACC-ON / streaming / recording-mode flows. Without it, BYD
-            // reaps com.byd.avc during a multi-hour park, the AVM HAL goes
-            // cold, frames stall, and the GL watchdog drops into the restart
-            // cascade that eventually trips MAX_RETRIES on the wrapper.
-            startAvcKeepAliveIfNeeded();
-            log("Surveillance mode activated successfully (AVC keep-alive on)");
-        } catch (Exception e) {
-            log("ERROR: Failed to enable surveillance: " + e.getMessage());
+
+            // SOTA: Safe Location check — don't start camera if parked at safe zone
+            com.overdrive.app.surveillance.SafeLocationManager safeMgr =
+                com.overdrive.app.surveillance.SafeLocationManager.getInstance();
+            if (safeMgr.isInSafeZone()) {
+                log("SAFE ZONE: Surveillance suppressed — " + safeMgr.getCurrentZoneName()
+                    + " (dist=" + Math.round(safeMgr.getDistanceToNearestZone()) + "m)");
+                surveillanceEnabled = true;   // Mark intent so it auto-starts when leaving zone
+                safeZoneSuppressed = true;
+                return;  // Camera never opens. Zero resources.
+            }
+
+            log("Enabling GPU surveillance (pipeline=" + (gpuPipeline != null) +
+                ", running=" + (gpuPipeline != null && gpuPipeline.isRunning()) +
+                ", sentry=" + (gpuPipeline != null && gpuPipeline.getSentry() != null) + ")");
+            surveillanceEnabled = true;
+            safeZoneSuppressed = false;
+
+            try {
+                if (!gpuPipeline.isRunning()) {
+                    log("Pipeline not running — starting...");
+                    gpuPipeline.start();
+                }
+                // Enable surveillance mode (motion detection)
+                gpuPipeline.enableSurveillance();
+                // AVC keep-alive: same 60s `am start com.byd.avc` poke we use on
+                // the ACC-ON / streaming / recording-mode flows. Without it, BYD
+                // reaps com.byd.avc during a multi-hour park, the AVM HAL goes
+                // cold, frames stall, and the GL watchdog drops into the restart
+                // cascade that eventually trips MAX_RETRIES on the wrapper.
+                startAvcKeepAliveIfNeeded();
+                log("Surveillance mode activated successfully (AVC keep-alive on)");
+            } catch (Exception e) {
+                log("ERROR: Failed to enable surveillance: " + e.getMessage());
+            }
+        } finally {
+            try {
+                com.overdrive.app.server.OemDashcamApiHandler.scheduleLifecycleRecalc();
+            } catch (Throwable ignored) {}
         }
     }
     
@@ -2183,11 +2304,17 @@ public class CameraDaemon {
     public static void disableSurveillance() {
         log("Disabling surveillance mode");
         surveillanceEnabled = false;
-        
+
         if (gpuPipeline != null) {
             gpuPipeline.disableSurveillance();
             // Keep pipeline running for potential streaming
         }
+        // OEM Dashcam: surv-axis state changed (schedule window closed, master
+        // toggle off, etc.). Recalc so surv=continuous tears down and surv=smart
+        // unwarms the pipeline if no other consumer keeps it alive.
+        try {
+            com.overdrive.app.server.OemDashcamApiHandler.scheduleLifecycleRecalc();
+        } catch (Throwable ignored) {}
     }
     
     // ==================== DOOR LOCK GATE ====================
@@ -2665,33 +2792,21 @@ public class CameraDaemon {
                         outsideSchedule = (schedule != null && schedule.isEnabled() && !schedule.isActiveNow());
                     } catch (Exception ignored) {}
                     boolean surveillanceSuppressed = !userEnabled || inSafeZone || outsideSchedule;
-                    // Keep-alive when either mode is "continuous" (record
-                    // through ACC-off) OR surveillance is set (any non-off
-                    // value implies the pipeline must stay warm to fire on
-                    // motion events). Treat "smart" as ALSO requiring keep-
-                    // alive on the surveillance side because the engine
-                    // needs the pipeline ready to record event clips when
-                    // motion fires during sentry.
-                    boolean survSideKeepAlive = "continuous".equals(survMode) || "smart".equals(survMode);
-                    if (surveillanceSuppressed) survSideKeepAlive = false;
-                    boolean keepAlive = "continuous".equals(recMode) || survSideKeepAlive;
+                    // Two-axis policy: recording-side modes describe drive-time
+                    // intent (ACC ON only); surveillance-side modes describe
+                    // parked-time intent (ACC OFF only). At ACC OFF the recording
+                    // axis is dormant by design — only the surveillance axis can
+                    // keep the pipeline alive. ALWAYS schedule a recalc so the
+                    // resolver in OemDashcamApiHandler.applyTriggerLifecycleFromUcm
+                    // is the single source of truth: the ACC boundary itself is a
+                    // state change (e.g. rec=continuous,surv=smart must stop
+                    // recording AND keep the pipeline warm — only the resolver
+                    // can express that without duplicating the gating logic here).
                     if (anyTriggerOn) {
-                        if (keepAlive) {
-                            log("OEM Dashcam: ACC OFF — keep-alive (rec=" + recMode
-                                + ", surv=" + survMode + ")");
-                        } else {
-                            log("OEM Dashcam: ACC OFF — stopping pipeline (rec="
-                                + recMode + ", surv=" + survMode + ")");
-                            // Route through scheduleLifecycleRecalc so the
-                            // dedicated lifecycle executor dedups against any
-                            // user Apply / quality-mirror restart hitting
-                            // applyTriggerLifecycleFromUcm at the same instant.
-                            // The previous raw-thread path ran in parallel
-                            // with LIFECYCLE_EXEC and lost the dedup, racing
-                            // over LIFECYCLE_LOCK with no guarantee the
-                            // ACC-OFF intent landed last.
-                            com.overdrive.app.server.OemDashcamApiHandler.scheduleLifecycleRecalc();
-                        }
+                        log("OEM Dashcam: ACC OFF — recalc (rec=" + recMode
+                            + ", surv=" + survMode
+                            + (surveillanceSuppressed ? ", survSuppressed" : "") + ")");
+                        com.overdrive.app.server.OemDashcamApiHandler.scheduleLifecycleRecalc();
                     }
                 } catch (Throwable t) {
                     log("OEM Dashcam ACC OFF dispatch failed: " + t.getMessage());
@@ -2801,46 +2916,19 @@ public class CameraDaemon {
                 };
 
                 if (isDilink4ModeActive()) {
-                    // esco-parity 60 s grace before opening AVMCamera. Earlier
-                    // open races the MCU/ISP power-down and yields all-zero
-                    // frames forever (esco p111dh/C4995i.java:407 — fixed 60_000L
-                    // delay between ACC OFF and SentryRecordService.startService).
-                    //
-                    // The grace is enforced as a process-wide gate inside
-                    // PanoramicCameraGpu.startCameraViaAvmReflection. Every
-                    // open path (this handler, StreamingApiHandler, OEM,
-                    // RecordingModeManager) funnels through that method and
-                    // sleeps until the gate clears — so even if a user opens
-                    // /api/stream/view/N during the grace, the underlying
-                    // camera open still waits.
-                    com.overdrive.app.camera.PanoramicCameraGpu
-                        .armDilink4PostAccOffGrace(DILINK4_SENTRY_DEFER_MS);
-
-                    // Warm com.byd.avc up at the START of the grace so it's
-                    // alive and re-attached to the AVM HAL by the time we
-                    // open the camera 60 s from now. AccSentry's 10 s
-                    // keep-alive tick will sustain it past this point.
+                    // ESCO-PARITY: no 60s gate. esco opens AVMCamera
+                    // immediately on PanoCameraRecordService start. The
+                    // FlameoutService 60s timer schedules a SECONDARY
+                    // sentry consumer, not a delay before camera open.
+                    // ensureAvcAlive() (pidof on dilink4 — no am start)
+                    // probes AVC presence without launching it.
                     try {
                         com.overdrive.app.camera.AvcHalWarmup.ensureAvcAlive();
                     } catch (Throwable th) {
-                        log("AVC initial warmup failed: " + th.getMessage());
+                        log("AVC initial probe failed: " + th.getMessage());
                     }
-
-                    log("DiLink 4: armed " + DILINK4_SENTRY_DEFER_MS
-                        + " ms open gate (esco-parity grace). Pipeline start "
-                        + "will sleep at lowest open level until gate clears.");
-                    // Run the start path in the background; gpuPipeline.start
-                    // will internally block on PanoramicCameraGpu.waitForDilink4OpenGate
-                    // before AVMCamera.open. We cannot run it inline because
-                    // onAccStateChanged is called from the IPC thread and
-                    // we don't want to block that for 60 s.
-                    Thread t = new Thread(startSentryPipeline,
-                        "Dilink4SentryStart");
-                    t.setDaemon(true);
-                    t.start();
-                } else {
-                    startSentryPipeline.run();
                 }
+                startSentryPipeline.run();
             } catch (Exception e) {
                 String errorMsg = e.getMessage();
                 if (errorMsg == null) {
@@ -2856,12 +2944,6 @@ public class CameraDaemon {
             // recordings until the user cycled ACC OFF→ON. The watchdog is
             // started at daemon boot in main() and runs for the daemon's
             // lifetime as long as any storage type is set to SD.
-
-            // Clear any active DiLink 4 post-ACC-OFF open gate so a quick
-            // OFF→ON cycle doesn't strand a pending camera open on a 60 s
-            // sleep that's no longer relevant.
-            com.overdrive.app.camera.PanoramicCameraGpu
-                .clearDilink4PostAccOffGrace();
 
             // Stop schedule checker (only runs during ACC OFF sentry mode)
             stopScheduleChecker();
@@ -2967,21 +3049,17 @@ public class CameraDaemon {
             if (recordingModeManager != null) {
                 recordingModeManager.onAccStateChanged(true);
             }
-            // OEM Dashcam ACC-on hook. If the user has enabled OEM dashcam
-            // and we tore it down at ACC-off (accOffMode='off' branch), the
-            // pipeline needs a fresh start now that the car is awake. The
-            // applyLifecycle helper is idempotent so a no-op fires when
-            // concurrent==1 already kept it running.
+            // OEM Dashcam ACC-on hook. The ACC boundary itself is a state
+            // transition for the two-axis resolver — recording-axis modes only
+            // arm during ACC ON, surveillance-axis modes only arm during ACC
+            // OFF. Always recalc when any trigger is on, regardless of whether
+            // the pipeline is currently live (it may have been kept warm by
+            // surv=smart during sentry, in which case rec=continuous still
+            // needs to flip recording on now).
             try {
-                // Post-migration mode-based gate (R9 regression #1). The
-                // legacy oem.enabled key is null after migrateOemDashcamModes
-                // runs; isAnyOemDashcamTriggerEnabled inspects recordingMode
-                // / surveillanceMode and returns true if either is non-off.
                 if (com.overdrive.app.config.UnifiedConfigManager
-                        .isAnyOemDashcamTriggerEnabled()
-                        && getOemDashcamPipeline() == null) {
-                    log("OEM Dashcam: ACC ON — restarting pipeline");
-                    // Route through scheduleLifecycleRecalc so the desired-state computation reads the user's current oemRecordingMode + oemSurveillanceMode rather than hardcoding recordingDesired=true. Without this, surveillance-only configs (rec=off, surv=smart) would silently start a dvr_*.mp4 on every ACC ON.
+                        .isAnyOemDashcamTriggerEnabled()) {
+                    log("OEM Dashcam: ACC ON — recalc");
                     com.overdrive.app.server.OemDashcamApiHandler.scheduleLifecycleRecalc();
                 }
             } catch (Throwable t) {
@@ -4097,14 +4175,42 @@ public class CameraDaemon {
             socDb.init();
             socDb.start();
 
-            // Fix stale kWh records from before PHEV capacity was correctly detected
-            if (sohEstimator != null && sohEstimator.getNominalCapacityKwh() > 0
-                    && sohEstimator.getNominalCapacityKwh() < 30.0) {
-                log("Fixing stale kWh records for PHEV (nominal=" + sohEstimator.getNominalCapacityKwh() + " kWh)");
-                socDb.fixStaleRemainingKwh(sohEstimator.getNominalCapacityKwh());
-            }
-
             log("SOC History Database initialized successfully");
+
+            // Fix stale kWh records from before PHEV capacity was correctly
+            // detected. Runs on a background thread — this is a one-shot data
+            // migration over the soc_history table that has been observed to
+            // take 100+ seconds on a long-running install (full table scan
+            // with per-row arithmetic). Blocking the main init thread here
+            // delayed ABRP / MQTT / TripAnalytics by the same 100+ s, which
+            // is exactly the "trips loading 3-4 min" symptom users hit.
+            //
+            // The migration is idempotent (rows that already match the
+            // formula are no-ops); SocHistoryDatabase's periodic recorder
+            // tolerates concurrent UPDATE on the same connection (H2
+            // serializes internally) and the migration runs once per
+            // daemon lifetime.
+            final com.overdrive.app.abrp.SohEstimator sohEstSnapshotForMigration = sohEstimator;
+            if (sohEstSnapshotForMigration != null
+                    && sohEstSnapshotForMigration.getNominalCapacityKwh() > 0
+                    && sohEstSnapshotForMigration.getNominalCapacityKwh() < 30.0) {
+                Thread migration = new Thread(() -> {
+                    try {
+                        long t0 = System.currentTimeMillis();
+                        log("Fixing stale kWh records for PHEV (nominal="
+                                + sohEstSnapshotForMigration.getNominalCapacityKwh()
+                                + " kWh) — async");
+                        socDb.fixStaleRemainingKwh(sohEstSnapshotForMigration.getNominalCapacityKwh());
+                        log("Stale kWh migration done in "
+                                + (System.currentTimeMillis() - t0) + "ms");
+                    } catch (Throwable t) {
+                        log("Stale kWh migration failed: " + t.getMessage());
+                    }
+                }, "SocHistoryMigration");
+                migration.setDaemon(true);
+                migration.setPriority(Thread.MIN_PRIORITY);
+                migration.start();
+            }
             
         } catch (Exception e) {
             log("Failed to initialize Vehicle Data Monitor: " + e.getMessage());

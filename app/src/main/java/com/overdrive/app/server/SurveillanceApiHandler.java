@@ -1595,20 +1595,37 @@ public class SurveillanceApiHandler {
         // SOTA: Only persist the preference. Surveillance should only activate on ACC OFF.
         // Starting motion detection while driving wastes CPU/GPU and is meaningless.
         com.overdrive.app.config.UnifiedConfigManager.setSurveillanceEnabled(true);
-        
+
         // Only actually start surveillance if ACC is currently OFF (sentry mode)
         boolean accIsOn = com.overdrive.app.monitor.AccMonitor.isAccOn();
         if (!accIsOn) {
-            CameraDaemon.enableSurveillance();
+            CameraDaemon.enableSurveillance();   // fires OEM recalc internally
         } else {
             CameraDaemon.log("Surveillance preference saved — will activate on next ACC OFF");
+            // Even though pano sentry doesn't arm during ACC ON, the OEM
+            // resolver reads UnifiedConfigManager.isSurveillanceEnabled()
+            // into survSuppressed (negated). Without this recalc, an OEM
+            // surv=continuous user who flips master ON while driving would
+            // see correct behavior on next ACC OFF only because the ACC OFF
+            // dispatch fires another recalc — but the resolver also feeds
+            // keepWarmSurv at any reachable ACC OFF transition. Defensive.
+            try {
+                com.overdrive.app.server.OemDashcamApiHandler.scheduleLifecycleRecalc();
+            } catch (Throwable ignored) {}
         }
         HttpResponse.sendJsonSuccess(out);
     }
-    
+
     private static void handleDisable(OutputStream out) throws Exception {
-        CameraDaemon.disableSurveillance();
+        CameraDaemon.disableSurveillance();   // fires OEM recalc internally
         com.overdrive.app.config.UnifiedConfigManager.setSurveillanceEnabled(false);
+        // disableSurveillance ran BEFORE the UCM write, so its recalc saw the
+        // old surveillanceEnabled=true. Fire a second recalc post-write so
+        // the resolver picks up the now-disabled master toggle and applies
+        // survSuppressed=true to any in-flight surv=continuous recording.
+        try {
+            com.overdrive.app.server.OemDashcamApiHandler.scheduleLifecycleRecalc();
+        } catch (Throwable ignored) {}
         HttpResponse.sendJsonSuccess(out);
     }
 

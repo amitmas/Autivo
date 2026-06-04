@@ -262,20 +262,48 @@ public class OemDashcamApiHandler {
 
         boolean accOn = com.overdrive.app.monitor.AccMonitor.isAccOn();
 
-        // surveillance-side continuous = "always record while parked" — gate on ACC OFF.
-        // Without this, the UI promise "Always record dvr_*.mp4 the whole time the car
-        // is parked" lies; users get continuous recording during driving phases too.
+        // Surveillance-axis suppression: the user's safe-zone / schedule /
+        // master-surveillance toggles already gate pano sentry; the OEM
+        // surveillance axis must honor the same gates so a parked-window
+        // user-intent doesn't bypass them. Recording-axis suppression is
+        // intentionally NOT applied — recording is the user's ACC-ON intent
+        // and is independent of the surveillance master toggle.
+        boolean survSuppressed = false;
+        if (!accOn) {
+            try {
+                boolean userEnabled = com.overdrive.app.config.UnifiedConfigManager.isSurveillanceEnabled();
+                boolean inSafeZone = com.overdrive.app.surveillance.SafeLocationManager.getInstance().isInSafeZone();
+                boolean outsideSchedule = false;
+                com.overdrive.app.surveillance.SurveillanceSchedule schedule =
+                    com.overdrive.app.config.UnifiedConfigManager.getSurveillanceSchedule();
+                if (schedule != null && schedule.isEnabled() && !schedule.isActiveNow()) {
+                    outsideSchedule = true;
+                }
+                survSuppressed = !userEnabled || inSafeZone || outsideSchedule;
+            } catch (Throwable ignored) {}
+        }
+
+        // The two axes are independent and ACC-gated symmetrically:
+        //   recordingMode  = drive-time intent  (ACC ON  phase only)
+        //   surveillanceMode = parked-time intent (ACC OFF phase only)
+        // Pre-fix, rec=continuous bled into ACC OFF, so a user who picked
+        // "rec=continuous, surv=off" got dvr_*.mp4 across parked windows
+        // they never asked for — and conversely a "rec=off, surv=continuous"
+        // user got nothing during ACC OFF if rec was the only path checked.
         boolean recordingDesired = false;
-        if ("continuous".equals(rec)) recordingDesired = true;          // recording-side continuous = ACC ON phase
-        if ("continuous".equals(surv) && !accOn) recordingDesired = true; // surveillance-side continuous = ACC OFF phase only
+        if ("continuous".equals(rec)  &&  accOn) recordingDesired = true;
+        if ("continuous".equals(surv) && !accOn && !survSuppressed) recordingDesired = true;
         if ("smart".equals(rec) && isPanoDashcamRecording()) recordingDesired = true;
 
-        // "smart" recording-side mirrors pano during ACC ON only — pano isn't recording
-        // during ACC OFF so there's nothing to mirror. Keeping the pipeline warm during
-        // the parked window burns 12V and contends with sentry for the AVMCamera handle.
-        boolean keepWarmRec = "smart".equals(rec) && accOn;
+        // Keep-warm follows the same axis split: rec=smart needs a warm pipeline
+        // during ACC ON to mirror pano starts; surv=smart needs a warm pipeline
+        // during ACC OFF to fire motion-triggered event clips. Outside its own
+        // ACC phase each axis is dormant — keeping the pipeline up burns 12V
+        // and contends with sentry for the AVMCamera handle on single-client HALs.
+        boolean keepWarmRec  = "smart".equals(rec)  &&  accOn;
+        boolean keepWarmSurv = "smart".equals(surv) && !accOn && !survSuppressed;
         boolean keepWarm = keepWarmRec
-            || "smart".equals(surv)              // surveillance-smart needs warm pipeline for motion events
+            || keepWarmSurv
             || isAnyStreamingViewerActive();
 
         applyTriggerLifecycle(recordingDesired, keepWarm);

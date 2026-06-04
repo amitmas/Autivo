@@ -42,75 +42,48 @@ public class PanoramicCameraGpu {
     private static final int PHYSICAL_CAMERA_ID = 1;
     private static final int MAX_CAMERA_ID = 5;     // Probe camera IDs 0-5
 
-    // ==================== DILINK 4 POST-ACC-OFF OPEN GATE ====================
-    //
-    // Global hold on AVMCamera.open() during the post-ACC-OFF transition
-    // window. esco hardcodes a 60 s grace before opening AVMCamera
-    // (FlameoutService p111dh/C4995i.java:407 m22726w(60_000L)). Earlier
-    // open races the MCU/ISP power-down and yields all-zero frames forever.
-    //
-    // We previously implemented the grace as a local timer in
-    // CameraDaemon.onAccStateChanged(true), but that was bypassable: a
-    // user-issued GET /api/stream/view/N during ACC OFF spawns its own
-    // pano.start() via StreamingApiHandler.ensurePanoStartedNonBlocking,
-    // which doesn't consult the timer. Same for RecordingModeManager and
-    // OemDashcam open paths.
-    //
-    // The gate now lives at the lowest-level open point
-    // ({@link #startCameraViaAvmReflection}) — every caller transparently
-    // sleeps until the grace expires. Cleared on ACC ON.
-    //
-    // Legacy fleet: gate is never armed (only set from dilink4 paths).
-    private static volatile long dilink4OpenAllowedAfterMs = 0L;
+    /** Sentry-restart straddle token. The CameraDaemon dilink4 ACC-OFF
+     *  handler acquires this BEFORE calling gpuPipeline.stop(), so the
+     *  BydApaViewpointHelper observer set never goes empty during the
+     *  close+gate+reopen window. Releases automatically on ACC ON or after
+     *  the new pipeline registers its own per-instance token (whichever
+     *  comes first). Mirrors esco's behaviour where the FlameoutService
+     *  keeps no observer of its own but the new C5319i registers its
+     *  fresh C5920a into C6498a.observerSet during the reopen, BEFORE the
+     *  caller's own MainService-side C5320a was released — so the set
+     *  stays non-empty across the whole flow.
+     *
+     *  We approximate that by acquiring the bridge token explicitly at
+     *  ACC-OFF (before stop) and releasing it explicitly after start
+     *  completes. Use a static singleton — there's only ever one ACC-OFF
+     *  in flight per process. */
+    private static final Object SENTRY_BRIDGE_TOKEN = new Object() {
+        @Override public String toString() { return "sentry-bridge"; }
+    };
+    private static volatile boolean sentryBridgeHeld = false;
 
-    /**
-     * Arm the post-ACC-OFF open gate. Call from the dilink4 ACC-OFF
-     * handler with durationMs = 60_000 (esco-parity).
-     */
-    public static void armDilink4PostAccOffGrace(long durationMs) {
-        if (durationMs <= 0) {
-            dilink4OpenAllowedAfterMs = 0L;
+    /** Called by CameraDaemon at ACC-OFF, BEFORE gpuPipeline.stop().
+     *  Idempotent. */
+    public static void acquireSentryBridgeViewpoint() {
+        if (sentryBridgeHeld) {
+            logger.info("sentry-bridge token already held");
             return;
         }
-        dilink4OpenAllowedAfterMs = System.currentTimeMillis() + durationMs;
-        logger.info("dilink4 open gate armed for " + durationMs + " ms");
+        BydApaViewpointHelper.acquire(SENTRY_BRIDGE_TOKEN);
+        sentryBridgeHeld = true;
+        logger.info("sentry-bridge viewpoint token acquired (straddling stop+reopen)");
     }
 
-    /** Clear the gate immediately. Used on ACC ON. */
-    public static void clearDilink4PostAccOffGrace() {
-        if (dilink4OpenAllowedAfterMs != 0L) {
-            logger.info("dilink4 open gate cleared");
-            dilink4OpenAllowedAfterMs = 0L;
-        }
+    /** Called by CameraDaemon AFTER gpuPipeline.start() returns successfully
+     *  (the new pipeline instance has acquired its own per-instance token).
+     *  Also called on ACC ON as a safety net. Idempotent. */
+    public static void releaseSentryBridgeViewpoint() {
+        if (!sentryBridgeHeld) return;
+        BydApaViewpointHelper.release(SENTRY_BRIDGE_TOKEN);
+        sentryBridgeHeld = false;
+        logger.info("sentry-bridge viewpoint token released");
     }
 
-    /**
-     * Block the calling thread until the dilink4 grace expires.
-     * Returns immediately if the gate isn't armed or the camera mode is
-     * not dilink4. Safe to call from any thread.
-     */
-    private static void waitForDilink4OpenGate() {
-        long until = dilink4OpenAllowedAfterMs;
-        if (until == 0L) return;
-        long now = System.currentTimeMillis();
-        long waitMs = until - now;
-        if (waitMs <= 0) {
-            // Stale gate — already passed.
-            dilink4OpenAllowedAfterMs = 0L;
-            return;
-        }
-        logger.info("dilink4 open gate active — sleeping " + waitMs + " ms before AVMCamera.open");
-        try {
-            Thread.sleep(waitMs);
-        } catch (InterruptedException ie) {
-            // Re-arm interrupt and proceed; if the caller cancelled the
-            // open it'll surface elsewhere.
-            Thread.currentThread().interrupt();
-            logger.warn("dilink4 open gate interrupted — proceeding anyway");
-        }
-        dilink4OpenAllowedAfterMs = 0L;
-    }
-    
     // AVMCamera surface mode — 0 works on Seal, Atto 1 may need different value
     // Set via setCameraSurfaceMode() before start() for per-model override.
     // On the esco SurfaceTexture path this same value is the previewIndex
@@ -212,7 +185,17 @@ public class PanoramicCameraGpu {
     // dead BufferQueue (which is what was tripping the GL watchdog on
     // ACC OFF→ON transitions).
     private volatile Object cameraObj;
-    
+
+    /** Per-instance BydApaViewpointHelper observer-set token. Mirrors esco
+     *  C5920a's "self" registration into C6498a.observerSet (C5920a.java:323
+     *  /:387 — `C6498a.f26622a.m28933k(this)` / `m28930h(this)`). Scoping
+     *  the token to this instance lets a separate sentry caller acquire its
+     *  own token at ACC-OFF and straddle our close+reopen — keeping the set
+     *  non-empty so the helper never writes viewpoint=0 mid-session. */
+    private final Object viewpointToken = new Object() {
+        @Override public String toString() { return "PanoramicCameraGpu@" + System.identityHashCode(this); }
+    };
+
     // Render loop
     private HandlerThread glThread;
     private Handler glHandler;
@@ -559,17 +542,23 @@ public class PanoramicCameraGpu {
                     // Legacy fleet (USE_ESCO_SURFACE_TEXTURE_PATH == false)
                     // keeps the prior immediate-restart behaviour.
                     if (USE_ESCO_SURFACE_TEXTURE_PATH) {
+                        // ESCO-PARITY: dilink4 does NOT restart on HAL
+                        // onCameraError. Field log shows the BYD HAL emits
+                        // event=8 spuriously during normal parked operation
+                        // — restarting puts the producer surface in
+                        // red-banner mode (close+reopen race on byd_apa).
+                        // esco's PanoCameraRecord retries via the recorder
+                        // listener path with a 5×15s backoff, NOT a camera
+                        // close+reopen. Skip the restart entirely on
+                        // dilink4 — log the event for observability.
                         long now = System.currentTimeMillis();
                         long timeSinceLastError = now - lastErrorRestartTime;
-                        if (lastErrorRestartTime != 0
-                                && timeSinceLastError < DILINK4_ERROR_RESTART_MIN_INTERVAL_MS) {
-                            logger.warn("CAMERA ERROR: event=" + eventType
-                                + " — THROTTLED (dilink4, last restart "
-                                + timeSinceLastError + "ms ago, min interval "
-                                + DILINK4_ERROR_RESTART_MIN_INTERVAL_MS + "ms)");
-                            return;
-                        }
                         lastErrorRestartTime = now;
+                        logger.warn("CAMERA ERROR: event=" + eventType
+                            + " — IGNORED on dilink4 (esco-parity, "
+                            + (timeSinceLastError == now ? "first" : timeSinceLastError + "ms since last")
+                            + ")");
+                        return;
                     }
                     logger.error("CAMERA ERROR: event=" + eventType + " — restarting camera");
                     if (glHandler != null) {
@@ -1141,9 +1130,14 @@ public class PanoramicCameraGpu {
     private void closeCameraForPath(Object cam) {
         if (cam == null) return;
         if (USE_ESCO_SURFACE_TEXTURE_PATH) {
-            // Step 1 — must run BEFORE camera tear-down so the native AVM app
-            // can reclaim viewpoint ownership cleanly (matches esco order).
-            BydApaViewpointHelper.disable();
+            // Step 1 — release our viewpoint token. Mirrors esco C5920a.m26747m
+            // (gl/C5920a.java:323 — C6498a.f26622a.m28933k(this)). Observer-set
+            // semantics: this only writes viewpoint=0 + disableDevice if WE were
+            // the last holder. If a sentry-restart caller acquired its own token
+            // before stop() was invoked (ACC-OFF straddle), the set stays
+            // non-empty and the HAL is never told to drop mosaic — that's what
+            // keeps frames flowing across the close+reopen on this car.
+            BydApaViewpointHelper.release(viewpointToken);
             // Step 2 — remove our texture binding from the HAL.
             detachSurfaceTextureFromCamera(cam);
             // Steps 3+4 — null callback proxies on the AVMCamera.
@@ -1327,15 +1321,11 @@ public class PanoramicCameraGpu {
      * with native apps (reverse camera, dashcam, AVM parking view).
      */
     private void startCameraViaAvmReflection(int cameraId) throws Exception {
-        // Block here if the dilink4 post-ACC-OFF grace gate is armed.
-        // Esco-parity 60 s wall-clock wait before AVMCamera.open. All
-        // open paths (StreamingApiHandler, RecordingModeManager,
-        // CameraDaemon.onAccStateChanged, OemDashcam) funnel through
-        // this method so one gate covers them all. No-op when the gate
-        // isn't armed (legacy mode or already-cleared by ACC ON).
-        if (USE_ESCO_SURFACE_TEXTURE_PATH) {
-            waitForDilink4OpenGate();
-        }
+        // ESCO-PARITY: no gate. esco's user-preview path opens AVMCamera
+        // immediately on PanoCameraRecordService.m19854a → AIDL → daemon
+        // C5312b.m24073j → C5920a.mo26750v with no wall-clock wait. All
+        // OverDrive open paths (StreamingApiHandler, RecordingModeManager,
+        // OemDashcam, CameraDaemon ACC-OFF) reach this method directly.
 
         // Notify camera service we're about to open
         if (cameraCoordinator != null) {
@@ -1354,7 +1344,18 @@ public class PanoramicCameraGpu {
         // anyway (no panorama device exposed), but skipping the call also
         // skips a binder round-trip per camera open.
         if (USE_ESCO_SURFACE_TEXTURE_PATH) {
-            BydApaViewpointHelper.enableForPanoramic();
+            // Acquire our viewpoint token. Mirrors esco C5920a.mo26750v
+            // (gl/C5920a.java:387 — C6498a.f26622a.m28930h(this)). If
+            // we're the only holder this writes viewpoint=2012 and registers
+            // the listener; if a sentry-restart caller is already holding a
+            // token, this just re-issues the viewpoint write idempotently
+            // (matches esco's "size>1 already, no enableDevice/listener" branch).
+            BydApaViewpointHelper.acquire(viewpointToken);
+
+            // Release the static sentry-bridge token NOW (set transitions
+            // bridge+pano → pano on the same lock acquire as our add — no
+            // empty-set window). Idempotent + harmless if no bridge was held.
+            releaseSentryBridgeViewpoint();
         }
 
         Class<?> avmClass = Class.forName("android.hardware.AVMCamera");
@@ -2756,19 +2757,36 @@ public class PanoramicCameraGpu {
                                 (nativeActive ? " (native app active)" : ""));
                             // Reset lastFrameTime to prevent repeated triggers
                             lastFrameTime = now;
-                            
-                            if (cameraCoordinator != null) {
+
+                            // ESCO-PARITY: dilink4 has NO frame-stall-driven
+                            // restart. esco's PanoCameraRecord (`gl/C5920a.java`,
+                            // `PanoCameraRecordService.java:174-200`) only
+                            // restarts on actual `onCameraError` HAL events,
+                            // capped at 5 retries with backoff. There is NO
+                            // 4 s no-frame watchdog in esco. On parked cars
+                            // the HAL routinely pauses frame emission (no
+                            // consumer, AVC reaped) and a stall-driven
+                            // close+reopen produces the all-zero frames the
+                            // user reports. The HAL onEvent path
+                            // (BydCameraCoordinator → onCameraError) still
+                            // catches genuine fatal events (8/1000/1002) and
+                            // routes through the throttled restart at
+                            // line 547 (DILINK4_ERROR_RESTART_MIN_INTERVAL_MS).
+                            boolean dilink4SkipStallRestart = USE_ESCO_SURFACE_TEXTURE_PATH;
+                            if (dilink4SkipStallRestart) {
+                                logger.info("Frame stall on dilink4 — NOT restarting (esco-parity, await real HAL error)");
+                            } else if (cameraCoordinator != null) {
                                 if (nativeActive) {
                                     // Contention path: require consecutive stalls before yielding
                                     consecutiveContentionStalls++;
                                     if (consecutiveContentionStalls >= CONTENTION_STALL_COUNT_TO_YIELD) {
-                                        logger.warn("Consecutive contention stalls: " + 
+                                        logger.warn("Consecutive contention stalls: " +
                                             consecutiveContentionStalls + " — yielding camera");
                                         consecutiveContentionStalls = 0;
                                         cameraCoordinator.onFrameStallDetected();
                                     } else {
-                                        logger.info("Contention stall " + consecutiveContentionStalls + 
-                                            "/" + CONTENTION_STALL_COUNT_TO_YIELD + 
+                                        logger.info("Contention stall " + consecutiveContentionStalls +
+                                            "/" + CONTENTION_STALL_COUNT_TO_YIELD +
                                             " — waiting for more evidence before yielding");
                                     }
                                 } else {
