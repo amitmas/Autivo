@@ -35,15 +35,19 @@
 
             <div class="dashboard-page-body">
                 <section class="dash-hero">
-                    <div class="dash-hero-copy">
-                        <span class="dash-overline">OverDrive</span>
-                        <h1 data-i18n="dashboard.heading">Dashboard</h1>
-                        <p id="dashHeroSubtitle" data-i18n="dashboard.subtitle">Vehicle status, position and main controls.</p>
+                    <div class="dash-hero-main">
+                        <div class="dash-hero-copy">
+                            <h1 data-i18n="dashboard.heading">Dashboard</h1>
+                            <p id="dashHeroSubtitle" data-i18n="dashboard.subtitle">Vehicle status, position and main controls.</p>
+                        </div>
+                        <div class="dash-hero-status">
+                            <span class="dash-chip" id="dashConnChip" data-i18n="dashboard.chip_device_pending">Device --</span>
+                            <span class="dash-chip" id="dashSurvChip" data-i18n="dashboard.chip_surveillance_pending">Surveillance --</span>
+                            <span class="dash-chip" id="dashGpsChip" data-i18n="dashboard.chip_gps_pending">GPS --</span>
+                        </div>
                     </div>
-                    <div class="dash-hero-status">
-                        <span class="dash-chip" id="dashConnChip" data-i18n="dashboard.chip_device_pending">Device --</span>
-                        <span class="dash-chip" id="dashSurvChip" data-i18n="dashboard.chip_surveillance_pending">Surveillance --</span>
-                        <span class="dash-chip" id="dashGpsChip" data-i18n="dashboard.chip_gps_pending">GPS --</span>
+                    <div class="dash-vehicle-canvas-wrap">
+                        <canvas id="dashHero3d" class="dash-vehicle-canvas" aria-hidden="true"></canvas>
                     </div>
                 </section>
 
@@ -56,21 +60,10 @@
                   EV-card. yawOffset = π/2 reuses the side rig and rotates the
                   GLB to face the camera (no new view in ev-card-3d.js).
                 -->
-                <!-- Reorderable card grid. All four cards (vehicle 3D,
-                     location, commands, info) share the same drag-reorder
-                     parent. Each card carries data-card-id for layout
-                     persistence. The vehicle card spans all columns
-                     (.dash-card-full) so when it's first in the order it
-                     looks like the original full-width hero. -->
+                <!-- Reorderable card grid. Dashboard + vehicle now live in
+                     the unified hero above; the remaining cards carry
+                     data-card-id for layout persistence. -->
                 <section class="dash-grid" id="dashCards">
-                    <section class="dash-vehicle-card dash-card-full" data-card-id="vehicle">
-                        <button class="dash-card-grip" type="button" aria-label="Drag to reorder" tabindex="-1">
-                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="9" cy="6" r="1"/><circle cx="9" cy="12" r="1"/><circle cx="9" cy="18" r="1"/><circle cx="15" cy="6" r="1"/><circle cx="15" cy="12" r="1"/><circle cx="15" cy="18" r="1"/></svg>
-                        </button>
-                        <div class="dash-vehicle-canvas-wrap">
-                            <canvas id="dashHero3d" class="dash-vehicle-canvas" aria-hidden="true"></canvas>
-                        </div>
-                    </section>
                     <article class="dash-card dash-location-card" data-card-id="location">
                         <div class="dash-card-head">
                             <div>
@@ -80,18 +73,15 @@
                             <button class="dash-card-grip" type="button" aria-label="Drag to reorder" tabindex="-1">
                                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="9" cy="6" r="1"/><circle cx="9" cy="12" r="1"/><circle cx="9" cy="18" r="1"/><circle cx="15" cy="6" r="1"/><circle cx="15" cy="12" r="1"/><circle cx="15" cy="18" r="1"/></svg>
                             </button>
-                            <a class="dash-icon-btn" href="live-view.html"
-                               data-i18n-attr="aria-label:dashboard.open_live_view"
-                               aria-label="Open Live View">
-                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18l6-6-6-6"/></svg>
-                            </a>
                         </div>
                         <div class="dash-location-map">
                             <div id="mapContainer"></div>
                         </div>
                         <div class="dash-action-row">
-                            <a class="dash-secondary-btn" href="live-view.html" data-i18n="dashboard.open_live_view">Open Live View</a>
-                            <button class="dash-secondary-btn" type="button" onclick="BYD.dashboard.openDirections()" data-i18n="dashboard.directions">Directions</button>
+                            <button class="dash-primary-btn" type="button" onclick="BYD.dashboard.openDirections()">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 11 22 2l-9 19-2-8-8-2Z"/><path d="m11 13 4-4"/></svg>
+                                <span data-i18n="dashboard.directions">Navigate to car</span>
+                            </button>
                         </div>
                     </article>
 
@@ -198,34 +188,27 @@
         }
 
         .dash-hero {
-            display: flex;
-            align-items: flex-end;
-            justify-content: space-between;
-            flex-wrap: wrap;          /* allow status row to drop below copy on narrow widths */
-            gap: 20px;
-            padding: 24px;
+            display: grid;
+            grid-template-columns: minmax(260px, 0.8fr) minmax(360px, 1.2fr);
+            align-items: stretch;
+            gap: 18px;
+            padding: 20px;
             background: var(--bg-surface);
             border: 1px solid var(--border-subtle);
             border-radius: 8px;
+            overflow: hidden;
         }
         .dash-hero-copy {
-            /* min-width:0 releases the flex-min-content lock so a very
-               long headline doesn't push the chip row off the card.
-               flex: 1 grows the copy to consume free space; the chip
-               column gets `flex-shrink: 0` from being a static block
-               of fixed-content chips. */
-            flex: 1 1 320px;
             min-width: 0;
         }
 
-        .dash-overline {
-            display: block;
-            color: var(--brand-primary);
-            font-size: 12px;
-            font-weight: 700;
-            letter-spacing: 0.08em;
-            text-transform: uppercase;
-            margin-bottom: 6px;
+        .dash-hero-main {
+            min-width: 0;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            gap: 18px;
+            padding: 4px 0 4px 4px;
         }
 
         .dash-hero h1,
@@ -249,9 +232,19 @@
         .dash-hero-status,
         .dash-action-row {
             display: flex;
-            flex-wrap: wrap;
             gap: 8px;
         }
+
+        .dash-hero-status {
+            flex-wrap: nowrap;
+            overflow-x: auto;
+            padding-bottom: 2px;
+            scrollbar-width: none;
+        }
+
+        .dash-hero-status::-webkit-scrollbar { display: none; }
+
+        .dash-action-row { flex-wrap: wrap; }
 
         .dash-chip {
             padding: 8px 11px;
@@ -274,24 +267,13 @@
         .dash-chip.good { color: var(--brand-primary); border-color: rgba(0, 212, 170, 0.35); }
         .dash-chip.warn { color: #f59e0b; border-color: rgba(245, 158, 11, 0.35); }
 
-        .dash-vehicle-card {
-            margin-top: 16px;
-            background: var(--bg-surface);
-            border: 1px solid var(--border-subtle);
-            border-radius: 8px;
-            overflow: hidden;
-        }
-
         .dash-vehicle-canvas-wrap {
             position: relative;
             width: 100%;
-            /* Fixed height (CSS aspect-ratio is Chrome 88+, our floor is
-               the BYD head-unit's Chrome 58 WebView). 380px on desktop
-               keeps the card prominent without leaving a wide empty
-               band above and below the side-profile car (which is
-               width-bound on the desktop aspect). Mobile trims to
-               200px via the media query below. */
-            height: 380px;
+            /* Stable height for old BYD WebViews without aspect-ratio.
+               Desktop fills the unified hero card; mobile trims to 200px. */
+            min-height: 270px;
+            height: 100%;
             /* Soft brand-tinted gradient. Diagonal teal glow upper-left
                fading to base elevated dark bottom-right gives the panel
                depth without competing with the 3D model. Layered:
@@ -336,23 +318,13 @@
         }
 
         .dash-info-card { grid-column: 1 / -1; }
-        /* Full-width card span — used by the vehicle 3D card so it
-           still fills the row when reordered to the top. Pinning
-           grid-column on the class (not the position) means any card
-           tagged dash-card-full keeps the full-row look at any order. */
-        .dash-card-full { grid-column: 1 / -1; }
-        /* Vehicle card retains its existing visuals (gradient bg from
-           .dash-vehicle-card) but needs position:relative now so the
-           grip handle can pin to the top-right corner. */
-        .dash-vehicle-card { position: relative; }
-
         /* ── Drag-reorder handle ─────────────────────────────────────
            Six-dot grip sitting in the card head (or top-right corner
-           for cards without a head, like the 3D vehicle card). Wide
-           hit target for thumb drag; visual is a small icon so it
-           doesn't dominate. cursor:grab when idle, grabbing when
-           dragging. Only shown when JS has attached the reorder
-           controller (.dash-cards-ready on the parent). */
+           for cards without a head). Wide hit target for thumb drag;
+           visual is a small icon so it doesn't dominate. cursor:grab
+           when idle, grabbing when dragging. Only shown when JS has
+           attached the reorder controller (.dash-cards-ready on the
+           parent). */
         .dash-card-grip {
             display: none;
             align-items: center;
@@ -378,25 +350,11 @@
         }
         .dash-card-grip:active { cursor: grabbing; }
         .dash-card-grip svg { width: 18px; height: 18px; }
-        /* Vehicle card has no head — pin the grip top-right with a
-           subtle glassy chip so it's visible against the gradient bg. */
-        .dash-vehicle-card > .dash-card-grip {
-            position: absolute;
-            top: 10px;
-            right: 10px;
-            background: rgba(20, 22, 30, 0.55);
-            color: var(--text-primary);
-            backdrop-filter: blur(8px);
-            -webkit-backdrop-filter: blur(8px);
-            z-index: 5;
-        }
-
         /* While a card is being dragged: lift it visually with a
            shadow + slight scale, and dim the rest. The .dash-card-ghost
            class marks the placeholder slot so siblings know where the
            dragged card will land — uses dashed outline + tinted bg. */
-        .dash-card.dash-card-dragging,
-        .dash-vehicle-card.dash-card-dragging {
+        .dash-card.dash-card-dragging {
             cursor: grabbing;
             opacity: 0.96;
             box-shadow: 0 18px 40px rgba(0, 0, 0, 0.45),
@@ -442,6 +400,7 @@
         }
 
         .dash-icon-btn,
+        .dash-primary-btn,
         .dash-secondary-btn,
         .dash-command {
             border: 1px solid var(--border-subtle);
@@ -461,6 +420,27 @@
 
         .dash-icon-btn svg { width: 20px; height: 20px; }
 
+        .dash-primary-btn {
+            min-height: 44px;
+            width: 100%;
+            padding: 0 15px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 9px;
+            font-weight: 800;
+            font-size: 13px;
+            background: var(--brand-primary);
+            border-color: var(--brand-primary);
+            color: #001f1a;
+        }
+
+        .dash-primary-btn svg {
+            width: 18px;
+            height: 18px;
+            flex: 0 0 auto;
+        }
+
         .dash-secondary-btn {
             min-height: 38px;
             padding: 0 13px;
@@ -472,11 +452,18 @@
         }
 
         .dash-icon-btn:hover,
+        .dash-primary-btn:hover,
         .dash-secondary-btn:hover,
         .dash-command:hover {
             background: rgba(0, 212, 170, 0.10);
             border-color: rgba(0, 212, 170, 0.35);
             color: var(--brand-primary);
+        }
+
+        .dash-primary-btn:hover {
+            background: #00f0c0;
+            border-color: #00f0c0;
+            color: #001f1a;
         }
 
         .dash-command.pending {
@@ -576,14 +563,9 @@
                 padding-bottom: calc(96px + var(--safe-bottom));
             }
             .dash-hero {
-                flex-direction: column;
-                align-items: flex-start;
+                grid-template-columns: 1fr;
                 padding: 18px;
             }
-            /* In column mode the 320px flex-basis on .dash-hero-copy would
-               translate to a 320px height — way more than needed. Reset
-               flex so the copy hugs its intrinsic height. */
-            .dash-hero-copy { flex: 0 0 auto; }
             .dash-hero h1 { font-size: 27px; }
             /* The GLB renders side-on (wider than tall); a fixed
                200px wastes vertical space on portrait phones. Scale
@@ -593,6 +575,7 @@
                (the head-unit's in-app WebView never loads this), so
                clamp() (Chrome 79+) is fair game. */
             .dash-vehicle-canvas-wrap {
+                min-height: 140px;
                 height: clamp(140px, 38vw, 200px);
             }
             .dash-grid,
