@@ -445,7 +445,7 @@
     <string name="dashboard_starting_tailscale">Tailscale tunnel starten...</string>
     <string name="dashboard_waiting_url">Wachtend op tunnel URL...</string>
     <string name="dashboard_daemons_running">%1$d/%2$d</string>
-    <string name="tunnel_label_cloudflared">Wolkenbladen</string>
+    <string name="tunnel_label_cloudflared">Cloudflared</string>
     <string name="tunnel_label_zrok">Zrok</string>
     <string name="tunnel_label_tailscale">Tailscale</string>
     <!-- Daemon names — shown on the Daemons list and dashboard. -->
@@ -969,4 +969,7 @@
     <!-- content descriptions -->
     <string name="roadsense_cd_cal_level">Route kalibratieniveau</string>
     <string name="roadsense_cd_direction">Richting naar volgend gevaar</string>
+    <!-- Blind Spot overlay labels (native overlay window). -->
+    <string name="blindspot_overlay_left">LINKS</string>
+    <string name="blindspot_overlay_right">RECHTS</string>
 </resources>
