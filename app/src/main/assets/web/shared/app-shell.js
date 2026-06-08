@@ -607,6 +607,8 @@
     // share the same model/colour as the sidebar card and stay in sync
     // when the user changes their selection on vehicle-control.html.
     var auxEv3dInstances = [];
+    var FALLBACK_MODEL_ID = 'seal';
+    var FALLBACK_MODEL_COLOR = '#E8E8EC';
 
     function setEvCardAppearance(modelId, hexColor) {
         // Forward the user's selection to the 3D card. ev-card-3d.js
@@ -778,21 +780,31 @@
     function applyVehicleSelection() {
         // No-op if the EV card isn't mounted (login.html, dev-only pages).
         if (!document.getElementById('evCardCanvas')) return;
+        function applyFallbackAppearance() {
+            setEvCardAppearance(FALLBACK_MODEL_ID, FALLBACK_MODEL_COLOR);
+        }
         try {
             var xhr = new XMLHttpRequest();
             xhr.open('GET', '/api/models/selected', true);
             xhr.timeout = 4000;
             xhr.onload = function () {
-                if (xhr.status < 200 || xhr.status >= 300) return;
+                if (xhr.status < 200 || xhr.status >= 300) {
+                    applyFallbackAppearance();
+                    return;
+                }
                 var data;
                 try { data = JSON.parse(xhr.responseText) || {}; }
-                catch (e) { return; }
-                setEvCardAppearance(data.modelId, data.color);
+                catch (e) {
+                    applyFallbackAppearance();
+                    return;
+                }
+                setEvCardAppearance(data.modelId || FALLBACK_MODEL_ID,
+                                    data.color || FALLBACK_MODEL_COLOR);
             };
-            xhr.onerror = function () { /* network — leave defaults */ };
-            xhr.ontimeout = function () { /* slow daemon — leave defaults */ };
+            xhr.onerror = function () { applyFallbackAppearance(); };
+            xhr.ontimeout = function () { applyFallbackAppearance(); };
             xhr.send();
-        } catch (e) { /* security/policy — leave defaults */ }
+        } catch (e) { applyFallbackAppearance(); }
     }
 
     // ============================================================

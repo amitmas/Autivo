@@ -234,17 +234,54 @@
         if (manifestCache) return Promise.resolve(manifestCache);
         if (manifestPromise) return manifestPromise;
         manifestPromise = new Promise(function (resolve) {
+            function fallbackManifest() {
+                return {
+                    version: 0,
+                    'default': 'seal',
+                    models: [{ id: 'seal', name: 'BYD Seal', file: 'seal.glb', bundled: true }]
+                };
+            }
+            function fetchBundledManifest() {
+                var localXhr = new XMLHttpRequest();
+                localXhr.open('GET', '../shared/models/manifest.json', true);
+                localXhr.timeout = 4000;
+                localXhr.onload = function () {
+                    if (localXhr.status >= 200 && localXhr.status < 300) {
+                        try { manifestCache = JSON.parse(localXhr.responseText); }
+                        catch (e) { manifestCache = fallbackManifest(); }
+                        resolve(manifestCache);
+                        return;
+                    }
+                    manifestCache = fallbackManifest();
+                    resolve(manifestCache);
+                };
+                localXhr.onerror = function () {
+                    manifestCache = fallbackManifest();
+                    resolve(manifestCache);
+                };
+                localXhr.ontimeout = function () {
+                    manifestCache = fallbackManifest();
+                    resolve(manifestCache);
+                };
+                localXhr.send();
+            }
+
             var xhr = new XMLHttpRequest();
             xhr.open('GET', '/api/models/manifest', true);
             xhr.timeout = 4000;
             xhr.onload = function () {
                 if (xhr.status >= 200 && xhr.status < 300) {
-                    try { manifestCache = JSON.parse(xhr.responseText); } catch (e) {}
+                    try { manifestCache = JSON.parse(xhr.responseText); }
+                    catch (e) { manifestCache = null; }
+                    if (manifestCache) {
+                        resolve(manifestCache);
+                        return;
+                    }
                 }
-                resolve(manifestCache);
+                fetchBundledManifest();
             };
-            xhr.onerror = function () { manifestPromise = null; resolve(null); };
-            xhr.ontimeout = function () { manifestPromise = null; resolve(null); };
+            xhr.onerror = function () { fetchBundledManifest(); };
+            xhr.ontimeout = function () { fetchBundledManifest(); };
             xhr.send();
         });
         return manifestPromise;
@@ -350,8 +387,9 @@
             this.camera.position.set(0, 3, 0);
             this.camera.lookAt(0, 0, 0);
         } else if (this.view === 'three-quarter') {
-            // 3/4 profile for larger hero canvases.
-            this.camera.position.set(0.9, 0.45, 3.2);
+            // 3/4 profile for larger hero canvases. Use centered X so
+            // the model appears visually centered in the canvas.
+            this.camera.position.set(0, 0.45, 3.2);
             this.camera.lookAt(0, 0.05, 0);
         } else {
             // Pure side profile. Camera held close (distance 3) with
@@ -488,8 +526,10 @@
         // makes the car's length run vertically on the canvas).
         var modelW = this._naturalSize.x;
         var modelH = (this.view === 'top') ? this._naturalSize.z : this._naturalSize.y;
-        var widthScale  = (visibleW * 0.90) / Math.max(modelW, 1e-6);
-        var heightScale = (visibleH * 0.90) / Math.max(modelH, 1e-6);
+        var fitFill = 0.98;
+        if (this.view === 'three-quarter') fitFill = 0.90;
+        var widthScale  = (visibleW * fitFill) / Math.max(modelW, 1e-6);
+        var heightScale = (visibleH * fitFill) / Math.max(modelH, 1e-6);
         var s = Math.min(widthScale, heightScale);
         // Reset → apply, instead of multiplyScalar, so repeated calls
         // converge instead of compounding.
@@ -502,6 +542,12 @@
         var box = new T.Box3().setFromObject(this.carModel);
         var center = box.getCenter(new T.Vector3());
         this.carModel.position.sub(center);
+        if (this.view === 'three-quarter') {
+            // Nudge the model slightly up and to the left so it is
+            // visually centered in this hero canvas (user feedback).
+            this.carModel.position.y += this._naturalSize.y * s * 0.2;
+            this.carModel.position.x -= this._naturalSize.x * s * 0.1;
+        }
     };
 
     OverdriveEvCard3D.prototype._observeVisibility = function () {
@@ -681,7 +727,8 @@
             if (self.view === 'top') {
                 self.carModel.rotation.y = Math.PI;
             } else if (self.view === 'three-quarter') {
-                self.carModel.rotation.y = Math.PI / 4;
+                // Slightly rotated for a pleasing 3/4 perspective. Tuned incrementally.
+                    self.carModel.rotation.y = 0.95;
             } else {
                 self.carModel.rotation.y = Math.PI / 2;
             }
