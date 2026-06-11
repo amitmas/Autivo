@@ -1395,7 +1395,14 @@ public class StatusOverlayService extends Service {
             // its own amber branch below).
             boolean deferredActive = !isProximity && modeActive && pipelineRunning
                     && !recordingWedged;
-            boolean recordingLive = isRecording || deferredActive;
+            // FIX (false-GREEN): the daemon now reports wedged=true when a muxer
+            // is open (isRecording()==true) but no video sample has reached disk
+            // for >8s (SD unmount / ENOSPC / write failures). Previously the bare
+            // `isRecording` term sat OUTSIDE the !wedged guard, so the pill stayed
+            // GREEN over a dead writer. Gate isRecording on !recordingWedged too
+            // so a confirmed disk-write stall falls through to the red
+            // shouldBeRecording fault branch instead of a false "recording".
+            boolean recordingLive = (isRecording && !recordingWedged) || deferredActive;
 
             if (!recConfigured) {
                 // Recording is OFF. Muted anchor so the user can tap to
@@ -1480,7 +1487,13 @@ public class StatusOverlayService extends Service {
             long now = android.os.SystemClock.elapsedRealtime();
             boolean recentFailure = lastAudioStartFailureMs > 0
                 && (now - lastAudioStartFailureMs) < AUDIO_FAILURE_HINT_WINDOW_MS;
-            if (isCapturing && isRecording) {
+            if (isCapturing && isRecording && !recordingWedged) {
+                // FIX (false-GREEN): require !recordingWedged so the mic icon
+                // can't stay green while the daemon reports the writer is
+                // wedged (muxer open but nothing reaching disk). Otherwise the
+                // cabin mic would read as "audio is being saved" while no clip
+                // is actually being written — falls through to the amber
+                // "capturing but not muxing" branch below instead.
                 ivMicIcon.setImageResource(R.drawable.ic_overlay_mic_active);
                 tvMicLabel.setText(R.string.overlay_mic_inactive_label);
                 tvMicLabel.setTextColor(getColor(R.color.status_success));

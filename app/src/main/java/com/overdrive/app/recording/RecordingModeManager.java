@@ -358,6 +358,15 @@ public class RecordingModeManager {
 
     private static final long PERIODIC_RESYNC_INTERVAL_MS = 30_000L;
 
+    // FIX (false-GREEN): how long isRecording() may be true with NO video
+    // sample reaching disk before we treat the session as wedged. Must exceed
+    // a normal between-segments gap and any brief writer backpressure, but be
+    // short enough that a real SD-unmount / ENOSPC stall surfaces as a fault
+    // rather than a sticky false-GREEN. 8s: longer than the 5s rotation grace,
+    // shorter than the 30s resync tick so a stall is caught on the first tick
+    // after it crosses the threshold.
+    private static final long DISK_WRITE_STALL_THRESHOLD_MS = 8_000L;
+
     /**
      * Re-query authoritative ACC + gear from hardware/monitors and re-drive
      * mode activation if state has drifted from what we currently believe.
@@ -570,8 +579,43 @@ public class RecordingModeManager {
                     + lastEncodedAgeMs + "ms since last encoded frame "
                     + "(threshold 15000ms); treating as wedged");
             }
+            // FIX (false-GREEN: "REC/MIC green but no video file"): the encoder
+            // can be alive (lastEncodedFrameMs fresh, isRecording()==true) while
+            // NOTHING reaches disk — SD unmounted mid-segment, ENOSPC, or every
+            // muxer write failing below the 5-strike abort. encoderStalled
+            // CANNOT see this (the encoder always runs for the pre-record ring),
+            // and recordingHealthy is true (isRecording()==true), so without a
+            // disk-write probe the pill stays GREEN over a dead writer. Probe
+            // the last-disk-write timestamp: if we believe we're recording but
+            // no VIDEO sample has been muxed in DISK_WRITE_STALL_THRESHOLD_MS,
+            // that's a wedge. Gated on isRecording() (a muxer is supposedly
+            // open) and lastDiskWrittenMs>0 (a muxer actually opened) so the
+            // deferred/pending window — where isRecording() is false and the
+            // pendingPrefixStuck arm already covers it — is not double-counted.
+            // PROXIMITY_GUARD excluded (same no-continuous-recording rationale).
+            long lastDiskWrittenAgeMs = -1L;
+            try {
+                long lastDiskMs = pipeline.getLastDiskWrittenMs();
+                if (lastDiskMs > 0L) {
+                    lastDiskWrittenAgeMs = System.currentTimeMillis() - lastDiskMs;
+                }
+            } catch (Throwable ignored) {
+                // Older pipeline build without the accessor — fall through.
+            }
+            boolean diskStalled = modeActive
+                    && currentMode != Mode.PROXIMITY_GUARD
+                    && !inRotationGrace
+                    && pipeline.isRecording()
+                    && lastDiskWrittenAgeMs > DISK_WRITE_STALL_THRESHOLD_MS;
+            if (diskStalled) {
+                logger.warn("Recording disk-write stalled (" + reason + ") — "
+                    + lastDiskWrittenAgeMs + "ms since last sample written to disk "
+                    + "(threshold " + DISK_WRITE_STALL_THRESHOLD_MS + "ms) while "
+                    + "isRecording()==true; treating as wedged (likely SD unmount / "
+                    + "ENOSPC / write failures — recording is NOT being saved)");
+            }
             boolean wedgeDetected = modeActive
-                    && (!recordingHealthy || pendingPrefixStuck || encoderStalled)
+                    && (!recordingHealthy || pendingPrefixStuck || encoderStalled || diskStalled)
                     && !inRotationGrace
                     && currentMode != Mode.PROXIMITY_GUARD;
             // Publish the wedge truth for status surfaces (overlay pill / web

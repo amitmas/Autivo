@@ -495,6 +495,29 @@ public class GpuMosaicRecorder {
                         + reason + ")");
                 }
                 com.overdrive.app.storage.StorageManager.getInstance().setRecordingActive(false);
+                // FIX (false-GREEN): notify RMM immediately so its wedge flag
+                // latches NOW instead of waiting up to a full 30s resync tick
+                // (and risking the tick landing inside the 5s rotation grace,
+                // which would mask it entirely). Without this, the status pill
+                // stays GREEN via the deferredActive branch for up to 30s after
+                // the writer died. resyncFromHardware does heavy work
+                // (GearMonitor.start, synchronized(this)) so it MUST NOT run on
+                // this disk-writer thread (it's being torn down) — fire it on a
+                // short-lived daemon thread.
+                final String abortReason = reason;
+                Thread t = new Thread(() -> {
+                    try {
+                        com.overdrive.app.recording.RecordingModeManager rmm =
+                            com.overdrive.app.daemon.CameraDaemon.getRecordingModeManager();
+                        if (rmm != null) {
+                            rmm.resyncFromHardware("writer-abort:" + abortReason);
+                        }
+                    } catch (Throwable inner) {
+                        logger.warn("writer-abort RMM resync failed: " + inner.getMessage());
+                    }
+                }, "WriterAbortResync");
+                t.setDaemon(true);
+                t.start();
             } catch (Throwable t) {
                 logger.warn("onWriterAborted bridge failed: " + t.getMessage());
             }
@@ -1169,6 +1192,19 @@ public class GpuMosaicRecorder {
                 targetDir = storageManager.getRecordingsDir();
             }
 
+            // ENOSPC fallback (false-GREEN fix): if the resolved target lives on
+            // a configured EXTERNAL volume that is mounted-but-FULL, redirect
+            // THIS segment to internal so the recording is saved rather than
+            // ENOSPC-aborting into a quarantined .broken clip. One-directional
+            // (external→internal only) and start-of-segment only, so it can't
+            // ping-pong a live session. No-op when target is already internal,
+            // has room, or is genuinely unmounted (left to the unmount path).
+            java.io.File enospcSafe = storageManager.resolveTargetWithEnospcFallback(
+                targetDir, 100 * 1024 * 1024, true /* trackState — primary path drives the UI banner */);
+            if (enospcSafe != null && enospcSafe != targetDir) {
+                targetDir = enospcSafe;
+            }
+
             // Ensure directory exists
             if (!targetDir.exists()) {
                 targetDir.mkdirs();
@@ -1210,6 +1246,27 @@ public class GpuMosaicRecorder {
 
             // Use target directory
             String outputPath = new java.io.File(targetDir, filename).getAbsolutePath();
+            // DIAGNOSTIC (root-cause confirm for "REC green, no file"): log the
+            // FINAL resolved target + its free space + configured-vs-active
+            // storage type at each segment open. With the user-reported trigger
+            // being "varies", this single line ties a missing clip to its exact
+            // cause on-car — ENOSPC (free near 0), internal fallback fired
+            // (path under /storage/emulated/0 while type=SD_CARD/USB), or a
+            // healthy external write — without needing a repro.
+            try {
+                long freeBytes = -1L;
+                try {
+                    java.io.File probe = targetDir.exists() ? targetDir : targetDir.getParentFile();
+                    if (probe != null && probe.exists()) {
+                        freeBytes = new android.os.StatFs(probe.getAbsolutePath()).getAvailableBytes();
+                    }
+                } catch (Throwable ignore) { /* unmounted — leave -1 */ }
+                logger.info("Recording start: target=" + targetDir.getAbsolutePath()
+                    + " free=" + (freeBytes < 0 ? "unknown(unmounted?)" : (freeBytes / (1024 * 1024)) + "MB")
+                    + " configuredType=" + storageManager.getRecordingsStorageType()
+                    + " activeType=" + storageManager.getActiveRecordingsStorageType()
+                    + " prefix=" + prefix);
+            } catch (Throwable ignore) { /* diagnostics must never block a start */ }
             startRecording(outputPath);
         } catch (Exception e) {
             long ms = (System.nanoTime() - startNs) / 1_000_000L;

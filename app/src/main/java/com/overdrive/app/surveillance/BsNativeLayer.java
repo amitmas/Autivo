@@ -393,44 +393,31 @@ public final class BsNativeLayer {
             p = new ProcessBuilder("dumpsys", "display").redirectErrorStream(true).start();
             java.io.BufferedReader r = new java.io.BufferedReader(
                 new java.io.InputStreamReader(p.getInputStream()));
-            java.util.regex.Pattern idLine =
-                java.util.regex.Pattern.compile("mDisplayId\\s*=\\s*(\\d+)");
-            java.util.regex.Pattern stackLine =
-                java.util.regex.Pattern.compile("(?:m)?[Ll]ayerStack[ =]+(\\d+)");
+            // AUTHORITATIVE source = a line that mentions "fission" AND carries a
+            // same-line layerStack. That is the fission logical-display DisplayInfo
+            // line (mBaseDisplayInfo/mOverrideDisplayInfo):
+            //   ...DisplayInfo{"fission_bg_xdjaVirtualSurface, displayId 1", ...,
+            //                  layerStack 1, ...}
+            // Its "layerStack N" is the SF COMPOSITING stack — the value the BS
+            // layer must be tagged with. PROVEN on the Seal across size profiles
+            // (stacks 1/2/4). We do NOT trust the bare `mLayerStack=`/
+            // `mCurrentLayerStack=` lines that sit a few lines ABOVE it: on the Seal
+            // those read 0 (the device-level default), and a block parser that grabs
+            // the first bare mLayerStack=0 then sees "fission" on a later line
+            // returns 0 → the layer composites onto a dead stack → BLACK/no-video.
+            // (That block-parser was a regression — this restores the same-line read.)
+            // The displayId is on the SAME fission line ("displayId 1"), so it comes
+            // for free. Prefer the LAST such line (Override after Base; identical N).
+            java.util.regex.Pattern sameLineStack =
+                java.util.regex.Pattern.compile("(?i)layerstack[ =]+(\\d+)");
             String line;
-            // Current logical-display block being accumulated.
-            int curId = -1, curStack = -1;
-            boolean curFission = false;
             int foundId = -1, foundStack = -1;
             while ((line = r.readLine()) != null) {
-                java.util.regex.Matcher mid = idLine.matcher(line);
-                if (mid.find()) {
-                    // New block boundary — finalize the previous block first.
-                    if (curFission) {
-                        if (foundId < 0) foundId = curId;
-                        if (foundStack < 0) foundStack = curStack;
-                    }
-                    curId = parseIntSafe(mid.group(1));
-                    curStack = -1;
-                    curFission = false;
-                    continue;
-                }
-                java.util.regex.Matcher mst = stackLine.matcher(line);
-                if (mst.find() && curStack < 0) curStack = parseIntSafe(mst.group(1));
-                if (line.toLowerCase(java.util.Locale.US).contains("fission")) {
-                    curFission = true;
-                    // The fission DisplayInfo line may also inline displayId/layerStack
-                    // (Seal layout) — prefer those when the block didn't carry them.
-                    int idHere = extractDisplayIdOnLine(line);
-                    if (idHere >= 0 && curId < 0) curId = idHere;
-                    java.util.regex.Matcher inl = stackLine.matcher(line);
-                    if (inl.find() && curStack < 0) curStack = parseIntSafe(inl.group(1));
-                }
-            }
-            // Flush the trailing block.
-            if (curFission) {
-                if (foundId < 0) foundId = curId;
-                if (foundStack < 0) foundStack = curStack;
+                if (!line.toLowerCase(java.util.Locale.US).contains("fission")) continue;
+                int id = extractDisplayIdOnLine(line);
+                if (id >= 0) foundId = id;
+                java.util.regex.Matcher m = sameLineStack.matcher(line);
+                if (m.find()) foundStack = parseIntSafe(m.group(1));
             }
             return new FissionDisplay(foundId, foundStack);
         } catch (Throwable t) {

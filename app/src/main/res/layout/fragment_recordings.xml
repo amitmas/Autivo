@@ -1,22 +1,33 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Recordings page — portrait. Events.html-style inline filter strip lives
-  ABOVE the embedded RecordingLibraryFragment, so the user gets:
-    1. Title row + tonal Settings.
-    2. Counts subtitle.
-    3. Top filter strip:
-         • Date jump card (◀  Today / clip count  ▶).
-         • Dashcam | Surveillance segmented control (counts in label).
-         • "What" actor-class chip row.
-         • "Severity" chip row.
-    4. Library container hosts the recordings list (no chrome of its own).
+  Recordings page — portrait. SOTA redesign matching events.html aesthetic.
 
-  IDs preserved (consumed by RecordingsFragment.kt):
+  Vertical rhythm:
+    1. Hero header
+       ・ Title row: "Recordings" + tonal Settings (right-aligned).
+       ・ Subtitle row: count chip pill ("12 today · 320 total · 42 GB")
+         on a faint surface, reads like the events.html top bar's count
+         strip.
+    2. Filter strip — wrapped in a subtle surface container (events.html
+       `.filter-tabs-row2` parity):
+         ・ Segmented Dashcam / Surveillance with icons (running counts).
+         ・ Date jump card (◀ Today / clip count ▶).
+         ・ TYPE chips (Dashcam segment only).
+         ・ WHAT chip row (Surveillance only).
+         ・ SEVERITY chip row (Surveillance only) + Reset.
+         ・ PLACE chip row (auto-hidden until any place is tagged).
+    3. Library container — hosts the embedded RecordingLibraryFragment list.
+
+  IDs preserved (consumed by RecordingsFragment.kt — DO NOT rename):
     segmentedSource, segmentDashcam, segmentSurveillance,
     btnRecordingsSettings, libraryContainer,
     btnPrevDay, btnNextDay, cardDateJump, tvSelectedDate, tvDayClipCount,
-    chipActorAny, chipActorPerson, chipActorVehicle, chipActorBike, chipActorAnimal,
-    chipSevAny, chipSevAlert, chipSevCritical, btnFilterReset.
+    chipActorAny, chipActorPerson, chipActorVehicle, chipActorBike,
+    chipActorAnimal, chipSevAny, chipSevAlert, chipSevCritical,
+    btnFilterReset, chipTypeNormal, chipTypeProximity, chipGroupPlace,
+    rowTypeFilter, rowWhatFilter, rowSeverityFilter, rowPlaceFilter,
+    btnClearDate, tvRecordingsSummary,
+    cardPlaceSearch, etPlaceSearch, btnClearPlaceSearch (place substring search).
 -->
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
@@ -26,7 +37,7 @@
     android:background="?android:attr/colorBackground"
     android:orientation="vertical">
 
-    <!-- ============ Hero header: title + summary ============ -->
+    <!-- ============ Hero header ============ -->
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
@@ -43,15 +54,41 @@
             android:baselineAligned="false">
 
             <TextView
-                android:layout_width="0dp"
+                android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:layout_weight="1"
                 android:text="@string/recordings_title"
                 android:textAppearance="@style/TextAppearance.Material3.HeadlineSmall"
                 android:textColor="?attr/colorOnSurface"
                 android:textStyle="bold"
                 android:singleLine="true"
                 android:ellipsize="end" />
+
+            <!--
+              Total-count badge next to the title. Reads like the small
+              counter on events.html's top bar; populated by the parent's
+              refreshCounts() executor. Hidden until the first scan lands
+              so the title doesn't briefly flicker "0".
+            -->
+            <TextView
+                android:id="@+id/tvTitleCountBadge"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="10dp"
+                android:background="@drawable/recording_lib_count_pill"
+                android:fontFamily="sans-serif-medium"
+                android:paddingHorizontal="10dp"
+                android:paddingVertical="3dp"
+                android:textColor="?attr/colorOnSurface"
+                android:textSize="11sp"
+                android:visibility="gone"
+                tools:text="320"
+                tools:visibility="visible" />
+
+            <!-- spacer pushes Settings to the trailing edge -->
+            <View
+                android:layout_width="0dp"
+                android:layout_height="0dp"
+                android:layout_weight="1" />
 
             <com.google.android.material.button.MaterialButton
                 android:id="@+id/btnRecordingsSettings"
@@ -79,13 +116,27 @@
             tools:text="12 today · 320 total · 42 GB" />
     </LinearLayout>
 
-    <!-- ============ Top filter strip ============ -->
-    <LinearLayout
+    <!-- ============ Top filter strip ============
+         Wrapped in a subtle MaterialCardView so the chip rows read as a
+         single coherent affordance rather than four loose horizontal
+         scrollers, mirroring events.html's `.filter-tabs-row2` block.
+    -->
+    <com.google.android.material.card.MaterialCardView
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:orientation="vertical"
-        android:paddingHorizontal="@dimen/page_padding_horizontal"
-        android:paddingBottom="6dp">
+        android:layout_marginHorizontal="@dimen/page_padding_horizontal"
+        android:layout_marginTop="6dp"
+        android:layout_marginBottom="@dimen/card_gap_vertical"
+        app:cardBackgroundColor="?attr/colorSurfaceContainerLow"
+        app:cardCornerRadius="@dimen/card_radius_standard"
+        app:cardElevation="0dp"
+        app:strokeWidth="0dp">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:padding="12dp">
 
         <!-- Row 1: Dashcam | Surveillance segmented control -->
         <com.google.android.material.button.MaterialButtonToggleGroup
@@ -101,19 +152,92 @@
                 style="@style/Widget.Material3.Button.OutlinedButton"
                 android:layout_width="0dp"
                 android:layout_weight="1"
-                android:layout_height="42dp"
+                android:layout_height="44dp"
                 android:text="@string/recordings_segment_dashcam"
-                android:textAllCaps="false" />
+                android:textAllCaps="false"
+                app:icon="@drawable/ic_directions_car"
+                app:iconSize="18dp"
+                app:iconGravity="textStart"
+                app:iconPadding="6dp" />
 
             <com.google.android.material.button.MaterialButton
                 android:id="@+id/segmentSurveillance"
                 style="@style/Widget.Material3.Button.OutlinedButton"
                 android:layout_width="0dp"
                 android:layout_weight="1"
-                android:layout_height="42dp"
+                android:layout_height="44dp"
                 android:text="@string/recordings_segment_surveillance"
-                android:textAllCaps="false" />
+                android:textAllCaps="false"
+                app:icon="@drawable/ic_sentry"
+                app:iconSize="18dp"
+                app:iconGravity="textStart"
+                app:iconPadding="6dp" />
         </com.google.android.material.button.MaterialButtonToggleGroup>
+
+        <!-- Row 1b: Free-text place search.
+             Substring narrowing across short / medium / displayName place
+             labels — routed through `placeContains=` on /api/recordings.
+             Full-width on portrait because the title row is already
+             saturated; the M3 surface treatment matches the date-jump
+             card immediately below so they read as a coherent control
+             stack. RecordingsFragment.setupPlaceSearch null-safely binds
+             the same etPlaceSearch / btnClearPlaceSearch IDs as the
+             landscape variant. -->
+        <com.google.android.material.card.MaterialCardView
+            android:id="@+id/cardPlaceSearch"
+            android:layout_width="match_parent"
+            android:layout_height="44dp"
+            android:layout_marginTop="10dp"
+            app:cardBackgroundColor="?attr/colorSurfaceVariant"
+            app:cardCornerRadius="22dp"
+            app:cardElevation="0dp"
+            app:strokeWidth="0dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:paddingStart="14dp"
+                android:paddingEnd="6dp">
+
+                <ImageView
+                    android:layout_width="18dp"
+                    android:layout_height="18dp"
+                    android:contentDescription="@null"
+                    android:src="@drawable/ic_events"
+                    app:tint="?attr/colorOnSurfaceVariant" />
+
+                <EditText
+                    android:id="@+id/etPlaceSearch"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1"
+                    android:layout_marginStart="10dp"
+                    android:background="@null"
+                    android:hint="@string/recording_lib_place_search_hint"
+                    android:imeOptions="actionSearch"
+                    android:importantForAutofill="no"
+                    android:inputType="text"
+                    android:maxLines="1"
+                    android:singleLine="true"
+                    android:textColor="?attr/colorOnSurface"
+                    android:textColorHint="?attr/colorOnSurfaceVariant"
+                    android:textSize="14sp" />
+
+                <ImageButton
+                    android:id="@+id/btnClearPlaceSearch"
+                    android:layout_width="32dp"
+                    android:layout_height="32dp"
+                    android:background="?attr/selectableItemBackgroundBorderless"
+                    android:contentDescription="@string/cd_clear_date_filter"
+                    android:padding="6dp"
+                    android:src="@drawable/ic_clear"
+                    android:visibility="gone"
+                    app:tint="?attr/colorOnSurfaceVariant"
+                    tools:visibility="visible" />
+            </LinearLayout>
+        </com.google.android.material.card.MaterialCardView>
 
         <!-- Row 2: date jump (◀ card ▶) -->
         <LinearLayout
@@ -466,7 +590,8 @@
                     app:singleLine="true" />
             </LinearLayout>
         </HorizontalScrollView>
-    </LinearLayout>
+        </LinearLayout>
+    </com.google.android.material.card.MaterialCardView>
 
     <!-- ============ Library list (fills remaining height) ============ -->
     <androidx.fragment.app.FragmentContainerView

@@ -1,47 +1,45 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Recording library — v4 redesign (portrait).
+  Recording library — v5 redesign (portrait).
 
-  Goals: stop stacking 4 calendar/filter UIs on top of the list. Hero is the
-  recordings grid; date and filters are slim, on-demand affordances.
+  This fragment is always embedded inside RecordingsFragment via
+  newInstanceEmbedded(); the parent owns the date row + chip filters via
+  the surrounding layout, so the chrome here defaults to GONE in embedded
+  mode. The standalone fallback (date row + slim filter bar) is kept for
+  any future direct nav-graph callers and any deep-link surfaces.
 
-  Layout:
-    1. Date jump card: ◀  [icon | "Today" / formatted date | clip count | ›]  ▶
-       Tap card → MaterialDatePicker. ◀/▶ → ±1 day.
-    2. Filter bar: scrollable strip of currently-active filter chips (each with
-       an X to clear), trailing M3 "Filter" pill that opens a bottom sheet
-       hosting the actor + severity chip rows. Hidden when no filters active
-       except for the trailing pill.
-    3. Multi-select toolbar (unchanged).
-    4. Recordings list (unchanged grid).
+  Vertical rhythm:
+    1. Date jump card (◀  card  ▶) — STANDALONE ONLY (GONE in embed mode).
+    2. Filter pill row (active filter chips + "Filter" trailing pill) —
+       STANDALONE ONLY.
+    3. Recordings grid OR illustrated empty state with "Clear filters" CTA.
+    4. Multi-select bottom action bar (overlays the grid bottom edge while
+       active): selected count + Select all + Share + Delete + Cancel.
 
   IDs preserved for findViewById in RecordingLibraryFragment:
     tvSelectedDate, recyclerRecordings, emptyStateContainer, tvEmptyState,
     selectToolbar, tvSelectedCount, btnSelectAll, btnDeleteSelected,
-    btnCancelSelect, filterBar (now the active-filter strip).
+    btnCancelSelect, filterBar (active-filter strip).
 
-  Removed (and removed from Kotlin too):
-    tvCurrentMonth, btnPrevMonth, btnNextMonth, btnCalendarCollapse,
-    recyclerWeekStrip, btnPrevWeek, btnNextWeek, calendarBody, recyclerCalendar.
-
-  The Source-filter chips (btnFilterAll/Normal/Sentry/Proximity) are REMOVED
-  from this layout — when this fragment is embedded inside RecordingsFragment
-  the parent's segmented control drives that filter, and standalone callers
-  can use setSourceFilter() programmatically. This matches the existing
-  ARG_HIDE_INTERNAL_FILTERS behaviour but eliminates the dead chip row.
-
-  Actor + severity chips moved into sheet_recording_library_filters.xml.
+  New IDs:
+    btnEmptyClearFilters — empty-state CTA, calls back into the parent to
+                           drop every chip + place + date filter.
+    btnShareSelected     — multi-select share-via-chooser action.
 -->
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
     xmlns:tools="http://schemas.android.com/tools"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:background="?attr/colorSurface"
-    android:orientation="vertical">
+    android:background="?attr/colorSurface">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:orientation="vertical">
 
     <!-- ============================================================
-         1. DATE JUMP ROW
+         1. DATE JUMP ROW (standalone-only chrome)
          ============================================================ -->
     <LinearLayout
         android:id="@+id/dateRowContainer"
@@ -146,7 +144,7 @@
     </LinearLayout>
 
     <!-- ============================================================
-         2. FILTER BAR (active-filter chips + "Filter" pill)
+         2. FILTER BAR (standalone-only chrome)
          id=filterBar preserved so existing ARG_HIDE_INTERNAL_FILTERS path
          continues to GONE the whole bar when embedded.
          ============================================================ -->
@@ -196,61 +194,7 @@
     </LinearLayout>
 
     <!-- ============================================================
-         3. MULTI-SELECT TOOLBAR (unchanged behaviour)
-         ============================================================ -->
-    <LinearLayout
-        android:id="@+id/selectToolbar"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:orientation="horizontal"
-        android:gravity="center_vertical"
-        android:paddingHorizontal="20dp"
-        android:paddingVertical="8dp"
-        android:background="?attr/colorSurfaceVariant"
-        android:visibility="gone">
-
-        <TextView
-            android:id="@+id/tvSelectedCount"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:textColor="?attr/colorPrimary"
-            android:textSize="13sp"
-            android:fontFamily="sans-serif-medium"
-            android:text="@string/recording_lib_selected_count_zero" />
-
-        <com.google.android.material.button.MaterialButton
-            android:id="@+id/btnSelectAll"
-            style="@style/Widget.Material3.Button.TextButton"
-            android:layout_width="wrap_content"
-            android:layout_height="36dp"
-            android:text="@string/action_select_all_short"
-            android:textSize="12sp" />
-
-        <com.google.android.material.button.MaterialButton
-            android:id="@+id/btnDeleteSelected"
-            style="@style/Widget.Material3.Button.TextButton"
-            android:layout_width="wrap_content"
-            android:layout_height="36dp"
-            android:text="@string/action_delete"
-            android:textSize="12sp"
-            android:textColor="@color/status_danger"
-            app:icon="@drawable/ic_delete"
-            app:iconTint="@color/status_danger"
-            app:iconSize="16dp" />
-
-        <com.google.android.material.button.MaterialButton
-            android:id="@+id/btnCancelSelect"
-            style="@style/Widget.Material3.Button.TextButton"
-            android:layout_width="wrap_content"
-            android:layout_height="36dp"
-            android:text="@string/action_cancel"
-            android:textSize="12sp" />
-
-    </LinearLayout>
-
-    <!-- ============================================================
-         4. RECORDINGS LIST (hero)
+         3. RECORDINGS GRID + EMPTY STATE (hero)
          ============================================================ -->
     <FrameLayout
         android:layout_width="match_parent"
@@ -266,6 +210,9 @@
             android:paddingTop="4dp"
             android:paddingBottom="20dp" />
 
+        <!-- SOTA empty state: tonal icon disc + headline + body + CTA.
+             Reads like the events.html "no events match" panel rather
+             than the previous tiny grey icon. -->
         <LinearLayout
             android:id="@+id/emptyStateContainer"
             android:layout_width="match_parent"
@@ -273,25 +220,146 @@
             android:gravity="center"
             android:orientation="vertical"
             android:visibility="gone"
-            android:padding="24dp">
+            android:padding="32dp">
 
-            <ImageView
-                android:layout_width="40dp"
-                android:layout_height="40dp"
-                android:contentDescription="@null"
-                android:src="@drawable/ic_videocam_off"
-                app:tint="?attr/colorOnSurfaceVariant" />
+            <FrameLayout
+                android:layout_width="80dp"
+                android:layout_height="80dp"
+                android:background="@drawable/recording_lib_empty_disc">
+
+                <ImageView
+                    android:layout_width="40dp"
+                    android:layout_height="40dp"
+                    android:layout_gravity="center"
+                    android:contentDescription="@null"
+                    android:src="@drawable/ic_videocam_off"
+                    app:tint="?attr/colorOnSurfaceVariant" />
+            </FrameLayout>
 
             <TextView
                 android:id="@+id/tvEmptyState"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="8dp"
+                android:layout_marginTop="16dp"
                 android:gravity="center"
-                android:text="@string/recording_lib_no_recordings"
-                android:textColor="?attr/colorOnSurfaceVariant"
-                android:textSize="13sp" />
+                android:text="@string/recording_lib_empty_title"
+                android:textAppearance="@style/TextAppearance.Material3.TitleMedium"
+                android:textColor="?attr/colorOnSurface" />
+
+            <TextView
+                android:id="@+id/tvEmptyStateBody"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:gravity="center"
+                android:text="@string/recording_lib_empty_body"
+                android:textAppearance="@style/TextAppearance.Material3.BodyMedium"
+                android:textColor="?attr/colorOnSurfaceVariant" />
+
+            <!-- CTA: visible only when filters are narrowing the visible
+                 set. Dropped to GONE on the "no recordings on disk" empty
+                 case — clearing filters can't help when there are zero
+                 clips to begin with. The Kotlin side flips visibility per
+                 case via [setEmptyStateMode]. -->
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnEmptyClearFilters"
+                style="@style/Widget.Material3.Button.TonalButton"
+                android:layout_width="wrap_content"
+                android:layout_height="40dp"
+                android:layout_marginTop="20dp"
+                android:text="@string/recording_lib_empty_clear_filters"
+                android:textAllCaps="false"
+                android:visibility="gone"
+                app:cornerRadius="20dp"
+                app:icon="@drawable/ic_clear"
+                app:iconSize="18dp" />
         </LinearLayout>
     </FrameLayout>
+    </LinearLayout>
 
-</LinearLayout>
+    <!-- ============================================================
+         4. MULTI-SELECT BOTTOM ACTION BAR (overlay)
+         Docked at the bottom edge so the selection feedback never
+         pushes the recordings grid down — list scroll position is
+         preserved, and the action set sits closer to the user's thumb.
+         ============================================================ -->
+    <com.google.android.material.card.MaterialCardView
+        android:id="@+id/selectToolbar"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom"
+        android:layout_marginHorizontal="@dimen/page_padding_horizontal"
+        android:layout_marginBottom="@dimen/page_padding_bottom"
+        android:visibility="gone"
+        app:cardBackgroundColor="?attr/colorSurfaceContainerHigh"
+        app:cardCornerRadius="@dimen/card_radius_accent"
+        app:cardElevation="6dp"
+        app:strokeWidth="0dp">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:paddingHorizontal="16dp"
+            android:paddingVertical="8dp">
+
+            <TextView
+                android:id="@+id/tvSelectedCount"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:textColor="?attr/colorOnSurface"
+                android:textSize="14sp"
+                android:fontFamily="sans-serif-medium"
+                android:text="@string/recording_lib_selected_count_zero" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnSelectAll"
+                style="@style/Widget.Material3.Button.TextButton"
+                android:layout_width="wrap_content"
+                android:layout_height="36dp"
+                android:text="@string/action_select_all_short"
+                android:textSize="12sp"
+                android:textAllCaps="false" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnShareSelected"
+                style="@style/Widget.Material3.Button.TextButton"
+                android:layout_width="wrap_content"
+                android:layout_height="36dp"
+                android:contentDescription="@string/cd_share"
+                android:text="@string/action_share"
+                android:textSize="12sp"
+                android:textAllCaps="false"
+                app:icon="@drawable/ic_share"
+                app:iconSize="16dp" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnDeleteSelected"
+                style="@style/Widget.Material3.Button.TextButton"
+                android:layout_width="wrap_content"
+                android:layout_height="36dp"
+                android:text="@string/action_delete"
+                android:textSize="12sp"
+                android:textAllCaps="false"
+                android:textColor="@color/status_danger"
+                app:icon="@drawable/ic_delete"
+                app:iconTint="@color/status_danger"
+                app:iconSize="16dp" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnCancelSelect"
+                style="@style/Widget.Material3.Button.IconButton"
+                android:layout_width="36dp"
+                android:layout_height="36dp"
+                android:contentDescription="@string/action_cancel"
+                app:icon="@drawable/ic_clear"
+                app:iconSize="18dp"
+                app:iconTint="?attr/colorOnSurfaceVariant"
+                app:iconGravity="textStart"
+                app:iconPadding="0dp" />
+        </LinearLayout>
+    </com.google.android.material.card.MaterialCardView>
+
+</FrameLayout>

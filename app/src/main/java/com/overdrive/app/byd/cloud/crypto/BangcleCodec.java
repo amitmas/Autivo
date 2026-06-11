@@ -15,7 +15,7 @@ import java.nio.charset.StandardCharsets;
  * Port of: pyBYD/src/pybyd/_crypto/bangcle.py (BangcleCodec)
  * Also matches: Niek/BYD-re/bangcle.js (encodeEnvelope/decodeEnvelope)
  */
-public final class BangcleCodec {
+public final class BangcleCodec implements EnvelopeCodec {
 
     private static final byte[] ZERO_IV = new byte[16];
 
@@ -24,6 +24,7 @@ public final class BangcleCodec {
     /**
      * Load tables from an InputStream (typically from AssetManager).
      */
+    @Override
     public synchronized void loadTables(InputStream is) throws IOException {
         if (tables == null) {
             tables = BangcleTables.loadFromStream(is);
@@ -42,6 +43,7 @@ public final class BangcleCodec {
     /**
      * Check if tables are loaded.
      */
+    @Override
     public boolean isReady() {
         return tables != null;
     }
@@ -60,6 +62,7 @@ public final class BangcleCodec {
      * @param plaintext UTF-8 string to encrypt
      * @return Bangcle envelope string
      */
+    @Override
     public String encodeEnvelope(String plaintext) {
         BangcleTables t = requireTables();
         byte[] plainBytes = plaintext.getBytes(StandardCharsets.UTF_8);
@@ -74,6 +77,7 @@ public final class BangcleCodec {
      * @param envelope Bangcle envelope (starts with "F")
      * @return Decoded plaintext
      */
+    @Override
     public String decodeEnvelope(String envelope) {
         BangcleTables t = requireTables();
         String cleaned = normalizeInput(envelope);

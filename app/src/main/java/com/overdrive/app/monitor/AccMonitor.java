@@ -130,20 +130,30 @@ public class AccMonitor {
      * call, so this de-dupes to the actual OFF→ON / ON→OFF transition.
      *
      * <p>OFF→ON: if the user enabled "auto-project map to cluster"
-     * (navMap.autoProjectCluster), start the cluster map projection. ON→OFF is
-     * already handled downstream by ClusterProjectionController.forceClose (every
-     * ACC-off path restores the gauges), and ClusterMapProjector.start() itself is
-     * idempotent, so this only needs to TRIGGER the start on the on-edge. Never throws.
+     * (navMap.autoProjectCluster), start the cluster map projection.
+     *
+     * <p>ON→OFF: two distinct teardowns are needed, because the SUSTAINED map
+     * holder and a TRANSIENT blind-spot projection close via different paths:
+     * <ul>
+     *   <li>SUSTAINED map: {@code ClusterMapProjector.stop()} releases the holder
+     *       (and tears down the launched cluster Activity).</li>
+     *   <li>TRANSIENT blind-spot: there is NO ACC-off path inside the BS turn loop
+     *       — {@code bsTurnTick} has no ACC guard and the pipeline stays alive in
+     *       sentry mode, so {@code disableBlindSpot()} (the only BS forceClose) is
+     *       never reached on ACC-off. Without an explicit close here, a turn signal
+     *       held ON at the instant of ACC-off would leave the gauges blanked until
+     *       the 8s linger / 90s max-cap. So we force-close the projection directly
+     *       via {@link com.overdrive.app.surveillance.ClusterProjectionController#forceCloseIfActive}.</li>
+     * </ul>
+     * Both are idempotent + no-op if nothing is active, and never construct the
+     * controller singleton on a head-unit-only daemon. Never throws.
      */
     private static void notifyAccEdge(boolean isAccOn) {
         if (lastEdgeState == (isAccOn ? 1 : 0)) return;  // no real transition
         lastEdgeState = isAccOn ? 1 : 0;
         if (!isAccOn) {
             // ACC-OFF: stop the cluster map projector so its holder releases + the
-            // launched cluster Activity is torn down. The gauge RESTORE itself is
-            // still driven independently by ClusterProjectionController.forceClose
-            // (every ACC-off path) — this just ensures the projector's `active`
-            // flag + sustained hold don't linger. Safe + idempotent if not active.
+            // launched cluster Activity is torn down. Safe + idempotent if not active.
             try {
                 if (com.overdrive.app.navmap.ClusterMapProjector.isActive()) {
                     CameraDaemon.log("ACC-off edge: stopping cluster map projection");
@@ -151,6 +161,17 @@ public class AccMonitor {
                 }
             } catch (Throwable t) {
                 CameraDaemon.log("notifyAccEdge ACC-off stop failed: " + t.getMessage());
+            }
+            // ACC-OFF: ALSO force-close any TRANSIENT blind-spot cluster projection
+            // so the gauges are restored IMMEDIATELY (not after the 8s linger). No-op
+            // if the projection was never opened (controller singleton null) or is
+            // already closed. The BS turn loop is gated against re-opening after an
+            // authoritative ACC-off (see GpuSurveillancePipeline.bsTurnTick), so this
+            // close is not re-asserted by the next 250ms tick mid-blink.
+            try {
+                com.overdrive.app.surveillance.ClusterProjectionController.forceCloseIfActive("acc-off");
+            } catch (Throwable t) {
+                CameraDaemon.log("notifyAccEdge ACC-off cluster force-close failed: " + t.getMessage());
             }
             return;
         }

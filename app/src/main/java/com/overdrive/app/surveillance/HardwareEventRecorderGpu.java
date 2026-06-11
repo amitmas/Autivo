@@ -212,7 +212,21 @@ public class HardwareEventRecorderGpu {
     // and not CODEC_CONFIG); INFO_TRY_AGAIN_LATER and INFO_OUTPUT_FORMAT_CHANGED
     // do not update it.
     private volatile long lastEncodedFrameMs = 0L;
-    
+
+    // FIX (false-GREEN: "REC/MIC green but no video file"): timestamp of the
+    // last VIDEO sample actually written to the muxer (disk). Distinct from
+    // lastEncodedFrameMs, which is stamped on every coded frame dequeued from
+    // the encoder BEFORE the disk-write step — and the encoder always runs to
+    // feed the pre-record ring, so lastEncodedFrameMs advances even when
+    // NOTHING is being muxed to a file. The wedge ticker therefore could not
+    // tell "muxer open and frames landing on disk" from "muxer open but every
+    // write is failing / dropped / the segment will be discarded." This is the
+    // true "bytes are reaching disk" signal: updated ONLY inside the disk
+    // writer's successful writeRebased (video track) and seeded at segment
+    // open / rotation so a fresh segment isn't mistaken for a stall. RMM reads
+    // it via getLastDiskWrittenMs(). 0 = no signal yet (skip the check).
+    private volatile long lastDiskWrittenMs = 0L;
+
     // Pre-record ring buffer.
     // SOTA: byte-ring (single contiguous direct ByteBuffer) shared across encoder
     // instances. Replaces the per-packet slot-pool (H264CircularBuffer) which
@@ -2119,6 +2133,11 @@ public class HardwareEventRecorderGpu {
             lastFramePtsUs = -1;
             ptsOriginUs = -1;
             lastAudioPtsUs = -1L;
+            // Seed the disk-write clock at segment open so the wedge ticker's
+            // grace window is measured from "muxer just opened," not a stale
+            // prior-session value — a fresh segment must never be judged a
+            // disk-stall before its first sample lands.
+            lastDiskWrittenMs = System.currentTimeMillis();
             writerAbortedCorrupt = false;
             writerAbortedErrorMessage = null;
             // Reset per-recording audio failure counter. Without this, the
@@ -2602,6 +2621,7 @@ public class HardwareEventRecorderGpu {
                             // firstFramePtsUs/lastFramePtsUs are tracked inside
                             // writeRebased on the rebased timeline.
                             recordedFrames++;
+                            lastDiskWrittenMs = System.currentTimeMillis();
                         }
                         flushed++;
                     } catch (Exception e) {
@@ -2897,6 +2917,21 @@ public class HardwareEventRecorderGpu {
      */
     public long getLastEncodedFrameMs() {
         return lastEncodedFrameMs;
+    }
+
+    /**
+     * @return wall-clock ms (System.currentTimeMillis) of the last VIDEO
+     *         sample actually written to the muxer (disk). Seeded at segment
+     *         open/rotation. 0 = never written yet (no muxer has opened).
+     *         RMM's wedge ticker reads this via
+     *         GpuSurveillancePipeline.getLastDiskWrittenMs() to detect the
+     *         "muxer open / encoder alive but nothing landing on disk" state
+     *         that getLastEncodedFrameMs() structurally cannot see (the
+     *         encoder always runs to feed the pre-record ring, so its
+     *         timestamp advances even when no file is being written).
+     */
+    public long getLastDiskWrittenMs() {
+        return lastDiskWrittenMs;
     }
 
     /**
@@ -3333,6 +3368,12 @@ public class HardwareEventRecorderGpu {
                                     packet.data, packet.info);
                                 // PTS tracking handled inside writeRebased.
                                 recordedFrames++;
+                                // FIX (false-GREEN): a VIDEO sample actually
+                                // reached the muxer (disk). This is the only
+                                // honest "bytes are landing" signal — see the
+                                // field doc. RMM's wedge ticker reads it to
+                                // catch "muxer open but nothing written."
+                                lastDiskWrittenMs = System.currentTimeMillis();
                             }
                             consecutiveWriteFailures[0] = 0;
                         }
@@ -3964,6 +4005,7 @@ public class HardwareEventRecorderGpu {
                             // the OLD segment's origin since muxer/ptsOriginUs
                             // haven't been swapped yet.
                             recordedFrames++;
+                            lastDiskWrittenMs = System.currentTimeMillis();
                         }
                         drained++;
                     } catch (Exception e) {
@@ -4024,6 +4066,9 @@ public class HardwareEventRecorderGpu {
                 lastFramePtsUs = -1;
                 ptsOriginUs = -1;
                 lastAudioPtsUs = -1L;
+                // Re-seed the disk-write clock on rotation so the new segment
+                // gets a fresh grace window (mirrors the trigger-open seed).
+                lastDiskWrittenMs = System.currentTimeMillis();
                 segmentStartTime = System.currentTimeMillis();
                 rotationOk = true;
             } catch (Exception e) {

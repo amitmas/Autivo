@@ -308,6 +308,11 @@ BYD.recording = {
             if (data.success) {
                 this.config.recordingsLimitMb = data.recordingsLimitMb || 500;
                 this.config.recordingsStorageType = data.recordingsStorageType || 'INTERNAL';
+                // Active (resolved) type may differ from configured when the
+                // chosen external volume is unavailable/full and recordings
+                // fell back to internal. Used to surface the fallback banner.
+                this.config.recordingsStorageTypeActive =
+                    data.recordingsStorageTypeActive || this.config.recordingsStorageType;
 
                 // SD card info
                 this.storageInfo.sdCardAvailable = data.sdCardAvailable || false;
@@ -459,6 +464,20 @@ BYD.recording = {
         // Update storage type buttons
         document.querySelectorAll('#recStorageTypeBtns .btn-toggle').forEach(btn =>
             btn.classList.toggle('active', btn.dataset.value === this.config.recordingsStorageType));
+
+        // Storage fallback banner: configured an external volume but it's
+        // unavailable/full so recordings are actually landing on internal.
+        // The active!=configured divergence is computed server-side
+        // (recordingsStorageTypeActive); only render when the user picked an
+        // external target and it fell back to INTERNAL.
+        var fallbackBanner = document.getElementById('recStorageFallbackBanner');
+        if (fallbackBanner) {
+            var configured = this.config.recordingsStorageType;
+            var active = this.config.recordingsStorageTypeActive || configured;
+            var fellBack = (configured === 'SD_CARD' || configured === 'USB')
+                && active === 'INTERNAL';
+            fallbackBanner.style.display = fellBack ? 'flex' : 'none';
+        }
 
         // SD card button state
         const sdCardBtn = document.getElementById('btnRecSdCard');
@@ -2107,7 +2126,12 @@ BYD.recording = {
         // daemon reports the activation is wedged — then it must fall through
         // to the fault state instead of a false "recording".
         var deferredActive = !isProximity && modeActive && pipelineRunning && !wedged;
-        var recordingLive = isRecording || deferredActive;
+        // FIX (false-GREEN): gate the bare isRecording term on !wedged too. The
+        // daemon now reports wedged=true when a muxer is open but no video
+        // sample has reached disk for >8s (SD unmount / ENOSPC / write
+        // failures); without this the card would show "Recording" over a dead
+        // writer. Mirrors StatusOverlayService.updateUI's recordingLive.
+        var recordingLive = (isRecording && !wedged) || deferredActive;
 
         // shouldBeRecording mirrors StatusOverlayService.shouldRecordingBeActive:
         // CONTINUOUS records whenever ACC is on; DRIVE_MODE records in a driving

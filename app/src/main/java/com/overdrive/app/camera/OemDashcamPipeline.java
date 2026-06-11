@@ -1576,7 +1576,36 @@ public class OemDashcamPipeline {
 
     private String generateOutputPath() {
         String stamp = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
-        File f = new File(outputDir, "dvr_" + stamp + ".mp4");
+        // FIX (false-GREEN / dvr_ stranded on dead volume): re-resolve the LIVE
+        // recordings dir at each segment open instead of using the dir latched
+        // at construction. The pano cam_* path already tracks the resolved
+        // (post-fallback) dir per-segment via StorageManager.getRecordingsDir();
+        // dvr_ previously did not — so a dvr pipeline (re)started during a BYD
+        // vold ACC-cycle unmount window wrote to internal for its ENTIRE
+        // lifetime (or to a dead mount), never recovering when SD remounted.
+        // getRecordingsPath() returns the resolveActive()-resolved volatile dir,
+        // which already reflects the unmount→internal fallback AND the
+        // remount→external recovery, so reading it here makes dvr_ honor both
+        // automatically. Construction-time `outputDir` stays the safety net if
+        // StorageManager is somehow unreachable.
+        String dir = outputDir;
+        try {
+            com.overdrive.app.storage.StorageManager sm =
+                com.overdrive.app.storage.StorageManager.getInstance();
+            String live = sm.getRecordingsPath();
+            if (live != null && !live.isEmpty()) dir = live;
+            // ENOSPC fallback: if the live dir is on a full external volume,
+            // redirect this dvr_ segment to internal (mirrors the cam_* path).
+            // Reserve is smaller than cam_*'s 100MB because OEM dvr clips are a
+            // single forward sensor at a lower bitrate; 40MB comfortably covers
+            // a 2-min segment with headroom.
+            File safe = sm.resolveTargetWithEnospcFallback(new File(dir), 40 * 1024 * 1024);
+            if (safe != null) dir = safe.getAbsolutePath();
+        } catch (Throwable t) {
+            logger.warn("generateOutputPath: live recordings dir unavailable, "
+                + "using construction-time outputDir: " + t.getMessage());
+        }
+        File f = new File(dir, "dvr_" + stamp + ".mp4");
         return f.getAbsolutePath();
     }
 

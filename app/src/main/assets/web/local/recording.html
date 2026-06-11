@@ -668,6 +668,15 @@
                                 </div>
                             </div>
                         </div>
+                        <!-- Storage fallback banner: shown when the configured
+                             external volume is unavailable/full and recordings
+                             are actually landing on internal storage. Without
+                             this, a fallback is silent and the user assumes
+                             clips are on the SD/USB they chose. -->
+                        <div class="storage-fallback-banner" id="recStorageFallbackBanner" style="display:none;" role="status" aria-live="polite">
+                            <span class="sd-status-dot" style="background:#f0a020;"></span>
+                            <span id="recStorageFallbackText" data-i18n="recording.storage_fallback_internal">SD/USB unavailable — saving to internal storage</span>
+                        </div>
                         <!-- SD Card Status -->
                         <div class="sd-card-status" id="recSdCardStatus" style="display:none;">
                             <div class="sd-status-row">

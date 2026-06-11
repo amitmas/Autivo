@@ -1414,6 +1414,22 @@ select.md-input ~ .md-label {
     margin: 8px 0 16px 0;
 }
 
+/* Storage fallback banner — recordings configured for SD/USB but landing on
+   internal because the external volume is unavailable/full. Amber-tinted so it
+   reads as a warning, not an error. */
+.storage-fallback-banner {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: rgba(240, 160, 32, 0.12);
+    border: 1px solid rgba(240, 160, 32, 0.35);
+    border-radius: var(--radius-md);
+    padding: 10px 12px;
+    margin: 8px 0 16px 0;
+    font-size: 12px;
+    color: var(--text-primary);
+}
+
 .sd-status-row {
     display: flex;
     align-items: center;

@@ -1087,12 +1087,26 @@ object UnifiedConfigManager {
         // Pre-migration semantics: enabled=true recorded during the ACC ON
         // (driving) phase regardless of accOffMode; accOffMode then governed
         // what happened at ACC OFF (off=tear down, smart=event-trigger,
-        // continuous=keep recording). Map recording-side to "continuous" for
-        // any legacyEnabled=true install so the driving-phase recording
-        // promise is preserved. Surveillance-side then independently captures
+        // continuous=keep recording). Surveillance-side independently captures
         // the parked-window intent from accOffMode + surveillance.enabled.
+        //
+        // FIX (dvr_ clips with OEM recording "disabled"): map recording-side to
+        // "smart" — NOT "continuous". Two reasons: (1) "continuous" silently
+        // records dvr_*.mp4 the ENTIRE ACC-ON drive, which surprised users who
+        // only ever had the OEM feed enabled for VIEWING; "smart" mirrors the
+        // pano dashcam (records only while the user's main recording is active),
+        // the least-surprising faithful mapping. (2) It now AGREES with
+        // getOemRecordingMode()'s own pre-migration fallback (legacy enabled=true
+        // -> "smart", :1060). The old "continuous" mapping made the persisted
+        // migrated value disagree with the on-the-fly getter for the same
+        // legacy config — a latent split-brain. On a vehicle whose OEM camera id
+        // is unset the recording-mode picker is hidden entirely (recording.js
+        // gates it on oemDashcamCameraId>=0), so a "continuous" migration was
+        // also UN-resettable from the UI: the user saw no toggle yet got dvr_
+        // for every drive. "smart" + the camera-id guard in the resolver close
+        // that hole.
         if (legacyEnabled) {
-            delta.put("recordingMode", "continuous")
+            delta.put("recordingMode", "smart")
             // accOffMode=continuous → user wanted parked-window recording too.
             // accOffMode=smart      → user wanted parked-window event clips.
             // accOffMode=off/unset  → user wanted clean ACC OFF teardown,

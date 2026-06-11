@@ -4383,6 +4383,14 @@ public class GpuSurveillancePipeline {
                 int want = bs.optInt("debugView", 7) == 8 ? 8 : 7;
                 if (want != bsViewMode) setBlindSpotViewMode(want);
                 if (cluster) {
+                    // ACC-off gate (same as the turn-signal branch): never (re)open the
+                    // cluster projection while ACC is authoritatively off, so the ACC-off
+                    // force-close that restored the gauges isn't undone by a left-on
+                    // calibration preview on the next tick.
+                    if (com.overdrive.app.monitor.AccMonitor.isAccStateAuthoritative()
+                            && !com.overdrive.app.monitor.AccMonitor.isAccOn()) {
+                        return;
+                    }
                     // Calibration on the cluster: keep the projection open while
                     // previewing; show only once the cluster display is present
                     // (onClusterProjectionReady also shows it on the ready edge).
@@ -4406,6 +4414,17 @@ public class GpuSurveillancePipeline {
                 bsLastTurnOnMs = now;
                 if (side != bsViewMode) setBlindSpotViewMode(side);
                 if (cluster) {
+                    // ACC-off gate: when ACC is AUTHORITATIVELY off, do NOT (re)open the
+                    // cluster projection. The ACC-off edge (AccMonitor.notifyAccEdge)
+                    // force-closes it to restore the gauges immediately; without this
+                    // guard the still-running 250ms loop would re-open it on the very
+                    // next tick if the indicator is mid-blink at ACC-off — FLASHING the
+                    // gauges. Gated on isAccStateAuthoritative() so an unknown/default
+                    // state (daemon just restarted) never wrongly suppresses projection.
+                    if (com.overdrive.app.monitor.AccMonitor.isAccStateAuthoritative()
+                            && !com.overdrive.app.monitor.AccMonitor.isAccOn()) {
+                        return;
+                    }
                     // Lazy-open the OEM cluster projection on the first signal; keep it
                     // open across the blink phase. Show the layer only once the cluster
                     // display is present (never composite stack-1 onto nothing).
@@ -4900,7 +4919,23 @@ public class GpuSurveillancePipeline {
         if (enc == null) return 0L;
         return enc.getLastEncodedFrameMs();
     }
-    
+
+    /**
+     * FIX (false-GREEN: "REC/MIC green but no video file"): expose the
+     * encoder's last-disk-write timestamp so RMM's wedge ticker can detect a
+     * "muxer open but nothing landing on disk" stall (SD unmount mid-segment,
+     * ENOSPC, every write failing below the 5-strike abort). Distinct from
+     * getLastEncodedFrameMs(): that advances on every coded frame even when no
+     * file is being written, because the encoder always runs for the
+     * pre-record ring. Returns 0 when the encoder is null or no muxer has
+     * opened yet — caller must treat 0 as "no signal" (skip the check).
+     */
+    public long getLastDiskWrittenMs() {
+        HardwareEventRecorderGpu enc = encoder;
+        if (enc == null) return 0L;
+        return enc.getLastDiskWrittenMs();
+    }
+
     /**
      * Sets the telemetry collector instance for overlay data.
      */

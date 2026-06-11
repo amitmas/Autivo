@@ -369,7 +369,10 @@ dependencies {
     
     // QR Code generation
     implementation(libs.zxing.core)
-    
+
+    // MapLibre Native — GPU vector map for the RoadSense map / navigation feature
+    implementation(libs.maplibre.android.sdk)
+
     // RTMP streaming client for pushing to MediaMTX
     implementation(libs.rtmp.client)
     

@@ -153,7 +153,7 @@ public final class ClusterProjectionController {
     // stretched cluster projection. UCM-tunable (surveillance.clusterSizeProfile) so
     // the correct profile for this cluster can be dialled in live without a rebuild;
     // 0 = skip the size-profile step entirely (just 16→35).
-    private int sizeProfileOpcode = OP_SIZE_PROFILE;   // default 30 (current behaviour)
+    private int sizeProfileOpcode = OP_SIZE_PROFILE;   // default 31=10.25" (OP_SIZE_PROFILE)
     // Optional OVERRIDE for the on-close restore profile. Normally close re-sends
     // sizeProfileOpcode (the user's "Cluster layout" choice = the car's native size),
     // which automatically returns the gauges to the model's original layout. This
@@ -209,6 +209,25 @@ public final class ClusterProjectionController {
     public static void shutdownIfActive() {
         ClusterProjectionController i = instance;
         if (i != null) i.shutdown();
+    }
+
+    /**
+     * ACC-off edge helper (called from {@code AccMonitor.notifyAccEdge}) that
+     * force-closes the projection + restores the gauges WITHOUT constructing the
+     * singleton. If {@code instance} is null this daemon never opened a projection
+     * (the HandlerThread was never spawned, target was head-unit), so there is
+     * nothing blanked to restore — skip entirely. Mirrors {@link #shutdownIfActive}.
+     *
+     * <p>This closes BOTH consumer kinds: {@link #forceClose} drops the sustained
+     * map hold AND tears down a transient blind-spot projection. It is the path
+     * that makes the gauge-restore on ACC-off IMMEDIATE for the transient case —
+     * without it, a turn signal held ON at the instant of ACC-off would leave the
+     * gauges blanked until the 8s linger / 90s max-cap fired. (Not terminal like
+     * {@link #shutdown}: a later ACC-on can legitimately re-open.)
+     */
+    public static void forceCloseIfActive(String reason) {
+        ClusterProjectionController i = instance;
+        if (i != null) i.forceClose(reason);
     }
 
     // ── Public API (called from the BS turn loop / pipeline) ────────────────────

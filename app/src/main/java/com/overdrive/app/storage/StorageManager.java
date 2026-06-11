@@ -193,6 +193,16 @@ public class StorageManager {
     private volatile StorageType recordingsStorageType = StorageType.INTERNAL;
     private volatile StorageType surveillanceStorageType = StorageType.INTERNAL;
     private volatile StorageType tripsStorageType = StorageType.INTERNAL;
+    // True while the most recent recordings segment was redirected to internal
+    // by the ENOSPC fallback because the configured EXTERNAL volume is
+    // mounted-but-FULL. Distinct from the unmounted case (sdCardAvailable=false)
+    // — a full-but-writable volume keeps its availability flag true, so without
+    // this signal getActiveRecordingsStorageType() would still report the
+    // external type and the "saving to internal" banner would never fire for
+    // the very disk-full case the fallback exists to handle. Set/cleared by
+    // resolveTargetWithEnospcFallback at each segment-target resolution; read by
+    // getActiveRecordingsStorageType() so the existing UI banner surfaces it.
+    private volatile boolean recordingsEnospcFallbackActive = false;
 
     // SD card state.
     // volatile: (re)assigned by discoverVolumes/ensureVolumeMounted on the
@@ -1837,6 +1847,118 @@ public class StorageManager {
     }
 
     /**
+     * ENOSPC fallback: given the directory a recorder is about to write into,
+     * return an INTERNAL recordings directory instead if {@code targetDir}
+     * lives on a configured EXTERNAL volume that is mounted-but-full (free
+     * space below {@code reserveBytes}) AND internal storage has room.
+     *
+     * <p><b>Why this exists.</b> The existing fallback machinery
+     * ({@link #resolveActive}, the volume watchdog, {@link
+     * #reconcileRecordingOverride}) only redirects to internal when an external
+     * volume is <em>unmounted</em> (availability flag false). A mounted-but-FULL
+     * SD/USB volume is treated as "ready" everywhere, so the recorder retargets
+     * it forever: every segment hits ENOSPC, the disk writer aborts after 5
+     * failures and quarantines each clip as {@code .broken}, while
+     * {@code modeActive} stays true — the "REC green, no file" permanent-death
+     * case. This method closes that gap at the one place it matters: the
+     * instant a recorder resolves its segment target.
+     *
+     * <p><b>One-directional and start-of-segment only.</b> It only ever
+     * redirects external→internal (never internal→external), so it cannot
+     * ping-pong a live session across volumes. Callers invoke it at
+     * start-of-recording / start-of-segment, never mid-clip. When the external
+     * volume frees space (retention reap) or is swapped, the next segment's
+     * resolution naturally returns to it because {@link #getRecordingsDir()}
+     * still points at the external dir — this method redirects a COPY of the
+     * target for this segment, it does NOT mutate {@code recordingsDir}.
+     *
+     * <p><b>Conservative.</b> Returns {@code targetDir} unchanged when: target
+     * is null; target is already internal (path under {@link
+     * #INTERNAL_BASE_DIR}); StatFs on the target succeeds and shows enough free;
+     * or internal itself lacks {@code reserveBytes}. If the target StatFs THROWS
+     * (genuinely unmounted), this returns {@code targetDir} unchanged and leaves
+     * recovery to the unmount path (watchdog / resolveActive / reconcile) —
+     * this method's job is the FULL case, not the GONE case.
+     *
+     * @param targetDir   the directory the recorder intends to use
+     * @param reserveBytes minimum free bytes a new segment needs
+     * @return the directory to actually write into — {@code targetDir} or an
+     *         internal recordings dir
+     */
+    public File resolveTargetWithEnospcFallback(File targetDir, long reserveBytes) {
+        return resolveTargetWithEnospcFallback(targetDir, reserveBytes, false);
+    }
+
+    /**
+     * @param trackState when true, this resolution updates
+     *        {@link #recordingsEnospcFallbackActive} so the UI banner /
+     *        getActiveRecordingsStorageType() reflect a full-volume redirect.
+     *        Only the PRIMARY recordings (cam_*) path passes true; secondary
+     *        callers (OEM dvr_, smaller reserve) pass false so the two reserve
+     *        thresholds can't flap the shared flag.
+     */
+    public File resolveTargetWithEnospcFallback(File targetDir, long reserveBytes, boolean trackState) {
+        if (targetDir == null) return targetDir;
+        try {
+            String targetPath = targetDir.getAbsolutePath();
+            // Already internal — nothing to fall back to. Don't touch the flag:
+            // an internal-configured user is never "fell back from external."
+            if (targetPath.startsWith(INTERNAL_BASE_DIR)) return targetDir;
+
+            // Measure free space on the target volume. A throw here means the
+            // volume is unmounted/half-mounted (the GONE case) — not our job;
+            // leave it to the unmount fallback path.
+            long targetFree;
+            try {
+                File probe = targetDir.exists() ? targetDir : targetDir.getParentFile();
+                if (probe == null || !probe.exists()) return targetDir;
+                targetFree = new StatFs(probe.getAbsolutePath()).getAvailableBytes();
+            } catch (Throwable statThrow) {
+                logWarn("ENOSPC-fallback: StatFs on external target " + targetPath
+                    + " threw (" + statThrow.getMessage() + ") — treating as unmounted, "
+                    + "leaving to the unmount fallback path");
+                return targetDir;
+            }
+
+            if (targetFree >= reserveBytes) {
+                // External volume has room — keep it, and clear the full-fallback
+                // signal so the UI banner stops showing once SD frees space.
+                if (trackState) recordingsEnospcFallbackActive = false;
+                return targetDir;
+            }
+
+            // External volume is mounted-but-full. Redirect to internal IFF
+            // internal has the reserve.
+            long internalFree = getInternalFreeSpace();
+            if (internalFree < reserveBytes) {
+                logWarn("ENOSPC-fallback: external target " + targetPath + " is full ("
+                    + formatSize(targetFree) + " free < " + formatSize(reserveBytes)
+                    + " reserve) AND internal is also short (" + formatSize(internalFree)
+                    + " free) — cannot fall back; recording will fail to save");
+                // Both volumes short — we did NOT redirect to internal, so don't
+                // claim a fall-back. (The recording will likely fail; the wedge
+                // detector + diagnostic log surface that separately.)
+                if (trackState) recordingsEnospcFallbackActive = false;
+                return targetDir;
+            }
+
+            File internalDir = internalRecordingsDir;
+            if (internalDir == null) return targetDir;
+            if (!internalDir.exists()) internalDir.mkdirs();
+            logWarn("ENOSPC-fallback: external target " + targetPath + " is full ("
+                + formatSize(targetFree) + " free < " + formatSize(reserveBytes)
+                + " reserve) — redirecting THIS segment to internal "
+                + internalDir.getAbsolutePath() + " (" + formatSize(internalFree)
+                + " free) so recording is not lost");
+            if (trackState) recordingsEnospcFallbackActive = true;
+            return internalDir;
+        } catch (Throwable t) {
+            logWarn("resolveTargetWithEnospcFallback failed, using target as-is: " + t.getMessage());
+            return targetDir;
+        }
+    }
+
+    /**
      * Emit the canonical "<Category> using <type>: <path>" line. When the
      * resolved type doesn't match what the user configured (external volume
      * missing → fell back to internal), the line includes both so log
@@ -2249,6 +2371,16 @@ public class StorageManager {
      * a secondary "you wanted X, currently using Y" hint when they differ).
      */
     public StorageType getActiveRecordingsStorageType() {
+        // A mounted-but-FULL external volume keeps its availability flag true
+        // (ENOSPC surfaces on write, not on canWrite of a 0-free dir), so the
+        // mount-based normalizeStorageType alone would still report the
+        // external type while the ENOSPC fallback quietly writes to internal.
+        // Reflect that redirect so the UI's "saving to internal" banner fires
+        // for the disk-full case too, not only the unmounted case.
+        if (recordingsEnospcFallbackActive
+                && recordingsStorageType != StorageType.INTERNAL) {
+            return StorageType.INTERNAL;
+        }
         return normalizeStorageType(recordingsStorageType);
     }
 
@@ -2276,6 +2408,10 @@ public class StorageManager {
         if (!ensureExternalAvailable(type, "recordings")) return false;
 
         recordingsStorageType = type;
+        // Clear any stale ENOSPC full-fallback signal: the user just (re)chose
+        // a target, so the next segment re-evaluates free space fresh. Without
+        // this, switching away from a full volume could leave the banner stuck.
+        recordingsEnospcFallbackActive = false;
         // Re-clamp the persisted limit against the new volume's effective max
         // (e.g., user switches from SD to USB, USB is smaller). Limit may
         // need to shrink before updateActiveDirectories runs cleanup.

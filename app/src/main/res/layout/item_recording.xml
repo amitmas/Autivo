@@ -1,10 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Recording grid tile — designed for a 2-column grid (item 7 SOTA pattern,
-  Google-Photos / Eufy-style). Aspect 16:10 with metadata layered on top of
-  the thumbnail. Severity stripe across the top edge; severity badge top-
-  right; camera-id chip top-left; duration bottom-right; actor pills
-  bottom-left.
+  Recording grid tile — designed for a 2-column grid (Google-Photos /
+  Eufy-style). Aspect 16:10 with metadata layered on top of the thumbnail.
+
+  Layered overlays (top → bottom):
+    ・ Severity stripe across the top edge.
+    ・ Top-right column: severity badge over type badge.
+    ・ Top-left: camera-id chip OR selection checkbox (in select mode).
+    ・ Centre: play affordance.
+    ・ Bottom-right: duration scrim.
+    ・ Bottom-left: actor + proximity scrim.
 
   Card uses ?attr/colorSurfaceContainer (no stroke), 20dp radius. Footer
   text uses ?attr/colorOnSurface / ?attr/colorOnSurfaceVariant. The
@@ -17,7 +22,7 @@
   Preserved IDs (RecordingAdapter.kt findViewById targets):
     ivThumbnail, severityStripe, tvSeverity, tvCameraId, tvDuration,
     tvActorSummary, tvLocation, cbSelect, tvFilename, tvRecordingTime, tvSize,
-    btnDelete
+    btnDelete, tvTypeBadge
 -->
 <com.google.android.material.card.MaterialCardView xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
@@ -58,20 +63,43 @@
                 android:background="?attr/colorTertiary"
                 android:visibility="gone" />
 
-            <!-- Top-right severity badge — bg set per-bind. -->
-            <TextView
-                android:id="@+id/tvSeverity"
+            <!-- Top-right column: severity badge stacked above the type badge.
+                 Both pills share the same right edge so they read as one
+                 corner cluster. Each is independently visible — type badge
+                 is always shown, severity only when the sidecar provides one. -->
+            <LinearLayout
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:layout_gravity="top|end"
                 android:layout_margin="6dp"
-                android:fontFamily="sans-serif-medium"
-                android:paddingHorizontal="6dp"
-                android:paddingVertical="2dp"
-                android:textColor="@android:color/white"
-                android:textSize="9sp"
-                android:visibility="gone"
-                tools:text="ALERT" />
+                android:gravity="end"
+                android:orientation="vertical">
+
+                <TextView
+                    android:id="@+id/tvSeverity"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:fontFamily="sans-serif-medium"
+                    android:paddingHorizontal="6dp"
+                    android:paddingVertical="2dp"
+                    android:textColor="@android:color/white"
+                    android:textSize="9sp"
+                    android:visibility="gone"
+                    tools:text="ALERT" />
+
+                <TextView
+                    android:id="@+id/tvTypeBadge"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="3dp"
+                    android:background="#99000000"
+                    android:fontFamily="sans-serif-medium"
+                    android:paddingHorizontal="6dp"
+                    android:paddingVertical="2dp"
+                    android:textColor="@android:color/white"
+                    android:textSize="9sp"
+                    tools:text="EVENT" />
+            </LinearLayout>
 
             <!-- Top-left camera/type chip -->
             <TextView
@@ -209,6 +237,15 @@
                     android:textAppearance="@style/TextAppearance.Material3.LabelSmall"
                     android:textColor="?attr/colorOnSurfaceVariant"
                     tools:text="125 MB" />
+
+                <ImageButton
+                    android:id="@+id/btnShare"
+                    android:layout_width="32dp"
+                    android:layout_height="32dp"
+                    android:background="?attr/selectableItemBackgroundBorderless"
+                    android:contentDescription="@string/cd_share"
+                    android:src="@drawable/ic_share"
+                    app:tint="?attr/colorOnSurfaceVariant" />
 
                 <ImageButton
                     android:id="@+id/btnDelete"
