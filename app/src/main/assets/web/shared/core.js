@@ -667,10 +667,14 @@ BYD.core = {
                 if (el) el.textContent = status.deviceId;
             }
 
-            // App version
+            // App version. appVersion is the BuildConfig-derived identity
+            // "<channel>-v<versionName>" (e.g. "alpha-v26.0") — it ALREADY
+            // carries its own "-v", so do NOT prepend another 'v' (that
+            // produced "valpha-v26.0"). Show the label verbatim, matching the
+            // native About row.
             if (status.appVersion) {
                 const el = document.getElementById('appVersion');
-                if (el) el.textContent = 'v' + status.appVersion;
+                if (el) el.textContent = status.appVersion;
             }
 
             // 12V Battery
@@ -942,6 +946,11 @@ BYD.core = {
             if (evSohRow) evSohRow.style.display = '';
         }
 
+        // Stash the live HAL range so the sidebar can show the car's built-in
+        // fuel + total range immediately (PHEV), upgrading to the learned
+        // "Personalized" estimate once enough trips accumulate.
+        this._lastRange = status.range || null;
+
         // Personalized range from trip analytics
         this.updatePersonalizedRange();
 
@@ -1095,22 +1104,42 @@ BYD.core = {
                 pRow.style.display = 'none';
             }
         }
+        // HAL range as the immediate fallback when the learned estimate isn't
+        // ready yet (no tank capacity set / too few fuel trips). The car's
+        // built-in fuel + total range are always present on a PHEV, so the rows
+        // show real numbers right away and upgrade to "Personalized" later.
+        var hal = this._lastRange || {};
+        var halFuelKm = (typeof hal.fuelRangeKm === 'number' && hal.fuelRangeKm > 0)
+            ? hal.fuelRangeKm : 0;
+        var halTotalKm = (typeof hal.totalRangeKm === 'number' && hal.totalRangeKm > 0)
+            ? hal.totalRangeKm : 0;
+
         if (fRow && fVal) {
-            if (this._personalizedFuelKm > 0) {
+            // Learned petrol estimate first, else the HAL fuel range.
+            var fuelKm = this._personalizedFuelKm > 0 ? this._personalizedFuelKm : halFuelKm;
+            if (fuelKm > 0) {
                 fRow.style.display = 'flex';
-                fVal.textContent = BYD.units.dist(this._personalizedFuelKm);
+                fVal.textContent = BYD.units.dist(fuelKm);
             } else {
                 fRow.style.display = 'none';
             }
         }
         if (cRow && cVal) {
-            // Combined only when BOTH legs are present — otherwise the
-            // single-leg Personalized row already tells the full story.
+            // Prefer the learned combined total (both legs present). Otherwise
+            // fall back to the HAL total range — but only on a PHEV (HAL fuel
+            // leg present), so a BEV never shows a redundant "Combined" row that
+            // just mirrors its EV range.
+            var combinedKm = 0;
             if (this._personalizedTotalKm > 0
                     && this._personalizedRangeKm > 0
                     && this._personalizedFuelKm > 0) {
+                combinedKm = this._personalizedTotalKm;
+            } else if (halTotalKm > 0 && halFuelKm > 0) {
+                combinedKm = halTotalKm;
+            }
+            if (combinedKm > 0) {
                 cRow.style.display = 'flex';
-                cVal.textContent = BYD.units.dist(this._personalizedTotalKm);
+                cVal.textContent = BYD.units.dist(combinedKm);
             } else {
                 cRow.style.display = 'none';
             }

@@ -901,7 +901,16 @@ public class TelegramBotDaemon {
                             boolean postUpdatePresent = new File(
                                     "/data/local/tmp/overdrive_post_update_pending_telegram"
                                 ).exists();
+                            // A FAILED install (Telegram-triggered) leaves the
+                            // failure hint instead of the success hint — bypass
+                            // the throttle for that too so the owner learns the
+                            // install failed NOW, not 10 min later (symmetric
+                            // with the post-update success bypass above).
+                            boolean installFailedPresent = new File(
+                                    "/data/local/tmp/overdrive_install_failed_pending_telegram"
+                                ).exists();
                             if (!postUpdatePresent
+                                    && !installFailedPresent
                                     && shouldThrottleTunnelNotify()) {
                                 log("notifyTunnel throttled (URL-rotation loop suppression): "
                                         + url);
@@ -919,7 +928,23 @@ public class TelegramBotDaemon {
                             // Now consume the hint (if present). After
                             // consumption, the hint is gone and subsequent
                             // tunnel restarts go back to the generic copy.
+                            // Success and failure hints are mutually exclusive
+                            // (the detached install script never leaves both).
                             String postUpdateVersion = consumePostUpdateHint();
+                            String installFailedReason = consumeInstallFailedHint();
+
+                            // Surface a Telegram-triggered install FAILURE first,
+                            // then fall through to the generic URL-changed copy so
+                            // the owner still gets the (still-old-version) tunnel
+                            // URL. Mirrors the web (toast install_failed) and app
+                            // (showError) failure surfaces.
+                            if (installFailedReason != null) {
+                                String failMsg = "⚠️ *Overdrive update failed*\n"
+                                        + "The device is still on the previous version.\n"
+                                        + "Reason: " + mdEscape(installFailedReason);
+                                boolean failOk = sendMessage(ownerChatId, failMsg);
+                                log("notifyTunnel install-failed message sent: " + failOk);
+                            }
 
                             String msg;
                             if (postUpdateVersion != null) {
@@ -1056,7 +1081,16 @@ public class TelegramBotDaemon {
             
             // Skip old messages by getting latest update ID first
             flushOldUpdates();
-            
+
+            // Surface the outcome of a Telegram/IPC-triggered install that
+            // completed (or failed) at pm-install time in the previous process.
+            // This rides the criticalAlerts gate (default ON), NOT the
+            // connectivity gate (default OFF) that frames the tunnel-URL copy —
+            // so the owner learns the result under the same default settings the
+            // web/app surfaces already use. Runs once, unconditionally, on the
+            // reborn bot's first poll.
+            surfaceInstallResultOnStartup();
+
             // Send greeting to owner if paired
             sendStartupGreeting();
             
@@ -1117,7 +1151,66 @@ public class TelegramBotDaemon {
             log("Flush error: " + e.getMessage());
         }
     }
-    
+
+    /**
+     * On the reborn bot's first poll, surface the outcome of a Telegram/IPC-
+     * triggered install that finished in the previous process.
+     *
+     * Both hints are planted by the detached install script (AppUpdater.
+     * runDetachedInstall — the daemon UID-2000 path ALL surfaces take, since
+     * only that process can write /data/local/tmp): a SUCCESS leaves
+     * TELEGRAM_POST_UPDATE_HINT_FILE, a pm-install FAILURE leaves
+     * TELEGRAM_INSTALL_FAILED_HINT_FILE (the most common failure — signature
+     * mismatch, downgrade refusal, ENOSPC). They are mutually exclusive.
+     *
+     * Previously these were consumed ONLY inside the connectivity-gated
+     * notifyTunnel handler, so a default-configured owner (connectivity OFF) or
+     * any owner on a no-/stable-tunnel never learned a Telegram-triggered
+     * install failed — while web (toast install_failed) and app (showError +
+     * post-relaunch toast) always surface it. This hook reaches the owner on the
+     * criticalAlerts gate (default ON), matching the pre-kill surfaceIpcInstallFailure
+     * twin (SurveillanceIpcServer) so both Telegram failure paths use one
+     * consistent gate. The success confirmation rides the same gate for parity
+     * with the app/web "updated to X" surfaces.
+     *
+     * Synchronized on TUNNEL_NOTIFY_LOCK so a concurrent first notifyTunnel IPC
+     * can't double-consume/double-send (consume*Hint() deletes the file, so
+     * whichever path runs first wins and the other no-ops).
+     */
+    private static void surfaceInstallResultOnStartup() {
+        if (ownerChatId <= 0) return;
+        try {
+            synchronized (TUNNEL_NOTIFY_LOCK) {
+                String installFailedReason = consumeInstallFailedHint();
+                if (installFailedReason != null) {
+                    if (criticalAlertsEnabled) {
+                        String failMsg = "⚠️ *Overdrive update failed*\n"
+                                + "The device is still on the previous version.\n"
+                                + "Reason: " + mdEscape(installFailedReason);
+                        boolean ok = sendMessage(ownerChatId, failMsg);
+                        log("Startup install-failed message sent: " + ok);
+                    } else {
+                        log("Startup install-failed hint consumed but criticalAlerts off");
+                    }
+                    // Failure and success hints are mutually exclusive; done.
+                    return;
+                }
+                String postUpdateVersion = consumePostUpdateHint();
+                if (postUpdateVersion != null) {
+                    if (criticalAlertsEnabled) {
+                        String msg = "🔄 *Overdrive updated to " + mdEscape(postUpdateVersion) + "*";
+                        boolean ok = sendMessage(ownerChatId, msg);
+                        log("Startup update-success message sent: " + ok);
+                    } else {
+                        log("Startup update-success hint consumed but criticalAlerts off");
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log("Startup install-result surfacing error: " + e.getMessage());
+        }
+    }
+
     /**
      * Send a startup greeting message to the owner.
      *
@@ -2080,6 +2173,43 @@ public class TelegramBotDaemon {
         // stale hint to keep flagging unrelated tunnel restarts.
         try { hint.delete(); } catch (Exception ignored) {}
         return version;
+    }
+
+    /**
+     * Failure twin of {@link #consumePostUpdateHint()}. Reads + deletes the
+     * install-failed hint planted by the detached install script's FAILURE
+     * branch (only when the install was Telegram/IPC-triggered). Returns the
+     * pm-install error text (e.g. "Failure [INSTALL_PARSE_FAILED…]") or null if
+     * no failure hint is present. Lets the reborn bot tell the owner the
+     * scheduled install failed, symmetric with the web/app failure surfaces.
+     *
+     * Path is duplicated (not pulled from UpdateLifecycle) for the same reason
+     * as consumePostUpdateHint — this runs in the lazily-classloaded daemon
+     * process and we avoid pulling the whole updater package transitively.
+     */
+    private static String consumeInstallFailedHint() {
+        File hint = new File("/data/local/tmp/overdrive_install_failed_pending_telegram");
+        if (!hint.exists()) return null;
+        String reason = null;
+        try (BufferedReader r = new BufferedReader(new InputStreamReader(new FileInputStream(hint)))) {
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = r.readLine()) != null) {
+                if (sb.length() > 0) sb.append(' ');
+                sb.append(line);
+            }
+            String trimmed = sb.toString().trim();
+            if (!trimmed.isEmpty()) reason = trimmed;
+        } catch (Exception e) {
+            log("Install-failed hint read error: " + e.getMessage());
+        }
+        // Delete unconditionally so a stale hint can't re-fire on a later
+        // unrelated tunnel restart. Fall back to a generic reason if the file
+        // existed but was empty/unreadable — the user should still learn the
+        // install failed.
+        try { hint.delete(); } catch (Exception ignored) {}
+        if (reason == null) reason = "unknown (see head unit)";
+        return reason;
     }
     
     // ==================== PUBLIC API FOR NOTIFICATIONS ====================

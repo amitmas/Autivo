@@ -48,7 +48,11 @@ public class UpdateApiHandler {
     // One install at a time. AtomicReference so we don't hold an updater past
     // the install (it's GC'd along with the dying process anyway).
     private static final AtomicReference<AppUpdater> activeUpdater = new AtomicReference<>();
-    private static volatile boolean installInFlight = false;
+    // Concurrency guard moved to AppUpdater.tryBeginInstall()/endInstall() so
+    // the web (this handler), app-IPC, and Telegram-IPC install entry points —
+    // all running in this same daemon JVM — share ONE in-flight gate. Previously
+    // this flag was private here, so the IPC path could start a second install
+    // racing a web install (double pkill cascade + APK rm). See AppUpdater.
 
     public static boolean handle(String method, String path, String body, OutputStream out) throws Exception {
         if (path.equals("/api/update/check") && method.equals("GET")) {
@@ -57,6 +61,17 @@ public class UpdateApiHandler {
         }
         if (path.equals("/api/update/preview") && method.equals("GET")) {
             handlePreview(out);
+            return true;
+        }
+        // GET → return resolved channel; POST → switch channel (allowlist +
+        // public-mode gated). Check the path PREFIX so query params on POST
+        // (?value=…) still route here.
+        if (path.startsWith("/api/update/channel")) {
+            if (method.equals("GET")) { handleGetChannel(out); return true; }
+            if (method.equals("POST")) { handleSetChannel(path, out); return true; }
+        }
+        if (path.startsWith("/api/update/versions") && method.equals("GET")) {
+            handleVersions(out);
             return true;
         }
         if (path.startsWith("/api/update/install") && method.equals("POST")) {
@@ -86,6 +101,22 @@ public class UpdateApiHandler {
             return;
         }
 
+        final String channel = com.overdrive.app.config.UnifiedConfigManager.getUpdateChannel();
+
+        // Alpha is a browse-and-pick archive — there is no single "the update"
+        // to push. Tell the client to open the catalog instead of an install
+        // prompt. (forceReload first so a freshly-toggled channel is seen.)
+        if (AppUpdater.CHANNEL_ALPHA.equals(channel)) {
+            com.overdrive.app.config.UnifiedConfigManager.forceReload();
+            JSONObject r = new JSONObject();
+            r.put("available", false);
+            r.put("channel", channel);
+            r.put("currentVersion", AppUpdater.getDisplayVersionFromFile());
+            r.put("catalogEndpoint", "/api/update/versions");
+            HttpResponse.sendJson(out, r.toString());
+            return;
+        }
+
         // Run synchronously by blocking on a callback latch. AppUpdater.checkForUpdate
         // dispatches to its own executor + posts to mainHandler, so we wait here.
         // Cap wait at 12s so the tunnel timeout (typically 30s) has plenty
@@ -104,6 +135,7 @@ public class UpdateApiHandler {
                 JSONObject r = new JSONObject();
                 try {
                     r.put("available", true);
+                    r.put("channel", channel);
                     r.put("currentVersion", currentVersion);
                     r.put("remoteVersion", newVersion);
                     r.put("releaseNotes", releaseNotes != null ? releaseNotes : "");
@@ -115,6 +147,7 @@ public class UpdateApiHandler {
                 JSONObject r = new JSONObject();
                 try {
                     r.put("available", false);
+                    r.put("channel", channel);
                     r.put("currentVersion", currentVersion);
                     r.put("remoteVersion", currentVersion);
                     r.put("releaseNotes", "");
@@ -126,6 +159,7 @@ public class UpdateApiHandler {
                 JSONObject r = new JSONObject();
                 try {
                     r.put("available", false);
+                    r.put("channel", channel);
                     r.put("error", error != null ? error : "unknown");
                     r.put("currentVersion", AppUpdater.getDisplayVersionFromFile());
                 } catch (Exception ignored) {}
@@ -158,6 +192,171 @@ public class UpdateApiHandler {
                         "Update check failed: " + (t.getMessage() != null ? t.getMessage() : t.getClass().getSimpleName()));
             } catch (Exception ignored) { /* socket already gone */ }
         }
+    }
+
+    // ================== /api/update/channel ==================
+
+    /** Return the resolved update channel. Read-only; allowed in PUBLIC mode. */
+    private static void handleGetChannel(OutputStream out) throws Exception {
+        try {
+            com.overdrive.app.config.UnifiedConfigManager.forceReload();
+            String channel = com.overdrive.app.config.UnifiedConfigManager.getUpdateChannel();
+            JSONObject r = new JSONObject();
+            r.put("channel", channel);
+            HttpResponse.sendJson(out, r.toString());
+        } catch (Throwable t) {
+            HttpResponse.sendJsonError(out, "Channel read failed: "
+                    + (t.getMessage() != null ? t.getMessage() : t.getClass().getSimpleName()));
+        }
+    }
+
+    /**
+     * Switch the update channel. Gated by the SAME public-mode hard-block as
+     * /install — a tunnel visitor must not be able to flip the owner's
+     * channel. Validates the value against the {alpha, braveheart} allowlist
+     * so a crafted request can't set an arbitrary GitHub tag as the channel.
+     */
+    private static void handleSetChannel(String path, OutputStream out) throws Exception {
+        if (CameraDaemon.isPublicMode()) {
+            HttpResponse.sendJsonError(out, Messages.get("errors.update_disabled_in_public_mode"));
+            return;
+        }
+        String value = queryParam(path, "value");
+        if (!AppUpdater.CHANNEL_ALPHA.equals(value)
+                && !AppUpdater.CHANNEL_BRAVEHEART.equals(value)) {
+            HttpResponse.sendJsonError(out, Messages.get("errors.update_invalid_channel"));
+            return;
+        }
+        // Daemon HTTP worker thread (not the looper) — a full-JSON rewrite
+        // here is fine. setUpdateChannel writes locally + atomically in the
+        // daemon process.
+        boolean ok = com.overdrive.app.config.UnifiedConfigManager.setUpdateChannel(value);
+        if (!ok) {
+            HttpResponse.sendJsonError(out, Messages.get("errors.update_channel_write_failed"));
+            return;
+        }
+        com.overdrive.app.config.UnifiedConfigManager.forceReload();
+        JSONObject r = new JSONObject();
+        r.put("channel", value);
+        HttpResponse.sendJson(out, r.toString());
+    }
+
+    // ================== /api/update/versions ==================
+
+    /**
+     * Channel-aware version catalog. Alpha returns the full pick-any archive;
+     * braveheart returns a single-element list (the rolling head) so web AND
+     * native share one render path. Read-only; allowed in PUBLIC mode.
+     *
+     * Same 12s-latch + outer try-catch + always-JSON discipline as
+     * handleCheck so a flaky tunnel never receives an empty body.
+     */
+    private static void handleVersions(OutputStream out) throws Exception {
+        try {
+            Context ctx = CameraDaemon.getAppContext();
+            if (ctx == null) {
+                HttpResponse.sendJsonError(out, Messages.get("errors.update_app_context_not_ready"));
+                return;
+            }
+            com.overdrive.app.config.UnifiedConfigManager.forceReload();
+            final String channel = com.overdrive.app.config.UnifiedConfigManager.getUpdateChannel();
+
+            final Object lock = new Object();
+            final boolean[] done = {false};
+            final JSONObject[] resultRef = {null};
+
+            AppUpdater updater = new AppUpdater(ctx);
+
+            if (AppUpdater.CHANNEL_ALPHA.equals(channel)) {
+                updater.listVersions(new AppUpdater.VersionListCallback() {
+                    @Override public void onResult(java.util.List<AppUpdater.VersionEntry> versions, String currentVersion) {
+                        JSONObject r = new JSONObject();
+                        try {
+                            r.put("channel", channel);
+                            r.put("currentVersion", currentVersion);
+                            JSONArray arr = new JSONArray();
+                            for (AppUpdater.VersionEntry v : versions) arr.put(v.toJson());
+                            r.put("versions", arr);
+                        } catch (Exception ignored) {}
+                        resultRef[0] = r;
+                        signal(lock, done);
+                    }
+                    @Override public void onError(String error) {
+                        JSONObject r = new JSONObject();
+                        try {
+                            r.put("channel", channel);
+                            r.put("error", error != null ? error : "unknown");
+                            r.put("currentVersion", AppUpdater.getDisplayVersionFromFile());
+                        } catch (Exception ignored) {}
+                        resultRef[0] = r;
+                        signal(lock, done);
+                    }
+                });
+            } else {
+                // Braveheart (rolling): one entry derived from the timestamp
+                // check, so the client renders it in the same catalog shape.
+                updater.checkForUpdate(new AppUpdater.UpdateCallback() {
+                    @Override public void onUpdateAvailable(String currentVersion, String newVersion, String releaseNotes) {
+                        resultRef[0] = braveheartCatalog(channel, currentVersion, newVersion, releaseNotes, true);
+                        signal(lock, done);
+                    }
+                    @Override public void onNoUpdate(String currentVersion) {
+                        resultRef[0] = braveheartCatalog(channel, currentVersion, currentVersion, "", false);
+                        signal(lock, done);
+                    }
+                    @Override public void onError(String error) {
+                        JSONObject r = new JSONObject();
+                        try {
+                            r.put("channel", channel);
+                            r.put("error", error != null ? error : "unknown");
+                            r.put("currentVersion", AppUpdater.getDisplayVersionFromFile());
+                        } catch (Exception ignored) {}
+                        resultRef[0] = r;
+                        signal(lock, done);
+                    }
+                });
+            }
+
+            synchronized (lock) {
+                if (!done[0]) lock.wait(12_000);
+            }
+            try { updater.close(); } catch (Exception ignored) {}
+
+            if (resultRef[0] == null) {
+                HttpResponse.sendJsonError(out, Messages.get("errors.update_check_timed_out"));
+                return;
+            }
+            HttpResponse.sendJson(out, resultRef[0].toString());
+        } catch (Throwable t) {
+            CameraDaemon.log("update/versions failed: " + t.getClass().getSimpleName()
+                    + ": " + t.getMessage());
+            try {
+                HttpResponse.sendJsonError(out, "Version list failed: "
+                        + (t.getMessage() != null ? t.getMessage() : t.getClass().getSimpleName()));
+            } catch (Exception ignored) {}
+        }
+    }
+
+    /** Build a single-element braveheart catalog payload. */
+    private static JSONObject braveheartCatalog(String channel, String currentVersion,
+                                                String remoteVersion, String releaseNotes,
+                                                boolean available) {
+        JSONObject r = new JSONObject();
+        try {
+            r.put("channel", channel);
+            r.put("currentVersion", currentVersion);
+            JSONArray arr = new JSONArray();
+            JSONObject entry = new JSONObject();
+            entry.put("version", remoteVersion);
+            entry.put("tag", AppUpdater.CHANNEL_BRAVEHEART);
+            entry.put("downloadUrl", "");          // install path uses no &version for braveheart
+            entry.put("releaseNotes", releaseNotes != null ? releaseNotes : "");
+            entry.put("relation", available ? "newer" : "current");
+            entry.put("available", available);
+            arr.put(entry);
+            r.put("versions", arr);
+        } catch (Exception ignored) {}
+        return r;
     }
 
     // ================== /api/update/preview ==================
@@ -276,67 +475,154 @@ public class UpdateApiHandler {
             return;
         }
 
-        if (installInFlight) {
+        // Shared gate (AppUpdater) — covers web + app-IPC + Telegram-IPC. We
+        // acquire AFTER the public-mode + confirm checks but BEFORE the
+        // pre-install check/network so a concurrent trigger is rejected early.
+        // On any pre-spawn bail below we must endInstall(); the success path
+        // leaves it held (process dies; INSTALL_STALE_MS self-recovers).
+        if (!AppUpdater.tryBeginInstall()) {
             HttpResponse.sendJsonError(out, Messages.get("errors.update_already_in_progress"));
             return;
         }
 
         Context ctx = CameraDaemon.getAppContext();
         if (ctx == null) {
+            AppUpdater.endInstall();
             HttpResponse.sendJsonError(out, Messages.get("errors.update_app_context_not_ready"));
             return;
         }
 
-        // First check (synchronous) so /install isn't usable to download a
-        // random APK without the matching /check having been resolved. Also
-        // gives us latestDownloadUrl + remoteVersion populated on the updater.
         AppUpdater updater = new AppUpdater(ctx);
         activeUpdater.set(updater);
 
-        final Object lock = new Object();
-        final boolean[] done = {false};
-        final boolean[] available = {false};
-        final String[] err = {null};
+        // Targeted (alpha pick): a &version=<tag> selects a specific archived
+        // release. Resolve it SERVER-SIDE (never a client-supplied URL) and
+        // SKIP the braveheart "is an update available?" gate — alpha never
+        // returns onUpdateAvailable, so that gate would dead-on-arrival every
+        // alpha install. prepareInstall seeds latestDownloadUrl/remoteVersion/
+        // remoteUpdatedAt, then the unchanged downloadAndInstall takes over.
+        String version = queryParam(path, "version");
+        if (version != null && !version.isEmpty()) {
+            // Channel/tag consistency guard: a &version=alpha* targeted install
+            // is ONLY valid on the alpha channel. Reject it on braveheart so an
+            // alpha APK can't be installed on a braveheart device and silently
+            // corrupt the braveheart per-channel baseline. Resolve fresh (the
+            // toggle may have just changed it).
+            com.overdrive.app.config.UnifiedConfigManager.forceReload();
+            String activeChannel = com.overdrive.app.config.UnifiedConfigManager.getUpdateChannel();
+            // Strict tag validation (not a loose prefix) — rejects a crafted
+            // tag before it can reach prepareInstall / the shell-interpolated
+            // install script. The only supported targeted tags are alpha /
+            // alpha-v<semver>.
+            if (!AppUpdater.isValidAlphaTag(version)) {
+                AppUpdater.endInstall();
+                try { updater.close(); } catch (Exception ignored) {}
+                HttpResponse.sendJsonError(out, Messages.get("errors.update_channel_tag_mismatch"));
+                return;
+            }
+            if (!AppUpdater.CHANNEL_ALPHA.equals(activeChannel)) {
+                AppUpdater.endInstall();
+                try { updater.close(); } catch (Exception ignored) {}
+                HttpResponse.sendJsonError(out, Messages.get("errors.update_channel_tag_mismatch"));
+                return;
+            }
+            try {
+                updater.prepareInstall(version);
+            } catch (Exception e) {
+                AppUpdater.endInstall();
+                try { updater.close(); } catch (Exception ignored) {}
+                HttpResponse.sendJsonError(out,
+                        Messages.get("errors.update_pre_install_failed_with_detail",
+                                e.getMessage() != null ? e.getMessage() : "resolve failed"));
+                return;
+            }
+        } else {
+            // Braveheart (rolling): first check (synchronous) so /install isn't
+            // usable to download a random APK without the matching /check
+            // having resolved. Also populates latestDownloadUrl + remoteVersion.
+            final Object lock = new Object();
+            final boolean[] done = {false};
+            final boolean[] available = {false};
+            final String[] err = {null};
 
-        updater.checkForUpdate(new AppUpdater.UpdateCallback() {
-            @Override public void onUpdateAvailable(String c, String n, String rn) {
-                available[0] = true;
-                signal(lock, done);
+            updater.checkForUpdate(new AppUpdater.UpdateCallback() {
+                @Override public void onUpdateAvailable(String c, String n, String rn) {
+                    available[0] = true;
+                    signal(lock, done);
+                }
+                @Override public void onNoUpdate(String c) {
+                    signal(lock, done);
+                }
+                @Override public void onError(String e) {
+                    err[0] = e;
+                    signal(lock, done);
+                }
+            });
+            try {
+                synchronized (lock) {
+                    if (!done[0]) lock.wait(20_000);
+                }
+            } catch (InterruptedException ignored) {
+                // HttpServer runs handleClient on a fixed thread pool and tears
+                // it down with threadPool.shutdownNow() (server restart /
+                // reconfigure), which interrupts every worker. Object.wait()
+                // throws the checked InterruptedException, and handleInstall is
+                // `throws Exception`, so an unguarded interrupt would escape to
+                // HttpServer.handleClient's `catch (Exception e) {}` — which only
+                // logs + closes the socket and NEVER calls AppUpdater.endInstall().
+                // That wedges the shared install gate (web + app + Telegram) for
+                // INSTALL_STALE_MS (5 min) with no install running. Catch it here
+                // (restoring the interrupt flag) and fall through to the gated
+                // `!available[0]` bail below, matching the IPC twin
+                // (SurveillanceIpcServer.handleInstallUpdate).
+                Thread.currentThread().interrupt();
             }
-            @Override public void onNoUpdate(String c) {
-                signal(lock, done);
+            if (err[0] != null) {
+                // Update check errored — release the gate + per-instance executor.
+                AppUpdater.endInstall();
+                try { updater.close(); } catch (Exception ignored) {}
+                HttpResponse.sendJsonError(out, Messages.get("errors.update_pre_install_failed_with_detail", err[0]));
+                return;
             }
-            @Override public void onError(String e) {
-                err[0] = e;
-                signal(lock, done);
+            if (!available[0]) {
+                // No update — release the gate + per-instance executor before bail.
+                AppUpdater.endInstall();
+                try { updater.close(); } catch (Exception ignored) {}
+                HttpResponse.sendJsonError(out, Messages.get("errors.update_no_update_available"));
+                return;
             }
-        });
-        synchronized (lock) {
-            if (!done[0]) lock.wait(20_000);
-        }
-        if (err[0] != null) {
-            // Update check errored — release per-instance executor before bail.
-            try { updater.close(); } catch (Exception ignored) {}
-            HttpResponse.sendJsonError(out, Messages.get("errors.update_pre_install_failed_with_detail", err[0]));
-            return;
-        }
-        if (!available[0]) {
-            // No update — release per-instance executor before bail.
-            try { updater.close(); } catch (Exception ignored) {}
-            HttpResponse.sendJsonError(out, Messages.get("errors.update_no_update_available"));
-            return;
         }
 
         // Reply to the webapp BEFORE kicking the install. Once daemons start
         // dying, the response would never make it back. From here on, the
-        // webapp polls /api/update/progress.
-        installInFlight = true;
-        writeProgress("queued", 0, Messages.get("messages.update_queued"), null);
+        // webapp polls /api/update/progress. The gate is already held (acquired
+        // at the top via tryBeginInstall); it stays held through the install and
+        // self-recovers via INSTALL_STALE_MS if the kill cascade misses us.
+        //
+        // CRITICAL: this synchronous pre-spawn region must release the gate on
+        // ANY throw. sendJson() declares `throws Exception` and writes over a
+        // tunnel socket that free cloudflared/zrok links routinely drop right
+        // around the confirm-POST reply — if that throws, HttpServer.handleClient
+        // (the only caller) merely logs + closes the socket and NEVER calls
+        // endInstall(). The install thread below would never start, leaving the
+        // shared gate wedged for INSTALL_STALE_MS (5 min) with nothing installing
+        // — blocking the next web/app/Telegram attempt. Guard it ourselves: on a
+        // throw before Thread.start(), release the gate + close the updater, then
+        // rethrow (the caller still closes the socket). Once the thread is
+        // running the held gate is correct — the thread's own onError/onSuccess/
+        // crash handlers own it.
+        try {
+            writeProgress("queued", 0, Messages.get("messages.update_queued"), null);
 
-        JSONObject r = new JSONObject();
-        r.put("status", "scheduled");
-        r.put("estimatedDowntimeSeconds", 150);
-        HttpResponse.sendJson(out, r.toString());
+            JSONObject r = new JSONObject();
+            r.put("status", "scheduled");
+            r.put("estimatedDowntimeSeconds", 150);
+            HttpResponse.sendJson(out, r.toString());
+        } catch (Exception e) {
+            AppUpdater.endInstall();
+            try { updater.close(); } catch (Exception ignored) {}
+            throw e;
+        }
 
         // Background install on a fresh thread. The current thread returns
         // to the HttpServer worker pool.
@@ -387,21 +673,21 @@ public class UpdateApiHandler {
                         writeProgress("installing", 100,
                                 Messages.get("messages.update_installing_finishing"), null);
                         // Process should die before this matters, but defensive.
-                        installInFlight = false;
+                        AppUpdater.endInstall();
                         // pm install kills the process so leak doesn't materialize, but
                         // close() is idempotent and cheap — defensive.
                         try { updater.close(); } catch (Exception ignored) {}
                     }
                     @Override public void onError(String error) {
                         writeProgress("error", -1, Messages.get("messages.update_install_failed"), error);
-                        installInFlight = false;
+                        AppUpdater.endInstall();
                         // Install failed; release per-instance executor.
                         try { updater.close(); } catch (Exception ignored) {}
                     }
                 });
             } catch (Exception e) {
                 writeProgress("error", -1, Messages.get("messages.update_install_crashed"), e.getMessage());
-                installInFlight = false;
+                AppUpdater.endInstall();
             }
         }, "UpdateApi-Install").start();
     }
@@ -422,7 +708,19 @@ public class UpdateApiHandler {
         }
         String json = readTextFile(PROGRESS_FILE);
         if (json == null || json.isEmpty()) {
-            HttpResponse.sendJsonError(out, Messages.get("errors.update_progress_unreadable"));
+            // Empty/zero-byte read: the non-atomic writeProgress (new FileWriter
+            // truncates-then-writes) leaves a momentary zero-length window a poll
+            // can land in. Return the idle sentinel — same as the malformed-JSON
+            // catch below and the IPC reader (SurveillanceIpcServer
+            // .handleGetUpdateProgress) — rather than {success:false,error} (which
+            // has no phase, so the web renderer drew a blank label / indeterminate
+            // bar for that tick). Keeps the empty-read contract identical on both
+            // surfaces and self-heals on the next write.
+            JSONObject idle = new JSONObject();
+            idle.put("phase", "idle");
+            idle.put("percent", -1);
+            idle.put("message", "");
+            HttpResponse.sendJson(out, idle.toString());
             return;
         }
         // Stale-recovery: if the daemon was killed mid-download (low memory,
@@ -447,8 +745,21 @@ public class UpdateApiHandler {
                 return;
             }
         } catch (Exception ignored) {
-            // Malformed JSON falls through to the existing pass-through —
-            // we'd rather hand the webapp a confusing payload than a 500.
+            // Malformed JSON (torn read from the non-atomic writeProgress
+            // rewrite) → return the idle sentinel, mirroring the IPC reader
+            // (SurveillanceIpcServer.handleGetUpdateProgress). Passing the raw
+            // broken string through made r.json() throw client-side, which
+            // update-flow.js counts as a CONNECTION failure (consecutiveFailures
+            // ++) and nudges the web poller toward false "lost daemon" / give-up
+            // — whereas the same torn read is a harmless keep-polling no-op on
+            // the app/IPC poller. Sentinel-on-malformed keeps both surfaces
+            // self-healing on a single torn read.
+            JSONObject idle = new JSONObject();
+            idle.put("phase", "idle");
+            idle.put("percent", -1);
+            idle.put("message", "");
+            HttpResponse.sendJson(out, idle.toString());
+            return;
         }
         HttpResponse.sendJson(out, json);
     }
@@ -504,5 +815,32 @@ public class UpdateApiHandler {
             done[0] = true;
             lock.notify();
         }
+    }
+
+    /**
+     * Extract a query-string parameter from a request path
+     * ({@code /api/update/install?confirm=true&version=alpha-v25.4}).
+     * Returns the URL-decoded value, or {@code null} when absent. No external
+     * URI parser — the daemon's request path is a plain String and the values
+     * we read (confirm flag, version tag, channel enum) are simple tokens.
+     */
+    private static String queryParam(String path, String key) {
+        if (path == null) return null;
+        int q = path.indexOf('?');
+        if (q < 0 || q == path.length() - 1) return null;
+        String query = path.substring(q + 1);
+        for (String pair : query.split("&")) {
+            int eq = pair.indexOf('=');
+            String k = eq >= 0 ? pair.substring(0, eq) : pair;
+            if (k.equals(key)) {
+                String v = eq >= 0 ? pair.substring(eq + 1) : "";
+                try {
+                    return java.net.URLDecoder.decode(v, "UTF-8");
+                } catch (Exception e) {
+                    return v;
+                }
+            }
+        }
+        return null;
     }
 }

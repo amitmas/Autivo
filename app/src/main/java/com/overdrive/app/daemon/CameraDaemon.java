@@ -645,6 +645,26 @@ public class CameraDaemon {
         // the dir at 95%, or the user lowered the size limit while nothing
         // was recording. Cost: one directory walk every 30s; the threshold
         // check exits early if usage is below 90%.
+        //
+        // Wire the encoder-writing probe at BOOT — before the ticker starts
+        // and before initSurveillance() ever constructs gpuPipeline. The
+        // probeWired gate inside the ticker early-returns the ENTIRE tick
+        // (incl. the encoder-independent trips/proximity categories) until a
+        // probe is bound, and the only other wiring point is inside
+        // GpuSurveillancePipeline.init(). A persistent pre-init throw (AVM HAL
+        // unavailable at cold boot, AssetManager cookie failure, the ~187 MB
+        // encoder-construction OOM) means init() is never reached, probeWired
+        // stays false forever, and limit enforcement is silently disabled even
+        // though the uncapped initSurveillance retry keeps re-arming. The
+        // lambda reads the static gpuPipeline field via the null-safe
+        // isEncoderWriting() accessor, so it reports idle while the pipeline is
+        // null/pre-init — flipping probeWired=true now without ever fail-opening
+        // a destructive delete during an active write. init() may re-wire the
+        // concrete probe later; that is idempotent (probeWired is already true).
+        storageManager.setEncoderWritingProbe(() -> {
+            com.overdrive.app.surveillance.GpuSurveillancePipeline p = gpuPipeline; // static field
+            return p != null && p.isEncoderWriting();
+        });
         storageManager.startPeriodicCleanup();
 
         // Data-layer kickoff. RecordingsIndex's H2 open + warmup walk is
@@ -693,15 +713,11 @@ public class CameraDaemon {
             dataLayerInitFuture.complete(null);
         }
 
-        // Note: we deliberately don't seed the version file here. The
-        // updater writes it after a successful install with the actual
-        // GitHub release string (e.g. "alpha-v15.6"). Until the user has
-        // run a check-for-update the file is absent and
-        // AppUpdater.getDisplayVersionFromFile() returns the
-        // DISPLAY_VERSION_FALLBACK ("Manually Installed") which is more
-        // accurate than seeding gradle's BuildConfig.VERSION_NAME stub
-        // ("11.0") that has no relationship to the release the user
-        // actually installed.
+        // Note: nothing to seed here. Version identity is BuildConfig-derived
+        // (AppUpdater.getInstalledVersion() = UPDATE_CHANNEL + "-v" +
+        // VERSION_NAME, e.g. "alpha-v26.0") — the running build's true identity,
+        // identical in every process and never read from a file, so it's always
+        // correct regardless of how the build was installed.
 
 
         // ImageReader FPS probe sentinel: when /data/local/tmp/run_imagereader_probe
@@ -819,12 +835,19 @@ public class CameraDaemon {
         // RoadSense: daemon-side road-hazard detection (D-019/D-023). BydDataCollector
         // + GpsMonitor are up by now (initGpsMonitor above; collector re-init on ACC ON),
         // which RoadSense reuses (D-020). Never let it block daemon boot.
+        //
+        // We always CONSTRUCT the controller (so getRoadSense() is non-null for the IPC
+        // IMU_BATCH case and the map API), but call attach() — NOT start() — so a DISABLED
+        // feature costs ~zero: attach() only start()s the heavy machinery (stores, the 2 Hz
+        // ticker, the sync executor) when roadSense.enabled is true, and installs a config
+        // listener that start()s/stop()s it live when the user flips the toggle. No daemon
+        // restart needed either way.
         try {
             roadSense = new com.overdrive.app.roadsense.RoadSenseController(sharedAppContext);
-            roadSense.start();
-            log("RoadSense controller started");
+            roadSense.attach();
+            log("RoadSense controller attached (starts iff enabled)");
         } catch (Throwable t) {
-            log("RoadSense start failed: " + t.getMessage());
+            log("RoadSense attach failed: " + t.getMessage());
         }
 
         // Pre-warm the geocode cache so the first recording's place
@@ -1692,10 +1715,12 @@ public class CameraDaemon {
         // Cancel PermissionGranter to stop orphaned pm grant processes
         PermissionGranter.cancel();
         
-        // Stop RoadSense (releases IMU sidecar, stores, warning audio). Early so
-        // its warning-tick can't fire against tearing-down state.
+        // Stop RoadSense (releases IMU sidecar, stores, warning audio) AND deregister
+        // its live-toggle config listener. detach() = stop() + remove listener, the
+        // inverse of attach(); safe even if the controller was never started (disabled).
+        // Early so its warning-tick can't fire against tearing-down state.
         if (roadSense != null) {
-            try { roadSense.stop(); } catch (Exception e) { log("RoadSense stop error: " + e.getMessage()); }
+            try { roadSense.detach(); } catch (Exception e) { log("RoadSense detach error: " + e.getMessage()); }
         }
 
         // Stop RecordingModeManager BEFORE the pipeline so its periodic
@@ -3645,6 +3670,30 @@ public class CameraDaemon {
                     // wedge-resync) against the now-cleanly-stopped pipeline.
                     log("WARN: clearing lastDispatchedAccIsOff so next ACC heartbeat re-runs full ACC ON dispatch");
                     lastDispatchedAccIsOff = null;
+                }
+            } else if (gpuPipeline != null && gpuPipeline.isRecording()) {
+                // FIX (false-GREEN PROX pill at ACC-ON): NOT in surveillance
+                // mode, so the onAccOn() drain above was skipped — but the
+                // recorder still reports isRecording()=true. That is a STALE
+                // leftover clip from the parked window (most often a proximity
+                // radar trigger whose recorder survived the ACC-OFF→ON
+                // transition without being finalized), NOT a genuinely-live
+                // drive recording (a fresh ACC-ON activation has not started
+                // one yet at this point). Left uncleared, /status reports
+                // isRecording=true and the overlay paints a false GREEN "PROX"
+                // until the first real trigger's stop clears it.
+                //
+                // Drain ONLY the recording (stopRecording finalizes the stale
+                // clip) — deliberately NOT the full onAccOn() (which also
+                // reopens the camera; the comment above documents why that is
+                // a regression for steady-state NORMAL_RECORDING / duplicate
+                // ACC-ON IPCs). stopRecording() is idempotent and cheap.
+                try {
+                    log("ACC ON - draining stale leftover recording (not in surveillance mode, "
+                        + "isRecording()=true before fresh activation) to clear false-GREEN pill");
+                    gpuPipeline.stopRecording();
+                } catch (Throwable t) {
+                    log("Stale-recording drain on ACC ON failed: " + t.getMessage());
                 }
             }
 

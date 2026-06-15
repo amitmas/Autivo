@@ -53,6 +53,27 @@ public class OverlayBitmapRenderer {
     // Cached PorterDuffColorFilters — keyed by color int, avoids allocation per icon per frame
     private final Map<Integer, PorterDuffColorFilter> colorFilterCache = new HashMap<>();
 
+    // ==================== OFF-GL-THREAD RASTER WORKER ====================
+    // renderFrame() is a software android.graphics.Canvas raster with per-icon
+    // setShadowLayer Gaussian blur — the expensive HALF of the overlay pass.
+    // It used to run INLINE on the encoder GL thread (every ~8th frame), adding
+    // a recurring CPU spike right before eglSwap. We move it onto a dedicated
+    // low-priority worker that rasters the BACK bitmap at ~2 Hz; the GL thread
+    // then only swapAndGetFront() + texSubImage2D + composites (the cheap half
+    // that must touch the GL context). OverlayDoubleBuffer already guarantees
+    // the worker writes BACK while GL reads FRONT with a synchronized swap, so
+    // there is no shared-bitmap race. start/stop are idempotent + join-safe
+    // because setOverlayEnabled is called from IPC/API/daemon threads that can
+    // race the recorder's release().
+    private static final long WORKER_PERIOD_MS = 500L;  // 2 Hz, matches the old stride cadence
+    private Thread workerThread;
+    private volatile boolean workerRunning = false;
+    private volatile TelemetryDataCollector workerCollector;
+    // Monotonic tick owned by the worker, driving the turn-signal/seatbelt blink
+    // (blink = (tick/3)%2). Must NOT reuse the GL frame counter — the worker is
+    // decoupled from the render cadence now.
+    private int workerTick = 0;
+
     public OverlayBitmapRenderer() {
         logger = DaemonLogger.getInstance("OverlayRenderer");
         doubleBuffer = new OverlayDoubleBuffer(WIDTH, HEIGHT);
@@ -133,6 +154,66 @@ public class OverlayBitmapRenderer {
             logger.warn("Icon load failed: " + name + " " + e.getMessage());
         }
         return null;
+    }
+
+    /**
+     * Start the off-GL-thread raster worker. Idempotent: a second call while
+     * already running is a no-op. The worker rasters the overlay BACK bitmap at
+     * ~2 Hz from {@code collector}'s latest snapshot; the GL thread consumes via
+     * {@link #swapAndGetFront()}. Safe to call from any thread (IPC/API/daemon).
+     */
+    public synchronized void startWorker(TelemetryDataCollector collector) {
+        this.workerCollector = collector;
+        if (workerRunning) return;
+        workerRunning = true;
+        Thread t = new Thread(() -> {
+            // Low priority: the overlay is cosmetic burn-in; never let it
+            // contend with the realtime encoder/GL threads on the shared SoC.
+            try {
+                android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);
+            } catch (Throwable ignored) {}
+            while (workerRunning) {
+                try {
+                    TelemetryDataCollector c = workerCollector;
+                    if (c != null) {
+                        // getLatestSnapshot is a lock-free volatile read of an
+                        // immutable snapshot — zero contention with the poller.
+                        TelemetrySnapshot snap = c.getLatestSnapshot();
+                        renderFrame(snap, workerTick++);
+                    }
+                } catch (Throwable t2) {
+                    // Never let a raster error kill the worker loop.
+                }
+                try {
+                    Thread.sleep(WORKER_PERIOD_MS);
+                } catch (InterruptedException ie) {
+                    break;  // stopWorker interrupted us — exit promptly
+                }
+            }
+        }, "OverlayRaster");
+        t.setDaemon(true);
+        workerThread = t;
+        t.start();
+    }
+
+    /**
+     * Stop and JOIN the raster worker. MUST be called before {@link #release()}
+     * recycles the bitmaps, so the worker can never draw into a recycled bitmap.
+     * Idempotent and safe to call twice / after release.
+     */
+    public synchronized void stopWorker() {
+        workerRunning = false;
+        Thread t = workerThread;
+        workerThread = null;
+        if (t != null) {
+            t.interrupt();
+            try {
+                t.join(1000);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        workerCollector = null;
     }
 
     public boolean renderFrame(TelemetrySnapshot snap, int fc) {

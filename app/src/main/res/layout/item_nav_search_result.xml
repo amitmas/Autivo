@@ -56,4 +56,21 @@
             tools:visibility="visible" />
     </LinearLayout>
 
+    <!-- Trailing remove (✕) — shown ONLY for recent-search rows so a single recent
+         destination can be deleted in place (Gmaps-style). GONE for live autocomplete
+         results. Borderless ripple + 44dp touch target, sits clear of the row tap. -->
+    <ImageButton
+        android:id="@+id/btnResultRemove"
+        android:layout_width="44dp"
+        android:layout_height="44dp"
+        android:layout_marginStart="8dp"
+        android:background="?attr/selectableItemBackgroundBorderless"
+        android:contentDescription="@string/roadsense_map_recent_remove"
+        android:padding="11dp"
+        android:scaleType="fitCenter"
+        android:src="@drawable/ic_clear"
+        android:visibility="gone"
+        app:tint="?attr/colorOnSurfaceVariant"
+        tools:visibility="visible" />
+
 </LinearLayout>

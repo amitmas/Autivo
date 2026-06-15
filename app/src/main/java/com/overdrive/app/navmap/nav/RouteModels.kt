@@ -36,6 +36,14 @@ data class GeoPoint(
  * @property lat latitude (decimal degrees) of the maneuver point, taken from
  *   `points[beginShapeIndex]`
  * @property lng longitude (decimal degrees) of the maneuver point
+ * @property roundaboutExitCount for a roundabout maneuver, which exit to take
+ *   (Valhalla `roundabout_exit_count`); 0 when not a roundabout / absent.
+ * @property bearingBefore heading (deg) approaching the maneuver point, or -1.
+ * @property bearingAfter heading (deg) leaving the maneuver point, or -1. Together
+ *   with [bearingBefore] these let the UI draw a true turn/exit angle.
+ * @property verbalPre concise spoken pre-instruction ("Turn left onto Main Street")
+ *   — better for TTS than the on-screen [instruction]; empty if absent.
+ * @property verbalPost spoken post-instruction ("Continue for 2 miles"); empty if absent.
  */
 data class RouteManeuver(
     val instruction: String,
@@ -44,7 +52,12 @@ data class RouteManeuver(
     val lengthMeters: Double,
     val timeSeconds: Double,
     val lat: Double,
-    val lng: Double
+    val lng: Double,
+    val roundaboutExitCount: Int = 0,
+    val bearingBefore: Int = -1,
+    val bearingAfter: Int = -1,
+    val verbalPre: String = "",
+    val verbalPost: String = ""
 )
 
 /**

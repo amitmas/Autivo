@@ -178,7 +178,11 @@
     "map_cluster_layout": "Kích thước cụm đồng hồ",
     "map_cluster_layout_desc": "Điều chỉnh cho phù hợp với cụm đồng hồ của bạn. Được chia sẻ với chế độ xem điểm mù trên cụm đồng hồ. Nếu hình chiếu trông bị kéo giãn hoặc cắt xén, hãy thử một tùy chọn khác.",
     "map_cluster_projecting": "Đang chiếu",
-    "map_cluster_off": "Tắt"
+    "map_cluster_off": "Tắt",
+    "overlay_title": "Lớp phủ trên màn hình",
+    "overlay_show": "Hiển thị lớp phủ trên màn hình",
+    "overlay_show_desc": "Hiển thị thẻ nguy hiểm và biểu tượng RoadSense nổi trên màn hình. Tắt tùy chọn này để ẩn chúng — tính năng phát hiện, cảnh báo âm thanh và đóng góp cộng đồng vẫn chạy ngầm; chỉ có hiển thị trên màn hình bị ẩn đi.",
+    "unit_seconds": "{n} giây"
   },
   "status": {
     "device": "Thiết bị",
@@ -811,7 +815,10 @@
     "layout_windshield_unavailable": "Không có camera kính chắn gió nào được định nghĩa cho cấu hình/hồ sơ camera đang hoạt động.",
     "layout_standard_toast": "Bố cục 360 tiêu chuẩn đã bật",
     "layout_dashcam_toast": "Bố cục Dashcam đã bật",
-    "layout_update_failed": "Không thể cập nhật bố cục ghi hình"
+    "layout_update_failed": "Không thể cập nhật bố cục ghi hình",
+    "storage_indexing": "Đang lập chỉ mục — {done} / {total} ({pct}%)",
+    "storage_fallback_internal": "SD/USB không khả dụng — đang lưu vào bộ nhớ trong",
+    "storage_fallback_enforcing": "SD/USB không khả dụng — đang lưu vào bộ nhớ trong, giữ lại {mb} MB mới nhất"
   },
   "events": {
     "select_date": "Chọn ngày",
@@ -893,7 +900,8 @@
     "videos_count_initial": "0 video",
     "selected_count_initial": "0 được chọn",
     "page_initial": "Trang 1 của 1",
-    "calendar_title_initial": "Lịch"
+    "calendar_title_initial": "Lịch",
+    "index_warming": "Đang xây dựng chỉ mục thư viện — {done} / {total} ({pct}%)"
   },
   "surveillance": {
     "tab_general": "Tổng thống",
@@ -1251,7 +1259,13 @@
     "oem_record_desc": "Captures a synchronized dvr_*.mp4 from the forward sensor alongside the panoramic event clip. Honors the same Safe Locations, Schedule, and per-camera filters as the panoramic surveillance.",
     "oem_record_enabled": "OEM Dashcam recording on events enabled",
     "oem_record_disabled": "OEM Dashcam recording on events disabled",
-    "oem_id_unset_hint": "Open Diagnostics → Camera Probe to pick the OEM Dashcam camera id first."
+    "oem_id_unset_hint": "Open Diagnostics → Camera Probe to pick the OEM Dashcam camera id first.",
+    "storage_indexing": "Đang lập chỉ mục — {done} / {total} ({pct}%)",
+    "keep_usb_power": "Giữ nguồn USB khi đỗ xe",
+    "keep_usb_power_desc": "Giữ nguồn cho các cổng USB sau khi xe tắt máy (ví dụ để sạc điện thoại hoặc cấp nguồn cho phụ kiện). Tắt tùy chọn này để các cổng USB chuyển sang chế độ ngủ và tiết kiệm pin 12V. Điều này không ảnh hưởng đến camera — giám sát khi đỗ xe vẫn hoạt động bình thường. Có hiệu lực vào lần tắt máy xe tiếp theo.",
+    "keep_usb_saved_on": "USB sẽ giữ nguồn khi đỗ xe",
+    "keep_usb_saved_off": "USB sẽ ngủ khi đỗ xe (ACC-OFF tiếp theo)",
+    "keep_usb_save_failed": "Không thể lưu cài đặt"
   },
   "mqtt": {
     "tab_connections": "Mối nối",
@@ -1621,7 +1635,30 @@
     "title_update_to": "Cập nhật OverDrive thành <span class=\"upd-newv\">{version}</span>?",
     "currently_on": "Hiện tại trên {version}",
     "downtime_warning": "<strong>Remote access offline for ~{minutes} min.</strong> Daemons khởi động lại và đường hầm kết nối lại sau khi cài đặt.",
-    "fallback_check_label": "Kiểm tra các bản cập nhật"
+    "fallback_check_label": "Kiểm tra các bản cập nhật",
+    "channel_alpha": "Alpha",
+    "channel_braveheart": "Braveheart",
+    "channel_alpha_desc": "Bản phát hành ổn định. Mọi phiên bản đã phát hành đều được giữ ở đây — chọn bất kỳ phiên bản nào để cài đặt (cho phép hạ cấp). Khuyên dùng cho sử dụng hàng ngày.",
+    "channel_braveheart_desc": "Các bản dựng tiên tiến nhất, được phát hành ngay khi chúng được công bố. Bạn sẽ nhận được các tính năng mới trước tiên, nhưng chúng có thể không ổn định hoặc có lỗi. Nếu có sự cố, hãy gửi nhật ký daemon từ Giới thiệu → Chẩn đoán và báo cáo (xem bên dưới).",
+    "report_how": "Gặp lỗi trên Braveheart? Gửi nhật ký daemon từ Giới thiệu → Chẩn đoán, sau đó chia sẻ mã với chúng tôi:",
+    "report_discord": "Discord",
+    "report_github": "GitHub Issues",
+    "report_whatsapp": "WhatsApp",
+    "report_discord_url": "https://discord.gg/PZutk9fg4h",
+    "report_github_url": "https://github.com/yash-srivastava/Overdrive-release/issues",
+    "report_whatsapp_url": "https://chat.whatsapp.com/HChmriCWgr9KwAtE6OEkiM",
+    "catalog_title": "Chọn một phiên bản",
+    "catalog_empty": "Chưa có phiên bản nào được phát hành.",
+    "catalog_retry": "Thử lại",
+    "pill_installed": "Đã cài đặt",
+    "pill_older": "Cũ hơn",
+    "install_downgrade": "Hạ cấp",
+    "downgrade_note": "Phiên bản này cũ hơn phiên bản bạn đã cài đặt. Cài đặt nó sẽ thay thế bản dựng hiện tại bằng bản này.",
+    "switched_to_channel": "Đã chuyển sang {channel}",
+    "switched_to_braveheart_warn": "Đã chuyển sang Braveheart. Các bản dựng có thể không ổn định — nếu có sự cố, hãy gửi nhật ký daemon từ Giới thiệu → Chẩn đoán và báo cáo trên Discord/GitHub.",
+    "switch_channel_failed": "Không thể chuyển kênh: {error}",
+    "notify_available": "Có bản cập nhật: {version}. Mở Kiểm tra cập nhật để cài đặt.",
+    "badge_new": "MỚI"
   },
   "vehicle": {
     "car_locked": "Chiếc xe bị khóa",
@@ -2063,5 +2100,16 @@
     "native_dvr_disable_toast": "Native DVR disabled. OverDrive now owns the camera.",
     "native_dvr_enable_toast": "Native DVR re-enabled.",
     "start_timeout": "Pipeline start timed out — check daemon logs"
+  },
+  "logs": {
+    "section_title": "Chẩn đoán",
+    "section_sub": "Gặp lỗi? Gửi nhật ký của daemon tại đây — bạn sẽ nhận được một mã ngắn, sau đó chia sẻ nó với chúng tôi trên Discord, GitHub Issues hoặc WhatsApp và cho chúng tôi biết điều gì đã xảy ra.",
+    "send": "Gửi",
+    "uploading": "Đang tải lên…",
+    "upload_failed": "Tải lên thất bại",
+    "uploaded_title": "Đã tải nhật ký lên",
+    "uploaded_body": "Chia sẻ mã này với người duy trì, cùng với những gì bạn đang làm khi sự cố xảy ra:",
+    "uploaded_where": "Đăng nó lên Discord, GitHub Issues hoặc WhatsApp:",
+    "copy_code": "Sao chép mã"
   }
 }

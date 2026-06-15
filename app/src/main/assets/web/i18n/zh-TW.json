@@ -178,7 +178,11 @@
     "map_cluster_layout": "Cluster size",
     "map_cluster_layout_desc": "Match this to your instrument cluster. Shared with the blind-spot cluster view. If the projection looks stretched or cropped, try another option.",
     "map_cluster_projecting": "Projecting",
-    "map_cluster_off": "Off"
+    "map_cluster_off": "Off",
+    "overlay_title": "螢幕疊加顯示",
+    "overlay_show": "在螢幕上顯示疊加畫面",
+    "overlay_show_desc": "在螢幕上顯示浮動的 RoadSense 膠囊和危險卡。關閉此選項可將其隱藏 — 偵測、音訊警報和群眾回報功能仍會在背景執行；僅螢幕顯示會被隱藏。",
+    "unit_seconds": "{n} 秒"
   },
   "status": {
     "device": "裝置",
@@ -811,7 +815,10 @@
     "layout_windshield_unavailable": "未針對目前啟用的相機設定檔/配置定義擋風玻璃相機。",
     "layout_standard_toast": "已啟用標準 360 版面配置",
     "layout_dashcam_toast": "已啟用行車記錄器版面配置",
-    "layout_update_failed": "更新錄影版面配置失敗"
+    "layout_update_failed": "更新錄影版面配置失敗",
+    "storage_indexing": "正在建立索引 — {done} / {total} ({pct}%)",
+    "storage_fallback_internal": "SD/USB 無法使用 — 正在儲存至內部儲存空間",
+    "storage_fallback_enforcing": "SD/USB 無法使用 — 正在儲存至內部儲存空間，保留最新的 {mb} MB"
   },
   "events": {
     "select_date": "選擇日期",
@@ -893,7 +900,8 @@
     "videos_count_initial": "沒有影片",
     "selected_count_initial": "0 選擇",
     "page_initial": "排名第 1 的頁面",
-    "calendar_title_initial": "年 月 日"
+    "calendar_title_initial": "年 月 日",
+    "index_warming": "正在建立媒體庫索引 — {done} / {total} ({pct}%)"
   },
   "surveillance": {
     "tab_general": "總統",
@@ -1251,7 +1259,13 @@
     "oem_record_desc": "在記錄全景事件剪輯的同時，從前置感應器同步擷取 dvr_*.mp4。其遵循與全景監控相同的「安全位置」、時程表和單獨攝影機過濾器設定。",
     "oem_record_enabled": "已啟用事件發生時的原廠行車記錄器錄影",
     "oem_record_disabled": "已停用事件發生時的原廠行車記錄器錄影",
-    "oem_id_unset_hint": "請先開啟「診斷」→「攝影機探測」以選取原廠行車記錄器的攝影機 ID。"
+    "oem_id_unset_hint": "請先開啟「診斷」→「攝影機探測」以選取原廠行車記錄器的攝影機 ID。",
+    "storage_indexing": "正在建立索引 — {done} / {total} ({pct}%)",
+    "keep_usb_power": "停車時保持 USB 供電",
+    "keep_usb_power_desc": "汽車關閉後，保持 USB 連接埠供電（例如為手機充電或為配件供電）。關閉此選項可讓 USB 連接埠休眠並節省 12V 電池電量。這不會影響攝影機 — 停車監控功能仍會執行。將於下次汽車關閉時生效。",
+    "keep_usb_saved_on": "停車時 USB 將保持供電",
+    "keep_usb_saved_off": "停車時 USB 將休眠 (下次 ACC-OFF 時)",
+    "keep_usb_save_failed": "無法儲存設定"
   },
   "mqtt": {
     "tab_connections": "連接方式",
@@ -1621,7 +1635,30 @@
     "title_update_to": "更新OverDrive至<span class=\"upd-newv\">{version}</span>?",
     "currently_on": "目前在{version}上播放",
     "downtime_warning": "<strong> 遠端接入無法開啟 ~{minutes}分鐘.</strong> Daemons重新啟動,",
-    "fallback_check_label": "查看更新"
+    "fallback_check_label": "查看更新",
+    "channel_alpha": "Alpha",
+    "channel_braveheart": "Braveheart",
+    "channel_alpha_desc": "穩定版本。所有已發布的版本都儲存在這裡 — 可選擇任何版本進行安裝（允許降級）。建議日常使用。",
+    "channel_braveheart_desc": "最新的開發版本，一經發布即提供。您可以優先體驗新功能，但這些版本可能不穩定或存在錯誤。如果出現問題，請從「關於」→「診斷」傳送守護程式日誌並回報（詳見下方）。",
+    "report_how": "在 Braveheart 版本中遇到錯誤？請從「關於」→「診斷」傳送守護程式日誌，然後與我們分享代碼：",
+    "report_discord": "Discord",
+    "report_github": "GitHub Issues",
+    "report_whatsapp": "WhatsApp",
+    "report_discord_url": "https://discord.gg/PZutk9fg4h",
+    "report_github_url": "https://github.com/yash-srivastava/Overdrive-release/issues",
+    "report_whatsapp_url": "https://chat.whatsapp.com/HChmriCWgr9KwAtE6OEkiM",
+    "catalog_title": "選擇版本",
+    "catalog_empty": "尚未發布任何版本。",
+    "catalog_retry": "重試",
+    "pill_installed": "已安裝",
+    "pill_older": "較舊版本",
+    "install_downgrade": "降級",
+    "downgrade_note": "此版本比您已安裝的版本舊。安裝此版本將會取代目前的版本。",
+    "switched_to_channel": "已切換至 {channel}",
+    "switched_to_braveheart_warn": "已切換至 Braveheart。版本可能不穩定 — 如果出現問題，請從「關於」→「診斷」傳送守護程式日誌，並在 Discord/GitHub 上回報。",
+    "switch_channel_failed": "無法切換頻道：{error}",
+    "notify_available": "有可用的更新：{version}。開啟「檢查更新」以安裝。",
+    "badge_new": "新功能"
   },
   "vehicle": {
     "car_locked": "汽車鎖定",
@@ -2063,5 +2100,16 @@
     "native_dvr_disable_toast": "內建行車記錄器已停用。OverDrive 現在已獨佔攝影機。",
     "native_dvr_enable_toast": "內建行車記錄器已重新啟用。",
     "start_timeout": "管線啟動逾時 — 請檢查幕後程式 (Daemon) 日誌"
+  },
+  "logs": {
+    "section_title": "診斷",
+    "section_sub": "遇到錯誤？在此傳送守護程式日誌 — 您將會收到一個簡短代碼，然後在 Discord、GitHub Issues 或 WhatsApp 上與我們分享，並告知我們發生了什麼問題。",
+    "send": "傳送",
+    "uploading": "正在上傳…",
+    "upload_failed": "上傳失敗",
+    "uploaded_title": "日誌已上傳",
+    "uploaded_body": "與維護者分享此代碼，並說明發生問題時您正在做什麼：",
+    "uploaded_where": "在 Discord、GitHub Issues 或 WhatsApp 上發布：",
+    "copy_code": "複製代碼"
   }
 }

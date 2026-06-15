@@ -31,7 +31,11 @@ public class BydDataCollector {
 
     // Device references (all nullable)
     private Object bodyworkDevice;
-    private Object speedDevice;
+    // Volatile: read by the cluster speed overlay's 2 Hz thread in readCurrentSpeedKmh()
+    // without the monitor, while init() (synchronized) may reassign it on an ACC-on
+    // re-init. Volatile gives the happens-before so the overlay never sees a stale ref
+    // (matches speedHwFactor/hwUnitDetected, read on the same path).
+    private volatile Object speedDevice;
     private Object engineDevice;
     private Object statisticDevice;
     private Object energyDevice;
@@ -55,8 +59,35 @@ public class BydDataCollector {
     // If the user set miles on the instrument cluster, mileage/speed/range come back in miles/mph.
     // We detect this once at init and convert everything to km at the ingestion boundary.
     private static final double MILES_TO_KM = 1.60934;
-    private double distanceToKmFactor = 1.0;  // 1.0 = already km, 1.60934 = miles→km
+    private volatile double distanceToKmFactor = 1.0;  // 1.0 = already km, 1.60934 = miles→km
     private boolean unitDetected = false;
+    // HARDWARE-ONLY SDK→km factor for the cluster speed badge. Unlike
+    // distanceToKmFactor (which setDistanceUnitOverride drives from the user's APP
+    // display preference and so can diverge from the cluster's real unit), this
+    // tracks ONLY the authoritative getMileageUnit() hardware detection — so
+    // readCurrentSpeedKmh() returns TRUE km/h and the overlay's single mph conversion
+    // isn't double-applied. When hardware detection never succeeds (hwUnitDetected
+    // stays false) readCurrentSpeedKmh() returns NaN ("--") — it NEVER falls back to
+    // the app override (distanceToKmFactor), since that can be unit-contaminated and
+    // the app preference can't disambiguate the raw cluster unit. Volatile: read from
+    // the overlay's 2 Hz thread, written on the init/API threads.
+    private volatile double speedHwFactor = 1.0;
+    private volatile boolean hwUnitDetected = false;
+
+    // PHEV half-scale energy correction. FIELD-CONFIRMED (owner ground truth,
+    // multiple BYD PHEVs): on EVERY PHEV the BYD HAL reports remaining battery
+    // energy at HALF the true (gross-nameplate) scale — a constant ~0.497
+    // fraction across pack sizes, the fingerprint of a fixed scaling artifact,
+    // not real degradation (e.g. ~9.1 kWh read on an 18.3 kWh gross pack at full
+    // charge; ×2 = 18.2 ≈ nameplate). This is NOT a "usable window" — every
+    // remaining-energy getter (getBatteryRemainPowerEV / getRemainingBatteryPower
+    // / getBatteryPowerHEV / getBatteryCapacity) is affected. We correct it ONCE,
+    // at the read boundary in collectBodywork, so the single corrected remainKwh
+    // flows in the true gross frame into trips, MQTT, and SOH. BEV is never
+    // touched (gated on isPhevForKwh). Applied BEFORE the validation gates so a
+    // gross value at full charge passes the impliedCap[10,130] check instead of
+    // failing it (a half value implies ~9 kWh and would be rejected).
+    private static final double PHEV_ENERGY_HALF_SCALE_CORRECTION = 2.0;
 
     private final List<String> availableDevices = new ArrayList<>();
     private final List<String> unavailableDevices = new ArrayList<>();
@@ -280,12 +311,39 @@ public class BydDataCollector {
                     // Miles mode
                     distanceToKmFactor = MILES_TO_KM;
                     unitDetected = true;
+                    // Authoritative HARDWARE factor for the speed badge (never touched
+                    // by the app-preference override).
+                    speedHwFactor = MILES_TO_KM;
+                    hwUnitDetected = true;
                     logger.info("Mileage unit: MILES detected (factor=" + MILES_TO_KM + ")");
-                } else {
-                    // km mode (unit == 1 or any other value)
+                } else if (unit == 1) {
+                    // km mode
                     distanceToKmFactor = 1.0;
                     unitDetected = true;
+                    speedHwFactor = 1.0;
+                    hwUnitDetected = true;
                     logger.info("Mileage unit: KM detected (factor=1.0)");
+                } else {
+                    // Unrecognized / in-band SDK sentinel (getMileageUnit can return a
+                    // non-zero garbage value on flaky trims, e.g. SDK_NOT_AVAILABLE).
+                    // Do NOT latch the HARDWARE flag: leave hwUnitDetected=false so the
+                    // speed badge shows "--" instead of a possibly-1.6×-wrong number
+                    // (readCurrentSpeedKmh returns NaN when the true cluster unit is
+                    // unknown — it does NOT consult the app override, which can't
+                    // disambiguate the raw unit).
+                    // For the DISPLAY factor (distanceToKmFactor, used by odometer/
+                    // distance reads): default to km ONLY on a FRESH detect. If a PRIOR
+                    // init already detected a good unit (unitDetected), PRESERVE it — a
+                    // flaky re-init returning garbage must not clobber a known-good MILES
+                    // factor back to km and silently halve every distance read.
+                    if (!unitDetected) {
+                        distanceToKmFactor = 1.0;
+                        logger.info("Mileage unit: unrecognized getMileageUnit=" + unit
+                                + " — defaulting display to km, HW unit undetected");
+                    } else {
+                        logger.info("Mileage unit: unrecognized getMileageUnit=" + unit
+                                + " on re-init — preserving prior factor=" + distanceToKmFactor);
+                    }
                 }
             } else {
                 logger.info("Mileage unit: defaulting to km (getMileageUnit returned null)");
@@ -376,6 +434,57 @@ public class BydDataCollector {
      */
     public FastDynamics getFastDynamics() {
         return fastDynamics.get();
+    }
+
+    /**
+     * Current vehicle speed in km/h for the cluster speed badge — self-contained, so
+     * it does NOT depend on RoadSense's {@link #startFastDynamicsPoll() fast poll}
+     * being active (that poll only runs while RoadSense is enabled + driving).
+     *
+     * <p>This is a SINGLE live SDK read of {@code getCurrentSpeed}, scaled ONLY by the
+     * HARDWARE-detected unit factor ({@link #speedHwFactor} from {@code getMileageUnit}).
+     * It is NEVER scaled by {@link #distanceToKmFactor} when that has been driven by the
+     * app's km/mi DISPLAY preference, because the app preference is fundamentally
+     * AMBIGUOUS about the raw unit — "user picked mi" could mean "my cluster reads
+     * miles" OR "my cluster reads km but I want mph shown", and those are
+     * indistinguishable. Only hardware detection knows the true raw unit.
+     *
+     * <p>So:
+     * <ul>
+     *   <li>hardware unit detected ({@link #hwUnitDetected}) → scale by
+     *       {@link #speedHwFactor} → TRUE km/h; the overlay then applies the single
+     *       display km↔mph conversion.</li>
+     *   <li>hardware unit NOT detected (getMileageUnit failed / returned garbage) →
+     *       the raw unit is genuinely UNKNOWN, so return {@link Double#NaN} → the badge
+     *       shows "--". Assuming km would read ~1.6× LOW on a real miles cluster, and
+     *       the app preference can't disambiguate it — a blank speedometer is safer than
+     *       a confidently-wrong one (matches this collector's "-- over a wrong number"
+     *       philosophy).</li>
+     * </ul>
+     * The cached {@code fastDynamics}/{@code snapshot} values are deliberately NOT used
+     * as a fallback (they are pre-scaled by the possibly-overridden
+     * {@link #distanceToKmFactor}, so they can be unit-contaminated). A transient SDK
+     * miss therefore returns NaN → the badge shows "--" for that ~500 ms tick and
+     * self-corrects. NaN is also returned when the trim has no speed device / SDK
+     * unavailable / ACC off. Lock-free; safe from the overlay's 2 Hz thread.
+     */
+    public double readCurrentSpeedKmh() {
+        // Only a HARDWARE-detected unit is trustworthy for the raw value. Without it the
+        // unit is unknown → NaN ("--"), never a guess (km would be ~1.6× low on a miles
+        // cluster; the app preference can't disambiguate the raw unit).
+        if (!hwUnitDetected) return Double.NaN;
+        try {
+            if (speedDevice != null) {
+                Object sp = BydDeviceHelper.callGetter(speedDevice, "getCurrentSpeed");
+                if (sp instanceof Number) {
+                    double v = ((Number) sp).doubleValue();
+                    if (v != BydFeatureIds.SDK_NOT_AVAILABLE && !Double.isNaN(v)) {
+                        return v * speedHwFactor;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
+        return Double.NaN;
     }
 
     /**
@@ -889,6 +998,108 @@ public class BydDataCollector {
                 com.overdrive.app.monitor.GearMonitor.GEAR_P);
     }
 
+    /**
+     * Resolve a raw PHEV remaining-energy reading to the true GROSS frame.
+     *
+     * <p>The BYD HAL reports PHEV remaining energy at HALF the gross-nameplate
+     * scale on its PRIMARY getter ({@code getBatteryRemainPowerEV}). But that
+     * getter goes stale when the ICE is running, and the priority cascade then
+     * falls back to {@code getRemainingBatteryPower} / {@code getBatteryCapacity},
+     * which are NOT necessarily in the same half frame — field-confirmed: on a
+     * 21.5 kWh-gross Tang-class DM-i, the live card read a correct ~16.5 kWh at
+     * 77% SOC most of the time (half primary ×2), but intermittently jumped to
+     * ~22 kWh for the ICE-running window because a near-gross fallback getter was
+     * being blindly doubled. That doubled remainKwh also poisoned the SOC capacity
+     * heuristic (estimatedCapacity = remainKwh/SOC) and per-trip kWh, so BOTH the
+     * displayed remaining AND trip consumption read exactly double until detection
+     * re-anchored — hence the "sometimes, especially after a SOH reset" symptom.
+     *
+     * <p>So a BLANKET ×2 is wrong. Instead, when we have a trustworthy nominal
+     * capacity anchor and a valid SOC, pick whichever frame — raw, or raw×2 —
+     * implies a pack capacity CLOSEST to nominal. A genuine half reading (implied
+     * cap ≈ nominal/2) doubles cleanly; an already-gross fallback (implied cap ≈
+     * nominal) is left alone. When a reading can't be placed in either frame
+     * within tolerance, return NaN so the caller skips it and keeps the last
+     * known-good value rather than writing a wrong one.
+     *
+     * <p>Fallback when no nominal anchor is available yet (cold boot, before
+     * capacity detection): apply the historical ×2, since the primary getter is
+     * the one that fills remainKwh first and it is the half-frame source. BEV
+     * never calls this (callers gate on {@code isPhevForKwh}).
+     *
+     * @param rawKwh the raw HAL reading (already in kWh, e.g. rawVal/10 for the
+     *               0.1-kWh-unit getters)
+     * @param socPercent current display SOC, or NaN if unknown this cycle
+     * @return the gross-frame kWh, or NaN if the reading is frame-ambiguous and
+     *         should be skipped
+     */
+    private double phevGrossRemainKwh(double rawKwh, double socPercent) {
+        if (Double.isNaN(rawKwh) || rawKwh <= 0) return rawKwh;
+
+        double nominal = 0;
+        try {
+            com.overdrive.app.abrp.SohEstimator sohEst =
+                com.overdrive.app.monitor.SocHistoryDatabase.getInstance().getSohEstimator();
+            if (sohEst != null) nominal = sohEst.getNominalCapacityKwh();
+        } catch (Throwable ignored) { /* nominal stays 0 → ×2 fallback below */ }
+
+        // No anchor (or no SOC) → can't disambiguate frames. Apply the historical
+        // ×2: the primary half-frame getter is what seeds remainKwh first, and a
+        // doubled value is what downstream capacity detection then anchors on.
+        if (nominal <= 0 || Double.isNaN(socPercent) || socPercent <= 5) {
+            return rawKwh * PHEV_ENERGY_HALF_SCALE_CORRECTION;
+        }
+
+        // The discriminator is the IMPLIED CAPACITY = remainKwh / SOC, NOT the
+        // remaining kWh itself. A reading in the true gross frame implies a pack
+        // capacity equal to nominal × SOH; in the half frame it implies half that.
+        // The two candidate frames (raw, raw×2) are therefore exactly 2× apart in
+        // implied capacity, while a real pack's implied capacity sits in a bounded
+        // band below nominal — so at most ONE frame can land in the band, making
+        // the choice unambiguous given a trustworthy nominal + SOC.
+        //
+        // Worked example (the user's challenge): raw = 8.5 kWh.
+        //  - at 40% SOC, 8.5 is the TRUE gross value: impliedRaw = 8.5/0.40 = 21.25
+        //    (≈ nominal, in band) while impliedDoubled = 42.5 (≫ nominal, rejected)
+        //    → return 8.5, NOT doubled. Correct.
+        //  - at 77% SOC, 8.5 is the HALF value: impliedRaw = 11.0 (too low, below
+        //    band) while impliedDoubled = 17/0.77 = 22.1 (≈ nominal, in band)
+        //    → return 17. Correct. SOC breaks the tie; doubling a genuine gross
+        //    reading always implies ~2× the pack, which never qualifies.
+        double socFraction = socPercent / 100.0;
+        double impliedRaw = rawKwh / socFraction;                               // capacity if raw is gross
+        double impliedDoubled = (rawKwh * PHEV_ENERGY_HALF_SCALE_CORRECTION) / socFraction; // capacity if raw is half
+        double errRaw = Math.abs(impliedRaw - nominal);        // how well "raw is gross" fits the pack
+        double errDoubled = Math.abs(impliedDoubled - nominal);// how well "raw is half" fits the pack
+
+        // Pick the frame whose implied capacity fits the known pack, but ONLY when
+        // the fit is BOTH (a) within a plausible-capacity tolerance of nominal, and
+        // (b) DECISIVELY better than the other frame. The two frames are exactly 2×
+        // apart, so for a genuine reading one fits tightly while the other implies
+        // ~2× (or ~0.5×) the pack — a clear winner. When the two errors are
+        // comparable, the reading is frame-ambiguous (a stale / decoupled getter
+        // value that fits neither clean frame), so we SKIP it (return NaN) and the
+        // caller keeps the last known-good remainKwh — never writing a doubled value.
+        //
+        // Tolerance 0.45·nominal on the absolute fit accommodates a degraded pack
+        // (implied cap = nominal × SOH, SOH down to ~0.6) plus SOC-curve slop,
+        // without being so wide both frames qualify. "Decisive" = the loser's error
+        // is at least 2× the winner's — guarantees we only correct/keep when the
+        // frame is unambiguous.
+        double fitTol = 0.45 * nominal;
+        boolean halfWins = errDoubled < errRaw;
+        double winErr = halfWins ? errDoubled : errRaw;
+        double loseErr = halfWins ? errRaw : errDoubled;
+        boolean decisive = winErr <= fitTol && loseErr >= 2.0 * winErr;
+
+        if (!decisive) {
+            // Ambiguous — e.g. raw ≈ 11 at 77% on a 21.5 pack implies 14.3 (raw)
+            // vs 28.6 (doubled): both ~7 off nominal, neither clean → skip.
+            return Double.NaN;
+        }
+        return halfWins ? rawKwh * PHEV_ENERGY_HALF_SCALE_CORRECTION : rawKwh;
+    }
+
     private void collectBodywork(BydVehicleData.Builder b) {
         if (bodyworkDevice == null) return;
         try {
@@ -933,16 +1144,14 @@ public class BydDataCollector {
             boolean isPhevForKwh = isPhev(b);
 
             // PHEV: read getBatteryPowerHEV ONLY to populate socHevPercent (telemetry)
-            // and STASH it as a last-resort remainKwh fallback — it is no longer the
-            // PHEV-primary energy source. Field-confirmed to read ~half the true
-            // remaining energy at full charge on Blade DM-i packs (e.g. 9.1 kWh on an
-            // 18.3 kWh / ~15.2 kWh-usable pack — a constant ~0.5× across pack sizes,
-            // the fingerprint of a scaling/per-string artifact, not real degradation).
-            // getBatteryRemainPowerEV (Priority 1 below) is the accurate PHEV source:
-            // it returns the usable-frame remaining kWh. HEV is retained only as a
-            // fallback so firmwares where the EV getter genuinely echoes SOC% (the
-            // SOC-as-kWh bug) still get *some* reading; that path preserves the old
-            // (under-reporting) behavior rather than producing none.
+            // and STASH it as a last-resort remainKwh fallback — it is not the
+            // PHEV-primary energy source. Like every PHEV energy getter it reports at
+            // HALF the true gross scale (see PHEV_ENERGY_HALF_SCALE_CORRECTION), so the
+            // stashed value is ×2-corrected to the gross frame below — matching the
+            // Priority 1/2 sources. getBatteryRemainPowerEV (Priority 1 below) is the
+            // preferred PHEV source; HEV is retained only as a fallback so firmwares
+            // where the EV getter genuinely echoes SOC% (the SOC-as-kWh bug) still get
+            // *some* reading rather than none.
             double phevHevKwh = Double.NaN;
             boolean phevHevKwhUsable = false;
             if (isPhevForKwh && bodyworkDevice != null) {
@@ -951,12 +1160,21 @@ public class BydDataCollector {
                     if (hev instanceof Number) {
                         double hevVal = ((Number) hev).doubleValue();
                         if (hevVal >= 0) {
+                            // socHevPercent telemetry + the SOC-mimic check stay on the
+                            // RAW value (the check detects firmware echoing SOC% in the
+                            // kWh field — comparing a corrected value to SOC% would break
+                            // it). The stashed remainKwh fallback is frame-resolved to the
+                            // gross frame (raw vs raw×2 vs nominal anchor — see
+                            // phevGrossRemainKwh) so a near-gross HEV reading isn't blindly
+                            // doubled.
                             b.socHevPercent(hevVal);
                             double soc = b.socPercent;
                             boolean looksLikeSocPercent = !Double.isNaN(soc)
                                     && soc > 0 && Math.abs(hevVal - soc) < 3.0;
-                            if (!looksLikeSocPercent && hevVal > 1 && hevVal < 120) {
-                                phevHevKwh = hevVal;
+                            double hevKwh = phevGrossRemainKwh(hevVal, soc);
+                            if (!looksLikeSocPercent && !Double.isNaN(hevKwh)
+                                    && hevKwh > 1 && hevKwh < 120) {
+                                phevHevKwh = hevKwh;
                                 phevHevKwhUsable = true;
                             } else if (looksLikeSocPercent) {
                                 logger.debug("getBatteryPowerHEV returned " +
@@ -971,16 +1189,24 @@ public class BydDataCollector {
             }
 
             // Priority 1 (BEV and PHEV): PowerDevice.getBatteryRemainPowerEV() — the
-            // most accurate remaining-energy source on both drivetrains. On PHEVs it
-            // returns the usable-frame remaining kWh; it may go stale when the ICE is
-            // running, which the implied-capacity gate below rejects. The SOC-as-kWh
-            // guard skips firmwares that echo SOC% here, falling through to the PHEV
-            // HEV last-resort fallback further down.
+            // most accurate remaining-energy source on both drivetrains. On PHEVs the
+            // HAL reports it at HALF the true gross scale, so we apply the half-scale
+            // correction (×2) immediately on read — the gross value then passes the
+            // implied-capacity gate below (a half value implies ~9 kWh and would fail
+            // it). It may go stale when the ICE is running, which the implied-capacity
+            // gate rejects. The SOC-as-kWh guard skips firmwares that echo SOC% here
+            // (checked against the RAW value), falling through to the PHEV HEV
+            // last-resort fallback further down.
             if (!kwhWrittenThisCycle && powerDevice != null) {
                 try {
                     Object evKwh = BydDeviceHelper.callGetter(powerDevice, "getBatteryRemainPowerEV");
                     if (evKwh instanceof Number) {
-                        double evVal = ((Number) evKwh).doubleValue();
+                        double evRaw = ((Number) evKwh).doubleValue();
+                        // Frame-resolve on PHEV (raw may be half OR already gross when
+                        // the ICE-running fallback wins). NaN = frame-ambiguous → the
+                        // `evVal > 1` guard below skips it, keeping the last good value.
+                        double evVal = isPhevForKwh
+                                ? phevGrossRemainKwh(evRaw, b.socPercent) : evRaw;
                         if (evVal > 1 && evVal < 120) {
                             // Validate: implied capacity should be within 50-150% of any BYD pack
                             double soc = b.socPercent;
@@ -991,12 +1217,14 @@ public class BydDataCollector {
                                 // inside the 10-130 BEV-friendly window and would otherwise
                                 // be accepted. When this is the SOC-mimic bug, let the
                                 // slot stay NaN so a later priority / the PHEV HEV
-                                // last-resort fallback fills it.
-                                boolean looksLikeSocMimic = Math.abs(evVal - soc) < 5.0;
+                                // last-resort fallback fills it. Checked against evRaw —
+                                // the half-scale ×2 would push a genuine SOC echo out of
+                                // the ±5 window and defeat the guard.
+                                boolean looksLikeSocMimic = Math.abs(evRaw - soc) < 5.0;
                                 double impliedCap = evVal / (soc / 100.0);
                                 if (looksLikeSocMimic) {
-                                    logger.debug("getBatteryRemainPowerEV rejected: " +
-                                        String.format("%.1f", evVal) + " kWh ≈ SOC " +
+                                    logger.debug("getBatteryRemainPowerEV rejected: raw " +
+                                        String.format("%.1f", evRaw) + " ≈ SOC " +
                                         String.format("%.0f", soc) + "% — SOC-as-kWh firmware bug");
                                 } else if (impliedCap >= 10 && impliedCap <= 130) {
                                     b.remainKwh(evVal);
@@ -1046,7 +1274,12 @@ public class BydDataCollector {
                     if (rawPower instanceof Number) {
                         int rawVal = ((Number) rawPower).intValue();
                         if (rawVal > 10 && rawVal < 1200) {  // 1-120 kWh in 0.1 units
-                            double kwh = rawVal / 10.0;
+                            double kwhRaw = rawVal / 10.0;
+                            // Frame-resolve on PHEV (raw may be half OR already gross).
+                            // BEV unchanged. NaN = ambiguous → skipped by the impliedCap
+                            // gate below, keeping the last good value.
+                            double kwh = isPhevForKwh
+                                    ? phevGrossRemainKwh(kwhRaw, b.socPercent) : kwhRaw;
                             // Validate against SOC
                             double soc = b.socPercent;
                             if (!Double.isNaN(soc) && soc > 5) {
@@ -1054,12 +1287,13 @@ public class BydDataCollector {
                                 // The Sealion 6 DM-i HAL returns raw=841 (84.1 kWh) at 84% SOC;
                                 // impliedCap=100 passes a generic [10,130] gate even though
                                 // the pack is only 18.3 kWh. Reject so a later priority /
-                                // the PHEV HEV last-resort fallback fills this slot.
-                                boolean looksLikeSocMimic = Math.abs(kwh - soc) < 5.0;
+                                // the PHEV HEV last-resort fallback fills this slot. Checked
+                                // against the RAW kWh — the ×2 would defeat the ±5 SOC window.
+                                boolean looksLikeSocMimic = Math.abs(kwhRaw - soc) < 5.0;
                                 double impliedCap = kwh / (soc / 100.0);
                                 if (looksLikeSocMimic) {
-                                    logger.debug("getRemainingBatteryPower rejected: " +
-                                        String.format("%.1f", kwh) + " kWh ≈ SOC " +
+                                    logger.debug("getRemainingBatteryPower rejected: raw " +
+                                        String.format("%.1f", kwhRaw) + " ≈ SOC " +
                                         String.format("%.0f", soc) + "% — SOC-as-kWh firmware bug (raw=" +
                                         rawVal + ")");
                                 } else if (impliedCap >= 10 && impliedCap <= 130) {
@@ -1083,13 +1317,11 @@ public class BydDataCollector {
                 }
             }
 
-            // PHEV last-resort fallback: the getBatteryPowerHEV value stashed above.
-            // Only used when getBatteryRemainPowerEV (Priority 1) and
-            // getRemainingBatteryPower (Priority 2) both failed to produce a usable
-            // reading this cycle — e.g. a firmware where the EV getter genuinely
-            // echoes SOC% and gets rejected. This value under-reports (~half) on
-            // Blade DM-i packs, so it is deliberately the LAST choice; preferring it
-            // would reintroduce the half-reading. Better a known-low reading than none.
+            // PHEV last-resort fallback: the getBatteryPowerHEV value stashed above
+            // (already ×2-corrected to the gross frame). Only used when
+            // getBatteryRemainPowerEV (Priority 1) and getRemainingBatteryPower
+            // (Priority 2) both failed to produce a usable reading this cycle — e.g.
+            // a firmware where the EV getter genuinely echoes SOC% and gets rejected.
             if (isPhevForKwh && !kwhWrittenThisCycle && phevHevKwhUsable
                     && !Double.isNaN(phevHevKwh)) {
                 b.remainKwh(phevHevKwh);
@@ -1153,7 +1385,12 @@ public class BydDataCollector {
                 // to fix). The 1-120 kWh sanity window protects against junk readings.
                 boolean looksLikeAhRating = (capVal >= 50 && capVal <= 350);
                 if (!kwhWrittenThisCycle && !looksLikeAhRating && capVal > 0) {
-                    double kwhFromCap = capVal / 10.0;
+                    // Frame-resolve on PHEV (raw may be half OR already gross).
+                    // BEV unchanged. NaN (frame-ambiguous) is excluded by the
+                    // 1-120 window below, keeping the last good value.
+                    double kwhFromCap = isPhevForKwh
+                            ? phevGrossRemainKwh(capVal / 10.0, b.socPercent)
+                            : (capVal / 10.0);
                     // Plausible remaining energy range for any BYD model: 1-120 kWh
                     if (kwhFromCap > 1.0 && kwhFromCap < 120.0) {
                         b.remainKwh(kwhFromCap);

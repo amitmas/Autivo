@@ -24,12 +24,25 @@ public class SurveillanceIpcServer implements Runnable {
     private static final DaemonLogger logger = DaemonLogger.getInstance(TAG);
     
     private final int port;
-    private ServerSocket serverSocket;
+    // volatile: written by the run() thread on every (re)bind, read+closed by
+    // stop() on the shutdown thread. Without volatile, stop() could see a stale
+    // reference and fail to close the LIVE listen socket — leaving accept()
+    // blocked and the server thread leaked on shutdown. The rebind loop
+    // reassigns this more often than the old single-shot bind, so safe
+    // publication matters.
+    private volatile ServerSocket serverSocket;
     private volatile boolean running = true;
     
-    // SOTA FIX: Thread Pool to prevent server clogging
-    // IPC server typically has fewer connections than HTTP, so 8 threads is sufficient
-    private final ExecutorService threadPool = Executors.newFixedThreadPool(8);
+    // Cached thread pool (not fixed): persistent clients (IMU + GPS sidecars,
+    // peer daemons) now hold a worker blocked in readLine() for the life of
+    // their connection, so a fixed-8 pool could be saturated by a handful of
+    // long-lived holders + a burst of one-shot callers, starving the accept
+    // dispatch. A cached pool grows on demand and reaps idle threads after 60s,
+    // so steady state is ~one thread per live persistent connection plus
+    // transient threads for one-shot commands — no artificial ceiling, no idle
+    // cost when nothing is connected. Localhost JSON traffic, so thread count
+    // stays small in practice (a few persistent + brief one-shots).
+    private final ExecutorService threadPool = Executors.newCachedThreadPool();
 
     // ABRP integration references (set by CameraDaemon)
     private static volatile com.overdrive.app.abrp.AbrpConfig abrpConfig;
@@ -71,47 +84,159 @@ public class SurveillanceIpcServer implements Runnable {
     
     @Override
     public void run() {
-        try {
-            serverSocket = new ServerSocket(port, 50, java.net.InetAddress.getByName("127.0.0.1"));
-            logger.info("Surveillance IPC server listening on 127.0.0.1:" + port);
-            
-            while (running) {
-                try {
-                    Socket client = serverSocket.accept();
-                    // SOTA FIX: Offload to Thread Pool instead of spawning new thread
-                    threadPool.execute(() -> handleClient(client));
-                } catch (Exception e) {
-                    if (running) {
-                        logger.error("Error accepting client", e);
+        // DURABILITY: bind in a RETRY loop, never let a bind failure kill the
+        // server thread. This is the config-write + sidecar lifeline (port 19877):
+        // app-process config writes route through it for atomic durability, and
+        // the IMU/GPS sidecars + peer daemons hold persistent connections to it.
+        // If the daemon crashes and respawns into a transient EADDRINUSE (the old
+        // listen socket / a client connection still in TIME_WAIT from the killed
+        // predecessor), a single-shot bind would throw, the thread would return,
+        // and 19877 would stay DEAD for the entire life of this daemon process —
+        // every app config write would silently fall back to the truncation-prone
+        // local path and the sidecars could never reconnect. So we mirror the
+        // proven TcpCommandServer/HttpServer pattern: outer while(running) loop,
+        // setReuseAddress(true) BEFORE bind (the immediate-bind constructor can't
+        // do that), BindException → sleep+retry, and a listen-socket error breaks
+        // the inner accept loop to rebind rather than dying. Idempotent: the next
+        // iteration closes any half-open serverSocket before re-binding.
+        while (running) {
+            try {
+                if (serverSocket != null && !serverSocket.isClosed()) {
+                    try { serverSocket.close(); } catch (Exception ignored) {}
+                }
+                ServerSocket ss = new ServerSocket();   // unbound — lets us set reuse first
+                ss.setReuseAddress(true);
+                ss.bind(new java.net.InetSocketAddress(
+                        InetAddress.getByName("127.0.0.1"), port), 50);
+                serverSocket = ss;
+                logger.info("Surveillance IPC server listening on 127.0.0.1:" + port);
+
+                while (running && !serverSocket.isClosed()) {
+                    try {
+                        Socket client = serverSocket.accept();
+                        // Offload to the cached thread pool (persistent clients
+                        // hold a worker for their connection lifetime). If stop()
+                        // raced us and called threadPool.shutdownNow(), execute()
+                        // throws RejectedExecutionException — close the just-
+                        // accepted client so its FD isn't leaked (matters only if
+                        // stop() is ever used for an in-process restart; on the
+                        // current SIGKILL/process-exit shutdown the kernel reclaims
+                        // it anyway, but this keeps the pattern correct).
+                        try {
+                            threadPool.execute(() -> handleClient(client));
+                        } catch (java.util.concurrent.RejectedExecutionException rej) {
+                            try { client.close(); } catch (Exception ignored) {}
+                        }
+                    } catch (java.net.SocketException se) {
+                        // Listen socket closed/errored (shutdown, or transient) —
+                        // leave the accept loop and let the outer loop rebind
+                        // (unless we're shutting down).
+                        if (running) {
+                            logger.warn("IPC accept socket error — rebinding: " + se.getMessage());
+                        }
+                        break;
+                    } catch (Exception e) {
+                        // Per-accept transient (e.g. EMFILE) — log and keep accepting.
+                        if (running) {
+                            logger.error("Error accepting client", e);
+                        }
                     }
                 }
+                // Inner accept loop exited via a listen-socket SocketException
+                // (not shutdown). Back off before the outer loop rebinds so a
+                // recurring transient listener error can't hot-spin a core
+                // (close→bind→accept→throw→repeat). Mirrors TcpCommandServer's
+                // post-inner-loop sleep. Skipped on shutdown (running==false).
+                if (running) {
+                    sleepQuietly(1000);
+                }
+            } catch (java.net.BindException be) {
+                // Port still held by a just-killed predecessor's TIME_WAIT, or a
+                // racing respawn. Retry — do NOT die. The watchdog's respawn delay
+                // plus this backoff comfortably exceeds localhost TIME_WAIT.
+                if (running) {
+                    logger.warn("IPC port " + port + " in use — retrying in 3s: " + be.getMessage());
+                    sleepQuietly(3000);
+                }
+            } catch (Exception e) {
+                if (running) {
+                    logger.error("IPC server bind/loop error — retrying in 3s", e);
+                    sleepQuietly(3000);
+                }
             }
-        } catch (Exception e) {
-            logger.error("Failed to start IPC server", e);
+        }
+        // Clean shutdown exit.
+        if (serverSocket != null && !serverSocket.isClosed()) {
+            try { serverSocket.close(); } catch (Exception ignored) {}
+        }
+        logger.info("Surveillance IPC server stopped");
+    }
+
+    private static void sleepQuietly(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
         }
     }
     
     private void handleClient(Socket client) {
         try {
-            // Read timeout: a client that opens the socket and never sends a
-            // newline would otherwise pin one of the worker threads forever.
-            // Eight half-open sockets (a buggy/restarting daemon under load)
-            // exhaust the pool and the IPC server stops accepting commands.
-            // 5s is plenty for localhost JSON traffic.
-            client.setSoTimeout(5000);
+            // Read timeout: bounds how long a worker waits for the NEXT line on
+            // an idle-but-open connection. A client that opens the socket and
+            // never sends would otherwise pin a worker forever. 30s (raised
+            // from 5s) accommodates persistent clients — the hot sidecars (IMU
+            // ~10/s, GPS ~1/s) now hold ONE connection and stream many commands
+            // over it instead of reconnecting per message, so the worker legitimately
+            // blocks between bursts; 30s is well above their inter-message gap
+            // yet still reaps a truly dead half-open socket. Per-message clients
+            // are unaffected — they send one line, read the reply, close, and
+            // our readLine() then returns null (EOF) so we exit the loop at once.
+            client.setSoTimeout(30_000);
             BufferedReader in = new BufferedReader(new InputStreamReader(client.getInputStream()));
             PrintWriter out = new PrintWriter(client.getOutputStream(), true);
 
-            String line = in.readLine();
-            if (line != null) {
-                JSONObject request = new JSONObject(line);
-                JSONObject response = handleCommand(request);
-                out.println(response.toString());
+            // Loop over newline-delimited commands so a single persistent socket
+            // can carry a stream of requests. Backward-compatible with the old
+            // one-shot clients: they close after one exchange → readLine() == null
+            // → loop ends. This converts ~10 TCP connect/teardown per second
+            // (IMU) + ~1/s (GPS) into ZERO once the connection is established.
+            String line;
+            while ((line = in.readLine()) != null) {
+                // Skip blank/whitespace lines instead of feeding them to the
+                // JSON parser. A connect-then-send-empty-line probe (and the
+                // brief window between a client's connect and its first write)
+                // yields "" here; new JSONObject("") throws
+                // "End of input at character 0", which under the per-connection
+                // loop was logged ~3x/sec as "Error handling client". Treat an
+                // empty line as a keep-alive no-op, not a malformed command.
+                if (line.trim().isEmpty()) {
+                    continue;
+                }
+                // A SINGLE malformed command must not tear down the whole
+                // (now persistent) connection or spam the log — catch per-line,
+                // reply with an error, and keep serving the next command.
+                try {
+                    JSONObject request = new JSONObject(line);
+                    JSONObject response = handleCommand(request);
+                    // handleCommand returns null for fire-and-forget streaming
+                    // commands (IMU_BATCH ~10/s, UPDATE_GPS ~1/s) whose sidecar
+                    // clients never read the reply — skip the per-message
+                    // JSONObject build + toString + write syscall on the hot path,
+                    // and stop accumulating unread ack bytes in the socket buffer.
+                    if (response != null) {
+                        out.println(response.toString());
+                    }
+                } catch (org.json.JSONException je) {
+                    logger.debug("IPC: ignoring malformed command line: " + je.getMessage());
+                }
             }
 
             client.close();
         } catch (java.net.SocketTimeoutException ste) {
-            logger.warn("IPC client read timeout — closing socket");
+            // Idle persistent client (no command within the window) or a stuck
+            // half-open socket — close and free the worker. The client's
+            // reconnect-on-failure path re-establishes when it next has data.
             try { client.close(); } catch (Exception ignored) {}
         } catch (Exception e) {
             logger.error("Error handling client", e);
@@ -378,25 +503,27 @@ public class SurveillanceIpcServer implements Runnable {
                 
                 case "UPDATE_GPS":
                     handleGpsUpdate(request);
-                    response.put("success", true);
-                    break;
+                    // Fire-and-forget: LocationSidecarService writes the fix and
+                    // never reads the ack. Return null so handleClient skips the
+                    // reply write (saves a serialize + write syscall ~1/s).
+                    return null;
 
                 // ==================== ROADSENSE ====================
                 // Batched IMU frames from the app-side RoadSense sidecar (D-023).
                 // Feed straight into the daemon-side RoadSenseController pipeline.
                 case com.overdrive.app.roadsense.detect.ImuFrameCodec.COMMAND: { // "IMU_BATCH"
-                    int n = 0;
                     com.overdrive.app.roadsense.RoadSenseController rs =
                             com.overdrive.app.daemon.CameraDaemon.getRoadSense();
                     if (rs != null) {
-                        // The server already parsed the line into `request`; the
-                        // codec decodes from the same JSON. request.toString()
-                        // round-trips cleanly at the ~10 batches/sec rate.
-                        n = rs.onImuBatch(request.toString());
+                        // Pass the ALREADY-PARSED request straight to the codec —
+                        // no request.toString() + re-parse round-trip of the
+                        // nested-array batch (~10/s on the IPC reader thread).
+                        rs.onImuBatch(request);
                     }
-                    response.put("success", true);
-                    response.put("samples", n);
-                    break;
+                    // Fire-and-forget: RoadSenseImuSidecarService never reads the
+                    // ack. Return null so handleClient skips the reply write
+                    // (saves a JSONObject build + serialize + write ~10/s).
+                    return null;
                 }
 
                 // ==================== ABRP COMMANDS ====================
@@ -474,8 +601,28 @@ public class SurveillanceIpcServer implements Runnable {
                     handleCheckUpdate(response);
                     break;
 
+                case "LIST_VERSIONS":
+                    handleListVersions(response);
+                    break;
+
+                case "GET_CHANNEL":
+                    handleGetChannel(response);
+                    break;
+
+                case "SET_CHANNEL":
+                    handleSetChannel(request, response);
+                    break;
+
                 case "INSTALL_UPDATE":
                     handleInstallUpdate(request, response);
+                    break;
+
+                case "GET_UPDATE_PROGRESS":
+                    handleGetUpdateProgress(response);
+                    break;
+
+                case "UPLOAD_LOG":
+                    handleUploadLog(request, response);
                     break;
 
                 default:
@@ -1566,6 +1713,22 @@ public class SurveillanceIpcServer implements Runnable {
             response.put("error", "App context not ready");
             return;
         }
+
+        // Channel-aware, mirroring UpdateApiHandler.handleCheck. Alpha is a
+        // pick-any archive — there's no single "the update", so report
+        // not-available + the channel marker; the Telegram handler then lists
+        // versions (LIST_VERSIONS) instead of offering a single Install button.
+        com.overdrive.app.config.UnifiedConfigManager.forceReload();
+        String channel = com.overdrive.app.config.UnifiedConfigManager.getUpdateChannel();
+        response.put("channel", channel);
+        if (com.overdrive.app.updater.AppUpdater.CHANNEL_ALPHA.equals(channel)) {
+            response.put("success", true);
+            response.put("available", false);
+            response.put("currentVersion",
+                    com.overdrive.app.updater.AppUpdater.getDisplayVersionFromFile());
+            return;
+        }
+
         com.overdrive.app.updater.AppUpdater updater =
                 new com.overdrive.app.updater.AppUpdater(ctx);
         final Object lock = new Object();
@@ -1634,6 +1797,108 @@ public class SurveillanceIpcServer implements Runnable {
     }
 
     /**
+     * Enumerate the alpha archive over IPC (mirrors UpdateApiHandler /versions).
+     * Returns {success, channel, currentVersion, versions:[{version,tag,
+     * relation,publishedAt}]}. Used by the Telegram /update handler on the
+     * alpha channel to present a pick-any list.
+     */
+    private void handleListVersions(JSONObject response) throws Exception {
+        android.content.Context ctx = CameraDaemon.getAppContext();
+        if (ctx == null) {
+            response.put("success", false);
+            response.put("error", "App context not ready");
+            return;
+        }
+        com.overdrive.app.updater.AppUpdater updater =
+                new com.overdrive.app.updater.AppUpdater(ctx);
+        final Object lock = new Object();
+        final boolean[] done = {false};
+        final JSONObject[] resultRef = {null};
+        updater.listVersions(new com.overdrive.app.updater.AppUpdater.VersionListCallback() {
+            @Override public void onResult(java.util.List<com.overdrive.app.updater.AppUpdater.VersionEntry> versions, String currentVersion) {
+                JSONObject r = new JSONObject();
+                try {
+                    r.put("available", true);
+                    r.put("currentVersion", currentVersion);
+                    org.json.JSONArray arr = new org.json.JSONArray();
+                    for (com.overdrive.app.updater.AppUpdater.VersionEntry v : versions) arr.put(v.toJson());
+                    r.put("versions", arr);
+                } catch (Exception ignored) {}
+                resultRef[0] = r;
+                synchronized (lock) { done[0] = true; lock.notify(); }
+            }
+            @Override public void onError(String error) {
+                JSONObject r = new JSONObject();
+                try {
+                    r.put("error", error != null ? error : "unknown");
+                    r.put("currentVersion", com.overdrive.app.updater.AppUpdater.getDisplayVersionFromFile());
+                } catch (Exception ignored) {}
+                resultRef[0] = r;
+                synchronized (lock) { done[0] = true; lock.notify(); }
+            }
+        });
+        try {
+            synchronized (lock) {
+                if (!done[0]) lock.wait(12_000);
+            }
+        } catch (InterruptedException ignored) {
+            Thread.currentThread().interrupt();
+        }
+        try { updater.close(); } catch (Exception ignored) {}
+        if (resultRef[0] == null) {
+            response.put("success", false);
+            response.put("error", "Version list timed out");
+            return;
+        }
+        java.util.Iterator<String> keys = resultRef[0].keys();
+        while (keys.hasNext()) {
+            String k = keys.next();
+            response.put(k, resultRef[0].opt(k));
+        }
+        response.put("success", !resultRef[0].has("error"));
+    }
+
+    /** Return the resolved update channel. */
+    private void handleGetChannel(JSONObject response) throws Exception {
+        com.overdrive.app.config.UnifiedConfigManager.forceReload();
+        response.put("success", true);
+        response.put("channel", com.overdrive.app.config.UnifiedConfigManager.getUpdateChannel());
+    }
+
+    /**
+     * Switch the update channel from Telegram. Validates against the
+     * {alpha, braveheart} allowlist (the bot is owner-paired, but keep the
+     * policy uniform with the HTTP endpoint).
+     */
+    private void handleSetChannel(JSONObject request, JSONObject response) throws Exception {
+        // Public-mode block mirrors UpdateApiHandler.handleSetChannel and the
+        // sibling IPC handleInstallUpdate — keeps the channel-write policy
+        // uniform across all three surfaces (defense-in-depth; this IPC server
+        // is loopback-only, but a client must not flip the owner's channel in
+        // public mode any more than the HTTP twin lets a tunnel visitor do so).
+        if (CameraDaemon.isPublicMode()) {
+            response.put("success", false);
+            response.put("error", "Update disabled in public mode");
+            return;
+        }
+        String value = request.optString("channel", "");
+        if (!com.overdrive.app.updater.AppUpdater.CHANNEL_ALPHA.equals(value)
+                && !com.overdrive.app.updater.AppUpdater.CHANNEL_BRAVEHEART.equals(value)) {
+            response.put("success", false);
+            response.put("error", "Invalid update channel");
+            return;
+        }
+        boolean ok = com.overdrive.app.config.UnifiedConfigManager.setUpdateChannel(value);
+        response.put("success", ok);
+        if (ok) {
+            com.overdrive.app.config.UnifiedConfigManager.forceReload();
+            response.put("channel", value);
+        } else {
+            response.put("error", "Could not save the update channel");
+        }
+    }
+
+    /**
      * Two-stage install:
      *   1. Sync check to populate latestDownloadUrl (so /install can't be used
      *      as a blind download trigger, mirroring UpdateApiHandler).
@@ -1663,74 +1928,195 @@ public class SurveillanceIpcServer implements Runnable {
             return;
         }
 
+        // Shared single-install gate (covers web + app-IPC + Telegram-IPC, all
+        // in this daemon JVM). Acquire BEFORE prepareInstall/network so a
+        // concurrent trigger is rejected early. endInstall() on every pre-spawn
+        // bail below; the success path leaves it held (process dies during
+        // install, INSTALL_STALE_MS self-recovers).
+        if (!com.overdrive.app.updater.AppUpdater.tryBeginInstall()) {
+            response.put("success", false);
+            response.put("error", "Update already in progress");
+            return;
+        }
+
         com.overdrive.app.updater.AppUpdater updater =
                 new com.overdrive.app.updater.AppUpdater(ctx);
 
-        final Object lock = new Object();
-        final boolean[] done = {false};
-        final boolean[] available = {false};
-        final String[] err = {null};
         final String[] versionRef = {null};
 
-        updater.checkForUpdate(new com.overdrive.app.updater.AppUpdater.UpdateCallback() {
-            @Override public void onUpdateAvailable(String c, String n, String rn) {
-                available[0] = true;
-                versionRef[0] = n;
-                synchronized (lock) { done[0] = true; lock.notify(); }
+        // Targeted (alpha pick): a "version" tag selects a specific archived
+        // release. Resolve it SERVER-SIDE (prepareInstall, never a client URL)
+        // and SKIP the braveheart available-gate — alpha never returns
+        // onUpdateAvailable, so the gate would dead-on-arrival every alpha
+        // install. Mirrors UpdateApiHandler.handleInstall.
+        String version = request.optString("version", "");
+        if (version != null && !version.isEmpty()) {
+            // Channel/tag guard (mirrors UpdateApiHandler): an alpha* targeted
+            // install is only valid on the alpha channel — reject it on
+            // braveheart so the wrong per-channel baseline can't be corrupted.
+            com.overdrive.app.config.UnifiedConfigManager.forceReload();
+            String activeChannel = com.overdrive.app.config.UnifiedConfigManager.getUpdateChannel();
+            // Strict tag validation (not a loose prefix) + channel match.
+            if (!com.overdrive.app.updater.AppUpdater.isValidAlphaTag(version)
+                    || !com.overdrive.app.updater.AppUpdater.CHANNEL_ALPHA.equals(activeChannel)) {
+                com.overdrive.app.updater.AppUpdater.endInstall();
+                try { updater.close(); } catch (Exception ignored) {}
+                response.put("success", false);
+                response.put("error", "Version is not on the active channel");
+                return;
             }
-            @Override public void onNoUpdate(String c) {
-                synchronized (lock) { done[0] = true; lock.notify(); }
-            }
-            @Override public void onError(String e) {
-                err[0] = e;
-                synchronized (lock) { done[0] = true; lock.notify(); }
-            }
-        });
-        try {
-            synchronized (lock) {
-                if (!done[0]) lock.wait(20_000);
-            }
-        } catch (InterruptedException ignored) {
-            Thread.currentThread().interrupt();
-        }
-        if (err[0] != null) {
-            try { updater.close(); } catch (Exception ignored) {}
-            response.put("success", false);
-            response.put("error", "Pre-install check failed: " + err[0]);
-            return;
-        }
-        if (!available[0]) {
-            try { updater.close(); } catch (Exception ignored) {}
-            response.put("success", false);
-            response.put("error", "No update available");
-            return;
-        }
-
-        // Plant the Telegram post-update hint so the new process's first
-        // notifyTunnel handler frames the message as "Overdrive updated to X".
-        // Best-effort: failure here just falls back to the generic "URL
-        // changed" copy. We're already in the daemon process (UID 2000), and
-        // /data/local/tmp/ is world-writable for shell, so a direct
-        // FileWriter is both simpler and avoids the AdbDaemonLauncher path
-        // (which would EACCES on the app's adbkey when called from here).
-        try {
-            String hintVersion = versionRef[0] != null ? versionRef[0] : "unknown";
-            try (java.io.FileWriter fw = new java.io.FileWriter(
-                    com.overdrive.app.updater.UpdateLifecycle.TELEGRAM_POST_UPDATE_HINT_FILE)) {
-                fw.write(hintVersion);
-                fw.write('\n');
-            }
-        } catch (Exception ignored) {}
-
-        // Start install on a background thread. The IPC reply returns now
-        // because the daemon dies mid-install; Telegram polls progress via a
-        // separate IPC request (CHECK_UPDATE-style polling isn't needed —
-        // /data/local/tmp/overdrive_update_progress.json is already tailed by
-        // the webapp; the Telegram bot reads it on demand instead).
-        new Thread(() -> {
+            // Bound the alpha resolve so it can't run past the app's IPC read
+            // budget. prepareInstall hits the GitHub API via buildClient(15,15)
+            // (connect 15s + read 15s, NO callTimeout), and a slow proxy probe
+            // can stack on top — a worst case ~30s, well past MainActivity's
+            // hard 25s socket read. Past that the app's DaemonIpcClient.send
+            // returns null and the app shows a FALSE "head unit unreachable"
+            // error, then is surprised by the restart when the install lands
+            // anyway. The braveheart path below already caps its pre-install
+            // wait at 20s (lock.wait(20_000)); cap the alpha path the same way
+            // so BOTH channels reply within ~20s and the app's 25s margin holds.
+            // (The web path has no such socket cutoff, so it just waited — this
+            // closes the app-vs-web divergence on slow networks.)
+            final Object aLock = new Object();
+            final boolean[] aDone = {false};
+            final String[] aResolved = {null};
+            final String[] aErr = {null};
+            new Thread(() -> {
+                try {
+                    String r = updater.prepareInstall(version);
+                    synchronized (aLock) { aResolved[0] = r; aDone[0] = true; aLock.notify(); }
+                } catch (Exception e) {
+                    synchronized (aLock) {
+                        aErr[0] = e.getMessage() != null ? e.getMessage() : "resolve failed";
+                        aDone[0] = true; aLock.notify();
+                    }
+                }
+            }, "AlphaPrepareInstall").start();
             try {
-                writeInstallProgress("queued", 0, "Update queued", null);
-                updater.downloadAndInstall(new com.overdrive.app.updater.AppUpdater.InstallCallback() {
+                synchronized (aLock) {
+                    if (!aDone[0]) aLock.wait(20_000);
+                }
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+            boolean resolved;
+            synchronized (aLock) { resolved = aDone[0]; }
+            if (!resolved) {
+                // Cap exceeded — reply an error within budget rather than let the
+                // app's socket read time out and mis-report "daemon down". The
+                // orphaned resolve thread may finish later, but we never read
+                // versionRef[0] / start the install thread on this path, and
+                // close() below tears down the updater's resources, so the late
+                // return is inert.
+                com.overdrive.app.updater.AppUpdater.endInstall();
+                try { updater.close(); } catch (Exception ignored) {}
+                response.put("success", false);
+                response.put("error", "Pre-install check failed: resolve timed out");
+                return;
+            }
+            if (aErr[0] != null) {
+                com.overdrive.app.updater.AppUpdater.endInstall();
+                try { updater.close(); } catch (Exception ignored) {}
+                response.put("success", false);
+                response.put("error", "Pre-install check failed: " + aErr[0]);
+                return;
+            }
+            versionRef[0] = aResolved[0];
+        } else {
+            final Object lock = new Object();
+            final boolean[] done = {false};
+            final boolean[] available = {false};
+            final String[] err = {null};
+
+            updater.checkForUpdate(new com.overdrive.app.updater.AppUpdater.UpdateCallback() {
+                @Override public void onUpdateAvailable(String c, String n, String rn) {
+                    available[0] = true;
+                    versionRef[0] = n;
+                    synchronized (lock) { done[0] = true; lock.notify(); }
+                }
+                @Override public void onNoUpdate(String c) {
+                    synchronized (lock) { done[0] = true; lock.notify(); }
+                }
+                @Override public void onError(String e) {
+                    err[0] = e;
+                    synchronized (lock) { done[0] = true; lock.notify(); }
+                }
+            });
+            try {
+                synchronized (lock) {
+                    if (!done[0]) lock.wait(20_000);
+                }
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+            if (err[0] != null) {
+                com.overdrive.app.updater.AppUpdater.endInstall();
+                try { updater.close(); } catch (Exception ignored) {}
+                response.put("success", false);
+                response.put("error", "Pre-install check failed: " + err[0]);
+                return;
+            }
+            if (!available[0]) {
+                com.overdrive.app.updater.AppUpdater.endInstall();
+                try { updater.close(); } catch (Exception ignored) {}
+                response.put("success", false);
+                response.put("error", "No update available");
+                return;
+            }
+        }
+
+        // Pre-spawn synchronous region: must release the shared gate on ANY
+        // throw before the install thread starts. handleCommand's outer catch
+        // only sets response.error — it does NOT call AppUpdater.endInstall().
+        // So a JSONException from response.put, or an OOM on Thread spawn, would
+        // otherwise wedge the shared gate (web + app + Telegram) for
+        // INSTALL_STALE_MS with no install running. Guard it ourselves and
+        // rethrow so handleCommand still surfaces the error to the caller. The
+        // gate must only be released for throws BEFORE Thread.start() succeeds —
+        // once the install thread is running the held gate is correct (its own
+        // onError/onSuccess/crash handlers own it).
+        try {
+            // Plant the Telegram post-update hint so the new process's first
+            // notifyTunnel handler frames the message as "Overdrive updated to X".
+            // Best-effort: failure here just falls back to the generic "URL
+            // changed" copy. We're already in the daemon process (UID 2000), and
+            // /data/local/tmp/ is world-writable for shell, so a direct
+            // FileWriter is both simpler and avoids the AdbDaemonLauncher path
+            // (which would EACCES on the app's adbkey when called from here).
+            try {
+                // Only write a canonical "<channel>-v<semver>" hint. If the
+                // resolved label is non-canonical (e.g. the literal "unknown"
+                // sentinel from a version-less APK on a bare tag), fall back to
+                // the running build's BuildConfig identity so the Telegram
+                // message never reads "Overdrive updated to unknown".
+                String hintVersion =
+                        com.overdrive.app.updater.AppUpdater.channelOfLabel(versionRef[0]) != null
+                                ? versionRef[0]
+                                : com.overdrive.app.updater.AppUpdater.getInstalledVersion();
+                try (java.io.FileWriter fw = new java.io.FileWriter(
+                        com.overdrive.app.updater.UpdateLifecycle.TELEGRAM_POST_UPDATE_HINT_FILE)) {
+                    fw.write(hintVersion);
+                    fw.write('\n');
+                }
+            } catch (Exception ignored) {}
+
+            // Write the "queued" record SYNCHRONOUSLY, BEFORE replying scheduled —
+            // mirrors UpdateApiHandler. If we only wrote it on the bg thread (after
+            // the reply), the app's first GET_UPDATE_PROGRESS poll could race in and
+            // read a PRIOR install's persisted terminal record (e.g. a stale
+            // phase=error or installing@100), then falsely abort/short-circuit a
+            // perfectly healthy install. Seeding queued first guarantees the first
+            // poll sees THIS install's state.
+            writeInstallProgress("queued", 0, "Update queued", null);
+
+            // Start install on a background thread. The IPC reply returns now
+            // because the daemon dies mid-install; Telegram polls progress via a
+            // separate IPC request (CHECK_UPDATE-style polling isn't needed —
+            // /data/local/tmp/overdrive_update_progress.json is already tailed by
+            // the webapp; the Telegram bot reads it on demand instead).
+            new Thread(() -> {
+                try {
+                    updater.downloadAndInstall(new com.overdrive.app.updater.AppUpdater.InstallCallback() {
                     @Override public void onProgress(String message) {
                         String m = message == null ? "" : message;
                         String phase = "downloading";
@@ -1760,21 +2146,43 @@ public class SurveillanceIpcServer implements Runnable {
                     private long dlLastAt = 0;
                     @Override public void onSuccess() {
                         writeInstallProgress("installing", 100, "Update installed, restarting…", null);
-                        // pm install kills the process so leak doesn't materialize, but
-                        // close() is idempotent and cheap — defensive.
+                        // Leave the gate held — pm install kills us; INSTALL_STALE_MS
+                        // self-recovers. close() is idempotent/defensive.
                         try { updater.close(); } catch (Exception ignored) {}
                     }
                     @Override public void onError(String error) {
                         writeInstallProgress("error", -1, "Install failed", error);
-                        // Install failed; release per-instance executor.
+                        // Install failed before process death — release the gate so
+                        // a retry isn't blocked for INSTALL_STALE_MS.
+                        com.overdrive.app.updater.AppUpdater.endInstall();
+                        // Pre-kill failure (download/verify): this daemon is still
+                        // alive, so the detached install script — the only code
+                        // that cleans up the Telegram success hint and surfaces
+                        // the failure to the owner — is NEVER reached. Do both
+                        // here: drop the stale success hint (so an unrelated tunnel
+                        // rotation can't later fire a false "updated to X") and tell
+                        // the owner now, symmetric with the app/web pollers that
+                        // already read phase=error from this still-alive daemon.
+                        surfaceIpcInstallFailure(error);
                         try { updater.close(); } catch (Exception ignored) {}
                     }
-                });
-            } catch (Exception e) {
-                writeInstallProgress("error", -1, "Install crashed", e.getMessage());
-                try { updater.close(); } catch (Exception ignored) {}
-            }
-        }, "TelegramUpdate-Install").start();
+                    });
+                } catch (Exception e) {
+                    writeInstallProgress("error", -1, "Install crashed", e.getMessage());
+                    com.overdrive.app.updater.AppUpdater.endInstall();
+                    // Same pre-kill cleanup + owner notify as the onError branch.
+                    surfaceIpcInstallFailure(e.getMessage());
+                    try { updater.close(); } catch (Exception ignored) {}
+                }
+            }, "TelegramUpdate-Install").start();
+        } catch (Throwable t) {
+            // Threw BEFORE the install thread started (e.g. OOM on spawn) — the
+            // thread's own handlers never run, so release the shared gate here.
+            com.overdrive.app.updater.AppUpdater.endInstall();
+            try { updater.close(); } catch (Exception ignored) {}
+            if (t instanceof Exception) throw (Exception) t;
+            throw new RuntimeException(t);
+        }
 
         response.put("success", true);
         response.put("status", "scheduled");
@@ -1794,6 +2202,149 @@ public class SurveillanceIpcServer implements Runnable {
                 "/data/local/tmp/overdrive_update_progress.json")) {
             fw.write(r.toString());
         } catch (Exception ignored) {}
+    }
+
+    /**
+     * Pre-kill (download/verify) install-failure cleanup for an IPC-triggered
+     * install. handleInstallUpdate plants TELEGRAM_POST_UPDATE_HINT_FILE (the
+     * "updated to X" success hint) BEFORE the background download starts — the
+     * web path does NOT. A failure that bails out before runDetachedInstall
+     * leaves this daemon alive, so the detached script (the only code that
+     * deletes the success hint and surfaces the failure) never runs. That left
+     * two defects on this path: (1) the stale success hint persisted for up to
+     * 24h, so the NEXT unrelated tunnel rotation made the reborn bot send a
+     * FALSE "Overdrive updated to X"; (2) the Telegram owner was never told the
+     * install failed (the app/web pollers see phase=error, but the bot already
+     * replied "scheduled" and waits silently for a hint). Fix both here:
+     *   1. Delete the success hint so it can't later fire a false success.
+     *   2. Notify the owner directly via TelegramNotifier (IPC to the bot
+     *      daemon on 19880) — symmetric with the app/web failure surfaces.
+     * Gate on the success hint having existed so a web-triggered install (which
+     * never plants it) doesn't message the Telegram owner about an install they
+     * didn't start from Telegram, matching the detached script's failure gate.
+     */
+    private static void surfaceIpcInstallFailure(String error) {
+        java.io.File hint = new java.io.File(
+                com.overdrive.app.updater.UpdateLifecycle.TELEGRAM_POST_UPDATE_HINT_FILE);
+        boolean wasIpcTriggered = hint.exists();
+        if (wasIpcTriggered) {
+            try { hint.delete(); } catch (Exception ignored) {}
+        }
+        if (!wasIpcTriggered) return;
+        String raw = (error != null && !error.trim().isEmpty())
+                ? error.trim() : "unknown (see head unit)";
+        // The bot sends with parse_mode=Markdown and does NOT escape the body,
+        // so an unescaped control char in the download/verify error (e.g. a CDN
+        // message with '_' or '*') would 400 "can't parse entities" and the
+        // message would be silently dropped. Strip the legacy-Markdown control
+        // chars from the reason, mirroring the bot-side failure copy's
+        // mdEscape (UpdateCommandHandler.stripMarkdown uses the same set).
+        StringBuilder safe = new StringBuilder(raw.length());
+        for (int i = 0; i < raw.length(); i++) {
+            char c = raw.charAt(i);
+            if (c == '*' || c == '_' || c == '`' || c == '[' || c == ']') continue;
+            safe.append(c);
+        }
+        String reason = safe.toString();
+        // TelegramNotifier runs the IPC on its own background executor + gates
+        // on the criticalAlerts toggle (matching the bot-side failure message
+        // category). Hardcoded English literals match the bot's house style.
+        try {
+            com.overdrive.app.telegram.TelegramNotifier.sendMessage(
+                    "⚠️ *Overdrive update failed*\n"
+                    + "The device is still on the previous version.\n"
+                    + "Reason: " + reason,
+                    "CRITICAL");
+        } catch (Exception ignored) {}
+    }
+
+    /**
+     * Read the install-progress file and return it to the app process (UID
+     * 10xxx can't read /data/local/tmp/ directly). Mirrors
+     * UpdateApiHandler.handleProgress: returns an "idle" sentinel when no
+     * install has run, and self-recovers a stale non-terminal state (daemon
+     * killed mid-download leaves the JSON frozen) older than 5 min back to
+     * "idle" so the app's poll loop doesn't spin forever on a dead transfer.
+     * response always carries success=true plus {phase, percent, message[, error]}.
+     */
+    private void handleGetUpdateProgress(JSONObject response) throws Exception {
+        response.put("success", true);
+        java.io.File f = new java.io.File("/data/local/tmp/overdrive_update_progress.json");
+        if (!f.exists()) {
+            response.put("phase", "idle");
+            response.put("percent", -1);
+            response.put("message", "");
+            return;
+        }
+        String json = null;
+        try (java.io.BufferedReader r = new java.io.BufferedReader(
+                new java.io.InputStreamReader(new java.io.FileInputStream(f)))) {
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = r.readLine()) != null) sb.append(line);
+            json = sb.toString().trim();
+        } catch (Exception ignored) {}
+        if (json == null || json.isEmpty()) {
+            response.put("phase", "idle");
+            response.put("percent", -1);
+            response.put("message", "");
+            return;
+        }
+        try {
+            JSONObject parsed = new JSONObject(json);
+            long ts = parsed.optLong("ts", 0);
+            String phase = parsed.optString("phase", "");
+            boolean terminal = "error".equals(phase) || "idle".equals(phase)
+                    || ("installing".equals(phase) && parsed.optInt("percent", -1) == 100);
+            if (!terminal && ts > 0 && (System.currentTimeMillis() - ts) > 5 * 60 * 1000L) {
+                response.put("phase", "idle");
+                response.put("percent", -1);
+                response.put("message", "");
+                return;
+            }
+            response.put("phase", phase);
+            response.put("percent", parsed.optInt("percent", -1));
+            response.put("message", parsed.optString("message", ""));
+            if (parsed.has("error")) response.put("error", parsed.optString("error"));
+        } catch (Exception e) {
+            // Malformed JSON → report idle rather than wedge the app poll.
+            response.put("phase", "idle");
+            response.put("percent", -1);
+            response.put("message", "");
+        }
+    }
+
+    /**
+     * Upload a single daemon's log to the Cloudflare Worker and return the
+     * short retrieval code. Braveheart-only (LogUploader.isUploadConfigured()
+     * is false otherwise). Runs synchronously on the IPC worker thread — the
+     * upload itself is network-bound but capped by LogUploader's timeouts.
+     * request: { daemon: "<key>" }   response: { success, code } | { error }
+     */
+    private void handleUploadLog(JSONObject request, JSONObject response) throws Exception {
+        if (!com.overdrive.app.logging.LogUploader.isUploadConfigured()) {
+            response.put("success", false);
+            response.put("error", "Log upload is not available in this build");
+            return;
+        }
+        String daemon = request.optString("daemon", "");
+        String path = com.overdrive.app.logging.DaemonLogPaths.pathFor(daemon);
+        if (path == null) {
+            response.put("success", false);
+            response.put("error", "Unknown daemon. Try: "
+                    + com.overdrive.app.logging.DaemonLogPaths.keyList());
+            return;
+        }
+        String version = com.overdrive.app.updater.AppUpdater.getDisplayVersionFromFile();
+        com.overdrive.app.logging.LogUploader.Result res =
+                com.overdrive.app.logging.LogUploader.upload(path, daemon, version);
+        response.put("success", res.ok);
+        if (res.ok) {
+            response.put("code", res.code);
+            response.put("daemon", daemon);
+        } else {
+            response.put("error", res.error != null ? res.error : "upload failed");
+        }
     }
 
     public void stop() {

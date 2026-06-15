@@ -41,13 +41,22 @@ object Od {
         // removed by R8), so the shipped binary has no bypass path.
         if (com.overdrive.app.BuildConfig.DEBUG) { ready = true; return true }
         try {
-            val d = hostKey(context) ?: return false
+            val d = hostKey(context)
+            if (d == null) {
+                // Diagnostic: signature unreadable → coefficients will zero-fill → BLACK
+                // BS card. (Was silent; this is the one line that makes "loaded but black"
+                // triageable from the log.)
+                android.util.Log.w("Od", "authorize: hostKey null (no readable signing cert) → od NOT ready → BS will render black")
+                return false
+            }
             var hi = 0L; var lo = 0L
             for (i in 0 until 8) hi = (hi shl 8) or (d[i].toLong() and 0xFF)
             for (i in 8 until 16) lo = (lo shl 8) or (d[i].toLong() and 0xFF)
             ready = nativeAuthorize(hi, lo) == 1
-        } catch (_: Throwable) {
+            android.util.Log.i("Od", "authorize: nativeAuthorize → ready=" + ready)
+        } catch (t: Throwable) {
             ready = false
+            android.util.Log.w("Od", "authorize: exception → od NOT ready: " + t.message)
         }
         return ready
     }

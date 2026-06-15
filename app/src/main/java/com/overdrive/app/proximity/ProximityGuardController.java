@@ -50,6 +50,16 @@ public class ProximityGuardController implements ProximityRadarMonitor.TriggerCa
     
     private volatile State currentState = State.IDLE;
     private ScheduledFuture<?> postRecordTimer;
+    // Keyframe-pulse timer, active ONLY while MONITORING under the low-power
+    // profile. The low monitor frame-rate stretches the encoder's natural GOP
+    // (KEY_I_FRAME_INTERVAL=2s is converted to a FRAME COUNT = 2s×cameraFps, so
+    // at ~4 fps an IDR would otherwise land only every ~8s wall-clock). The
+    // pre-record ring's flush needs a keyframe inside the window, so without
+    // this pulse a trigger after a quiet stretch would flush an empty/ragged
+    // pre-roll — defeating the feature. We pulse requestSyncFrame on a
+    // wall-clock cadence (~preRecordSeconds/2) so a keyframe is always within
+    // the pre-record window. Cancelled the moment we leave MONITORING.
+    private ScheduledFuture<?> keyframePulseTimer;
     private final ScheduledExecutorService scheduler;
     // Tracks whether a RED tier was hit during the CURRENT recording session.
     // Sticky for the duration of the recording so the post-record window
@@ -156,6 +166,77 @@ public class ProximityGuardController implements ProximityRadarMonitor.TriggerCa
     public boolean isActive() {
         return currentState != State.IDLE;
     }
+
+    /**
+     * The GLOBAL camera HAL fps this controller wants RIGHT NOW, or 0 meaning
+     * "no opinion — use the full recording rate". Consumed by the single
+     * camera-profile authority (RecordingModeManager.desiredCameraState) so the
+     * camera HAL — not just the recorder draw-stride — is dropped to the
+     * low-power rate while we sit MONITORING for radar triggers.
+     *
+     * <p>Why this matters (measured on-device): proximity detection is RADAR-
+     * driven, not camera-driven, so while MONITORING the camera only needs to
+     * keep the pre-record ring lightly warm. Previously we lowered only the
+     * recorder draw-stride and left the camera HAL at 15 fps — which kept the
+     * OEM camera stack (mm-qcamera-daemon) pinned at ~50% of a core capturing
+     * frames almost all of which were stride-skipped. Dropping the HAL capture
+     * rate to monitorFps cuts that capture cost roughly proportionally.
+     *
+     * <ul>
+     *   <li>MONITORING (low-power enabled) → monitorFps (~4) — the lean idle rate.</li>
+     *   <li>RECORDING / POST_RECORD → 0 (full rate; an event clip is live, the
+     *       camera must snap back to the configured recording fps).</li>
+     *   <li>IDLE, or low-power monitor disabled → 0 (no opinion).</li>
+     * </ul>
+     */
+    public int desiredCameraFps() {
+        if (currentState == State.MONITORING && config.isLowPowerMonitor()) {
+            return Math.max(1, config.getMonitorFps());
+        }
+        return 0;
+    }
+
+    /**
+     * Re-derive the MONITORING draw stride against the CURRENT camera fps, but
+     * ONLY while we are in MONITORING. Called by RecordingModeManager after it
+     * changes the shared camera HAL fps for a non-proximity reason (e.g. a
+     * live-view stream opening/closing raises/lowers the shared camera rate).
+     *
+     * <p>Why this is needed: applyMonitorProfile() computes stride =
+     * round(cameraFps / monitorFps) and is otherwise only invoked on the
+     * MONITORING state-entry. If the camera fps changes WHILE we are already
+     * monitoring, the stride captured at entry no longer maps to the configured
+     * monitor fps — the pre-record ring would over- or (worse) under-feed,
+     * silently degrading pre-roll. Re-running applyMonitorProfile() here
+     * recomputes the stride against the new camera fps so the effective monitor
+     * rate stays at the configured value regardless of camera-fps changes.
+     *
+     * <p>No-op outside MONITORING (RECORDING/POST_RECORD own the full-rate event
+     * profile; IDLE has no pipeline). Cheap: a couple of volatile pipeline writes.
+     *
+     * <p>MUST be {@code synchronized(this)}: this is the ONLY caller of
+     * applyMonitorProfile() that runs OFF the controller's own state-machine
+     * thread (it is invoked from RecordingModeManager's reconcile, on the
+     * live-view stream HTTP/WS thread). Every other profile mutator
+     * (applyMonitorProfile / applyEventProfile / restoreFullProfile /
+     * start/cancelKeyframePulse) is reached only via transitionTo() under
+     * synchronized(this). Without the monitor here, a stream open/close racing a
+     * radar trigger could (a) interleave applyMonitorProfile() AFTER an
+     * applyEventProfile() — stranding a live triggered clip at low monitor
+     * fps+bitrate until the recording ends — and (b) double-enter
+     * startKeyframePulse()'s null-guard and LEAK a ScheduledFuture (two pulses,
+     * one un-cancellable). Holding the monitor across the state-check + apply
+     * makes the "MONITORING ⇒ apply" decision atomic w.r.t. transitionTo, so the
+     * re-derive can never land on top of a state that has since left MONITORING.
+     * Lock order is safe: applyMonitorProfile only calls pipeline fps/stride/
+     * bitrate setters, none of which fire RMM's stream/BS listeners (no reverse
+     * controller-monitor → reconcileLock edge).
+     */
+    public synchronized void reapplyMonitorProfileIfMonitoring() {
+        if (currentState == State.MONITORING) {
+            applyMonitorProfile();
+        }
+    }
     
     // ==================== TRIGGER CALLBACKS ====================
     
@@ -242,20 +323,188 @@ public class ProximityGuardController implements ProximityRadarMonitor.TriggerCa
         switch (newState) {
             case IDLE:
                 logger.info("Entered IDLE state");
+                // Proximity is shutting down (e.g. gear->P). Restore the shared
+                // recording encoder to full rate + event bitrate so a following
+                // mode (surveillance/sentry/continuous reusing the same pipeline)
+                // doesn't inherit our throttled idle profile.
+                restoreFullProfile();
                 break;
             case MONITORING:
                 logger.info("Entered MONITORING state - waiting for radar triggers");
                 // Reset session-scoped escalation tracking so the next event
                 // starts from YELLOW unless the radar reports RED again.
                 redEscalatedThisSession = false;
+                // Drop the recording lane to the low-rate, low-bitrate idle
+                // profile while we wait for a trigger. The pre-record ring keeps
+                // filling (so pre-roll is preserved) but at a fraction of the
+                // GPU-encode / drain / disk cost.
+                applyMonitorProfile();
                 break;
             case RECORDING:
                 logger.info("Entered RECORDING state");
+                // Snap to full rate + event bitrate. Applied BEFORE the caller's
+                // startRecording() flushes the pre-record ring, so the live
+                // portion of the clip is full-quality from its first frame. The
+                // already-buffered pre-roll frames keep their (lower) idle
+                // quality — acceptable, they are lead-in context.
+                applyEventProfile();
                 break;
             case POST_RECORD:
                 logger.info("Entered POST_RECORD state - countdown started");
+                // Stay on the event profile — the post-record window is still
+                // capturing event aftermath and should remain full quality.
                 break;
         }
+    }
+
+    // ==================== ADAPTIVE RECORDING PROFILE ====================
+    // Proximity Guard records on radar triggers but the encoder runs continuously
+    // to keep a pre-record ring warm. While MONITORING (the common idle state) we
+    // feed that ring at a low frame-rate + low bitrate to minimise resource use,
+    // then snap to the configured event quality the instant a trigger fires, and
+    // revert when the event (incl. post-record) completes. fps is driven by the
+    // recorder draw stride (render loop feeds the encoder every Nth frame);
+    // bitrate is a runtime MediaCodec param. Streaming / blind-spot lanes use
+    // separate encoders and are unaffected. All gated on config.lowPowerMonitor.
+
+    private void applyMonitorProfile() {
+        if (!config.isLowPowerMonitor()) {
+            return;
+        }
+        try {
+            int monitorFps = Math.max(1, config.getMonitorFps());
+            // The camera HAL fps is owned by the SINGLE authority
+            // (RecordingModeManager.desiredCameraState), NOT here — it sets the HAL
+            // to the monitor rate while we sit MONITORING (the resource win), and
+            // raises it when ANOTHER consumer needs more (a SHOWN blind-spot view,
+            // or a live-view stream). We must NOT set the camera fps here or we'd
+            // fight that authority (e.g. flap 15->4 when BS is shown during
+            // proximity). Instead, derive the recorder DRAW STRIDE against the
+            // CURRENT camera fps so the pre-record RING always fills at ~monitorFps
+            // regardless of what the camera HAL is doing:
+            //   - camera at monitorFps (BS hidden, no stream) -> stride 1, ring = monitorFps.
+            //   - camera raised to 15 (BS shown) -> stride round(15/monitorFps),
+            //     so the ring still fills at ~monitorFps (low-power ENCODE preserved
+            //     even though the HAL must run faster for the BS view).
+            int cameraFps = pipeline.getCameraTargetFps();
+            if (cameraFps <= 0) cameraFps = monitorFps;
+            int stride = Math.max(1, Math.round(cameraFps / (float) monitorFps));
+            pipeline.setRecorderFrameStride(stride);
+            pipeline.setRecordingBitrate(config.getMonitorBitrate());
+            // At the low effective ring rate the encoder's frame-count GOP still
+            // stretches past the pre-record window, so drive keyframes on a
+            // wall-clock cadence: one immediately + a periodic pulse.
+            pipeline.requestRecordingSyncFrame();
+            startKeyframePulse();
+            logger.info("Monitor profile applied: stride=" + stride + " (camera HAL fps="
+                    + cameraFps + " -> ring ~" + (cameraFps / stride) + " fps), bitrate="
+                    + (config.getMonitorBitrate() / 1_000_000.0) + " Mbps, keyframe pulse on");
+        } catch (Exception e) {
+            logger.warn("Failed to apply monitor profile: " + e.getMessage());
+        }
+    }
+
+    private void applyEventProfile() {
+        if (!config.isLowPowerMonitor()) {
+            return;
+        }
+        try {
+            // Leaving MONITORING — stop the keyframe pulse; the full-rate GOP
+            // resumes natural 2s IDR spacing.
+            cancelKeyframePulse();
+            // Snap the GLOBAL camera HAL back to full recording fps IMMEDIATELY.
+            // While MONITORING we drop the camera HAL to the monitor rate (~4fps)
+            // to save the OEM capture cost; a radar event must record the LIVE
+            // portion at full fps, so we cannot wait for the 30s reconcile tick —
+            // set it here, synchronously, the instant the event fires. This is
+            // the camera CAPTURE rate; the stride below (=1) then draws every
+            // captured frame. reconcileCameraProfile's PROXIMITY branch defers to
+            // the controller (desiredCameraFps()==0 during RECORDING => "full"),
+            // so it agrees on the next tick — no fight.
+            try {
+                // getCameraTargetFps reflects the CURRENT (lowered) rate, so use
+                // the pipeline's CONFIGURED recording fps as the snap-up target.
+                // getConfiguredRecordingFps() never returns <=0 (loadTargetFps
+                // falls back to 15 + clamps internally), so no guard needed here.
+                pipeline.setCameraTargetFps(pipeline.getConfiguredRecordingFps());
+            } catch (Throwable t) {
+                logger.warn("Event profile: camera fps snap-up failed: " + t.getMessage());
+            }
+            // Full rate so the live recording is full-fps, then event bitrate.
+            pipeline.setRecorderFrameStride(1);
+            pipeline.setRecordingBitrate(config.getEventBitrate());
+            // Force an IDR NOW so the live portion opens on a clean keyframe
+            // regardless of how stale the last monitor-rate IDR was. Without
+            // this the live segment could open mid-GOP (P-frames referencing an
+            // IDR that may be many seconds old) and render garbage until the
+            // next scheduled keyframe.
+            pipeline.requestRecordingSyncFrame();
+            logger.info("Event profile applied: stride=1 (full rate), bitrate="
+                    + (config.getEventBitrate() / 1_000_000.0) + " Mbps, sync frame requested");
+        } catch (Exception e) {
+            logger.warn("Failed to apply event profile: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Restore the recording encoder to full rate + the pipeline's user-configured
+     * recording bitrate. Used on IDLE (proximity teardown) so the shared encoder
+     * is never left in the throttled idle profile for a subsequent recording
+     * mode. Runs UNCONDITIONALLY (not gated on lowPowerMonitor): if the flag was
+     * toggled off mid-session while we'd already throttled, gating here would
+     * strand the encoder at the low bitrate. setRecordingBitrate is idempotent
+     * and only re-asserts a known-good value, so this is safe even when we never
+     * throttled. Restores to the pipeline's configured bitrate (not proximity's
+     * eventBitrate) so a follow-on mode inherits the user's true quality.
+     */
+    private void restoreFullProfile() {
+        try {
+            cancelKeyframePulse();
+            // Restore the camera HAL to the configured recording fps too — while
+            // MONITORING we lowered it to the monitor rate, and a follow-on mode
+            // (or pipeline reuse) must not inherit our throttled capture rate.
+            try {
+                // getConfiguredRecordingFps() never returns <=0 (internal fallback).
+                pipeline.setCameraTargetFps(pipeline.getConfiguredRecordingFps());
+            } catch (Throwable t) {
+                logger.warn("restoreFullProfile: camera fps restore failed: " + t.getMessage());
+            }
+            pipeline.setRecorderFrameStride(1);
+            pipeline.setRecordingBitrate(pipeline.getConfiguredRecordingBitrate());
+        } catch (Exception e) {
+            logger.warn("Failed to restore full recording profile: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Start the MONITORING keyframe pulse (idempotent). Requests an IDR every
+     * ~preRecordSeconds/2 (min 1s) so the pre-record window always contains a
+     * keyframe despite the stretched low-rate GOP.
+     */
+    private void startKeyframePulse() {
+        if (keyframePulseTimer != null && !keyframePulseTimer.isDone()) {
+            return;
+        }
+        long periodSec = Math.max(1L, config.getPreRecordSeconds() / 2L);
+        keyframePulseTimer = scheduler.scheduleWithFixedDelay(() -> {
+            try {
+                // Only pulse while still MONITORING — a late tick after a state
+                // change is a harmless no-op but skip it cleanly.
+                if (currentState == State.MONITORING) {
+                    pipeline.requestRecordingSyncFrame();
+                }
+            } catch (Throwable t) {
+                logger.debug("Keyframe pulse tick failed: " + t.getMessage());
+            }
+        }, periodSec, periodSec, TimeUnit.SECONDS);
+        logger.debug("Keyframe pulse started (every " + periodSec + "s)");
+    }
+
+    private void cancelKeyframePulse() {
+        if (keyframePulseTimer != null && !keyframePulseTimer.isDone()) {
+            keyframePulseTimer.cancel(false);
+        }
+        keyframePulseTimer = null;
     }
     
     // ==================== POST-RECORD TIMER ====================

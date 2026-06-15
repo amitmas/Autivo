@@ -774,7 +774,14 @@ public class OemDashcamPipeline {
     }
 
     private void reconcileTelemetryHold() {
-        if (telemetryCollector == null) return;
+        // Stop the overlay raster worker whenever the collector is gone (it has
+        // nothing to read) — do this BEFORE the early return so a cleared
+        // collector reliably tears the worker down.
+        OverlayBitmapRenderer r = overlayRenderer;
+        if (telemetryCollector == null) {
+            if (r != null) r.stopWorker();
+            return;
+        }
         // Hold polling only when overlay is enabled AND we're actively
         // recording (no need to poll CAN/GPS just because the user opted
         // in — the overlay only paints into clips that are actually being
@@ -788,6 +795,15 @@ public class OemDashcamPipeline {
             telemetryCollector.setOverlayRecordingActive(false);
             telemetryCollector.stopPolling();
             overlayPollingHeld = false;
+        }
+        // Run the off-GL-thread overlay raster worker on the same condition the
+        // GL composite uses (overlayEnabled && recording). startWorker/stopWorker
+        // are idempotent. overlayRenderer is created lazily on the GL thread
+        // (line ~1175); if not up yet, the next reconcile (or the GL-init path)
+        // starts it.
+        if (r != null) {
+            if (shouldHold) r.startWorker(telemetryCollector);
+            else r.stopWorker();
         }
     }
 
@@ -1173,6 +1189,11 @@ public class OemDashcamPipeline {
 
                     try {
                         overlayRenderer = new OverlayBitmapRenderer();
+                        // Renderer is created lazily here on the GL thread, possibly
+                        // AFTER reconcileTelemetryHold already wanted the worker up —
+                        // reconcile now that the renderer exists so the off-thread
+                        // raster starts if overlay is active.
+                        reconcileTelemetryHold();
                     } catch (Throwable t) {
                         logger.warn("OverlayBitmapRenderer init failed: " + t.getMessage());
                         overlayRenderer = null;
@@ -1500,20 +1521,12 @@ public class OemDashcamPipeline {
                 && telemetryCollector != null) {
             overlayFrameCounter++;
             try {
-                // Re-raster the bitmap at ~2 Hz, matching TelemetryDataCollector's
-                // overlay poll rate (the shared collector publishes at 2 Hz).
-                // Rastering faster just redraws pixels the telemetry layer hasn't
-                // changed — pure CPU waste on the GL thread. Derive the stride
-                // from the configured fps so 30 fps rasters every 15th frame,
-                // 15 fps every 8th, etc. The Canvas raster is the expensive half;
-                // the composite draw below still runs every frame off the cached
-                // texture. (Mirrors the pano path in GpuMosaicRecorder.)
-                int overlayRasterStride = Math.max(1, Math.round(fps / 2.0f));
-                if (overlayFrameCounter == 1 || overlayFrameCounter % overlayRasterStride == 0) {
-                    TelemetrySnapshot snapshot = telemetryCollector.getLatestSnapshot();
-                    overlayRenderer.renderFrame(snapshot, overlayFrameCounter / overlayRasterStride);
-                }
-
+                // The software Canvas raster now runs on OverlayBitmapRenderer's
+                // dedicated 2 Hz background worker (started via reconcileTelemetryHold),
+                // not here — it was the expensive per-icon Gaussian-blur half eating
+                // GL-thread time before eglSwap. The GL thread keeps only the cheap
+                // half: swapAndGetFront() + texSubImage2D upload + composite.
+                //
                 // Upload the new bitmap only when the double buffer
                 // actually swapped — texSubImage2D on an unchanged
                 // bitmap is wasted bandwidth (matches the pano impl).
@@ -1878,6 +1891,9 @@ public class OemDashcamPipeline {
         overlayTextureReady = false;
         overlayFrameCounter = 0;
         if (overlayRenderer != null) {
+            // Stop+join the raster worker BEFORE recycling its bitmaps so it
+            // can't draw into a recycled bitmap (use-after-free).
+            try { overlayRenderer.stopWorker(); } catch (Throwable ignored) {}
             try { overlayRenderer.release(); } catch (Throwable ignored) {}
             overlayRenderer = null;
         }

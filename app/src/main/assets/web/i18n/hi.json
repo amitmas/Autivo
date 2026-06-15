@@ -178,7 +178,11 @@
     "map_cluster_layout": "क्लस्टर आकार",
     "map_cluster_layout_desc": "इसे अपने इंस्ट्रूमेंट क्लस्टर से मिलाएं। ब्लाइंड-स्पॉट क्लस्टर दृश्य के साथ साझा किया गया। यदि प्रोजेक्शन फैला हुआ या कटा हुआ दिखता है, तो कोई अन्य विकल्प आज़माएं।",
     "map_cluster_projecting": "प्रोजेक्ट कर रहा है",
-    "map_cluster_off": "बंद"
+    "map_cluster_off": "बंद",
+    "overlay_title": "ऑन-स्क्रीन ओवरले",
+    "overlay_show": "स्क्रीन पर ओवरले दिखाएं",
+    "overlay_show_desc": "स्क्रीन पर फ़्लोटिंग RoadSense पिल और ख़तरे का कार्ड दिखाता है। इसे छिपाने के लिए बंद करें — डिटेक्शन, ऑडियो चेतावनी और क्राउडसोर्सिंग बैकग्राउंड में चलती रहती है; केवल ऑन-स्क्रीन डिस्प्ले छिपा रहता है।",
+    "unit_seconds": "{n}सेकंड"
   },
   "status": {
     "device": "डिवाइस",
@@ -811,7 +815,10 @@
     "layout_windshield_unavailable": "सक्रिय कैमरा प्रोफ़ाइल/कॉन्फ़िगरेशन के लिए कोई विंडशील्ड कैमरा परिभाषित नहीं है।",
     "layout_standard_toast": "स्टैंडर्ड 360 लेआउट सक्षम किया गया",
     "layout_dashcam_toast": "डैशकैम लेआउट सक्षम किया गया",
-    "layout_update_failed": "रिकॉर्डिंग लेआउट अपडेट करने में विफल रहा"
+    "layout_update_failed": "रिकॉर्डिंग लेआउट अपडेट करने में विफल रहा",
+    "storage_indexing": "इंडेक्सिंग — {done} / {total} ({pct}%)",
+    "storage_fallback_internal": "SD/USB अनुपलब्ध — आंतरिक स्टोरेज में सहेजा जा रहा है",
+    "storage_fallback_enforcing": "SD/USB अनुपलब्ध — आंतरिक स्टोरेज में सहेजा जा रहा है, नवीनतम {mb} MB रखा जा रहा है"
   },
   "events": {
     "select_date": "दिनांक चुनें",
@@ -893,7 +900,8 @@
     "videos_count_initial": "0 वीडियो",
     "selected_count_initial": "0 चयनित",
     "page_initial": "पृष्ठ 1 में से 1",
-    "calendar_title_initial": "कैलेंडर"
+    "calendar_title_initial": "कैलेंडर",
+    "index_warming": "लाइब्रेरी इंडेक्स बनाया जा रहा है — {done} / {total} ({pct}%)"
   },
   "surveillance": {
     "tab_general": "सामान्य",
@@ -1251,7 +1259,13 @@
     "oem_record_desc": "Captures a synchronized dvr_*.mp4 from the forward sensor alongside the panoramic event clip. Honors the same Safe Locations, Schedule, and per-camera filters as the panoramic surveillance.",
     "oem_record_enabled": "OEM Dashcam recording on events enabled",
     "oem_record_disabled": "OEM Dashcam recording on events disabled",
-    "oem_id_unset_hint": "Open Diagnostics → Camera Probe to pick the OEM Dashcam camera id first."
+    "oem_id_unset_hint": "Open Diagnostics → Camera Probe to pick the OEM Dashcam camera id first.",
+    "storage_indexing": "इंडेक्सिंग — {done} / {total} ({pct}%)",
+    "keep_usb_power": "पार्क करते समय USB को चालू रखें",
+    "keep_usb_power_desc": "कार बंद होने के बाद USB पोर्ट को चालू रखता है (उदाहरण के लिए फ़ोन चार्ज करने या एक्सेसरी को पावर देने के लिए)। USB पोर्ट को स्लीप मोड में जाने देने और 12V बैटरी बचाने के लिए इसे बंद करें। इससे कैमरों पर कोई असर नहीं पड़ता — पार्क की गई निगरानी किसी भी तरह चलती रहती है। अगली बार कार बंद होने पर यह प्रभावी होगा।",
+    "keep_usb_saved_on": "पार्क करते समय USB चालू रहेगा",
+    "keep_usb_saved_off": "पार्क करते समय USB स्लीप मोड में रहेगा (अगली ACC-OFF पर)",
+    "keep_usb_save_failed": "सेटिंग सहेजी नहीं जा सकी"
   },
   "mqtt": {
     "tab_connections": "कनेक्शन",
@@ -1621,7 +1635,30 @@
     "title_update_to": "OverDrive को <span class=\"upd-newv\">{version}</span> में अपडेट करें?",
     "currently_on": "वर्तमान में {version} पर",
     "downtime_warning": "<strong> रिमोट एक्सेस ऑफ़लाइन ~{minutes} min.</strong> डेमोन पुनः आरंभ और सुरंग स्थापना के बाद फिर से कनेक्ट होता है।",
-    "fallback_check_label": "अद्यतन की जाँच करें"
+    "fallback_check_label": "अद्यतन की जाँच करें",
+    "channel_alpha": "अल्फा",
+    "channel_braveheart": "Braveheart",
+    "channel_alpha_desc": "स्थिर रिलीज़। हर प्रकाशित वर्ज़न यहाँ रखा गया है — इंस्टॉल करने के लिए कोई भी चुनें (डाउनग्रेड की अनुमति है)। रोज़मर्रा के उपयोग के लिए अनुशंसित।",
+    "channel_braveheart_desc": "बिल्कुल नए बिल्ड, प्रकाशित होते ही डिलीवर किए जाते हैं। आपको नई सुविधाएँ सबसे पहले मिलती हैं, लेकिन वे अस्थिर या बग वाली हो सकती हैं। यदि कुछ टूट जाता है, तो About → Diagnostics से एक डीमन लॉग भेजें और इसकी रिपोर्ट करें (नीचे देखें)।",
+    "report_how": "Braveheart पर कोई बग मिला? About → Diagnostics से एक डीमन लॉग भेजें, फिर कोड हमारे साथ साझा करें:",
+    "report_discord": "Discord",
+    "report_github": "GitHub Issues",
+    "report_whatsapp": "WhatsApp",
+    "report_discord_url": "https://discord.gg/PZutk9fg4h",
+    "report_github_url": "https://github.com/yash-srivastava/Overdrive-release/issues",
+    "report_whatsapp_url": "https://chat.whatsapp.com/HChmriCWgr9KwAtE6OEkiM",
+    "catalog_title": "एक वर्ज़न चुनें",
+    "catalog_empty": "अभी तक कोई वर्ज़न प्रकाशित नहीं हुआ है।",
+    "catalog_retry": "पुनः प्रयास करें",
+    "pill_installed": "इंस्टॉल किया गया",
+    "pill_older": "पुराना",
+    "install_downgrade": "डाउनग्रेड करें",
+    "downgrade_note": "यह आपके इंस्टॉल किए गए वर्ज़न से पुराना है। इसे इंस्टॉल करने से वर्तमान बिल्ड इस वाले से बदल जाएगा।",
+    "switched_to_channel": "{channel} पर स्विच किया गया",
+    "switched_to_braveheart_warn": "Braveheart पर स्विच किया गया। बिल्ड अस्थिर हो सकते हैं — यदि कुछ टूट जाता है, तो About → Diagnostics से एक डीमन लॉग भेजें और Discord/GitHub पर इसकी रिपोर्ट करें।",
+    "switch_channel_failed": "चैनल स्विच नहीं किया जा सका: {error}",
+    "notify_available": "अपडेट उपलब्ध है: {version}। इंस्टॉल करने के लिए 'अपडेट के लिए जाँच करें' खोलें।",
+    "badge_new": "नया"
   },
   "vehicle": {
     "car_locked": "कार लॉक",
@@ -2063,5 +2100,16 @@
     "native_dvr_disable_toast": "Native DVR disabled. OverDrive now owns the camera.",
     "native_dvr_enable_toast": "Native DVR re-enabled.",
     "start_timeout": "Pipeline start timed out — check daemon logs"
+  },
+  "logs": {
+    "section_title": "डायग्नोस्टिक्स",
+    "section_sub": "कोई बग मिला? यहाँ एक डीमन का लॉग भेजें — आपको एक छोटा कोड मिलेगा, फिर इसे Discord, GitHub Issues या WhatsApp पर हमारे साथ साझा करें और हमें बताएं कि क्या गलत हुआ।",
+    "send": "भेजें",
+    "uploading": "अपलोड हो रहा है…",
+    "upload_failed": "अपलोड विफल रहा",
+    "uploaded_title": "लॉग अपलोड किया गया",
+    "uploaded_body": "इस कोड को मेंटेनर के साथ साझा करें, साथ ही यह भी बताएं कि जब यह टूटा तो आप क्या कर रहे थे:",
+    "uploaded_where": "इसे Discord, GitHub Issues या WhatsApp पर पोस्ट करें:",
+    "copy_code": "कोड कॉपी करें"
   }
 }

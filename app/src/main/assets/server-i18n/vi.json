@@ -101,7 +101,12 @@
     "mqtt_not_initialized": "MQTT không khởi tạo",
     "max_connections_reached": "Max kết nối đạt được ({0})",
     "missing_connection_id": "ID kết nối bị mất",
-    "connection_not_found": "Kết nối không được tìm thấy: {0}"
+    "connection_not_found": "Kết nối không được tìm thấy: {0}",
+    "update_invalid_channel": "Kênh cập nhật không hợp lệ",
+    "update_channel_write_failed": "Không thể lưu kênh cập nhật",
+    "update_channel_tag_mismatch": "Phiên bản đó đang ở một kênh khác. Vui lòng chuyển kênh trước.",
+    "logs_upload_unavailable": "Tải nhật ký lên không khả dụng trong bản dựng này",
+    "logs_unknown_daemon": "Daemon không xác định. Thử: {0}"
   },
   "notifications": {
     "charging_started": "Sạc bắt đầu",

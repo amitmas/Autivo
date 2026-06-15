@@ -80,6 +80,16 @@ object ImuFrameCodec {
      */
     fun decode(line: String): Decoded? {
         val obj = try { JSONObject(line) } catch (_: Throwable) { return null }
+        return decode(obj)
+    }
+
+    /**
+     * Decode from an ALREADY-PARSED JSONObject. The IPC server parses the wire
+     * line once to read the command; feeding that same object here avoids a
+     * redundant toString()+re-parse of the (nested-array) batch ~10×/sec on the
+     * IPC reader thread that shares the SDM665 with the camera pipeline.
+     */
+    fun decode(obj: JSONObject): Decoded? {
         if (obj.optString(KEY_COMMAND) != COMMAND) return null
 
         val accel = ArrayList<ImuAccelSample>()

@@ -7,8 +7,11 @@ import java.io.File
 import java.io.FileWriter
 import java.io.InputStreamReader
 import java.io.PrintWriter
+import java.io.RandomAccessFile
 import java.net.InetAddress
 import java.net.Socket
+import java.nio.channels.FileChannel
+import java.nio.channels.FileLock
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicLong
 
@@ -96,14 +99,38 @@ object UnifiedConfigManager {
      */
     @JvmStatic
     fun init() {
+        // Provision the cross-process lock file here. init() runs in the daemon
+        // (UID 2000), which CAN create files in sticky /data/local/tmp; once it
+        // exists 0666, the app UID (which canNOT create there) can still OPEN it
+        // to acquire the lock. Without this, an app-UID writer in the daemon-down
+        // window can't create the lock and silently degrades to monitor-only
+        // (no cross-process exclusion). Best-effort — withConfigFileLock still
+        // falls back gracefully if it's somehow absent.
+        provisionLockFile()
+
         val configFile = File(CONFIG_PATH)
-        
+
         if (!configFile.exists()) {
             Log.i(TAG, "Unified config not found, migrating from legacy configs...")
             migrateFromLegacy()
         } else {
             Log.i(TAG, "Unified config exists at $CONFIG_PATH")
             loadConfig()
+        }
+    }
+
+    /** Create the lock file 0666 (daemon UID) so the app UID can later open it. */
+    private fun provisionLockFile() {
+        try {
+            val lf = File(LOCK_PATH)
+            if (!lf.exists()) {
+                lf.parentFile?.mkdirs()
+                lf.createNewFile()
+            }
+            lf.setReadable(true, false)
+            lf.setWritable(true, false)
+        } catch (e: Exception) {
+            Log.w(TAG, "Lock file provisioning skipped: ${e.message}")
         }
     }
     
@@ -204,11 +231,36 @@ object UnifiedConfigManager {
         
         // Apply defaults for missing values
         applyDefaults(unified)
-        
-        // Save unified config
-        saveConfigInternal(unified)
-        cachedConfig = unified
-        
+
+        // Persist cross-process-safely. This is the LAST write path that used
+        // to bypass the file lock: two daemon JVMs cold-starting before the
+        // file exists would both migrate-and-rename on the shared ${name}.tmp,
+        // and a peer's already-committed section could be clobbered with our
+        // defaults-only object. Acquire the lock and RE-READ under it: if the
+        // file now exists (a peer migrated/wrote first), fold our defaults into
+        // THOSE bytes for genuinely-absent keys only (applyDefaults is
+        // idempotent) and keep the peer's sections; only write `unified` when
+        // the file is still absent.
+        withConfigFileLock {
+            val cf = File(CONFIG_PATH)
+            val toPersist = if (cf.exists() && cf.length() > 0L) {
+                try {
+                    val onDisk = JSONObject(cf.readText())
+                    applyDefaults(onDisk)   // fill only absent keys; preserves peer sections
+                    onDisk
+                } catch (e: Exception) {
+                    // On-disk bytes unparseable (mid-write/corrupt) — fall back
+                    // to our freshly-migrated object rather than crash.
+                    Log.w(TAG, "Migration re-read failed (${e.message}); writing migrated object")
+                    unified
+                }
+            } else {
+                unified
+            }
+            saveConfigInternal(toPersist)
+            cachedConfig = toPersist
+        }
+
         Log.i(TAG, "Migration complete. Unified config saved to $CONFIG_PATH")
     }
     
@@ -262,6 +314,12 @@ object UnifiedConfigManager {
         // no AI. Branched at SurveillanceEngineGpu.enable(). Default smart so
         // behaviour matches the prior single-mode build.
         if (!surveillance.has("accOffMode")) surveillance.put("accOffMode", "smart")
+        // Keep ONLY the USB/data rail powered after ACC OFF (e.g. to charge a phone
+        // while parked). DEFAULT TRUE so out-of-box behaviour is unchanged; user
+        // opt-out (Surveillance → General) lets just that rail sleep on the next
+        // ACC-OFF cycle to save the 12 V battery. Does NOT affect the cameras — the
+        // camera/AVM/ISP power keep-alives are unconditional in AccSentryDaemon.
+        if (!surveillance.has("keepUsbPowerOnAccOff")) surveillance.put("keepUsbPowerOnAccOff", true)
         if (!surveillance.has("deterrentAction")) surveillance.put("deterrentAction", "silent")
         if (!surveillance.has("deterrentCooldownSeconds")) surveillance.put("deterrentCooldownSeconds", 15)
         if (!surveillance.has("screenDeterrentEnabled")) surveillance.put("screenDeterrentEnabled", false)
@@ -332,6 +390,18 @@ object UnifiedConfigManager {
         // native overlay; the 6 numerics are the dialed-in stitch calibration
         // for this car (rear+side panorama). See BlindSpotOverlayService.
         if (!blindspot.has("enabled")) blindspot.put("enabled", false)
+        // Blind-spot global camera-fps profile, used when the camera is kept warm
+        // ONLY for blind-spot (no recording mode owns it). BS renders to its own
+        // SurfaceControl layer with NO encoder, so its sole quality/cost lever is
+        // the shared camera HAL fps (live-settable via setCameraFps, no reopen).
+        //   idleFps   — turn signal OFF: camera ticks slowly to keep the rails warm
+        //               for an instant reveal while burning almost no GPU/encode.
+        //   activeFps — turn signal ON: ramp up so the blind-spot view is smooth.
+        // When a recording mode owns the camera, recording fps wins and these are
+        // ignored (recording always gets full rate; see RecordingModeManager
+        // .reconcileCameraProfile).
+        if (!blindspot.has("idleFps")) blindspot.put("idleFps", 1)
+        if (!blindspot.has("activeFps")) blindspot.put("activeFps", 15)
         // Display target: "head_unit" (default — 15.6" center screen, layerStack 0,
         // shipping behaviour) or "cluster" (driver gauge screen via OEM projection).
         if (!blindspot.has("target")) blindspot.put("target", "head_unit")
@@ -439,6 +509,12 @@ object UnifiedConfigManager {
         // Auto-project the map onto the driver cluster on ACC-on. Off by default;
         // the daemon reads this on power-up, the Map tab toggles it.
         if (!navMap.has("autoProjectCluster")) navMap.put("autoProjectCluster", false)
+        // Daemon→Activity coordination flag: ClusterMapProjector sets it true on
+        // start and false on stop/abort; the launched cluster map Activity polls it
+        // and self-finishes when false (the OEM projection close never destroys the
+        // fission display, so onDisplayRemoved can't be relied on). Default false =
+        // no map projected.
+        if (!navMap.has("clusterMapActive")) navMap.put("clusterMapActive", false)
 
         // Vehicle appearance defaults — selected 3D model and body paint color.
         // Stored unified so AVN and remote (phone-over-tunnel) clients show the
@@ -510,10 +586,28 @@ object UnifiedConfigManager {
         val configFile = File(CONFIG_PATH)
         
         // Check if file changed since last load
-        if (cachedConfig != null && configFile.exists()) {
+        // Cheap fast-path: serve the cache unless the file's mtime advanced.
+        // INVARIANT (intentional): ext4 mtime is second-granular, so a peer-UID
+        // write committing in the SAME wall-clock second yields equal mtime and
+        // this returns a one-write-stale snapshot. That is acceptable for hot
+        // poll loops (e.g. RoadSenseOverlayService) that call bare loadConfig.
+        // Correctness-critical cross-UID reads MUST call forceReload() first
+        // (getUpdateChannel/ScreenDeterrent/the update + IPC handlers all do),
+        // and every WRITE path re-reads via loadConfigFresh() under the file
+        // lock — so no write loses data to this window. Deliberately NOT
+        // tightened to `<` (that would force a re-parse on every same-second
+        // read and tax the hot loops for a non-bug).
+        // Snapshot the volatile field ONCE into a local: this fast-path runs
+        // OUTSIDE synchronized(this), and a concurrent writer (forceReload /
+        // loadConfigFresh) nulls cachedConfig under the monitor. A check-then-`!!`
+        // on the field directly is a TOCTOU — the null-write can land between the
+        // null-check and the `!!` deref, throwing NPE. The local read is atomic
+        // (field is @Volatile) so `cached` cannot become null after the check.
+        val cached = cachedConfig
+        if (cached != null && configFile.exists()) {
             val fileModified = configFile.lastModified()
             if (fileModified <= lastModified.get()) {
-                return cachedConfig!!
+                return cached
             }
         }
         
@@ -542,14 +636,18 @@ object UnifiedConfigManager {
                     }
                     if (migrationNeeded) {
                         applyDefaults(config)
-                        // Persist the migrated shape so subsequent loads
-                        // skip the migration check entirely.
-                        try {
-                            saveConfigInternal(config)
-                            Log.i(TAG, "Migrated legacy geocoding schema to nested form")
-                        } catch (e: Exception) {
-                            Log.w(TAG, "Failed to persist migrated schema: ${e.message}")
-                        }
+                        // Persist the migrated shape so subsequent loads skip
+                        // the migration check. DAEMON-ONLY + cross-process
+                        // locked + re-read-under-lock: the previous unconditional
+                        // saveConfigInternal here ran under only synchronized(this),
+                        // so a peer daemon JVM's section write landing between our
+                        // L550 read and this write was silently clobbered with our
+                        // stale snapshot. persistMigrationUnderLock re-reads the
+                        // CURRENT on-disk bytes under the file lock and re-applies
+                        // the (idempotent) migration to those, so no peer section
+                        // is lost. App UID skips persisting (keeps the migrated
+                        // object in memory); the daemon persists on its next write.
+                        persistMigrationUnderLock()
                     }
                     cachedConfig = config
                     lastModified.set(configFile.lastModified())
@@ -634,8 +732,9 @@ object UnifiedConfigManager {
                     // settings were already unrecoverable (corrupt + no .bak),
                     // so this loses nothing recoverable — it only restores the
                     // ability to save. Clear the latch since the file is now
-                    // clean.
-                    if (saveConfigInternal(defaults)) {
+                    // clean. Hold the cross-process lock so the repair rename
+                    // doesn't interleave with a peer daemon's write.
+                    if (withConfigFileLock { saveConfigInternal(defaults) }) {
                         cachedConfig = defaults
                         lastModified.set(configFile.lastModified())
                         corruptionDetected = false
@@ -671,13 +770,28 @@ object UnifiedConfigManager {
         return try {
             val recovered = JSONObject(bakFile.readText())
             // Promote the good bytes back to the live path so peer processes
-            // (and the cross-UID daemon) stop reading corruption too. Reuse
-            // saveConfigInternal's atomic-then-fallback write.
-            saveConfigInternal(recovered)
+            // stop reading corruption. Recovering from a CORRUPT live file, so
+            // we deliberately overwrite with the .bak content (no fresh re-read
+            // — the on-disk bytes ARE the corruption we're fixing). Persist for
+            // BOTH UIDs under the lock: the daemon does an atomic rename; the
+            // app does the non-atomic direct write onto the existing world-RW
+            // file (no worse than the corruption it replaces). The previous
+            // daemon-only persistSelfHeal left the app's torn file on disk and
+            // re-latched on the next forceReload — fixed here.
+            val repaired = withConfigFileLock { saveConfigInternal(recovered) }
             cachedConfig = recovered
-            lastModified.set(configFile.lastModified())
             corruptionDetected = false
-            Log.w(TAG, "Recovered config from ${bakFile.path} after corruption")
+            // Only trust the fast-path mtime gate if the DISK was actually
+            // repaired; otherwise leave lastModified at 0 so the next load
+            // re-reads (and re-recovers) rather than serving cache over still-
+            // corrupt bytes.
+            if (repaired) {
+                lastModified.set(configFile.lastModified())
+                Log.w(TAG, "Recovered + repaired config from ${bakFile.path} after corruption")
+            } else {
+                lastModified.set(0)
+                Log.w(TAG, "Recovered config in-memory from ${bakFile.path}; disk repair deferred")
+            }
             recovered
         } catch (e: Exception) {
             Log.w(TAG, "Backup at ${bakFile.path} also unusable: ${e.message}")
@@ -742,11 +856,14 @@ object UnifiedConfigManager {
             bakTmp.setWritable(true, false)
             if (!bakTmp.renameTo(bakFile)) {
                 // tmp-create/rename can fail for the app UID on sticky
-                // /data/local/tmp; fall back to a direct write if the .bak
-                // already exists and is writable.
-                if (bakFile.exists()) {
-                    FileWriter(bakFile).use { it.write(config.toString(2)) }
-                }
+                // /data/local/tmp. Do NOT fall back to a non-atomic direct
+                // write of the .bak: that would TRUNCATE the existing
+                // last-known-good copy, and a pm-install kill mid-write could
+                // leave BOTH primary and .bak torn — defeating the self-heal
+                // this backup exists for. A stale-but-VALID .bak is strictly
+                // better than a freshly-truncated one. Skip the update; the
+                // daemon (UID 2000, can atomic-rename) refreshes the .bak on
+                // its next write.
                 try { bakTmp.delete() } catch (_: Exception) {}
             }
         } catch (e: Exception) {
@@ -772,7 +889,14 @@ object UnifiedConfigManager {
         // updated, and `loadConfig` would re-enter `init()` →
         // `migrateFromLegacy()` on every subsequent call — producing the
         // ANR storm in the Connect-and-Test flow.
-        val tmpFile = File(configFile.parentFile, configFile.name + ".tmp")
+        // Per-PROCESS-unique tmp name (.tmp.<pid>): the rename onto CONFIG_PATH
+        // is atomic, but the sibling tmp itself must not be shared — two
+        // writers (e.g. two daemon JVMs both running migrateFromLegacy on first
+        // boot) using a fixed "${name}.tmp" could interleave write/rename on the
+        // SAME tmp inode and corrupt each other. A pid suffix gives each writer
+        // its own staging file; the locked write paths already serialize, this
+        // just hardens any residual unlocked caller.
+        val tmpFile = File(configFile.parentFile, configFile.name + ".tmp." + android.os.Process.myPid())
         try {
             FileWriter(tmpFile).use { it.write(payload) }
             tmpFile.setReadable(true, false)
@@ -802,8 +926,20 @@ object UnifiedConfigManager {
                 configFile.setReadable(true, false)
                 configFile.setWritable(true, false)
                 try { tmpFile.delete() } catch (_: Exception) {}
-                Log.i(TAG, "Config saved to $CONFIG_PATH (direct)")
-                true
+                // The direct write is NON-atomic — verify it landed intact
+                // before reporting success. If a concurrent reader or a partial
+                // flush left unparseable bytes, return false so the caller
+                // doesn't treat a torn write as durable (the .bak + corruption
+                // guard then recover on next load). Re-reading a few KB is cheap
+                // and only happens on the rare app-UID daemon-down fallback.
+                val verified = try {
+                    JSONObject(configFile.readText()); true
+                } catch (ve: Exception) {
+                    Log.e(TAG, "Direct write produced unparseable config: ${ve.message}")
+                    false
+                }
+                if (verified) Log.i(TAG, "Config saved to $CONFIG_PATH (direct)")
+                verified
             }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to save config: ${e.message}")
@@ -855,6 +991,26 @@ object UnifiedConfigManager {
     fun getBlindSpot(): JSONObject {
         return loadConfig().optJSONObject("blindspot") ?: JSONObject()
     }
+
+    /** True when the blind-spot feature is enabled. */
+    @JvmStatic
+    fun isBlindSpotEnabled(): Boolean = getBlindSpot().optBoolean("enabled", false)
+
+    /** Global camera fps while the camera is kept warm ONLY for blind-spot AND
+     *  the blind-spot view is HIDDEN (turn signal off). BS renders to a
+     *  SurfaceControl layer with no encoder, so the shared camera HAL fps is its
+     *  only cost/quality lever; keeping it low here burns almost no GPU/encode
+     *  while keeping the rails warm for an instant reveal. Default 1 fps. */
+    @JvmStatic
+    fun getBlindSpotIdleFps(): Int =
+        getBlindSpot().optInt("idleFps", 1).coerceIn(1, 15)
+
+    /** Global camera fps while the camera is kept warm ONLY for blind-spot AND
+     *  the blind-spot view is SHOWN (turn signal on). Ramps the shared camera up
+     *  so the blind-spot view is smooth. Default 15 fps. */
+    @JvmStatic
+    fun getBlindSpotActiveFps(): Int =
+        getBlindSpot().optInt("activeFps", 15).coerceIn(1, 30)
 
     /** Blind-spot display target: "head_unit" (default) or "cluster". */
     @JvmStatic
@@ -1234,6 +1390,39 @@ object UnifiedConfigManager {
     }
 
     /**
+     * Resolve the active update channel ("alpha" | "braveheart").
+     *
+     * Source of truth is the runtime-selectable "updates" section. When the
+     * section (or its channel field) is absent — every install that pre-dates
+     * this setting, including all current users mid-migration — we fall back
+     * to [com.overdrive.app.BuildConfig.UPDATE_CHANNEL]. That build-time seed
+     * is "alpha", so an un-toggled install resolves to the archive channel,
+     * matching the historical single-tag behavior with ZERO config write.
+     *
+     * Callers that may run in the daemon process (UID 2000) while the web
+     * toggle was written by the app (UID 10xxx) — or vice-versa — MUST
+     * [forceReload] before reading, since the in-memory config is per-UID.
+     * AppUpdater.resolveChannel() does exactly that.
+     */
+    @JvmStatic
+    fun getUpdateChannel(): String {
+        val ch = loadConfig().optJSONObject("updates")?.optString("channel", "")
+        return if (!ch.isNullOrEmpty()) ch else com.overdrive.app.BuildConfig.UPDATE_CHANNEL
+    }
+
+    /**
+     * Persist the user-selected update channel.
+     *
+     * Full-JSON rewrite via [updateSection] (which auto-routes app-UID writes
+     * to the daemon over IPC for atomicity) — callers MUST invoke this OFF the
+     * main looper (it can block on the IPC round-trip).
+     */
+    @JvmStatic
+    fun setUpdateChannel(channel: String): Boolean {
+        return updateSection("updates", JSONObject().put("channel", channel))
+    }
+
+    /**
      * Get status-overlay (floating pill) visibility section.
      * Each segment defaults to visible=true so installs that pre-date this
      * setting see no behavior change.
@@ -1516,8 +1705,17 @@ object UnifiedConfigManager {
         // App-process writes reroute to the daemon for atomic durability; a
         // non-null result is authoritative (no local write). See routeWriteIfApp.
         routeWriteIfApp("UPDATE_SECTION", section, "data", data)?.let { return it }
-        synchronized(this) {
-            val config = loadConfig()
+        // Cross-process lock + fresh re-read so a peer daemon JVM's just-
+        // committed section isn't dropped by a stale-snapshot merge.
+        // INVARIANT (audit Jun 2026): config-change listeners run INSIDE this OS
+        // file lock (here + saveConfig's notifyListeners("all")), so they MUST be
+        // non-blocking — a listener that does synchronous I/O would stall every
+        // peer daemon's config write (they block acquiring the FileLock). Current
+        // listeners comply (RoadSenseController hops to a short thread;
+        // GpuSurveillancePipeline.rectifyConfigListener is a fast in-memory
+        // setter). Keep new listeners non-blocking or dispatch them off-thread.
+        return withConfigFileLock {
+            val config = loadConfigFresh()
             // Merge into existing section to preserve keys not present in data
             // (e.g. surveillanceEnabled is set separately from detection params)
             val existing = config.optJSONObject(section) ?: JSONObject()
@@ -1531,7 +1729,7 @@ object UnifiedConfigManager {
             if (success) {
                 notifyListeners(section, existing)
             }
-            return success
+            success
         }
     }
 
@@ -1545,8 +1743,8 @@ object UnifiedConfigManager {
         val valuesJson = JSONObject()
         values.forEach { (key, value) -> valuesJson.put(key, value) }
         routeWriteIfApp("UPDATE_VALUES", section, "values", valuesJson)?.let { return it }
-        synchronized(this) {
-            val config = loadConfig()
+        return withConfigFileLock {
+            val config = loadConfigFresh()
             val sectionObj = config.optJSONObject(section) ?: JSONObject()
 
             values.forEach { (key, value) ->
@@ -1558,7 +1756,7 @@ object UnifiedConfigManager {
             if (success) {
                 notifyListeners(section, sectionObj)
             }
-            return success
+            success
         }
     }
     
@@ -1657,6 +1855,124 @@ object UnifiedConfigManager {
             lastModified.set(0)
             return loadConfig()
         }
+    }
+
+    // Sibling advisory-lock file for CROSS-PROCESS serialization of the config
+    // read-modify-write. synchronized(this) only excludes threads within ONE
+    // JVM; multiple UID-2000 daemon JVMs (CameraDaemon, AccSentryDaemon, the
+    // cluster projector, etc.) each run their own UnifiedConfigManager and
+    // would otherwise interleave loadConfig→merge→atomic-rename, dropping a
+    // peer's just-committed section (stale-snapshot lost update). An OS flock
+    // held across the whole critical section makes those writers mutually
+    // exclude. World-RW so any daemon UID can acquire it.
+    private const val LOCK_PATH = "$CONFIG_PATH.lock"
+
+    /**
+     * Run [body] while holding BOTH the in-JVM monitor AND an exclusive OS
+     * advisory lock on [LOCK_PATH], so the enclosed read-modify-write is
+     * atomic across processes. Best-effort: if the lock file can't be created
+     * or locked (e.g. the app UID can't create it in the sticky dir), we fall
+     * back to monitor-only — no worse than before this fix, and the daemon
+     * (which owns the file and does the real writes) can always lock.
+     */
+    // RE-ENTRANCY guard: java.nio FileLock is per-JVM for the whole file, so a
+    // second channel.lock() from the same JVM while one is held throws
+    // OverlappingFileLockException. loadConfig()'s internal self-heal persists
+    // can run while updateSection already holds the lock (updateSection →
+    // loadConfigFresh → loadConfig → migrate → saveConfigInternal), so nesting
+    // is real. This flag makes withConfigFileLock re-entrant per thread: the
+    // outermost holder owns the OS lock; inner calls just run body().
+    private val holdingFileLock = ThreadLocal.withInitial { false }
+
+    private fun <T> withConfigFileLock(body: () -> T): T {
+        synchronized(this) {
+            if (holdingFileLock.get()) {
+                // Already held by this thread higher in the stack — the OS lock
+                // is in force; just run.
+                return body()
+            }
+            var raf: RandomAccessFile? = null
+            var channel: FileChannel? = null
+            var lock: FileLock? = null
+            try {
+                val lf = File(LOCK_PATH)
+                raf = RandomAccessFile(lf, "rw")
+                channel = raf.channel
+                // Blocking exclusive lock — contention is rare (a few daemons,
+                // sub-ms writes) and a brief block is preferable to a dropped
+                // write. lock() releases on channel/raf close in finally.
+                lock = channel.lock()
+                try { lf.setReadable(true, false); lf.setWritable(true, false) } catch (_: Exception) {}
+            } catch (e: Exception) {
+                Log.w(TAG, "Config file lock unavailable (${e.message}); monitor-only write")
+            }
+            holdingFileLock.set(true)
+            try {
+                return body()
+            } finally {
+                holdingFileLock.set(false)
+                try { lock?.release() } catch (_: Exception) {}
+                try { channel?.close() } catch (_: Exception) {}
+                try { raf?.close() } catch (_: Exception) {}
+            }
+        }
+    }
+
+    /**
+     * Persist a config mutated by loadConfig()'s self-heal/migration paths,
+     * cross-process-safely. Gated to the daemon (UID 2000): only it can
+     * reliably atomic-rename, and routing all real persists through the daemon
+     * keeps a single locked writer. A non-daemon (app UID) caller skips the
+     * write and keeps the migrated object in memory — the daemon re-persists it
+     * on its next locked write, so nothing is lost on disk. Re-entrant: if the
+     * caller already holds the file lock (the updateSection path) this nests
+     * harmlessly.
+     */
+    private fun persistSelfHeal(config: JSONObject) {
+        if (android.os.Process.myUid() != SHELL_DAEMON_UID) return
+        withConfigFileLock { saveConfigInternal(config) }
+    }
+
+    /**
+     * Persist the geocoding-schema migration WITHOUT clobbering a peer's
+     * concurrently-written section. Daemon-only. Acquires the cross-process
+     * lock, RE-READS the current on-disk bytes (which may now carry a peer's
+     * new section that wasn't in the snapshot the caller migrated), re-applies
+     * the idempotent applyDefaults migration to THOSE bytes, and writes the
+     * result. App UID skips (no atomic write available); the daemon migrates +
+     * persists on its next load/write. Best-effort — failure just defers the
+     * migration to a later load.
+     */
+    private fun persistMigrationUnderLock() {
+        if (android.os.Process.myUid() != SHELL_DAEMON_UID) return
+        withConfigFileLock {
+            try {
+                val cf = File(CONFIG_PATH)
+                if (!cf.exists()) return@withConfigFileLock
+                val fresh = JSONObject(cf.readText())
+                applyDefaults(fresh)            // idempotent; folds legacy geocoding keys
+                if (saveConfigInternal(fresh)) {
+                    cachedConfig = fresh
+                    lastModified.set(cf.lastModified())
+                    Log.i(TAG, "Migrated legacy geocoding schema to nested form (locked re-read)")
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Locked migration persist failed: ${e.message}")
+            }
+        }
+    }
+
+    /**
+     * Force a fresh re-parse of the on-disk config, bypassing the cache + the
+     * 1-second-mtime freshness gate in loadConfig. Used by updateSection/
+     * updateValues BEFORE merging so a peer process's same-second write isn't
+     * missed (the mtime gate is second-granular on ext4, so two writes in one
+     * second look unchanged). Caller holds the monitor (+ ideally the file lock).
+     */
+    private fun loadConfigFresh(): JSONObject {
+        cachedConfig = null
+        lastModified.set(0)
+        return loadConfig()
     }
     
     /**

@@ -178,7 +178,11 @@
     "map_cluster_layout": "클러스터 크기",
     "map_cluster_layout_desc": "계기판 클러스터에 맞추세요. 사각지대 클러스터 뷰와 공유됩니다. 투영된 화면이 늘어나거나 잘려 보이면 다른 옵션을 시도해 보세요.",
     "map_cluster_projecting": "투영 중",
-    "map_cluster_off": "끄기"
+    "map_cluster_off": "끄기",
+    "overlay_title": "화면 오버레이",
+    "overlay_show": "화면에 오버레이 표시",
+    "overlay_show_desc": "화면에 RoadSense 플로팅 필과 위험 카드를 표시합니다. 이 기능을 끄면 숨겨지지만, 감지, 오디오 경고 및 크라우드소싱은 백그라운드에서 계속 실행되며 화면 표시만 숨겨집니다.",
+    "unit_seconds": "{n}초"
   },
   "status": {
     "device": "기기",
@@ -811,7 +815,10 @@
     "layout_windshield_unavailable": "활성 카메라 프로필/구성에는 전면 유리 카메라가 정의되어 있지 않습니다.",
     "layout_standard_toast": "표준 360도 레이아웃 활성화됨",
     "layout_dashcam_toast": "대시캠 레이아웃 활성화됨",
-    "layout_update_failed": "녹화 레이아웃 업데이트 실패"
+    "layout_update_failed": "녹화 레이아웃 업데이트 실패",
+    "storage_indexing": "인덱싱 중 — {done} / {total} ({pct}%)",
+    "storage_fallback_internal": "SD/USB 사용 불가 — 내부 저장소에 저장 중",
+    "storage_fallback_enforcing": "SD/USB 사용 불가 — 내부 저장소에 저장 중, 최신 {mb} MB 유지"
   },
   "events": {
     "select_date": "날짜를 선택",
@@ -893,7 +900,8 @@
     "videos_count_initial": "0 비디오",
     "selected_count_initial": "0 선택",
     "page_initial": "1 페이지의 1",
-    "calendar_title_initial": "달력"
+    "calendar_title_initial": "달력",
+    "index_warming": "라이브러리 인덱스 구축 중 — {done} / {total} ({pct}%)"
   },
   "surveillance": {
     "tab_general": "일반",
@@ -1251,7 +1259,13 @@
     "oem_record_desc": "Captures a synchronized dvr_*.mp4 from the forward sensor alongside the panoramic event clip. Honors the same Safe Locations, Schedule, and per-camera filters as the panoramic surveillance.",
     "oem_record_enabled": "OEM Dashcam recording on events enabled",
     "oem_record_disabled": "OEM Dashcam recording on events disabled",
-    "oem_id_unset_hint": "Open Diagnostics → Camera Probe to pick the OEM Dashcam camera id first."
+    "oem_id_unset_hint": "Open Diagnostics → Camera Probe to pick the OEM Dashcam camera id first.",
+    "storage_indexing": "인덱싱 중 — {done} / {total} ({pct}%)",
+    "keep_usb_power": "주차 중 USB 전원 유지",
+    "keep_usb_power_desc": "차량 시동이 꺼진 후에도 USB 포트에 전원을 유지합니다(예: 휴대폰 충전 또는 액세서리 전원 공급). 이 기능을 끄면 USB 포트가 절전 모드로 전환되어 12V 배터리를 절약합니다. 이는 카메라에 영향을 주지 않으며, 주차 감시는 계속 실행됩니다. 다음 번 차량 시동이 꺼질 때 적용됩니다.",
+    "keep_usb_saved_on": "주차 중 USB 전원이 유지됩니다",
+    "keep_usb_saved_off": "주차 중 USB가 절전 모드로 전환됩니다 (다음 ACC-OFF 시)",
+    "keep_usb_save_failed": "설정 저장 실패"
   },
   "mqtt": {
     "tab_connections": "연결",
@@ -1621,7 +1635,30 @@
     "title_update_to": "OverDrive를 <span class=\"upd-newv\">{version}</span>로 업데이트합니까?",
     "currently_on": "현재 {version}",
     "downtime_warning": "<strong>~{minutes} min.</strong> 다이몬스가 다시 시작되고 터널이 설치 후 다시 연결됩니다.",
-    "fallback_check_label": "업데이트 확인"
+    "fallback_check_label": "업데이트 확인",
+    "channel_alpha": "Alpha",
+    "channel_braveheart": "Braveheart",
+    "channel_alpha_desc": "안정적인 릴리스입니다. 모든 게시된 버전이 여기에 보관됩니다 — 설치할 버전을 선택하세요 (다운그레이드 허용). 일상적인 사용에 권장됩니다.",
+    "channel_braveheart_desc": "게시되는 즉시 제공되는 최신 빌드입니다. 새로운 기능을 가장 먼저 사용할 수 있지만, 불안정하거나 버그가 있을 수 있습니다. 문제가 발생하면 정보 → 진단에서 데몬 로그를 보내고 보고해주세요 (아래 참조).",
+    "report_how": "Braveheart에서 버그가 발생했나요? 정보 → 진단에서 데몬 로그를 보내고, 코드를 저희와 공유해주세요:",
+    "report_discord": "Discord",
+    "report_github": "GitHub Issues",
+    "report_whatsapp": "WhatsApp",
+    "report_discord_url": "https://discord.gg/PZutk9fg4h",
+    "report_github_url": "https://github.com/yash-srivastava/Overdrive-release/issues",
+    "report_whatsapp_url": "https://chat.whatsapp.com/HChmriCWgr9KwAtE6OEkiM",
+    "catalog_title": "버전 선택",
+    "catalog_empty": "아직 게시된 버전이 없습니다.",
+    "catalog_retry": "다시 시도",
+    "pill_installed": "설치됨",
+    "pill_older": "이전",
+    "install_downgrade": "다운그레이드",
+    "downgrade_note": "이 버전은 현재 설치된 버전보다 오래되었습니다. 이 버전을 설치하면 현재 빌드가 이 버전으로 교체됩니다.",
+    "switched_to_channel": "{channel}으로 전환됨",
+    "switched_to_braveheart_warn": "Braveheart로 전환되었습니다. 빌드가 불안정할 수 있습니다 — 문제가 발생하면 정보 → 진단에서 데몬 로그를 보내고 Discord/GitHub에 보고해주세요.",
+    "switch_channel_failed": "채널 전환 실패: {error}",
+    "notify_available": "업데이트 사용 가능: {version}. 업데이트 확인을 열어 설치하세요.",
+    "badge_new": "새"
   },
   "vehicle": {
     "car_locked": "자동차가 잠겨있어요",
@@ -2063,5 +2100,16 @@
     "native_dvr_disable_toast": "Native DVR disabled. OverDrive now owns the camera.",
     "native_dvr_enable_toast": "Native DVR re-enabled.",
     "start_timeout": "Pipeline start timed out — check daemon logs"
+  },
+  "logs": {
+    "section_title": "진단",
+    "section_sub": "버그가 발생했나요? 여기에 데몬 로그를 보내주세요 — 짧은 코드를 받게 되며, 이 코드를 Discord, GitHub Issues 또는 WhatsApp을 통해 저희와 공유하고 무엇이 잘못되었는지 알려주세요.",
+    "send": "보내기",
+    "uploading": "업로드 중…",
+    "upload_failed": "업로드 실패",
+    "uploaded_title": "로그 업로드됨",
+    "uploaded_body": "이 코드를 관리자와 공유하세요. 문제가 발생했을 때 무엇을 하고 있었는지와 함께:",
+    "uploaded_where": "Discord, GitHub Issues 또는 WhatsApp에 게시하세요:",
+    "copy_code": "코드 복사"
   }
 }

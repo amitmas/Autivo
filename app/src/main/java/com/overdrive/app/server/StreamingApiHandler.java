@@ -82,6 +82,19 @@ public class StreamingApiHandler {
                         new com.overdrive.app.camera.AvcHalWarmup();
                     warmup.warmupAndWait();
                     pano.start();
+                    // This cold-start ran OUTSIDE RecordingModeManager (it's the
+                    // blind-spot arm path), so the camera is now up at the
+                    // pipeline's full default profile. Tell RMM to reconcile: if
+                    // BS is the sole consumer (no recording mode active), it drops
+                    // the H.265 recorder lane and parks global camera fps at the
+                    // BS idle rate. No-op if a recording mode owns the camera.
+                    try {
+                        com.overdrive.app.recording.RecordingModeManager rmm =
+                            CameraDaemon.getRecordingModeManager();
+                        if (rmm != null) rmm.onPipelineStartedExternally();
+                    } catch (Throwable t) {
+                        CameraDaemon.log("ensurePanoStartedNonBlocking reconcile: " + t.getMessage());
+                    }
                     // BS-DEFECT-A: do NOT self-arm the blind-spot lane here.
                     // This worker runs concurrently with the app's re-arm loop
                     // (BlindSpotControl.armWithRetry), which hammers /api/bs/enable →
@@ -263,6 +276,21 @@ public class StreamingApiHandler {
                 HttpResponse.sendJson(out, pending.toString());
                 return;
             }
+            // BS just armed. If the pano was ALREADY running (so the cold-start
+            // path's onPipelineStartedExternally did NOT fire), the camera may
+            // still be at a full recording/idle profile that doesn't reflect the
+            // new BS-only consumer. Reconcile now so a BS-enable while the pipeline
+            // is up (e.g. a live-view stream kept it warm, mode=NONE) drops the
+            // recorder lane / parks fps at the BS profile. Idempotent + no-op when
+            // a recording mode owns the camera. (Covers audit finding: runtime
+            // BS-enable while pano already running skipped reconcile.)
+            try {
+                com.overdrive.app.recording.RecordingModeManager rmm =
+                    CameraDaemon.getRecordingModeManager();
+                if (rmm != null) rmm.onPipelineStartedExternally();
+            } catch (Throwable t) {
+                CameraDaemon.log("handleBsEnable reconcile: " + t.getMessage());
+            }
             JSONObject response = new JSONObject();
             response.put("success", true);
             response.put("native", true);
@@ -281,6 +309,23 @@ public class StreamingApiHandler {
         if (pipeline != null) {
             try { pipeline.disableBlindSpot(); } catch (Throwable t) {
                 CameraDaemon.log("handleBsDisable: " + t.getMessage());
+            }
+            // Reconcile the camera profile now. If BS was the SOLE consumer and
+            // its view was already hidden, disableBlindSpot() fires no visibility
+            // EDGE (bsLayerVisible was already false), so the camera would
+            // otherwise be stranded at the BS-only profile (recorder lane OFF,
+            // global fps ~1) with no owner — a live view opened afterward would
+            // render at 1fps. Driving a reconcile here lands the camera in the
+            // no-owner baseline (lane ON + recording/stream fps). Idempotent +
+            // no-op when a recording mode owns the camera. (The blindspot.enabled
+            // flag is already cleared by the app before this POST, so
+            // bsKeepWarmActive() is false and reconcile won't re-park it as BS.)
+            try {
+                com.overdrive.app.recording.RecordingModeManager rmm =
+                    CameraDaemon.getRecordingModeManager();
+                if (rmm != null) rmm.onPipelineStartedExternally();
+            } catch (Throwable t) {
+                CameraDaemon.log("handleBsDisable reconcile: " + t.getMessage());
             }
         }
         JSONObject response = new JSONObject();
@@ -590,6 +635,9 @@ public class StreamingApiHandler {
         try {
             GpuPipelineConfig.StreamingQuality q = GpuPipelineConfig.StreamingQuality.fromString(streamingQuality);
             CameraDaemon.log("handleEnableStreaming: quality=" + q.displayName);
+            // enableStreaming fires the pipeline's streamStateListener →
+            // RMM.reconcileCameraProfile, which floors the global camera fps at
+            // the stream fps if the camera was parked at the BS-only idle rate.
             pipeline.enableStreaming(q.width, q.height, q.fps, q.bitrate);
 
             CameraDaemon.log("handleEnableStreaming: success");
@@ -617,6 +665,11 @@ public class StreamingApiHandler {
             return;
         }
 
+        // disableStreaming fires the pipeline's streamStateListener →
+        // RMM.reconcileCameraProfile, so the global camera fps drops back from the
+        // stream floor to the BS idle / recording rate once the stream is gone.
+        // (This path covers BOTH the HTTP DELETE here and the WS idle auto-close
+        // inside the pipeline — neither strands the fps at the stream rate.)
         pipeline.disableStreaming();
 
         // Once the WS pipe goes dark, the OEM-stream "keep warm" reason

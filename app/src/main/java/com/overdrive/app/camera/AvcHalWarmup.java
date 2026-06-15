@@ -211,7 +211,22 @@ public class AvcHalWarmup {
                     logger.info("Keep-alive tick (dilink4): skipping AVC re-launch (esco-parity)");
                     continue;
                 }
-                logger.info("Keep-alive: re-launching com.byd.avc (accOn=" +
+                // pidof-first: only fork `am start` when AVC is actually dead.
+                // The legacy loop previously relaunched UNCONDITIONALLY every
+                // 60s — each relaunch is a zygote-forked app_process issuing a
+                // binder startActivity into AMS (+ up to 5s waitFor), a per-
+                // minute system-wide hitch on the shared SoC for what is a
+                // no-op when AVC is already running. A toybox `pidof` is far
+                // cheaper (no framework link) and is the same presence-probe
+                // the dilink4 ensureAvcAlive() path already uses. When AVC IS
+                // alive we treat the tick as a success for the escalation
+                // counter (it's healthy — nothing to recover).
+                int avcPid = probeAvcPid();
+                if (avcPid > 0) {
+                    consecutiveLaunchFailures = 0;
+                    continue;
+                }
+                logger.info("Keep-alive: com.byd.avc not running (pidof miss) — re-launching (accOn=" +
                     AccMonitor.isAccOn() + ")");
                 boolean launched = launchAvc();
                 if (launched) {

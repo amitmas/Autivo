@@ -121,11 +121,30 @@ object RoadSenseHazardApiClient {
                 val lat = loc.optDouble("lat", Double.NaN)
                 val lng = loc.optDouble("lng", Double.NaN)
                 if (lat.isNaN() || lng.isNaN()) return null
+                // The daemon's GpsMonitor emits the heading under the key "heading"
+                // (Android Location.getBearing → GpsMonitor.heading → JSON "heading").
+                // Reading "bearing" here left fix.bearing ALWAYS null, so every
+                // heading-up follow (puck rotation, head-unit camera, AND the cluster
+                // camera) fell back to a stale lastBearing and never rotated to the
+                // live travel direction. Accept "heading" (canonical) with "bearing"
+                // as a fallback for forward-compat.
+                val bearingKey = when {
+                    loc.has("heading") -> "heading"
+                    loc.has("bearing") -> "bearing"
+                    else -> null
+                }
                 LatLngFix(
                     lat = lat,
                     lng = lng,
-                    bearing = if (loc.has("bearing")) loc.optDouble("bearing", Double.NaN).takeUnless { it.isNaN() } else null,
-                    speed = if (loc.has("speed")) loc.optDouble("speed", Double.NaN).takeUnless { it.isNaN() } else null
+                    bearing = bearingKey?.let { loc.optDouble(it, Double.NaN).takeUnless { v -> v.isNaN() } },
+                    speed = if (loc.has("speed")) loc.optDouble("speed", Double.NaN).takeUnless { it.isNaN() } else null,
+                    // Horizontal accuracy (m) + the daemon's wall-clock fix time (ms).
+                    // Both feed the dead-reckoning estimator + the map-matcher: accuracy
+                    // gates how far we trust a fix / how far we predict; the timestamp
+                    // de-dupes identical re-polls (the daemon resends the SAME fix every
+                    // 2s) so the estimator advances ONCE per real fix, not per poll.
+                    accuracy = if (loc.has("accuracy")) loc.optDouble("accuracy", Double.NaN).takeUnless { it.isNaN() } else null,
+                    timestampMs = loc.optLong("lastUpdate", 0L).takeIf { it > 0L }
                 )
             }
         } catch (t: Throwable) {
@@ -134,12 +153,14 @@ object RoadSenseHazardApiClient {
         }
     }
 
-    /** A single GPS fix from the daemon. bearing/speed may be null. */
+    /** A single GPS fix from the daemon. bearing/speed/accuracy/timestampMs may be null. */
     data class LatLngFix(
         val lat: Double,
         val lng: Double,
         val bearing: Double?,
-        val speed: Double?
+        val speed: Double?,
+        val accuracy: Double? = null,
+        val timestampMs: Long? = null
     )
 
     private fun postVerdict(id: String, action: String, jsonBody: String): Boolean {

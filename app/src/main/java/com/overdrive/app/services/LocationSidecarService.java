@@ -395,48 +395,76 @@ public class LocationSidecarService extends Service implements LocationListener 
         }
     }
 
+    // Persistent IPC socket to the daemon (SurveillanceIpcServer 19877). Only
+    // touched on the workerThread looper (every send is posted there), so no
+    // locking. Previously each fix spawned a NEW Thread AND a NEW Socket
+    // (connect+handshake+teardown) at ~1-2Hz; now one socket is reused and the
+    // send runs on the existing worker looper — zero thread spawns, zero
+    // connects in steady state. The daemon server loops per-connection.
+    private java.net.Socket ipcSocket = null;
+    private java.io.OutputStream ipcOut = null;
+
     private void sendGpsViaTcp() {
-        // Must run on background thread (Android doesn't allow network on main thread)
-        new Thread(() -> {
-            java.net.Socket socket = null;
-            try {
-                JSONObject json = new JSONObject();
-                json.put("command", "UPDATE_GPS");
-                json.put("lat", latitude);
-                json.put("lng", longitude);
-                json.put("speed", speed);
-                json.put("heading", heading);
-                json.put("accuracy", accuracy);
-                json.put("altitude", altitude);
-                json.put("time", System.currentTimeMillis());
-                
-                socket = new java.net.Socket();
-                socket.connect(new java.net.InetSocketAddress("127.0.0.1", 19877), 1000);
-                socket.setSoTimeout(1000);
-                
-                java.io.OutputStream out = socket.getOutputStream();
-                byte[] data = (json.toString() + "\n").getBytes();
-                out.write(data);
-                out.flush();
-                
-                // Read response to confirm daemon received it
-                java.io.BufferedReader reader = new java.io.BufferedReader(
-                    new java.io.InputStreamReader(socket.getInputStream()));
-                String response = reader.readLine();
-                if (response == null) {
-                    Log.w(TAG, "No response from daemon - GPS update may be lost");
-                }
-                
-            } catch (java.net.ConnectException e) {
-                // Daemon not running yet - expected on startup
-            } catch (Exception e) {
-                Log.e(TAG, "IPC error: " + e.getClass().getSimpleName() + ": " + e.getMessage());
-            } finally {
-                if (socket != null) {
-                    try { socket.close(); } catch (Exception ignored) {}
-                }
+        // Snapshot the volatile fields on the caller, build + write on the
+        // worker looper (network off the main/GPS-callback thread).
+        final JSONObject json = new JSONObject();
+        try {
+            json.put("command", "UPDATE_GPS");
+            json.put("lat", latitude);
+            json.put("lng", longitude);
+            json.put("speed", speed);
+            json.put("heading", heading);
+            json.put("accuracy", accuracy);
+            json.put("altitude", altitude);
+            json.put("time", System.currentTimeMillis());
+        } catch (Exception e) {
+            return;
+        }
+        final byte[] payload = (json.toString() + "\n").getBytes();
+        android.os.Handler h = handler;
+        if (h != null) {
+            h.post(() -> writeGpsWithReconnect(payload, true));
+        }
+    }
+
+    /** Write over the persistent socket, reconnecting once on failure. Worker thread only. */
+    private void writeGpsWithReconnect(byte[] payload, boolean allowReconnect) {
+        try {
+            if (ipcSocket == null) {
+                if (!allowReconnect || !openIpcSocket()) return;
             }
-        }, "GPS-IPC").start();
+            ipcOut.write(payload);
+            ipcOut.flush();
+            // Fire-and-forget: we don't block reading the ack (the old code read
+            // one line purely to log a warning; the daemon applies the update
+            // regardless). Skipping the read removes a per-fix round-trip wait.
+        } catch (java.net.ConnectException e) {
+            closeIpcSocket();  // daemon not up — expected on startup, drop fix
+        } catch (Exception e) {
+            closeIpcSocket();
+            if (allowReconnect) writeGpsWithReconnect(payload, false);
+        }
+    }
+
+    private boolean openIpcSocket() {
+        try {
+            java.net.Socket s = new java.net.Socket();
+            s.connect(new java.net.InetSocketAddress("127.0.0.1", 19877), 1000);
+            s.setSoTimeout(1000);
+            s.setTcpNoDelay(true);
+            ipcSocket = s;
+            ipcOut = s.getOutputStream();
+            return true;
+        } catch (Exception e) {
+            closeIpcSocket();
+            return false;
+        }
+    }
+
+    private void closeIpcSocket() {
+        try { if (ipcSocket != null) ipcSocket.close(); } catch (Exception ignored) {}
+        ipcSocket = null;
+        ipcOut = null;
     }
 
     @Override
@@ -467,7 +495,12 @@ public class LocationSidecarService extends Service implements LocationListener 
         if (handler != null && periodicSender != null) {
             handler.removeCallbacks(periodicSender);
         }
-        
+        // Close the persistent IPC socket on the worker thread that owns it,
+        // before quitSafely() lets the looper drain and stop.
+        if (handler != null) {
+            handler.post(this::closeIpcSocket);
+        }
+
         if (locationManager != null) {
             locationManager.removeUpdates(this);
         }

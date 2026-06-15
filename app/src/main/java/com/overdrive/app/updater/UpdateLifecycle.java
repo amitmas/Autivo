@@ -47,6 +47,20 @@ public final class UpdateLifecycle {
      */
     public static final String TELEGRAM_POST_UPDATE_HINT_FILE =
             "/data/local/tmp/overdrive_post_update_pending_telegram";
+    /**
+     * Failure twin of {@link #TELEGRAM_POST_UPDATE_HINT_FILE}. Planted by the
+     * detached install script's FAILURE branch (only for an IPC-triggered
+     * install — i.e. when the success hint above existed) and contains the
+     * pm-install error text. Consumed by the reborn TelegramBotDaemon's
+     * notifyTunnel handler so a Telegram-initiated install that fails AFTER it
+     * was scheduled surfaces the reason to the owner — symmetric with the
+     * web/app failure surfaces — instead of going silent behind the generic
+     * "Tunnel URL Changed" copy. Mutually exclusive with the success hint: the
+     * failure branch deletes the success hint, the success branch never plants
+     * this one, so the bot never sends both a success and a failure message.
+     */
+    public static final String TELEGRAM_INSTALL_FAILED_HINT_FILE =
+            "/data/local/tmp/overdrive_install_failed_pending_telegram";
 
     public static final String EXTRA_POST_UPDATE = "post_update";
 
@@ -107,15 +121,24 @@ public final class UpdateLifecycle {
         //      doesn't see them and refuse to start. Post-update sentinels
         //      (UPDATE_IN_PROGRESS_FILE, POST_UPDATE_FILE) are KEPT; the
         //      new process consumes them via isPostUpdateLaunch.
+        // Plant disable sentinels ONLY for CORE daemons (camera + sentry +
+        // acc-sentry). These are wiped again at the end of this same script —
+        // the transient sentinel just keeps any watchdog we miss with the pkill
+        // from re-exec'ing the daemon between our kill and the new process'
+        // launch. OPTIONAL daemons (telegram / zrok / tailscale / singbox) are
+        // deliberately NOT touched here: their disable sentinel is a DURABLE
+        // user-stop signal that must PERSIST across an app update. Planting
+        // (and then wiping) the telegram/zrok sentinels here would resurrect a
+        // user-stopped tunnel/bot — and would also destroy the only cross-UID
+        // record of a UI stop that AccSentryDaemon's ACC-on auto-start gate
+        // relies on. Mirrors DaemonStartupManager.clearStaleSentinels (core-only).
         String script =
                 "echo \"disabled by post-update reset at $(date)\" > /data/local/tmp/camera_daemon.disabled\n" +
                 "chmod 666 /data/local/tmp/camera_daemon.disabled 2>/dev/null\n" +
-                "echo \"disabled by post-update reset at $(date)\" > /data/local/tmp/zrok.disabled\n" +
-                "chmod 666 /data/local/tmp/zrok.disabled 2>/dev/null\n" +
+                "echo \"disabled by post-update reset at $(date)\" > /data/local/tmp/sentry_daemon.disabled\n" +
+                "chmod 666 /data/local/tmp/sentry_daemon.disabled 2>/dev/null\n" +
                 "echo \"disabled by post-update reset at $(date)\" > /data/local/tmp/acc_sentry_daemon.disabled\n" +
                 "chmod 666 /data/local/tmp/acc_sentry_daemon.disabled 2>/dev/null\n" +
-                "echo \"disabled by post-update reset at $(date)\" > /data/local/tmp/telegram_bot_daemon.disabled\n" +
-                "chmod 666 /data/local/tmp/telegram_bot_daemon.disabled 2>/dev/null\n" +
                 "rm -f /data/local/tmp/cam_watchdog.pid 2>/dev/null\n" +
                 "rm -f /data/local/tmp/start_cam_daemon.sh /data/local/tmp/start_acc_sentry.sh /data/local/tmp/start_zrok.sh /data/local/tmp/start_telegram.sh 2>/dev/null\n" +
                 // ps+awk+kill cascade — single-source-of-truth process
@@ -144,11 +167,35 @@ public final class UpdateLifecycle {
                 // pkill and our rm.
                 "sleep 1\n" +
                 "rm -f /data/local/tmp/*_daemon.lock 2>/dev/null\n" +
-                // Clear per-daemon sentinels so the new MainActivity starts
-                // clean. The post-update markers (UPDATE_IN_PROGRESS_FILE /
+                // The detached install script has finished executing by the
+                // time the new MainActivity runs this reset — remove it so it
+                // doesn't linger in /data/local/tmp (hygiene; it's rewritten via
+                // atomic tmp+rename each install so it never blocks recovery).
+                "rm -f /data/local/tmp/overdrive_install.sh 2>/dev/null\n" +
+                // Clear ONLY the CORE per-daemon sentinels so the new
+                // MainActivity starts clean (core re-arms on app-launch). The
+                // OPTIONAL daemon sentinels (telegram_bot_daemon.disabled,
+                // zrok.disabled, tailscale.disabled, singbox.disabled) are NOT
+                // wiped — they encode a durable user stop that must survive the
+                // update. A broad `*_daemon.disabled` glob would match
+                // telegram_bot_daemon.disabled and resurrect a user-stopped bot.
+                // Mirrors DaemonStartupManager.clearStaleSentinels (core-only).
+                // The post-update markers (UPDATE_IN_PROGRESS_FILE /
                 // POST_UPDATE_FILE) survive — new process owns them.
-                "rm -f /data/local/tmp/*_daemon.disabled 2>/dev/null\n" +
-                "rm -f /data/local/tmp/zrok.disabled 2>/dev/null\n" +
+                "rm -f /data/local/tmp/camera_daemon.disabled /data/local/tmp/sentry_daemon.disabled /data/local/tmp/acc_sentry_daemon.disabled 2>/dev/null\n" +
+                // Stale daemon-log cleanup: only when the NEWLY-INSTALLED build
+                // does NOT capture logs (BuildConfig.LOG_CAPTURE is false — i.e.
+                // a braveheart→alpha/stable downgrade). braveheart keeps file
+                // logging on for every tag, and NOTHING ages those *.log files
+                // out (DaemonLogger.cleanupOldLogs has no callers; the Kotlin
+                // LogCleaner only touches the app cache dir), so after a
+                // downgrade they'd linger forever. We must NOT run this on a
+                // braveheart→braveheart update or we'd wipe the very logs the
+                // user wants to send. Excludes the install log + sentinels.
+                (com.overdrive.app.BuildConfig.LOG_CAPTURE ? "" :
+                    "for lf in /data/local/tmp/*.log /data/local/tmp/*.log.[0-9]*; do " +
+                    "case \"$lf\" in *overdrive_install.log) ;; *) rm -f \"$lf\" 2>/dev/null;; esac; " +
+                    "done\n") +
                 "rm -f " + UPDATE_IN_PROGRESS_FILE + " " + POST_UPDATE_FILE + " 2>/dev/null\n" +
                 "echo done\n";
 

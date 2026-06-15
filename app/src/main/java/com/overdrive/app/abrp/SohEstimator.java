@@ -50,10 +50,12 @@ public class SohEstimator {
     private static final String PROP_PEAK_REMAIN_KWH_TS = "peak_remain_kwh_ts";
     private static final String PROP_PEAK_REMAIN_KWH_NOTIFIED = "peak_remain_kwh_notified";
     private static final String PROP_SCHEMA_VERSION = "schema_version";
-    // v3: PHEV peak-charge frame anchor — empirically derives the BMS's
-    // full-charge usable kWh by tracking max remainKwh observed at SOC≥99%.
-    // Lets the dialog show frame mismatches when user-entered nominal is in a
-    // different unit system than the BMS's remainKwh (nameplate vs usable).
+    // v3: PHEV peak-charge anchor — derives full-charge kWh by tracking max
+    // remainKwh observed at SOC≥99%, giving a noise-robust SOH source on small
+    // packs. remainKwh is gross-framed (corrected at the HAL read boundary), so
+    // a healthy pack's peak ≈ gross nominal (ratio ≈ 1.0); the legacy
+    // frame-mismatch flag effectively no longer fires for the old half-scale
+    // reason but is retained as a guard against a genuinely wrong user nominal.
     private static final int CURRENT_SCHEMA_VERSION = 3;
 
     private static final int LIVE_HISTORY_SIZE = 10;
@@ -1311,13 +1313,12 @@ public class SohEstimator {
      * explicit gross-frame nameplate kWh for the factory-Ah derivation.
      *
      * <p>The BMS coulomb-count Ah ({@code bmsReportedAh}) is a PHYSICAL gross-frame
-     * measurement (~71 Ah on an 18.3 kWh gross / 15.2 kWh usable Blade pack). The
-     * factory Ah it is compared against must therefore also be GROSS. When the
-     * nominal field is in the USABLE frame (PHEV model-picker, e.g. 15.2), passing
-     * the usable value here would derive ~59 Ah and rail the anchor SOH to 110%+
-     * (rejected) — silently killing the anchor. {@code grossNominalKwh} carries the
-     * nameplate so the Ah math stays gross-consistent while the live SOH formula
-     * keeps using the usable field. Pass {@code 0} to fall back to the field.
+     * measurement (~71 Ah on an 18.3 kWh gross Blade pack). The factory Ah it is
+     * compared against must therefore also be GROSS. The nominal field is gross on
+     * every drivetrain now (PHEV remainKwh is corrected to gross at the HAL read
+     * boundary), so {@code grossNominalKwh} and the nominal field agree; the param
+     * is kept to let callers pass the explicit model nameplate, and {@code 0} falls
+     * back to the nominal field.
      */
     public void updateFromCapacityAh(double bmsReportedAh, int cellCount, boolean isPhev,
                                      double currentSocPercent, double grossNominalKwh) {
@@ -2112,10 +2113,12 @@ public class SohEstimator {
         String ct = carType.toUpperCase();
         // PHEV / DM-i marketing strings FIRST — otherwise "Seal U DM-i" falls into
         // the BEV "SEAL U" branch (71.8) and "Destroyer 05" matches nothing. These
-        // return the GROSS nameplate (18.3); the live SOH formula reads it against
-        // the usable-frame remainKwh (~15.2) and the frame-mismatch anchor then
-        // nudges the user to the usable value. Keeps PHEV auto-detect in the right
-        // pack class instead of a wildly-wrong BEV capacity.
+        // return the GROSS nameplate (18.3), which is exactly what the SOH formula
+        // needs: PHEV remainKwh is corrected to the gross frame at the HAL read
+        // boundary (BydDataCollector.PHEV_ENERGY_HALF_SCALE_CORRECTION), so a
+        // healthy pack reads ~100% against gross with no frame-mismatch nudge.
+        // Keeps PHEV auto-detect in the right pack class instead of a wildly-wrong
+        // BEV capacity.
         boolean isDmiString = ct.contains("DM-I") || ct.contains("DMI") || ct.contains("DM-P");
         if (ct.contains("DESTROYER")) return 18.3;
         if (isDmiString && (ct.contains("SEAL U") || ct.contains("SEALU") || ct.contains("SEAL-U"))) return 18.3;

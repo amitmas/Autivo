@@ -33,7 +33,11 @@ public class GpuSurveillancePipeline {
     private GpuDownscaler downscaler;
     private SurveillanceEngineGpu sentry;
     private volatile HardwareEventRecorderGpu encoder;  // Single encoder for recording/surveillance
-    private AdaptiveBitrateController bitrateController;
+    // Volatile: read from non-main threads (proximity binder/scheduler via
+    // setRecordingBitrate) and nulled by stop()'s teardown body which runs
+    // OUTSIDE the synchronized prologue. Without volatile there's no
+    // happens-before edge and a reader could see a stale/partial reference.
+    private volatile AdaptiveBitrateController bitrateController;
     
     // Streaming components (separate encoder - always available)
     private com.overdrive.app.streaming.GpuStreamScaler streamScaler;
@@ -111,6 +115,14 @@ public class GpuSurveillancePipeline {
     // the deleted app-process BlindSpotOverlayService tick (no app process needed).
     private java.util.concurrent.ScheduledExecutorService bsTurnExec;
     private long bsLastTurnOnMs = 0L;
+    // Defense-in-depth latch for the map-leak fix: a turn-signal projection open is
+    // a SESSION (the signal goes on, blinks, goes off). On the LEADING edge of such a
+    // session — and only when no sustained map legitimately holds the projection — we
+    // dismiss any ORPHANED parked cluster-map Activity (navMap.clusterMapActive=false)
+    // so it can't paint under the partial BS card if its normal stop()-driven finish
+    // was ever missed. Latched so we issue the (full-JSON) UCM write ONCE per session,
+    // not every 250ms tick. Reset when the signal clears.
+    private boolean bsDismissedOrphanMap = false;
     private static final long BS_TURN_POLL_MS = 250L;
     private static final long BS_OFF_DEBOUNCE_MS = 800L;  // ride through blink off-phase
     private final java.util.concurrent.locks.ReentrantLock bsLifecycleLock =
@@ -162,7 +174,22 @@ public class GpuSurveillancePipeline {
     // this hook the idle-shutdown timer would tear the pipeline down between
     // monitoring and the next radar trigger.
     private volatile java.util.concurrent.Callable<Boolean> keepAlivePredicate;
-    
+
+    // Fired (best-effort) whenever the BS layer's on-screen visibility changes
+    // (turn signal on/off, debug-preview, cluster show/hide, disable). Lets
+    // RecordingModeManager re-reconcile the GLOBAL camera fps when BS is the SOLE
+    // consumer: ramp to BS active fps on show, drop to BS idle fps on hide.
+    // No-op when a recording mode owns the camera (recording fps wins). Set by
+    // RecordingModeManager; null otherwise. Invoked off the BS turn-tick thread.
+    private volatile Runnable bsVisibilityListener;
+
+    // Fired whenever live-view streaming is enabled or disabled (incl. the WS
+    // idle-shutdown auto-close). Lets RecordingModeManager re-reconcile the global
+    // camera fps floor: a live stream pins the camera at >= stream fps; when it
+    // goes away the camera can drop back to the BS idle rate (or recording rate).
+    // Set by RecordingModeManager; null otherwise.
+    private volatile Runnable streamStateListener;
+
     // Configuration
     private final int cameraWidth;
     private final int cameraHeight;
@@ -281,13 +308,169 @@ public class GpuSurveillancePipeline {
     public HardwareEventRecorderGpu getEncoder() {
         return recorder != null ? recorder.getEncoder() : null;
     }
-    
+
+    /**
+     * Set the recorder draw stride (Proximity Guard low-rate pre-record). A
+     * stride of N makes the render loop feed the recording encoder only every
+     * Nth camera frame, lowering the effective recording rate without a codec
+     * reconfigure. Streaming and blind-spot are unaffected. {@code 1} = full
+     * rate (default). No-op if the camera isn't up yet. Idempotent.
+     */
+    public void setRecorderFrameStride(int stride) {
+        PanoramicCameraGpu cam = camera;
+        if (cam != null) {
+            cam.setRecorderFrameStride(stride);
+        }
+    }
+
+    /**
+     * @return the camera's configured target FPS, or 0 if the camera isn't up.
+     * Used by Proximity Guard to derive the recorder draw stride from a desired
+     * monitor FPS (stride = round(cameraFps / monitorFps)).
+     */
+    public int getCameraTargetFps() {
+        PanoramicCameraGpu cam = camera;
+        return cam != null ? cam.getTargetFps() : 0;
+    }
+
+    /**
+     * Set the GLOBAL camera HAL emission fps at runtime (live setCameraFps, no
+     * camera reopen, no config persist). Used by RecordingModeManager to ramp the
+     * whole pipeline's rate — e.g. drop to ~1fps when the camera is kept warm only
+     * for a hidden blind-spot view, ramp to ~15fps on a turn-signal reveal. This
+     * affects ALL render-loop passes (recorder, stream, blind-spot) since they
+     * share the one camera. The recorder lane can be sub-sampled BELOW this with
+     * setRecorderFrameStride, or skipped entirely with setRecorderLaneEnabled.
+     * No-op if the camera isn't up.
+     */
+    public void setCameraTargetFps(int fps) {
+        PanoramicCameraGpu cam = camera;
+        if (cam != null) cam.setTargetFps(fps);
+    }
+
+    /**
+     * Enable/disable the recorder lane (PASS 1A: H.265 mosaic encode) at runtime
+     * without tearing down the pipeline. When disabled, the render loop skips the
+     * recorder drawFrame + drainEncoder entirely — the stream (PASS 1B) and
+     * blind-spot (PASS 1C) lanes are unaffected. Used when the camera is kept warm
+     * ONLY for blind-spot: BS has no encoder, and no recording mode owns the
+     * pre-record ring, so running the H.265 encoder would burn Venus for footage
+     * nothing will ever flush. Re-enabled (true) the instant a recording mode
+     * activates. No-op if the camera isn't up.
+     */
+    public void setRecorderLaneEnabled(boolean enabled) {
+        PanoramicCameraGpu cam = camera;
+        if (cam != null) cam.setRecorderLaneEnabled(enabled);
+    }
+
+    /**
+     * @return the fps of the currently-enabled live-view stream lane, or 0 when
+     * streaming is off. The stream (PASS 1B) shares the one camera; when the
+     * camera is dropped to a low BS-only idle fps, callers use this as a FLOOR so
+     * an active live view isn't starved/desynced. Returns 0 (no floor) when no
+     * stream is up.
+     */
+    public int getActiveStreamFps() {
+        if (!streamingEnabled) return 0;
+        HardwareEventRecorderGpu enc = streamEncoder;
+        if (enc == null) return 0;
+        try {
+            return enc.getFps();
+        } catch (Throwable t) {
+            return 0;
+        }
+    }
+
+    /**
+     * Set the recording encoder bitrate at runtime (Proximity Guard adaptive
+     * quality). Routed through the AdaptiveBitrateController when present so its
+     * cached currentBitrate stays coherent; falls back to a direct encoder
+     * setBitrate otherwise. No-op if the encoder isn't up. Safe and immediate —
+     * MediaCodec PARAMETER_KEY_VIDEO_BITRATE, no reconfigure, no pre-record-ring
+     * realloc.
+     */
+    public void setRecordingBitrate(int bitrate) {
+        // Capture into locals before deref — stop()'s teardown body runs
+        // outside the synchronized prologue and can null these between a
+        // re-read, so a TOCTOU re-read would NPE on the proximity binder/
+        // scheduler thread. Both fields are volatile so the null is visible.
+        AdaptiveBitrateController bc = bitrateController;
+        if (bc != null) {
+            bc.setImmediateBitrate(bitrate);
+            return;
+        }
+        HardwareEventRecorderGpu enc = getEncoder();
+        if (enc != null) {
+            enc.setBitrate(bitrate);
+        }
+    }
+
+    /**
+     * @return the pipeline's user-configured effective recording bitrate (bps).
+     * Proximity Guard restores the encoder to THIS on teardown so a follow-on
+     * recording mode inherits the user's real quality rather than proximity's
+     * own event bitrate.
+     */
+    public int getConfiguredRecordingBitrate() {
+        return config.getEffectiveBitrate();
+    }
+
+    /**
+     * @return the user-CONFIGURED recording fps from unified config (NOT the
+     * current live camera HAL rate, which may be temporarily lowered — e.g. by
+     * Proximity Guard's monitor profile). Proximity Guard uses this as the
+     * snap-UP target when a radar event fires, so the live event clip records at
+     * the user's real fps regardless of the lowered monitoring rate. Falls back
+     * to 15 if unreadable. (getCameraTargetFps() returns the live rate; this
+     * returns the configured rate.)
+     */
+    public int getConfiguredRecordingFps() {
+        return loadTargetFps();
+    }
+
+    /**
+     * Request an immediate keyframe (IDR) on the recording encoder. Proximity
+     * Guard uses this to keep a keyframe inside the pre-record window while the
+     * low-rate monitor profile stretches the natural GOP, and to open the live
+     * event clip on a clean IDR. No-op if the encoder isn't up.
+     */
+    public void requestRecordingSyncFrame() {
+        HardwareEventRecorderGpu enc = getEncoder();
+        if (enc != null) {
+            enc.requestSyncFrame();
+        }
+    }
+
     /**
      * Sets the recording mode (Normal/Sentry).
      */
     public void setRecordingMode(GpuPipelineConfig.RecordingMode mode) {
         config.setRecordingMode(mode);
-        
+
+        // SENTRY shares the SAME camera + recorder as the ACC-ON modes. When the
+        // pipeline is REUSED across ACC-off (not freshly start()ed — the common
+        // case when Proximity Guard kept it warm), the camera HAL may have been
+        // left at a LOWERED rate by Proximity's monitor profile (~4 fps). A fresh
+        // start() would read the configured fps, but a reuse does not — so sentry
+        // would inherit ~4 fps and record motion/event clips at 4 fps. Re-assert
+        // the configured recording fps + the full recorder lane here so surveillance
+        // always captures at the user's real rate regardless of what the prior
+        // ACC-ON mode left the shared camera at. setCameraTargetFps is the live
+        // runtime knob (no reopen); idempotent if already at this rate. (Recorder
+        // lane is also re-enabled in case a BS-only-warm state had it off — the
+        // same by-construction guarantee startRecording() makes.)
+        if (mode == GpuPipelineConfig.RecordingMode.SENTRY) {
+            try {
+                PanoramicCameraGpu cam = camera;
+                if (cam != null) {
+                    cam.setRecorderLaneEnabled(true);
+                    cam.setTargetFps(loadTargetFps());
+                }
+            } catch (Throwable t) {
+                logger.warn("setRecordingMode(SENTRY): camera fps/lane re-assert failed: " + t.getMessage());
+            }
+        }
+
         // Apply to encoder - but DON'T override user's bitrate setting
         // Only change FPS (which requires encoder restart anyway)
         if (encoder != null) {
@@ -1132,8 +1315,6 @@ public class GpuSurveillancePipeline {
         } catch (Exception e) {
             logger.warn("Failed to apply pre-record duration on reinit: " + e.getMessage());
         }
-        encoder.init();
-
         // Wire the StorageManager cleanup gate against the new encoder so
         // post-save / periodic / sidecar cleanup paths defer their delete
         // bursts while we're mid-write. Field-deref lambda (audit P1) so a
@@ -1141,6 +1322,15 @@ public class GpuSurveillancePipeline {
         // the older `enc::isWritingToFile` form captured the *instance* and
         // would return false on a released encoder, leaving cleanup un-gated
         // during the reinit window.
+        //
+        // Wired BEFORE encoder.init() (audit: probeWired gate): a persistent
+        // encoder.init() failure (codec configure timeout / OOM) must NOT leave
+        // probeWired=false forever, which would silently disable the ENTIRE
+        // periodic limit-enforcement ticker (including the encoder-independent
+        // trips/proximity categories). The lambda already null-guards the field
+        // and returns false until the encoder both exists and is actually
+        // writing, so wiring it before init() preserves the anti-fail-open
+        // intent while flipping probeWired=true on the first init attempt.
         try {
             com.overdrive.app.storage.StorageManager.getInstance()
                 .setEncoderWritingProbe(() -> {
@@ -1150,6 +1340,8 @@ public class GpuSurveillancePipeline {
         } catch (Exception e) {
             logger.warn("Failed to wire encoder writing probe: " + e.getMessage());
         }
+
+        encoder.init();
 
         // Reinitialize recorder with new encoder on GL thread
         if (camera != null && camera.getEglCore() != null) {
@@ -1354,10 +1546,17 @@ public class GpuSurveillancePipeline {
             logger.warn("Failed to pre-load config (will retry after init): " + e.getMessage());
         }
 
-        encoder.init();
-
         // Wire the StorageManager cleanup gate (RC9). Field-deref lambda so
         // reinit-driven encoder swaps don't leave a stale instance ref.
+        //
+        // Wired BEFORE encoder.init() (audit: probeWired gate): a persistent
+        // encoder.init() failure (codec configure timeout / OOM) must NOT leave
+        // probeWired=false forever, which would silently disable the ENTIRE
+        // periodic limit-enforcement ticker (including the encoder-independent
+        // trips/proximity categories). The lambda null-guards the field and
+        // returns false until the encoder exists AND is writing, so this keeps
+        // the anti-fail-open intent while flipping probeWired=true on the first
+        // init attempt regardless of whether init() later throws.
         try {
             com.overdrive.app.storage.StorageManager.getInstance()
                 .setEncoderWritingProbe(() -> {
@@ -1367,6 +1566,8 @@ public class GpuSurveillancePipeline {
         } catch (Exception e) {
             logger.warn("Failed to wire encoder writing probe: " + e.getMessage());
         }
+
+        encoder.init();
 
         // Resolve the camera profile NOW so the recorder, downscaler, foveated
         // cropper, and PanoramicCameraGpu all share consistent per-quadrant
@@ -2265,6 +2466,40 @@ public class GpuSurveillancePipeline {
      * @param prefix Filename prefix (e.g., "cam", "proximity", "event")
      */
     public void startRecording(java.io.File outputDir, String prefix) {
+        // LANE SAFETY (lifecycle redesign): the recorder lane (PASS 1A) can be
+        // switched OFF when the camera is kept warm ONLY for blind-spot (BS has
+        // no encoder). ANY recording — RMM mode, manual /api/start, TCP start,
+        // ACC-off sentry, OEM dashcam, proximity event — funnels through this
+        // method, so re-assert the lane HERE, by construction, rather than
+        // relying on every external caller to remember. Without this, a record
+        // started while the camera is BS-only-warm draws zero frames into the
+        // encoder (renderLoop gates drawFrame on recorderLaneEnabled) → a
+        // false-GREEN "recording" that writes an empty/zero-byte clip. Idempotent
+        // volatile write; does NOT touch stride/bitrate/fps (proximity's own
+        // MONITORING/event profile and the per-mode applyFullRecordingProfile
+        // own those) — it only guarantees PASS 1A is not gated off. The global
+        // camera fps is restored by the per-mode activate (applyFullRecordingProfile)
+        // for RMM modes; for non-RMM record paths the camera was already at a
+        // recording-grade fps unless BS-only-warmed, which onPipelineStartedExternally
+        // / the caller handles — but the LANE is the silent-failure lever, so it
+        // is the one we harden universally here.
+        com.overdrive.app.camera.PanoramicCameraGpu camLane = camera;
+        if (camLane != null && !camLane.isRecorderLaneEnabled()) {
+            logger.info("startRecording: recorder lane was OFF (BS-only keep-warm) — re-enabling for recording");
+            camLane.setRecorderLaneEnabled(true);
+            // Lane was off ONLY in the BS-only keep-warm state, which also drops
+            // the global camera fps to the BS idle/active rate (~1 fps). A record
+            // started from that state (manual /api/start, ACC-off sentry on
+            // dilink4) would otherwise capture at ~1 fps. Restore a recording-grade
+            // fps. RMM mode activations independently call applyFullRecordingProfile
+            // first; this is the safety net for non-RMM record paths. Idempotent
+            // (setTargetFps no-ops if already at this rate).
+            int recFps = loadTargetFps();
+            if (camLane.getTargetFps() < recFps) {
+                camLane.setTargetFps(recFps);
+            }
+        }
+
         // DIAG (Finding A): log the exact recorder/encoder/format state on
         // every start request so a silent no-op explains itself in the field
         // log. If this line is ABSENT from a drive's log right after "Starting
@@ -3253,6 +3488,15 @@ public class GpuSurveillancePipeline {
         logger.info("Creating stream encoder...");
         streamEncoder = new HardwareEventRecorderGpu(streamWidth, streamHeight, streamFps, streamBitrate);
         streamEncoder.setUsePreRecordBuffer(false);  // Stream-only, no pre-record needed
+        // Do NOT pin KEY_OPERATING_RATE on this SECONDARY encoder. The primary
+        // recording encoder already pins it at fps to hold the Venus clock; if
+        // the live-view stream encoder ALSO pins, both double-claim the single
+        // SDM665 Venus block's firmware frequency budget — over-subscribing it
+        // and producing the exact eglSwap stalls the pin was meant to prevent
+        // (two encoders on one HW block). Only the primary encoder should claim
+        // the frequency lock. Mirrors OemDashcamPipeline.java:1039, which sets
+        // this on its own secondary encoder for the same reason.
+        streamEncoder.setPinOperatingRate(false);
         streamEncoder.init();
         logger.info("Stream encoder initialized");
         
@@ -3402,7 +3646,8 @@ public class GpuSurveillancePipeline {
         logger.info("Starting WebSocket stream server...");
         wsStreamServer = new com.overdrive.app.streaming.WebSocketStreamServer();
         
-        // Set idle shutdown callback - auto-stop pipeline when no clients for 15 seconds
+        // Set idle shutdown callback - auto-stop pipeline when no clients for
+        // WebSocketStreamServer.IDLE_TIMEOUT_MS (30 seconds; was mis-documented as 15s)
         final GpuSurveillancePipeline self = this;
         wsStreamServer.setIdleShutdownCallback(new Runnable() {
             @Override
@@ -3498,6 +3743,11 @@ public class GpuSurveillancePipeline {
 
         streamingEnabled = true;
         logger.info("H.264 streaming enabled (WebSocket port 8887)");
+        // Live-view stream now needs the shared camera at >= stream fps. Notify
+        // RMM to floor the global camera fps (covers ALL enable callers — HTTP,
+        // OEM-dashcam, view-mode switches — not just the HTTP handler that also
+        // calls reconcileForExternalConsumerChange).
+        fireStreamStateChanged();
     }
     
     /**
@@ -3656,6 +3906,30 @@ public class GpuSurveillancePipeline {
         }
 
         logger.info("H.264 streaming disabled");
+
+        // The live-view stream just went away. If it was the only reason the
+        // global camera fps was held up (e.g. above the BS idle rate), the camera
+        // can now drop back. Notify RMM to re-reconcile the profile. This fires on
+        // EVERY disable path — HTTP DELETE /stream AND the WS idle-shutdown
+        // auto-close — so the fps doesn't get stranded at the stream rate when the
+        // HTTP handler isn't the one that closed it. Best-effort, off-thread-safe
+        // (reconcile self-serializes on its own lock).
+        fireStreamStateChanged();
+    }
+
+    /** Notify the registered stream-state listener (RMM camera-profile reconcile)
+     *  that streaming was enabled/disabled, so the global camera fps floor is
+     *  recomputed. Fires from ALL stream enable/disable paths. Never throws into
+     *  the caller. */
+    private void fireStreamStateChanged() {
+        Runnable l = streamStateListener;
+        if (l != null) {
+            try {
+                l.run();
+            } catch (Throwable t) {
+                logger.warn("streamStateListener failed: " + t.getMessage());
+            }
+        }
     }
 
     // ── Dedicated blind-spot lane (views 7/8) ────────────────────────────────
@@ -3683,6 +3957,11 @@ public class GpuSurveillancePipeline {
         return blindSpotEnabled && layer != null && layer.isCreated();
     }
     public int getBlindSpotViewMode() { return bsViewMode; }
+    /** Whether the BS SurfaceControl layer is currently SHOWN on screen (turn
+     *  signal active / debug preview) and thus PASS 1C is drawing. Distinct from
+     *  isBlindSpotEnabled() (lane armed but possibly hidden). Drives the BS
+     *  idle↔active global-fps ramp in RecordingModeManager. */
+    public boolean isBlindSpotLayerVisible() { return bsLayerVisible; }
     /** Current on-screen BS layer rect [x,y,w,h] (panel px); -1s if unresolved. */
     public int[] getBsGeometry() { int[] r = bsGeomRect; return new int[]{r[0], r[1], r[2], r[3]}; }
 
@@ -4207,6 +4486,8 @@ public class GpuSurveillancePipeline {
         bsLayerVisible = visible;
         com.overdrive.app.camera.PanoramicCameraGpu cam = camera;
         if (cam != null) cam.setBsLayerVisible(visible);
+        // Ramp global camera fps when BS is the sole consumer (edge-detected).
+        fireBsVisibilityChanged();
         com.overdrive.app.surveillance.BsNativeLayer layer = bsLayer;
         if (layer == null || !layer.isCreated()) return;
         if (visible) {
@@ -4231,6 +4512,14 @@ public class GpuSurveillancePipeline {
      *  into an orphaned layer (the "GPU stays high after the turn signal stops" bug).
      *  No-op for head-unit (this is only wired to the cluster lifecycle). */
     public void onClusterProjectionClosed() {
+        // SHOW-AFTER-CLOSE GUARD (I6/I7): serialize the hide against the show
+        // (clusterShowWhenReady / onClusterProjectionReady) on bsLifecycleLock so the
+        // close-hide and a racing present-edge show are MUTUALLY EXCLUSIVE — they can
+        // no longer interleave (hide landing between the show's isOpen() re-check and
+        // its setGeometry, which would strand the layer shown after close). Whichever
+        // wins the lock, the loser observes the authoritative state. Reentrant with
+        // disableBlindSpot (holds this lock when it calls forceClose→notifyPipelineClosed).
+        bsLifecycleLock.lock();
         try {
             // GPU fix ONLY: drop the render gate so PASS 1C stops drawing once the
             // projection's display is gone. Do the SAME as a turn-off: hide the layer
@@ -4239,10 +4528,23 @@ public class GpuSurveillancePipeline {
             bsLayerVisible = false;
             com.overdrive.app.camera.PanoramicCameraGpu cam = camera;
             if (cam != null) cam.setBsLayerVisible(false);
+            fireBsVisibilityChanged();   // drop global fps if BS is sole consumer
+            // INCREMENTING-STACK FIX: the fission VirtualDisplay is destroyed on this
+            // close; its layerStack is now dead and the NEXT open gets a new (higher)
+            // one. Clear the cached stack so clusterLayerStack(bsClusterStack)'s
+            // fallback path (fission block seen but stack unparsed) can never carry a
+            // value from a destroyed lower stack into the next open — it returns
+            // STACK_UNRESOLVED instead, so clusterShowWhenReady defers rather than
+            // tagging the layer onto a dead stack. The next onClusterProjectionReady
+            // re-resolves the live stack fresh. Guarded by bsLifecycleLock (same lock
+            // serializing the show path); bsClusterStack is volatile.
+            bsClusterStack = com.overdrive.app.surveillance.BsNativeLayer.STACK_UNRESOLVED;
             com.overdrive.app.surveillance.BsNativeLayer layer = bsLayer;
             if (layer != null && layer.isCreated()) layer.hide();
         } catch (Throwable t) {
             logger.warn("onClusterProjectionClosed failed: " + t.getMessage());
+        } finally {
+            bsLifecycleLock.unlock();
         }
     }
 
@@ -4260,33 +4562,89 @@ public class GpuSurveillancePipeline {
      *  shown (the one expensive transaction). Called every tick while intent=visible
      *  AND the projection is ready. Cluster-only. */
     private void clusterShowWhenReady() {
-        bsLayerVisible = true;
-        com.overdrive.app.camera.PanoramicCameraGpu cam = camera;
-        if (cam != null) cam.setBsLayerVisible(true);   // unconditional — re-arm gate
-        com.overdrive.app.surveillance.BsNativeLayer layer = bsLayer;
-        if (layer == null || !layer.isCreated()) return;
-        if (!layer.isShown()) {
-            // Re-resolve the live cluster layerStack on each hidden→shown edge — the
-            // fission display may have materialised AFTER the projection-ready commit
-            // (READY_SETTLE_MS=900ms is shorter than the ~1-3s materialise on some
-            // models), so a single resolve at onClusterProjectionReady can be stale.
-            int live = com.overdrive.app.surveillance.BsNativeLayer.clusterLayerStack(bsClusterStack);
-            // STACK_UNRESOLVED (-1) = no fission display found → DO NOT SHOW. Tagging
-            // the layer with a wrong/sentinel stack composites it onto a dead stack =
-            // BLACK (the model-dependent bug). Keep it hidden; bsTurnTick re-enters
-            // every poll within the linger/cap window and retries once the display
-            // appears. Never pass a negative stack to setLayerStack/setGeometry.
-            if (live == com.overdrive.app.surveillance.BsNativeLayer.STACK_UNRESOLVED) {
-                logger.warn("clusterShowWhenReady: fission display unresolved — deferring show");
-                return;
+        // USE-AFTER-RELEASE FIX: serialize the whole bsLayer snapshot + use against
+        // disableBlindSpot's teardown (which nulls + releases bsLayer under this same
+        // lock). Without it, a present-edge re-notify on projThread can read bsLayer
+        // non-null here, then disableBlindSpot can null + release it on another thread
+        // before this method reaches setLayerStack/setGeometry — operating on (and
+        // re-showing) a torn/released layer (violates I6/I7: no show-after-disable).
+        // bsLifecycleLock is reentrant, so onClusterProjectionReady can hold it across
+        // this call. The fireBsVisibilityChanged listener (RMM.reconcileCameraProfile)
+        // takes only its own reconcileLock AFTER bsLifecycleLock — the same order
+        // disableBlindSpot already uses — so no lock-inversion/deadlock.
+        bsLifecycleLock.lock();
+        try {
+            bsLayerVisible = true;
+            com.overdrive.app.camera.PanoramicCameraGpu cam = camera;
+            if (cam != null) cam.setBsLayerVisible(true);   // unconditional — re-arm gate
+            // Edge-detected: only the first show-tick of a signal session reaches the
+            // listener (per-250ms re-asserts no-op via bsLastNotifiedVisible).
+            fireBsVisibilityChanged();
+            com.overdrive.app.surveillance.BsNativeLayer layer = bsLayer;
+            if (layer == null || !layer.isCreated()) return;
+            if (!layer.isShown()) {
+                // I9 GUARD: resolving the live layerStack below spawns a `dumpsys
+                // display` (clusterLayerStack → resolveFissionDisplay). That MUST run
+                // ONLY on projThread, NEVER on the 250ms BsTurnTrigger loop. When this
+                // method is reached from bsTurnTick (BsTurnTrigger thread) with the layer
+                // hidden, defer the dumpsys-driven show to projThread via a re-drive —
+                // onClusterProjectionReady → clusterShowWhenReady then re-runs HERE on
+                // projThread (isOnProjThread()==true), resolves the stack, and shows. The
+                // cheap render-gate re-arm above (volatile writes + fireBsVisibilityChanged)
+                // already ran on this tick, so the GL lane stays armed in the meantime.
+                com.overdrive.app.surveillance.ClusterProjectionController ctrl =
+                    com.overdrive.app.surveillance.ClusterProjectionController.getInstance();
+                if (!ctrl.isOnProjThread()) {
+                    ctrl.requestShowRedrive();   // I9-safe: dumpsys re-runs on projThread
+                    return;
+                }
+                // Re-resolve the live cluster layerStack on each hidden→shown edge — the
+                // fission display may have materialised AFTER the projection-ready commit
+                // (READY_SETTLE_MS=900ms is shorter than the ~1-3s materialise on some
+                // models), so a single resolve at onClusterProjectionReady can be stale.
+                int live = com.overdrive.app.surveillance.BsNativeLayer.clusterLayerStack(bsClusterStack);
+                // STACK_UNRESOLVED (-1) = no fission display found → DO NOT SHOW. Tagging
+                // the layer with a wrong/sentinel stack composites it onto a dead stack =
+                // BLACK (the model-dependent bug). Keep it hidden; bsTurnTick re-enters
+                // every poll within the linger/cap window and retries once the display
+                // appears. Never pass a negative stack to setLayerStack/setGeometry.
+                if (live == com.overdrive.app.surveillance.BsNativeLayer.STACK_UNRESOLVED) {
+                    logger.warn("clusterShowWhenReady: fission display unresolved — deferring show");
+                    return;
+                }
+                // SHOW-AFTER-CLOSE GUARD (I6/I7): re-read the projection state as the
+                // FINAL gate before the show transaction. A forceClose/shutdown on
+                // another thread flips projState ST_OPEN→ST_CLOSING (under its monitor)
+                // BEFORE it hides the layer (notifyPipelineClosed → onClusterProjectionClosed,
+                // which serializes on this same bsLifecycleLock). So if a present-edge
+                // re-notify on projThread passed pollPresentEdge's guards but a close
+                // raced in, isOpen() is now false → DECLINE the show. Whichever of the
+                // show/close-hide wins this lock, the loser sees the authoritative state:
+                // close-first → show declines here; show-first → close-hide hides it.
+                // No-op for the bsTurnTick callers (they only enter on c.isReady(), i.e.
+                // projState==ST_OPEN). The dumpsys above already ran on projThread (I9).
+                if (!com.overdrive.app.surveillance.ClusterProjectionController
+                        .getInstance().isOpen()) {
+                    logger.warn("clusterShowWhenReady: projection no longer open — declining show");
+                    return;
+                }
+                bsClusterStack = live;
+                layer.setLayerStack(bsClusterStack);
+                int[] g = bsGeomRect; layer.setGeometry(g[0], g[1], g[2], g[3]);   // shows it
             }
-            bsClusterStack = live;
-            layer.setLayerStack(bsClusterStack);
-            int[] g = bsGeomRect; layer.setGeometry(g[0], g[1], g[2], g[3]);   // shows it
+        } finally {
+            bsLifecycleLock.unlock();
         }
     }
 
     public void onClusterProjectionReady() {
+        // USE-AFTER-RELEASE FIX: hold bsLifecycleLock across the bsLayer read + the
+        // clusterShowWhenReady() call so a concurrent disableBlindSpot (which nulls +
+        // releases bsLayer under the same lock) cannot release the layer between the
+        // null-check here and the show. Reentrant with clusterShowWhenReady's own
+        // acquire. Invoked only on projThread (the dumpsys-owning thread, per I9), so
+        // running clusterLayerStack/resolveBsGeometry under the lock is legal here.
+        bsLifecycleLock.lock();
         try {
             if (!isClusterTarget()) return;
             com.overdrive.app.surveillance.BsNativeLayer layer = bsLayer;
@@ -4297,13 +4655,51 @@ public class GpuSurveillancePipeline {
             // re-resolves and defers the show until the display is actually present).
             if (live != com.overdrive.app.surveillance.BsNativeLayer.STACK_UNRESOLVED) {
                 bsClusterStack = live;
+                // INCREMENTING-STACK FIX ("no video after 3-4 attempts"): SurfaceFlinger
+                // assigns a NEW, higher layerStack each time the fission VirtualDisplay
+                // is destroyed (linger close) + recreated (next open) — observed 1→2→3→4→5
+                // across cycles. The BS layer is created ONCE and kept warm, so it stays
+                // tagged to whatever stack it was last given. clusterShowWhenReady only
+                // re-tags on the hidden→shown EDGE, so an already-shown warm layer (or one
+                // shown on a now-destroyed lower stack) composites onto a DEAD stack =
+                // black. This hook runs ONCE per open on projThread (dumpsys-legal, unlike
+                // the 250ms bsTurnTick path — I9), so re-assert the freshly-resolved live
+                // stack on the layer NOW, regardless of shown-state. setLayerStack is a
+                // cheap transaction that no-ops internally when the stack is unchanged
+                // (BsNativeLayer.setLayerStack early-returns on ==), so this adds no churn
+                // on a warm reopen onto the SAME stack and never passes a negative stack.
+                if (layer.isShown()) layer.setLayerStack(live);
             }
             logger.info("onClusterProjectionReady: cluster layerStack=" + bsClusterStack
                     + " (resolved=" + live + ")");
             resolveBsGeometry();   // recompute against the live cluster panel
-            if (bsLayerVisible) clusterShowWhenReady();
+            // COLD-OPEN no-show fix: do NOT gate the show on the instantaneous
+            // bsLayerVisible. On a cold open the fission display materializes
+            // 1-3.5s AFTER commitReady, and the turn signal commonly clears in
+            // that gap (BS_OFF_DEBOUNCE_MS=800ms): bsTurnTick then runs
+            // setBlindSpotVisible(false) → bsLayerVisible=false BEFORE the
+            // present-edge re-notify lands here. Gating on bsLayerVisible would
+            // skip the show forever even though the projection is still up and
+            // LINGERING for exactly this card (gauges stay blanked the whole
+            // linger). During a transient (BS-driven) open the projection is up
+            // ONLY because a BS turn session occurred, so the card must show for
+            // the linger. We still HONOR the sustained-map hold (I5/I7): when the
+            // projection is held by the nav map and no BS signal is active
+            // (bsLayerVisible==false), do NOT spuriously paint the BS card over
+            // the map — that case only ever cold-opens for the map + speed badge.
+            // clusterShowWhenReady() still re-checks isOpen()/stack/lock itself.
+            boolean sustained;
+            try {
+                sustained = com.overdrive.app.surveillance.ClusterProjectionController
+                        .getInstance().isSustainedHeld();
+            } catch (Throwable t) {
+                sustained = false;
+            }
+            if (bsLayerVisible || !sustained) clusterShowWhenReady();
         } catch (Throwable t) {
             logger.warn("onClusterProjectionReady failed: " + t.getMessage());
+        } finally {
+            bsLifecycleLock.unlock();
         }
     }
 
@@ -4345,6 +4741,23 @@ public class GpuSurveillancePipeline {
             com.overdrive.app.surveillance.ClusterProjectionController.getInstance().forceClose("relayout");
         } catch (Throwable t) {
             logger.warn("relayoutCluster failed: " + t.getMessage());
+        }
+    }
+
+    /** Clear navMap.clusterMapActive so any ORPHANED parked cluster-map Activity
+     *  self-finishes (it polls this flag). Called from the BS-open path when no
+     *  sustained map holds the projection — a missed ClusterMapProjector.stop()
+     *  finish would otherwise let the parked map paint under the partial BS card.
+     *  Idempotent; safe no-op when no map Activity exists. Off the GL/turn loop's
+     *  critical path is unnecessary (this is the 250ms turn thread, not GL). */
+    private void dismissOrphanClusterMap() {
+        try {
+            java.util.Map<String, Object> m = new java.util.HashMap<>();
+            m.put("clusterMapActive", false);
+            com.overdrive.app.config.UnifiedConfigManager.updateValues("navMap", m);
+            logger.info("BS open (no sustained map): dismissed any orphaned cluster-map Activity");
+        } catch (Throwable t) {
+            logger.debug("dismissOrphanClusterMap failed: " + t.getMessage());
         }
     }
 
@@ -4453,6 +4866,16 @@ public class GpuSurveillancePipeline {
                     // display is present (never composite stack-1 onto nothing).
                     com.overdrive.app.surveillance.ClusterProjectionController c =
                         com.overdrive.app.surveillance.ClusterProjectionController.getInstance();
+                    // Belt-and-braces for the map-leak fix: if NO sustained map holds
+                    // the projection, this BS open must not re-surface an orphaned
+                    // parked cluster-map Activity. Dismiss it once per signal session
+                    // (idempotent UCM write; gated on !sustained so a legitimate
+                    // map-on-cluster session — which holds the projection — is never
+                    // dismissed). The Activity self-finishes on its ~500ms poll.
+                    if (!bsDismissedOrphanMap && !c.isSustainedHeld()) {
+                        bsDismissedOrphanMap = true;
+                        dismissOrphanClusterMap();
+                    }
                     c.requestOpen(); c.noteSignal(); c.requestCloseLingered();
                     bsLayerVisible = true;   // intent
                     if (c.isReady()) clusterShowWhenReady();   // desync-proof show
@@ -4470,6 +4893,9 @@ public class GpuSurveillancePipeline {
                 }
                 if (bsLayerVisible && (now - bsLastTurnOnMs) >= BS_OFF_DEBOUNCE_MS) {
                     setBlindSpotVisible(false);
+                    // Signal session ended — re-arm the orphan-dismiss latch so the
+                    // next turn-signal open re-checks for a parked map.
+                    bsDismissedOrphanMap = false;
                     if (cluster) {
                         // Hide the card now; restore the gauges after the linger window
                         // (rides brief blink gaps without re-paying the open latency).
@@ -4545,6 +4971,7 @@ public class GpuSurveillancePipeline {
             bsLayerVisible = false;
             com.overdrive.app.camera.PanoramicCameraGpu cam = camera;
             if (cam != null) cam.setBsLayerVisible(false);
+            fireBsVisibilityChanged();   // BS gone — let RMM re-reconcile camera profile
 
             // GL-thread teardown: scaler.release (which destroys its EGLSurface
             // wrapping the SurfaceControl layer's Surface) MUST happen before the
@@ -4836,6 +5263,22 @@ public class GpuSurveillancePipeline {
     }
 
     /**
+     * Null-safe "is the encoder currently writing packets to disk" accessor.
+     * Used by the boot-time StorageManager cleanup-gate probe wired in
+     * CameraDaemon.main(): the probe is bound before this pipeline is
+     * constructed/init'd so the limit-enforcement ticker is never silently
+     * disabled by a construction/pre-init throw. Returns false (encoder idle)
+     * while the encoder is null or pre-init, preserving the anti-fail-open
+     * intent (no destructive delete burst during an active write).
+     *
+     * @return true only if the encoder exists and is writing to a file
+     */
+    public boolean isEncoderWriting() {
+        HardwareEventRecorderGpu e = this.encoder;
+        return e != null && e.isWritingToFile();
+    }
+
+    /**
      * Register an external predicate that the WebSocket idle-shutdown
      * callback consults before tearing the pipeline down. Returning true
      * keeps the pipeline alive even when no recording is currently in
@@ -4848,6 +5291,47 @@ public class GpuSurveillancePipeline {
      */
     public void setKeepAlivePredicate(java.util.concurrent.Callable<Boolean> predicate) {
         this.keepAlivePredicate = predicate;
+    }
+
+    /**
+     * Register a listener fired whenever the BS layer's on-screen visibility
+     * changes. RecordingModeManager uses this to ramp the global camera fps when
+     * BS is the sole consumer. Best-effort; exceptions are swallowed.
+     */
+    public void setBsVisibilityListener(Runnable listener) {
+        this.bsVisibilityListener = listener;
+    }
+
+    /** Register a listener fired whenever live-view streaming is enabled/disabled
+     *  (incl. WS idle auto-close). RecordingModeManager uses it to recompute the
+     *  global camera fps floor. Best-effort; exceptions swallowed. */
+    public void setStreamStateListener(Runnable listener) {
+        this.streamStateListener = listener;
+    }
+
+    // Last bsLayerVisible value the listener was notified about. Edge-detect so
+    // callers (incl. the per-250ms clusterShowWhenReady re-assert) can invoke
+    // fireBsVisibilityChanged liberally without firing the listener every tick —
+    // only true on→off / off→on transitions reach RecordingModeManager.
+    private volatile boolean bsLastNotifiedVisible = false;
+
+    /** Fire the BS-visibility listener IFF bsLayerVisible actually changed since
+     *  the last notification. Safe to call from every BS show/hide site (turn-
+     *  tick, cluster show/close, disable). Never throws into the caller. */
+    private void fireBsVisibilityChanged() {
+        boolean now = bsLayerVisible;
+        if (now == bsLastNotifiedVisible) {
+            return;
+        }
+        bsLastNotifiedVisible = now;
+        Runnable l = bsVisibilityListener;
+        if (l != null) {
+            try {
+                l.run();
+            } catch (Throwable t) {
+                logger.warn("bsVisibilityListener failed: " + t.getMessage());
+            }
+        }
     }
 
     /**

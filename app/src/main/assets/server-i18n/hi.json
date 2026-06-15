@@ -101,7 +101,12 @@
     "mqtt_not_initialized": "MQTT प्रारंभ नहीं किया गया",
     "max_connections_reached": "अधिकतम कनेक्शन प्राप्त ({0})",
     "missing_connection_id": "अनुपस्थित कनेक्शन आईडी",
-    "connection_not_found": "कनेक्शन नहीं मिलाः {0}"
+    "connection_not_found": "कनेक्शन नहीं मिलाः {0}",
+    "update_invalid_channel": "अमान्य अपडेट चैनल",
+    "update_channel_write_failed": "अपडेट चैनल सहेजा नहीं जा सका",
+    "update_channel_tag_mismatch": "वह संस्करण एक अलग चैनल पर है। पहले चैनल बदलें।",
+    "logs_upload_unavailable": "इस बिल्ड में लॉग अपलोड उपलब्ध नहीं है",
+    "logs_unknown_daemon": "अज्ञात डीमन। प्रयास करें: {0}"
   },
   "notifications": {
     "charging_started": "चार्जिंग शुरू",

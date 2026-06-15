@@ -101,7 +101,12 @@
     "mqtt_not_initialized": "MQTT沒有初始化",
     "max_connections_reached": "達到最大的連接 ({0})",
     "missing_connection_id": "缺失連接身份證",
-    "connection_not_found": "沒有找到連結: {0}"
+    "connection_not_found": "沒有找到連結: {0}",
+    "update_invalid_channel": "無效的更新頻道",
+    "update_channel_write_failed": "無法儲存更新頻道",
+    "update_channel_tag_mismatch": "該版本位於不同頻道。請先切換頻道。",
+    "logs_upload_unavailable": "此版本不提供記錄檔上傳功能",
+    "logs_unknown_daemon": "未知的守護程式。請嘗試：{0}"
   },
   "notifications": {
     "charging_started": "開始充電",

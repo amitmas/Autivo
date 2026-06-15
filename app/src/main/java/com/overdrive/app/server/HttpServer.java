@@ -797,6 +797,11 @@ public class HttpServer {
             return UpdateApiHandler.handle(method, path, body, out);
         }
 
+        // Diagnostics log API (list daemons + upload a daemon log) — braveheart only
+        if (path.startsWith("/api/logs")) {
+            return LogsApiHandler.handle(method, path, body, out);
+        }
+
         // Notification API — web push notifications
         if (path.startsWith("/api/notifications") || path.startsWith("/api/push")) {
             return NotificationApiHandler.handle(method, path, body, out);
@@ -858,10 +863,12 @@ public class HttpServer {
         boolean vehicleReady = waitForVehicleDataReady(1500);
         status.put("vehicleDataReady", vehicleReady);
 
-        // App version — read from the persisted version file written by
-        // AppUpdater after a successful install. Falls back to
-        // "Manually Installed" when the file is missing (fresh sideload
-        // before any check-for-update has run).
+        // App version — the installed GitHub release label, read from the
+        // world-readable version file written by every install (shared across
+        // app + daemon UIDs), falling back to the BuildConfig identity
+        // (channel + versionName) when nothing's been installed via the updater
+        // or the persisted label is stale/malformed. getDisplayVersionFromFile()
+        // → getDisplayVersion(null) → persistedGithubVersion (file-first).
         status.put("appVersion", com.overdrive.app.updater.AppUpdater.getDisplayVersionFromFile());
         status.put("recording", TcpCommandServer.getRecordingCameras());
         status.put("viewing", TcpCommandServer.getViewOnlyCameras());

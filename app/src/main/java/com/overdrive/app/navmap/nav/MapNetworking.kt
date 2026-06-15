@@ -127,6 +127,31 @@ object MapNetworking {
     }
 
     /**
+     * Format the LIVE distance-to-next-turn with consumer-nav BUCKETING, honouring
+     * [useMiles]. Unlike [formatDistance] (literal, for trip totals), this rounds so
+     * the banner reads stably ("Now", "50 m", "200 m") instead of exposing raw GPS
+     * jitter as a flickering "237 m, 236 m, 241 m". Buckets:
+     *   metric:   <10m "Now"; ≤50m → nearest 10m; <1km → nearest 50m; else "x.x km"
+     *   imperial: <50ft "Now"; <0.1mi → nearest 50ft; else "x.x mi"
+     */
+    fun formatTurnDistance(meters: Double): String {
+        if (useMiles) {
+            val feet = meters / M_PER_FOOT
+            return when {
+                feet < 50 -> "Now"
+                feet < 528 -> "${(Math.round(feet / 50.0) * 50).toInt()} ft"   // <0.1 mi
+                else -> String.format("%.1f mi", meters / M_PER_MILE)
+            }
+        }
+        return when {
+            meters < 10 -> "Now"
+            meters <= 50 -> "${(Math.round(meters / 10.0) * 10).toInt()} m"
+            meters < 1000 -> "${(Math.round(meters / 50.0) * 50).toInt()} m"
+            else -> String.format("%.1f km", meters / 1000.0)
+        }
+    }
+
+    /**
      * Route MapLibre's OWN tile/style/glyph/sprite fetches through the proxy too.
      *
      * <p>MapLibre Native has its own internal OkHttp call factory; without this

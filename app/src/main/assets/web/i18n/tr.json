@@ -178,7 +178,11 @@
     "map_cluster_layout": "Gösterge paneli boyutu",
     "map_cluster_layout_desc": "Bunu gösterge panelinize göre ayarlayın. Kör nokta gösterge paneli görünümüyle paylaşılır. Yansıtma gerilmiş veya kırpılmış görünüyorsa, başka bir seçeneği deneyin.",
     "map_cluster_projecting": "Yansıtılıyor",
-    "map_cluster_off": "Kapalı"
+    "map_cluster_off": "Kapalı",
+    "overlay_title": "Ekran üstü yer paylaşımı",
+    "overlay_show": "Ekran üstü yer paylaşımını göster",
+    "overlay_show_desc": "Ekranda yüzen RoadSense hapını ve tehlike kartını gösterir. Gizlemek için bunu kapatın — algılama, sesli uyarılar ve kitlesel kaynak arka planda çalışmaya devam eder; yalnızca ekran üstü gösterim gizlenir.",
+    "unit_seconds": "{n}sn"
   },
   "status": {
     "device": "Cihaz",
@@ -811,7 +815,10 @@
     "layout_windshield_unavailable": "Etkin kamera profili/yapılandırması için ön cam kamerası tanımlanmamıştır.",
     "layout_standard_toast": "Standart 360 düzeni etkinleştirildi",
     "layout_dashcam_toast": "Dashcam düzeni etkinleştirildi",
-    "layout_update_failed": "Kayıt düzeni güncellenemedi"
+    "layout_update_failed": "Kayıt düzeni güncellenemedi",
+    "storage_indexing": "Dizin oluşturuluyor — {done} / {total} (%{pct})",
+    "storage_fallback_internal": "SD/USB kullanılamıyor — dahili depolamaya kaydediliyor",
+    "storage_fallback_enforcing": "SD/USB kullanılamıyor — dahili depolamaya kaydediliyor, en son {mb} MB tutuluyor"
   },
   "events": {
     "select_date": "Tarih Seçimleri",
@@ -893,7 +900,8 @@
     "videos_count_initial": "0 video",
     "selected_count_initial": "0 seçili",
     "page_initial": "Sayfa 1",
-    "calendar_title_initial": "Takvim"
+    "calendar_title_initial": "Takvim",
+    "index_warming": "Kütüphane dizini oluşturuluyor — {done} / {total} (%{pct})"
   },
   "surveillance": {
     "tab_general": "Genel",
@@ -1251,7 +1259,13 @@
     "oem_record_desc": "Captures a synchronized dvr_*.mp4 from the forward sensor alongside the panoramic event clip. Honors the same Safe Locations, Schedule, and per-camera filters as the panoramic surveillance.",
     "oem_record_enabled": "OEM Dashcam recording on events enabled",
     "oem_record_disabled": "OEM Dashcam recording on events disabled",
-    "oem_id_unset_hint": "Open Diagnostics → Camera Probe to pick the OEM Dashcam camera id first."
+    "oem_id_unset_hint": "Open Diagnostics → Camera Probe to pick the OEM Dashcam camera id first.",
+    "storage_indexing": "Dizin oluşturuluyor — {done} / {total} (%{pct})",
+    "keep_usb_power": "Park halindeyken USB'yi açık tut",
+    "keep_usb_power_desc": "Araç kapatıldıktan sonra USB bağlantı noktalarını açık tutar (örneğin bir telefonu şarj etmek veya bir aksesuarı çalıştırmak için). USB bağlantı noktalarının uykuya geçmesini ve 12V aküyü korumak için kapatın. Bu, kameraları etkilemez — park halindeki gözetim her iki durumda da çalışmaya devam eder. Araç bir sonraki kapatıldığında etkinleşir.",
+    "keep_usb_saved_on": "Park halindeyken USB açık kalacak",
+    "keep_usb_saved_off": "Park halindeyken USB uykuya geçecek (bir sonraki ACC-KAPALI)",
+    "keep_usb_save_failed": "Ayar kaydedilemedi"
   },
   "mqtt": {
     "tab_connections": "Bağlantılar",
@@ -1621,7 +1635,30 @@
     "title_update_to": "OverDrive'yi <span class=\"upd-newv\">{version}</span>'ye güncelleyecek misin?",
     "currently_on": "Şu anda {version}'de.",
     "downtime_warning": "<strong>{minutes} min.</strong> Daemons yeniden başlatılır ve tünel kurulduktan sonra yeniden bağlanır.",
-    "fallback_check_label": "Güncellemeleri kontrol edin"
+    "fallback_check_label": "Güncellemeleri kontrol edin",
+    "channel_alpha": "Alpha",
+    "channel_braveheart": "Braveheart",
+    "channel_alpha_desc": "Kararlı sürüm. Yayınlanan her sürüm burada tutulur — yüklemek için herhangi birini seçin (sürüm düşürmeye izin verilir). Günlük kullanım için önerilir.",
+    "channel_braveheart_desc": "Yayınlandıkları anda sunulan en yeni yapılar. Yeni özelliklere ilk siz sahip olursunuz, ancak bunlar kararsız veya hatalı olabilir. Bir sorun oluşursa, Hakkında → Tanılama bölümünden bir daemon günlüğü gönderin ve bildirin (aşağıya bakın).",
+    "report_how": "Braveheart'ta bir hatayla mı karşılaştınız? Hakkında → Tanılama bölümünden bir daemon günlüğü gönderin, ardından kodu bizimle paylaşın:",
+    "report_discord": "Discord",
+    "report_github": "GitHub Issues",
+    "report_whatsapp": "WhatsApp",
+    "report_discord_url": "https://discord.gg/PZutk9fg4h",
+    "report_github_url": "https://github.com/yash-srivastava/Overdrive-release/issues",
+    "report_whatsapp_url": "https://chat.whatsapp.com/HChmriCWgr9KwAtE6OEkiM",
+    "catalog_title": "Bir sürüm seçin",
+    "catalog_empty": "Henüz sürüm yayınlanmadı.",
+    "catalog_retry": "Tekrar Dene",
+    "pill_installed": "Yüklü",
+    "pill_older": "Daha Eski",
+    "install_downgrade": "Sürüm Düşür",
+    "downgrade_note": "Bu, yüklü sürümünüzden daha eskidir. Bunu yüklemek, mevcut yapıyı bununla değiştirir.",
+    "switched_to_channel": "{channel} kanalına geçildi",
+    "switched_to_braveheart_warn": "Braveheart'a geçildi. Yapılar kararsız olabilir — bir sorun oluşursa, Hakkında → Tanılama bölümünden bir daemon günlüğü gönderin ve Discord/GitHub üzerinden bildirin.",
+    "switch_channel_failed": "Kanal değiştirilemedi: {error}",
+    "notify_available": "Güncelleme mevcut: {version}. Yüklemek için Güncellemeleri Kontrol Et'i açın.",
+    "badge_new": "YENİ"
   },
   "vehicle": {
     "car_locked": "Araba kilitlendi .",
@@ -2063,5 +2100,16 @@
     "native_dvr_disable_toast": "Native DVR disabled. OverDrive now owns the camera.",
     "native_dvr_enable_toast": "Native DVR re-enabled.",
     "start_timeout": "Pipeline start timed out — check daemon logs"
+  },
+  "logs": {
+    "section_title": "Tanılama",
+    "section_sub": "Bir hatayla mı karşılaştınız? Bir daemon günlüğünü buraya gönderin — kısa bir kod alacaksınız, ardından Discord, GitHub Issues veya WhatsApp üzerinden bizimle paylaşın ve neyin yanlış gittiğini bize bildirin.",
+    "send": "Gönder",
+    "uploading": "Yükleniyor…",
+    "upload_failed": "Yükleme başarısız",
+    "uploaded_title": "Günlük yüklendi",
+    "uploaded_body": "Bu kodu, sorun oluştuğunda ne yaptığınızla birlikte bakıcıyla paylaşın:",
+    "uploaded_where": "Discord, GitHub Issues veya WhatsApp üzerinden paylaşın:",
+    "copy_code": "Kodu Kopyala"
   }
 }

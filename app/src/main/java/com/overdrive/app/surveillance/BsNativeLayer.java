@@ -34,11 +34,14 @@ public final class BsNativeLayer {
     private static final String TAG = "BsNativeLayer";
     private static final DaemonLogger logger = DaemonLogger.getInstance(TAG);
 
-    // Topmost — above all app windows / system chrome, so the safety overlay is
-    // never occluded while driving. Same z as ScreenDeterrent (Integer.MAX_VALUE),
-    // but they never actually contend: the deterrent only fires ACC-OFF (parked /
-    // sentry) and the blind-spot overlay only ACC-ON + signaling.
-    private static final int Z_ORDER = Integer.MAX_VALUE;
+    // Above all app windows / system chrome, so the safety overlay is never occluded
+    // while driving — but ONE BELOW the cluster speed badge (ClusterSpeedOverlay.Z_ORDER
+    // = Integer.MAX_VALUE) so the small centre-left speed readout stays visible on top of
+    // the BS card on the cluster (both composite on the same cluster layerStack). Still
+    // safely above the map/content. ScreenDeterrent uses Integer.MAX_VALUE too but never
+    // contends: it only fires ACC-OFF (parked/sentry) on the head-unit stack, while the
+    // blind-spot overlay is ACC-ON + signaling on the cluster stack.
+    private static final int Z_ORDER = Integer.MAX_VALUE - 1;
 
     private final int bufferW;
     private final int bufferH;
@@ -413,11 +416,60 @@ public final class BsNativeLayer {
             String line;
             int foundId = -1, foundStack = -1;
             while ((line = r.readLine()) != null) {
-                if (!line.toLowerCase(java.util.Locale.US).contains("fission")) continue;
-                int id = extractDisplayIdOnLine(line);
-                if (id >= 0) foundId = id;
+                String low = line.toLowerCase(java.util.Locale.US);
+                if (!low.contains("fission")) continue;
+                // LIVENESS GATE (root cause of "BS card no video + layout fails to
+                // restore" on a trim whose fission display never wires to the panel):
+                // accept a fission line's displayId/layerStack ONLY when that SAME line
+                // also reports the display is ON. The authoritative fission DisplayInfo
+                // line on this firmware inlines all three tokens, e.g.
+                //   ...DisplayInfo{"fission_bg_xdjaVirtualSurface, displayId 1", ...,
+                //                  layerStack 1, ..., type VIRTUAL, state ON, ...}
+                // so a same-line "state on" / "state=on" is the correct, model-robust
+                // discriminator (no block parsing — same rationale as reading layerStack
+                // same-line). WHY THIS MATTERS: SurfaceFlinger's layerStack counter is
+                // monotonic and process-global (survives daemon restarts), so a fresh
+                // daemon can read an already-high stack (observed: 5→6 on a just-restarted
+                // daemon). The OLD lenient grep accepted ANY "fission"+layerStack line —
+                // including a stale/transient/not-yet-wired entry — so the show path
+                // tagged the BS SurfaceControl layer (and the speed badge) onto a stack
+                // with NO live, panel-wired surface → SurfaceFlinger composited them onto
+                // nothing = BLACK/no-video, and the projection-close gauge restore looked
+                // "failed" because the takeover never had a healthy surface. Gating on
+                // state-on means a non-live fission line yields (-1,-1) → present()=false
+                // and clusterLayerStack()=STACK_UNRESOLVED → clusterShowWhenReady DEFERS
+                // (the "trim may not support projection" path) instead of painting a dead
+                // stack. On a model where the display IS live, its line carries state ON,
+                // so this passes and behaviour is unchanged. Strictly safer: it can only
+                // make resolution MORE conservative, never paint a card it wouldn't have.
+                // Token-aware liveness check: require a standalone "state on" /
+                // "state=on" token (word boundaries) so a substring like
+                // "state onhold" or "restate one" on a stale fission diagnostic line
+                // does NOT spoof the gate and re-admit a dead stack. Matches every
+                // real dumpsys form ("state ON," / "state ON}" / "state=ON" / EOL).
+                if (!low.matches(".*\\bstate[ =]+on\\b.*")) continue;
+                // Capture id + stack ATOMICALLY from the authoritative DisplayInfo line
+                // (the one that actually carries layerStack), not as independent halves
+                // accumulated across lines. A live fission display prints multiple
+                // matching lines — DisplayDeviceInfo (state ON, NO layerStack token),
+                // mBaseDisplayInfo + mOverrideDisplayInfo (state ON + "displayId N" +
+                // "layerStack N") — all for the SAME display, so on this firmware the
+                // halves agree. But pairing the layerStack with the displayId from the
+                // SAME physical line makes the parse robust if a future/secondary fission
+                // entry ever appears: we only adopt the stack together with that line's
+                // own id, so a stack can never be mismatched to a different display's id.
+                // The id-bearing layerStack line is the contract (DisplayInfo inlines
+                // both); fall back to a same-line id with no stack only when no
+                // layerStack line was seen yet. "Prefer LAST" still holds (Override after
+                // Base; identical N).
                 java.util.regex.Matcher m = sameLineStack.matcher(line);
-                if (m.find()) foundStack = parseIntSafe(m.group(1));
+                int id = extractDisplayIdOnLine(line);
+                if (m.find()) {
+                    foundStack = parseIntSafe(m.group(1));
+                    if (id >= 0) foundId = id;          // id paired with THIS stack's line
+                } else if (id >= 0 && foundStack < 0) {
+                    foundId = id;                        // id-only line, no stack seen yet
+                }
             }
             return new FissionDisplay(foundId, foundStack);
         } catch (Throwable t) {

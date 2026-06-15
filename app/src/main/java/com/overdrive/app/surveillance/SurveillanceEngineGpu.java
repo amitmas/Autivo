@@ -5648,8 +5648,18 @@ public class SurveillanceEngineGpu {
     }
 
     /**
+     * @return true when surveillance is in CONTINUOUS (always-record) ACC-OFF
+     * mode, where motion detection / YOLO / mosaic readback are NOT used —
+     * recording is fed directly by the GL→encoder surface chain. The AI lane
+     * has no consumer in this mode, so the pipeline skips bringing it up.
+     */
+    public boolean isContinuousMode() {
+        return continuousMode;
+    }
+
+    /**
      * Checks if currently recording.
-     * 
+     *
      * @return true if recording, false otherwise
      */
     public boolean isRecording() {

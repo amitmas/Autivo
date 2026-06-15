@@ -2,6 +2,7 @@ package com.overdrive.app.roadsense
 
 import android.content.Context
 import android.util.Log
+import org.json.JSONObject
 import com.overdrive.app.roadsense.detect.Assessment
 import com.overdrive.app.roadsense.detect.DaemonImuStream
 import com.overdrive.app.roadsense.detect.DetectionCandidate
@@ -88,7 +89,15 @@ class RoadSenseController @JvmOverloads constructor(
     // ── Pipeline stages (single-threaded; one feeder per DaemonImuStream) ──────
     private val gravity = GravityFrame()
     private val detector = EventDetector()
-    private val rejection = RejectionFilter()
+    // Last-applied corner-yaw config, to detect a change cheaply without rebuilding
+    // every poll. Declared BEFORE [rejection] so buildRejectionFilter's write to it
+    // in the initializer below isn't clobbered by a later default initializer.
+    private var lastYawCfg: YawCfg? = null
+    // RejectionFilter is stateless but carries the speed-adaptive cornering-yaw
+    // tunables as constructor params; rebuilt by [maybeRebuildRejection] when those
+    // config knobs change (rare — a settings edit). @Volatile so the IMU thread's
+    // handleCandidate read sees a rebuild done on the vehicle-poll thread.
+    @Volatile private var rejection = buildRejectionFilter(RoadSenseConfig.snapshot())
     private val classifier = SeverityClassifier()
     private val calibrator = VehicleCalibrator()
     private val gpsBuffer = GpsRingBuffer()
@@ -209,6 +218,25 @@ class RoadSenseController @JvmOverloads constructor(
 
     @Volatile private var regime = VehicleStateGate.Regime.OFF
     @Volatile private var started = false
+    // True once attach() has wired the config listener (boot). Distinct from [started]
+    // (which tracks whether the heavy machinery is running): attached can be true while
+    // started is false — that's the DISABLED steady state (listener armed, ~zero cost).
+    @Volatile private var attached = false
+    // Daemon-side config listener that starts/stops the controller live when the user
+    // flips roadSense.enabled, so a DISABLED feature pays nothing (no ticker, no stores,
+    // no sync executor) yet enabling it takes effect WITHOUT a daemon restart. Held as a
+    // field so detach() can deregister it. Runs on the UnifiedConfigManager notify thread.
+    private var enabledListener: com.overdrive.app.config.UnifiedConfigManager.ConfigChangeListener? = null
+    // Last `enabled` value the listener acted on, so it reconciles ONLY when the flag
+    // actually flips — NOT on the controller's own frequent roadSense self-writes
+    // (calQuietCount every 60 s, lastSyncMs/lastUploadCursor per sync). Without this
+    // gate, each self-write would spawn a toggle thread + forceReload() (a full-config
+    // disk re-read that also invalidates the shared cache the recording pipeline reads)
+    // for a guaranteed no-op. Written only inside the listener / reconcile (serialized).
+    @Volatile private var lastKnownEnabled: Boolean? = null
+    // Serializes attach/detach/reconcile (config-notify thread) against each other and the
+    // daemon boot/shutdown threads, so a toggle storm can't race start() with stop().
+    private val lifecycleLock = Any()
     private var ticker: java.util.concurrent.ScheduledExecutorService? = null
     // Set by onVehicleStatePoll (daemon housekeeping thread) when leaving DRIVING;
     // the actual pipeline-state reset is performed on the IPC/sensor thread at the
@@ -305,6 +333,121 @@ class RoadSenseController @JvmOverloads constructor(
     )
 
     // ── Lifecycle ──────────────────────────────────────────────────────────────
+
+    /**
+     * Wire the controller into the daemon WITHOUT paying for a disabled feature.
+     *
+     * Called once at daemon boot (CameraDaemon) instead of [start]. It:
+     *   1. start()s the heavy machinery (stores, 2 Hz ticker, sync executor) ONLY if
+     *      roadSense.enabled is currently true, and
+     *   2. registers a config-change listener so flipping the toggle later starts/stops
+     *      the controller LIVE — no daemon restart.
+     *
+     * The controller object itself is always constructed (so the IPC IMU_BATCH case and
+     * the map API's getRoadSense() are non-null), but a DISABLED feature now costs ~zero:
+     * no ticker thread, no open H2 connections, no sync executor — only this one armed
+     * listener + the resident (lazy, side-effect-free) field graph. Idempotent.
+     */
+    fun attach() {
+        synchronized(lifecycleLock) {
+            if (!attached) {
+                attached = true
+                // React to roadSense.enabled flips. The web settings page writes the
+                // `roadSense` section through UnifiedConfigManager.updateSection (in this
+                // same daemon process), which fires a section-specific notifyListeners
+                // synchronously — so this is the authoritative live-toggle hook. We match
+                // ONLY "roadSense" (NOT "all"): saveConfig fires notifyListeners("all") on
+                // EVERY config write app-wide, and updateSection("roadSense", …) ALSO fires
+                // the section-specific "roadSense" event — so matching the section alone
+                // catches every enable/disable without reconciling on unrelated writes.
+                // Same idiom as GpuSurveillancePipeline.rectifyConfigListener (matches only
+                // "recording"). ConfigChangeListener is a plain Kotlin interface (not a fun
+                // interface), so an object literal — not a SAM lambda — is required.
+                val l = object : com.overdrive.app.config.UnifiedConfigManager.ConfigChangeListener {
+                    override fun onConfigChanged(section: String, config: org.json.JSONObject) {
+                        if (section != "roadSense") return
+                        // Gate on the `enabled` key ACTUALLY flipping. `config` is the merged
+                        // roadSense section (updateSection passes the post-merge object), so we
+                        // can read the flag here cheaply — NO forceReload — and ignore our own
+                        // calibration/sync self-writes that don't touch `enabled`. Skipping them
+                        // avoids a per-60 s thread-spawn + full-config disk re-read for a no-op.
+                        val now = config.optBoolean("enabled", false)
+                        if (lastKnownEnabled == now) return
+                        lastKnownEnabled = now
+                        // CRITICAL: this callback runs INSIDE UnifiedConfigManager's
+                        // synchronized(this) monitor (notifyListeners is called under it).
+                        // reconcile()'s stop() can take ~2 s (awaitTermination + H2 close +
+                        // sidecar exec); running it here would hold the global config monitor
+                        // that long and stall EVERY other config read in the daemon (incl. the
+                        // recording pipeline). So hop onto a short-lived daemon thread — a real
+                        // enable/disable flip is rare (a user tap), so a thread per flip is
+                        // negligible (project's detached-spawn idiom). reconcile() is serialized
+                        // + idempotent.
+                        Thread({
+                            try { reconcile() } catch (t: Throwable) { Log.w(TAG, "reconcile error: ${t.message}") }
+                        }, "roadsense-toggle").apply { isDaemon = true }.start()
+                    }
+                }
+                enabledListener = l
+                com.overdrive.app.config.UnifiedConfigManager.addListener(l)
+                Log.i(TAG, "RoadSenseController attached (live-toggle listener armed)")
+            }
+        }
+        // Bring the running state in line with the persisted flag right now (boot thread —
+        // not under the config monitor, so a synchronous start() here is fine).
+        reconcile()
+    }
+
+    /**
+     * Deregister the live-toggle listener and stop the machinery. Called at daemon
+     * shutdown (CameraDaemon.stop path) — the inverse of [attach]. Idempotent. Holds
+     * [lifecycleLock] across stop() so an in-flight toggle reconcile can't race a start()
+     * against this shutdown stop(); clearing [attached] first makes any queued reconcile a
+     * no-op (it bails when not attached).
+     */
+    fun detach() {
+        synchronized(lifecycleLock) {
+            enabledListener?.let {
+                try { com.overdrive.app.config.UnifiedConfigManager.removeListener(it) } catch (_: Throwable) {}
+            }
+            enabledListener = null
+            attached = false
+            stop()
+        }
+    }
+
+    /**
+     * Start or stop the heavy machinery to match the persisted roadSense.enabled flag.
+     * forceReload so a cross-UID web write is seen immediately (the listener fires in this
+     * daemon process, but the flag may have been written via the app→daemon IPC path and
+     * only just landed on disk). Serialized on [lifecycleLock] so overlapping toggle
+     * notifications can't race start() against stop(). start()/stop() are themselves
+     * idempotent (guarded by [started]), so a redundant reconcile is a cheap no-op.
+     */
+    private fun reconcile() {
+        val enabled = try {
+            RoadSenseConfig.snapshot(forceReload = true).enabled
+        } catch (t: Throwable) {
+            Log.w(TAG, "reconcile snapshot failed: ${t.message}"); return
+        }
+        synchronized(lifecycleLock) {
+            // Record the authoritative flag we're acting on so the listener's flip-gate has a
+            // correct baseline (e.g. the boot reconcile seeds it; a later real flip differs).
+            lastKnownEnabled = enabled
+            // Don't start after detach() (shutdown) has fired — the listener may have
+            // queued one last reconcile before it was removed.
+            if (!attached && enabled) return
+            if (enabled && !started) {
+                Log.i(TAG, "roadSense.enabled=true → starting controller")
+                plog.info("enabled → start")
+                start()
+            } else if (!enabled && started) {
+                Log.i(TAG, "roadSense.enabled=false → stopping controller (releasing stores/ticker/sync)")
+                plog.info("disabled → stop (zero-cost)")
+                stop()
+            }
+        }
+    }
 
     fun start() {
         if (started) return
@@ -407,7 +550,7 @@ class RoadSenseController @JvmOverloads constructor(
      * imuStream.feed), so locking the entry point covers the entire pipeline.
      */
     @Synchronized
-    fun onImuBatch(line: String): Int {
+    fun onImuBatch(frame: JSONObject): Int {
         // FLUSH-on-leaving-DRIVING (RS-DEFER-1): when the regime just left DRIVING, deferred
         // candidates in pendingClassify would otherwise be stranded — the drain below is past
         // the early-return, and resetTransient would CLEAR them unclassified. So FORCE-finalize
@@ -429,7 +572,7 @@ class RoadSenseController @JvmOverloads constructor(
             resetRequested = false
             resetTransient()
         }
-        val decoded = ImuFrameCodec.decode(line) ?: return 0
+        val decoded = ImuFrameCodec.decode(frame) ?: return 0
         val n = imuStream.feed(decoded, clock())
         // Drain deferred classifications whose POST-event envelope has now elapsed (D-040).
         // feed() ran onAccel/onGyro synchronously above, so lastContextSampleMs is the newest
@@ -463,7 +606,13 @@ class RoadSenseController @JvmOverloads constructor(
         // Refresh the master-enabled flag here too (not only on the IMU throttle)
         // so toggling RoadSense off promptly tears the sidecar down even while the
         // car keeps driving — a disabled feature must cost ~zero (R-EXT-6 / D-021).
-        featureEnabled = RoadSenseConfig.snapshot().enabled
+        // Snapshot once: we also consult overlayVisible below for the app-side overlay
+        // launch, and a single read keeps the two decisions consistent within this tick.
+        val cfgSnap = RoadSenseConfig.snapshot()
+        featureEnabled = cfgSnap.enabled
+        // Pick up any change to the speed-adaptive cornering-yaw knobs (rare; off the
+        // 100 Hz IMU path — this is the ~2 Hz vehicle poll).
+        maybeRebuildRejection(cfgSnap)
         val dyn = vehicleSource.latest(now)
         val accOn = com.overdrive.app.monitor.AccMonitor.isAccOn()
         val accAuth = com.overdrive.app.monitor.AccMonitor.isAccStateAuthoritative()
@@ -517,7 +666,13 @@ class RoadSenseController @JvmOverloads constructor(
         // per tick. startFromDaemon is idempotent on a DRIVING↔RELAXED flip (am reuses
         // the running service via onStartCommand). The overlay self-guards overlay
         // permission, so this no-ops cleanly when it isn't granted.
-        if (newRegime == VehicleStateGate.Regime.OFF) {
+        //
+        // overlayVisible gate (user opt-out, default ON): hiding the overlay is purely
+        // an on-screen choice — detection/audio/crowdsource all keep running daemon-side
+        // (audio is daemon-owned, independent of this app window). So when the user has
+        // hidden it, DON'T launch the overlay on a regime edge (and the service's own poll
+        // self-stops if it was already up). We still tear it down on OFF unconditionally.
+        if (newRegime == VehicleStateGate.Regime.OFF || !cfgSnap.overlayVisible) {
             com.overdrive.app.roadsense.overlay.RoadSenseOverlayService.stopFromDaemon()
         } else {
             com.overdrive.app.roadsense.overlay.RoadSenseOverlayService.startFromDaemon()
@@ -1554,6 +1709,44 @@ class RoadSenseController @JvmOverloads constructor(
 
     private fun eventsPerSec(): Float =
         recentCandidateMs.size.toFloat() / (WASHBOARD_WINDOW_MS / 1000f)
+
+    // ── Speed-adaptive cornering-yaw config plumbing ──────────────────────────
+    /** The four corner-yaw knobs, captured so we can rebuild [rejection] only when
+     *  they actually change (cheap equality vs rebuilding every poll). */
+    private data class YawCfg(
+        val adaptive: Boolean,
+        val minRadiusM: Float,
+        val floorRps: Float,
+        val ceilRps: Float,
+    )
+
+    private fun yawCfgOf(cfg: RoadSenseConfig.Snapshot) = YawCfg(
+        adaptive = cfg.cornerYawSpeedAdaptive,
+        minRadiusM = cfg.cornerMinRadiusM,
+        floorRps = cfg.cornerYawFloorRps,
+        ceilRps = cfg.cornerYawCeilRps,
+    )
+
+    private fun buildRejectionFilter(cfg: RoadSenseConfig.Snapshot): RejectionFilter {
+        lastYawCfg = yawCfgOf(cfg)
+        return RejectionFilter(
+            cornerMinRadiusM = cfg.cornerMinRadiusM,
+            yawRejectFloorRps = cfg.cornerYawFloorRps,
+            yawRejectCeilRps = cfg.cornerYawCeilRps,
+            speedAdaptiveYaw = cfg.cornerYawSpeedAdaptive,
+        )
+    }
+
+    /** Rebuild the (stateless) RejectionFilter if the corner-yaw config changed.
+     *  Called from the ~2 Hz vehicle/warning ticks — off the 100 Hz IMU path. */
+    private fun maybeRebuildRejection(cfg: RoadSenseConfig.Snapshot) {
+        val now = yawCfgOf(cfg)
+        if (now != lastYawCfg) {
+            rejection = buildRejectionFilter(cfg)
+            plog.info("RejectionFilter rebuilt: cornerYaw adaptive=${now.adaptive} " +
+                "Rmin=${now.minRadiusM} floor=${now.floorRps} ceil=${now.ceilRps}")
+        }
+    }
 
     companion object {
         private const val TAG = "RoadSense/Controller"

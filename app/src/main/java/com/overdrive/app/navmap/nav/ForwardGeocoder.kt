@@ -30,6 +30,7 @@ object ForwardGeocoder {
     private const val TAG = "ForwardGeocoder"
 
     private const val PHOTON_BASE = "https://photon.komoot.io/api/"
+    private const val PHOTON_REVERSE_BASE = "https://photon.komoot.io/reverse"
     private const val NOMINATIM_BASE = "https://nominatim.openstreetmap.org/search"
 
     /** Required by OSM usage policy (identifies the client). */
@@ -37,11 +38,21 @@ object ForwardGeocoder {
 
     // Lazy so the OkHttpClient isn't built until search is first used. Proxy-aware
     // (dynamic proxy selector) + User-Agent come from MapNetworking.builder().
+    //
+    // Timeouts are sized for the PROXIED path (sing-box / Tailscale) on in-car mobile
+    // data, NOT a clean direct connection. Measured on-device: Photon THROUGH the proxy
+    // took ~2.4s even on good network — the old connect=4s/read=6s left almost no margin,
+    // so a proxy hop on patchy mobile data tipped search into a timeout (empty results,
+    // the "can't search routes while sing-box is on" symptom). Widened to connect=8s/
+    // read=12s (still bounded so the search box doesn't hang indefinitely). connect
+    // covers the proxy CONNECT handshake; read covers the upstream geocoder round-trip.
+    // retryOnConnectionFailure stays OFF: search-on-submit, the caller degrades to an
+    // empty list and the user can retry — we don't want a silent doubled latency.
     private val http: OkHttpClient by lazy {
         MapNetworking.builder()
-            .connectTimeout(4, TimeUnit.SECONDS)
-            .readTimeout(6, TimeUnit.SECONDS)
-            .writeTimeout(5, TimeUnit.SECONDS)
+            .connectTimeout(8, TimeUnit.SECONDS)
+            .readTimeout(12, TimeUnit.SECONDS)
+            .writeTimeout(8, TimeUnit.SECONDS)
             .retryOnConnectionFailure(false)
             .build()
     }
@@ -139,6 +150,51 @@ object ForwardGeocoder {
         } catch (t: Throwable) {
             Log.w(TAG, "searchPhoton failed: ${t.message}")
             emptyList()
+        }
+    }
+
+    /**
+     * Reverse-geocode a coordinate (lat/lng) to the nearest readable place label
+     * via Photon's `/reverse` endpoint. Used by the map's "drop a pin" long-press
+     * so a saved/navigated place gets a human name instead of bare coordinates.
+     *
+     * <p>SYNC + never-throws like the rest (the Activity runs it off the UI
+     * thread). Returns null on any failure / no hit so the caller can fall back to
+     * a generic "Dropped pin" label. The returned [SearchResult] carries the
+     * TAPPED coordinate (not Photon's snapped one) so navigation routes to exactly
+     * where the user pressed.
+     *
+     * @param lat latitude (decimal degrees) of the tapped point
+     * @param lng longitude (decimal degrees) of the tapped point
+     * @return the nearest place's label at the tapped coordinate, or null
+     */
+    fun reverse(lat: Double, lng: Double): SearchResult? {
+        return try {
+            val url = StringBuilder(PHOTON_REVERSE_BASE)
+                .append("?lat=").append(lat)
+                .append("&lon=").append(lng)
+                .append("&lang=").append(enc(MapNetworking.lang))
+                .toString()
+            val req = Request.Builder()
+                .url(url)
+                .header("User-Agent", USER_AGENT)
+                .header("Accept-Language", MapNetworking.acceptLanguage)
+                .get()
+                .build()
+            http.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) {
+                    Log.w(TAG, "Photon reverse -> HTTP ${resp.code}")
+                    return null
+                }
+                val bodyStr = resp.body?.string() ?: return null
+                // Reuse the forward parser (same FeatureCollection shape), then keep
+                // only the label — pin the result at the TAPPED coordinate.
+                val label = parsePhoton(bodyStr).firstOrNull()?.label ?: return null
+                SearchResult(label, lat, lng)
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "reverse failed: ${t.message}")
+            null
         }
     }
 

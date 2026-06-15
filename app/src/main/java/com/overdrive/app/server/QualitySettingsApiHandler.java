@@ -267,10 +267,20 @@ public class QualitySettingsApiHandler {
         response.put("surveillanceLimitMb", storage.getSurveillanceLimitMb());
         response.put("minLimitMb", StorageManager.getMinLimitMb());
 
-        // Dynamic per-volume max from live StatFs (clamped to per-category share).
+        // Dynamic per-volume max = the FULL usable volume (total − headroom) from
+        // live StatFs. No per-category /N division (removed 2026-06) — a category's
+        // slider tops out at the real volume capacity.
         response.put("maxLimitMb", storage.getEffectiveMaxLimitMb(StorageManager.StorageType.INTERNAL));
         response.put("maxLimitMbSdCard", storage.getEffectiveMaxLimitMb(StorageManager.StorageType.SD_CARD));
         response.put("maxLimitMbUsb", storage.getEffectiveMaxLimitMb(StorageManager.StorageType.USB));
+
+        // Effective enforced limit = configured clamped to the ACTIVE volume's
+        // capacity. Differs from the configured value only during a fallback to
+        // internal (external full/absent); the UI shows it so "saving to internal:
+        // enforcing N MB" is honest rather than implying the fallback volume holds
+        // the full external-sized limit.
+        response.put("recordingsEffectiveLimitMb", storage.getEffectiveLimitMb("recordings"));
+        response.put("surveillanceEffectiveLimitMb", storage.getEffectiveLimitMb("surveillance"));
 
         response.put("recordingsPath", storage.getRecordingsPath());
         response.put("surveillancePath", storage.getSurveillancePath());
@@ -616,6 +626,39 @@ public class QualitySettingsApiHandler {
                     if (p != null) p.relayoutCluster();
                 } catch (Exception e) {
                     CameraDaemon.log("blindspot relayout dispatch failed: " + e.getMessage());
+                }
+            }
+            // A blind-spot ENABLE flip must take effect live for NO-BRIDGE clients
+            // (tunnel/browser). The in-app head-unit path POSTs /api/bs/enable|disable
+            // via AndroidBridge, but road-sense.js _bsSyncNative() no-ops without the
+            // bridge — and the native SurfaceControl BS lane has no daemon-side
+            // disable poller (the self-heal ticker only ARMS). So a tunnel toggle would
+            // otherwise leave the lane armed (enabled=false but lane still up) on
+            // disable, or un-armed on enable, until a reboot. Drive the same
+            // arm/disarm + camera-profile reconcile the bridge path uses. The flag was
+            // already persisted by updateSection above, so isBlindSpotEnabled() reads
+            // fresh in-daemon.
+            if ("blindspot".equals(section) && data.has("enabled")) {
+                try {
+                    com.overdrive.app.surveillance.GpuSurveillancePipeline p = CameraDaemon.getGpuPipeline();
+                    boolean enabledNow = data.optBoolean("enabled", false);
+                    if (p != null) {
+                        if (enabledNow) {
+                            // Arm via the daemon resolver (idempotent; no-op if already armed).
+                            com.overdrive.app.server.StreamingApiHandler.resolveBlindSpotLifecycle();
+                        } else {
+                            p.disableBlindSpot();
+                        }
+                    }
+                    // Reconcile the camera profile either way: an enable that made BS
+                    // the sole consumer should drop to the BS-only profile; a disable
+                    // that removed the sole consumer should restore the no-owner
+                    // baseline (else the camera is stranded at lane-OFF/~1fps).
+                    com.overdrive.app.recording.RecordingModeManager rmm =
+                        CameraDaemon.getRecordingModeManager();
+                    if (rmm != null) rmm.onPipelineStartedExternally();
+                } catch (Exception e) {
+                    CameraDaemon.log("blindspot enable dispatch failed: " + e.getMessage());
                 }
             }
 

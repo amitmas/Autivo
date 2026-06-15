@@ -43,9 +43,14 @@ import java.io.InputStreamReader
  *
  * Renders identity (brand, version, build), MIT license + GitHub source
  * deep-links, and the "Check for updates" action. Version is pulled from
- * [AppUpdater.getDisplayVersion] at runtime — that's the GitHub release
- * string written by the updater, falling back to "Manually Installed"
- * when no update has been performed yet.
+ * [AppUpdater.getDisplayVersion], which prefers the installed GitHub release
+ * label (the world-readable version file written by every install, read
+ * cross-UID), falling back to the BuildConfig identity
+ * (UPDATE_CHANNEL + "-v" + VERSION_NAME, e.g. "alpha-v26.0") — the build's
+ * true running identity, NOT a persisted file. So it's always correct for the
+ * build actually installed, regardless of how it was installed (in-app update,
+ * Android Studio, sideload, channel switch). This row answers "what am I
+ * running?"; the "Check for updates" action answers "is something newer?".
  */
 class SettingsAboutFragment : Fragment() {
 
@@ -64,39 +69,26 @@ class SettingsAboutFragment : Fragment() {
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
 
-        // Show the locally-tracked installed version immediately so the row
-        // never sits blank, then refresh in the background with the published
-        // version on the configured channel from GitHub Releases — that's the
-        // value the user actually wants to see ("am I current?"). Both calls
-        // are routed through the AppUpdater so behavior matches the rest of
-        // the update surface (proxy detection, channel, label format).
+        // Show the INSTALLED version — i.e. the build actually running on this
+        // device. We deliberately do NOT overwrite this with the latest version
+        // published on GitHub: this row answers "what am I running?", and
+        // showing the latest-available would make a user on an older build look
+        // current and is simply mislabeled. "Is an update available?" is what
+        // the Check for Updates action below answers.
         val versionView = view.findViewById<TextView>(R.id.tvAboutVersion)
-        versionView.text = AppUpdater.getDisplayVersion(requireContext())
+        // Show the BuildConfig identity immediately (pure in-memory, no I/O),
+        // then resolve the persisted GitHub label off the looper and post it —
+        // getDisplayVersion does a /data/local/tmp file read, which must not run
+        // on the main thread (same off-thread pattern as the channel toggle).
+        versionView.text = AppUpdater.getInstalledVersion()
+        (avatarExecutor ?: java.util.concurrent.Executors.newSingleThreadExecutor()
+            .also { avatarExecutor = it }).execute {
+            val resolved = AppUpdater.getDisplayVersion(requireContext().applicationContext)
+            mainHandler.post { if (isAdded && view.parent != null) versionView.text = resolved }
+        }
         view.findViewById<TextView>(R.id.tvAboutBuild).text = BuildConfig.APPLICATION_ID
 
-        // Capture the AppUpdater so we can close() it after the async
-        // fetch completes — without close(), each fragment open allocates
-        // a fresh AppUpdater that strands its lazy AdbDaemonLauncher's
-        // executor + tunnel-poll scheduler for the life of the process.
-        val versionUpdater = AppUpdater(requireContext())
-        versionUpdater.fetchLatestReleaseVersion(
-            object : AppUpdater.RemoteVersionCallback {
-                override fun onResult(version: String) {
-                    try {
-                        if (!isAdded) return
-                        if (version.isNotBlank()) {
-                            versionView.text = version
-                        }
-                    } finally {
-                        versionUpdater.close()
-                    }
-                }
-                override fun onError(error: String?) {
-                    // Silent — the local fallback is already visible.
-                    versionUpdater.close()
-                }
-            }
-        )
+        setupChannelToggle(view)
 
         view.findViewById<View>(R.id.cardCheckUpdate).setOnClickListener {
             (activity as? MainActivity)?.invokeCheckForUpdates()
@@ -124,6 +116,87 @@ class SettingsAboutFragment : Fragment() {
         }
 
         populateThanks(view)
+    }
+
+    /**
+     * Wire the Alpha / Braveheart channel toggle.
+     *
+     * Channel state lives in UnifiedConfigManager's "updates" section (cross-
+     * process — the daemon honors it too). Reads call forceReload first (the
+     * web/daemon may have changed it) and run OFF the UI thread; writes go
+     * through setUpdateChannel on [avatarExecutor] — updateSection is a full
+     * JSON rewrite + potential IPC round-trip, which would ANR the looper.
+     * The UI flips optimistically and reverts on a failed write.
+     */
+    private fun setupChannelToggle(view: View) {
+        val group = view.findViewById<com.google.android.material.button.MaterialButtonToggleGroup>(
+            R.id.toggleUpdateChannel)
+        val desc = view.findViewById<TextView>(R.id.tvChannelDesc)
+        val executor = avatarExecutor
+            ?: Executors.newSingleThreadExecutor().also { avatarExecutor = it }
+
+        // Guard so the programmatic check() during seeding doesn't fire the
+        // listener and trigger a redundant (or racing) write.
+        var suppressListener = true
+
+        fun applyDesc(channel: String) {
+            desc.setText(
+                if (channel == AppUpdater.CHANNEL_BRAVEHEART)
+                    R.string.settings_update_channel_braveheart_desc
+                else R.string.settings_update_channel_alpha_desc
+            )
+        }
+
+        // Seed from current config off-thread, then bind on the UI thread.
+        executor.execute {
+            com.overdrive.app.config.UnifiedConfigManager.forceReload()
+            val current = com.overdrive.app.config.UnifiedConfigManager.getUpdateChannel()
+            mainHandler.post {
+                if (!isAdded || view.parent == null) return@post
+                suppressListener = true
+                group.check(
+                    if (current == AppUpdater.CHANNEL_BRAVEHEART) R.id.btnChannelBraveheart
+                    else R.id.btnChannelAlpha
+                )
+                applyDesc(current)
+                suppressListener = false
+            }
+        }
+
+        group.addOnButtonCheckedListener { _, checkedId, isChecked ->
+            if (!isChecked || suppressListener) return@addOnButtonCheckedListener
+            val channel = if (checkedId == R.id.btnChannelBraveheart)
+                AppUpdater.CHANNEL_BRAVEHEART else AppUpdater.CHANNEL_ALPHA
+            applyDesc(channel)
+            executor.execute {
+                val ok = com.overdrive.app.config.UnifiedConfigManager.setUpdateChannel(channel)
+                if (ok && channel == AppUpdater.CHANNEL_BRAVEHEART) {
+                    // Braveheart = beta: warn about instability + how to report.
+                    mainHandler.post {
+                        if (!isAdded) return@post
+                        Toast.makeText(requireContext(),
+                            R.string.settings_update_channel_braveheart_toast, Toast.LENGTH_LONG).show()
+                    }
+                }
+                if (!ok) {
+                    mainHandler.post {
+                        if (!isAdded) return@post
+                        Toast.makeText(requireContext(),
+                            R.string.settings_update_channel_save_failed, Toast.LENGTH_SHORT).show()
+                        // Revert to the persisted value.
+                        com.overdrive.app.config.UnifiedConfigManager.forceReload()
+                        val reverted = com.overdrive.app.config.UnifiedConfigManager.getUpdateChannel()
+                        suppressListener = true
+                        group.check(
+                            if (reverted == AppUpdater.CHANNEL_BRAVEHEART) R.id.btnChannelBraveheart
+                            else R.id.btnChannelAlpha
+                        )
+                        applyDesc(reverted)
+                        suppressListener = false
+                    }
+                }
+            }
+        }
     }
 
     override fun onDestroyView() {

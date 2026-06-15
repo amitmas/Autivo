@@ -60,10 +60,50 @@ public final class ClusterMapProjector {
     private static final int READY_POLL_MS = 250;
     private static final int READY_TIMEOUT_MS = 8000;
 
+    // Post-launch verify+retry budget. `am start` exits 0 on ACCEPT, not on RESUMED-
+    // on-display, so we confirm the Activity actually reached the foreground of the
+    // cluster display and re-launch if it lost the resume race (see launchMapOnDisplay).
+    // Total worst case ≈ ATTEMPTS × POLLS_PER_ATTEMPT × POLL_MS = 3 × 6 × 300 ≈ 5.4s,
+    // comfortably inside the drive and never blocking the BS loop / GL thread (this all
+    // runs on the ClusterMapLaunch thread). Each tick re-checks `active` so a stop()/
+    // ACC-off aborts immediately.
+    private static final int LAUNCH_VERIFY_ATTEMPTS = 3;
+    private static final int LAUNCH_VERIFY_POLLS_PER_ATTEMPT = 6;
+    private static final int LAUNCH_VERIFY_POLL_MS = 300;
+
+    // UCM coordination flag (navMap.clusterMapActive) the launched cluster Activity
+    // polls to self-finish. The daemon (uid 2000) can't call finish() on a uid-1000
+    // Activity, and the OEM projection close (18→0) deliberately never destroys the
+    // fission VirtualDisplay (opcode 1 is forbidden — it poisons teardown), so the
+    // Activity's onDisplayRemoved self-finish NEVER fires on a normal stop. Result:
+    // a stopped map Activity stays parked on the still-alive fission display and
+    // RE-SURFACES under the partial blind-spot card the next time a turn signal
+    // re-opens the SAME projection — the "map shows on the cluster even though map
+    // projection is disabled" bug. Fix mirrors the proven DeterrentActivity pattern:
+    // start() sets the flag true, stop()/abort sets it false, and RoadSense(Cluster)
+    // MapActivity polls UCM and finishAndRemoveTask() when it reads false. Lives in
+    // the navMap section alongside autoProjectCluster.
+    private static final String NAVMAP_SECTION = "navMap";
+    private static final String K_CLUSTER_MAP_ACTIVE = "clusterMapActive";
+
     private static volatile boolean active = false;
     private static Thread launchThread;
 
     private ClusterMapProjector() {}
+
+    /** Publish the cluster-map-active coordination flag the launched Activity polls
+     *  to self-finish (see {@link #K_CLUSTER_MAP_ACTIVE}). Best-effort; a missed
+     *  write just leaves the Activity parked-but-invisible (same as the old
+     *  behaviour) and never blanks gauges. Off the synchronized critical section. */
+    private static void publishActiveFlag(boolean activeFlag) {
+        try {
+            java.util.Map<String, Object> m = new java.util.HashMap<>();
+            m.put(K_CLUSTER_MAP_ACTIVE, activeFlag);
+            com.overdrive.app.config.UnifiedConfigManager.updateValues(NAVMAP_SECTION, m);
+        } catch (Throwable t) {
+            logger.warn("publishActiveFlag(" + activeFlag + ") failed: " + t.getMessage());
+        }
+    }
 
     /** True while the map is (being) projected onto the cluster. */
     public static boolean isActive() { return active; }
@@ -77,6 +117,9 @@ public final class ClusterMapProjector {
         if (active) return;
         active = true;
         logger.info("cluster map projection: start");
+        // Mark active BEFORE launch so the Activity's first poll sees true and
+        // doesn't immediately self-finish on a fast startup.
+        publishActiveFlag(true);
         try {
             ClusterProjectionController.getInstance().acquireSustained();
         } catch (Throwable t) {
@@ -87,11 +130,18 @@ public final class ClusterMapProjector {
         launchThread.start();
     }
 
-    /** Stop projecting: release the sustained hold; the controller restores gauges. */
+    /** Stop projecting: release the sustained hold (the controller restores gauges)
+     *  AND signal the launched cluster Activity to finish itself. Without the
+     *  finish signal the Activity stays parked on the still-alive fission display
+     *  and re-surfaces under the blind-spot card on the next turn-signal projection
+     *  open — the "map shows on the cluster even when disabled" bug. */
     public static synchronized void stop() {
         if (!active) return;
         active = false;
         logger.info("cluster map projection: stop");
+        // Tell the cluster Activity to finish (it polls navMap.clusterMapActive).
+        // Done first so the Activity is dismissed even if releaseSustained throws.
+        publishActiveFlag(false);
         try {
             ClusterProjectionController.getInstance().releaseSustained();
         } catch (Throwable t) {
@@ -124,6 +174,7 @@ public final class ClusterMapProjector {
             logger.warn("fission display not resolved (>0) in " + READY_TIMEOUT_MS
                     + "ms — aborting cluster map projection (no clobber of display 0)");
             active = false;
+            publishActiveFlag(false);   // dismiss any Activity that did come up
             try { com.overdrive.app.surveillance.ClusterProjectionController.getInstance().releaseSustained(); }
             catch (Throwable ignored) {}
             return;
@@ -132,6 +183,9 @@ public final class ClusterMapProjector {
         // launch the Activity if the projection was torn down in the meantime.
         if (!active) {
             logger.info("stop() raced the display resolve — skipping cluster map launch");
+            // stop() already cleared the flag; re-assert to cover a launch that
+            // slipped onto the display just before this guard.
+            publishActiveFlag(false);
             return;
         }
         launchMapOnDisplay(displayId);
@@ -188,8 +242,59 @@ public final class ClusterMapProjector {
         return -1;
     }
 
-    /** am start --display N the map Activity, telling it it's on the cluster. */
+    /**
+     * {@code am start --display N} the map Activity onto the cluster, then VERIFY it
+     * actually reached the foreground on that display — RETRYING if it didn't.
+     *
+     * <p>WHY (root cause of "map didn't project until a later restart"): {@code am
+     * start} returns exit 0 as soon as AMS ACCEPTS the launch — NOT when the Activity
+     * is RESUMED on the target display. On a contended ACC-on edge (observed on-car:
+     * the daemon was simultaneously finalizing recordings + auto-disabling
+     * surveillance at the exact ACC-on instant the map launched), the cluster map
+     * Activity could lose the resume race to the head-unit launcher/home that owns
+     * the fission display, ending up PAUSED/STOPPED behind it — the projection is
+     * "OPEN + ready (sustained)" and {@code am start} exited 0, yet nothing renders.
+     * A clean restart later won the race, which is why "it worked after 2-3 hrs".
+     *
+     * <p>Fix: after each launch, poll {@code dumpsys activity activities} to confirm
+     * OUR component is the RESUMED activity on {@code displayId}; if not, re-issue the
+     * launch (NEW_TASK + the cluster extra is idempotent — singleInstance just
+     * re-resumes the existing task) up to {@link #LAUNCH_VERIFY_ATTEMPTS} times. Every
+     * iteration re-checks {@link #active} so a stop()/ACC-off that raced in aborts the
+     * retry immediately (never fights the gauge-restore). All on the ClusterMapLaunch
+     * thread (off the 250ms BS loop / GL thread). On a genuine non-fission trim we
+     * never get here (waitAndLaunch already aborted on displayId<=0).
+     */
     private static void launchMapOnDisplay(int displayId) {
+        for (int attempt = 1; active && attempt <= LAUNCH_VERIFY_ATTEMPTS; attempt++) {
+            if (!issueLaunch(displayId, attempt)) {
+                // am start itself failed (non-zero exit / exception). Brief backoff
+                // then retry — a transient AMS hiccup during the ACC-on storm.
+                if (!sleepWhileActive(LAUNCH_VERIFY_POLL_MS)) return;
+                continue;
+            }
+            // Give AMS a moment to resume the Activity, then verify foreground-on-display.
+            for (int poll = 0; active && poll < LAUNCH_VERIFY_POLLS_PER_ATTEMPT; poll++) {
+                if (!sleepWhileActive(LAUNCH_VERIFY_POLL_MS)) return;
+                if (isMapResumedOnDisplay(displayId)) {
+                    logger.info("cluster map RESUMED on displayId " + displayId
+                            + " (attempt " + attempt + ")");
+                    return;
+                }
+            }
+            logger.warn("cluster map NOT resumed on displayId " + displayId
+                    + " after attempt " + attempt + " (likely lost the resume race to the "
+                    + "head-unit home) — re-launching");
+        }
+        if (active) {
+            logger.warn("cluster map failed to reach foreground on displayId " + displayId
+                    + " after " + LAUNCH_VERIFY_ATTEMPTS + " attempts — giving up "
+                    + "(projection stays up; gauges restore on the normal stop/ACC-off path)");
+        }
+    }
+
+    /** Issue one {@code am start --display N}. Returns true iff the command exited 0. */
+    private static boolean issueLaunch(int displayId, int attempt) {
         try {
             String[] cmd = {
                 "am", "start",
@@ -199,14 +304,72 @@ public final class ClusterMapProjector {
                 "--ez", "cluster", "true",   // RoadSenseMapActivity reads this → cluster view
                 "-n", MAP_ACTIVITY
             };
-            logger.info("launching map onto displayId " + displayId);
+            logger.info("launching map onto displayId " + displayId + " (attempt " + attempt + ")");
             Process proc = Runtime.getRuntime().exec(cmd);
             proc.waitFor();
             if (proc.exitValue() != 0) {
                 logger.warn("am start --display " + displayId + " exited " + proc.exitValue());
+                return false;
             }
+            return true;
         } catch (Throwable t) {
             logger.warn("launchMapOnDisplay failed: " + t.getMessage());
+            return false;
         }
+    }
+
+    /**
+     * True iff our cluster map component is the RESUMED activity on {@code displayId}
+     * per {@code dumpsys activity activities}. We scan for the "Display #N" block and,
+     * within it, a ResumedActivity line naming our component. Robust to per-build
+     * dumpsys layout: we accept a match when, after the target display header and
+     * before the next "Display #" header, a line contains both "ResumedActivity" and
+     * our class. Conservative — any parse failure returns false (→ retry), never a
+     * false positive that would mask a real no-show.
+     */
+    private static boolean isMapResumedOnDisplay(int displayId) {
+        Process p = null;
+        try {
+            p = new ProcessBuilder("dumpsys", "activity", "activities")
+                    .redirectErrorStream(true).start();
+            java.io.BufferedReader r = new java.io.BufferedReader(
+                    new java.io.InputStreamReader(p.getInputStream()));
+            String line;
+            boolean inTargetDisplay = false;
+            String displayHeader = "display #" + displayId;
+            while ((line = r.readLine()) != null) {
+                String low = line.toLowerCase(java.util.Locale.US);
+                int hdr = low.indexOf("display #");
+                if (hdr >= 0) {
+                    // Entering a display block — is it ours? (match "display #1" exactly,
+                    // not "display #10"+).
+                    inTargetDisplay = low.startsWith(displayHeader, hdr)
+                            && !Character.isDigit(charAt(low, hdr + displayHeader.length()));
+                    continue;
+                }
+                if (inTargetDisplay
+                        && low.contains("resumedactivity")
+                        && low.contains("roadsenseclustermapactivity")) {
+                    return true;
+                }
+            }
+        } catch (Throwable t) {
+            logger.debug("isMapResumedOnDisplay failed: " + t.getMessage());
+        } finally {
+            if (p != null) try { p.destroy(); } catch (Throwable ignored) {}
+        }
+        return false;
+    }
+
+    private static char charAt(String s, int i) {
+        return (i >= 0 && i < s.length()) ? s.charAt(i) : ' ';
+    }
+
+    /** Sleep {@code ms}, returning false if the projection was stopped meanwhile (so
+     *  the caller aborts the retry loop immediately rather than fighting a teardown). */
+    private static boolean sleepWhileActive(int ms) {
+        if (!active) return false;
+        try { Thread.sleep(ms); } catch (InterruptedException e) { return false; }
+        return active;
     }
 }

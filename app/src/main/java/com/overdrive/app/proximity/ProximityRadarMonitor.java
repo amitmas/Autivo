@@ -56,7 +56,24 @@ public class ProximityRadarMonitor {
     // Sensor state tracking
     private final int[] sensorStates = new int[RadarConstants.SENSOR_COUNT];
     private boolean isTriggered = false;
-    
+
+    // Per-sensor "trustworthy" flag. A sensor's cached state may participate in
+    // the trigger scan ONLY after we've observed it deliver at least one real
+    // onRadarProbeStateChanged event since listening started.
+    //
+    // Why: the boot/initial snapshot from getAllRadarProbeStates() is unreliable
+    // while the radar is still spinning up — on-car we saw [1,3,1,1,1,1,1,1,1]
+    // (seven sensors ABNORMAL, one phantom YELLOW) captured before the radar
+    // settled. The phantom YELLOW never produced a change event (correctly — the
+    // HAL is edge-driven and nothing physically changed), so if we let that
+    // snapshot value arm the trigger it poisons the all-sensor OR-scan forever:
+    // checkTriggerCondition() stays true, the safe edge is unreachable, and
+    // recording runs until an unrelated gear->P teardown. Requiring a real
+    // observed event before trusting a sensor means a stale snapshot can never
+    // arm a trigger that can't later be cleared. The listener was working fine;
+    // this is purely our own logic not to trust un-observed state.
+    private final boolean[] sensorObserved = new boolean[RadarConstants.SENSOR_COUNT];
+
     // Debouncing
     private long lastTriggerTime = 0;
     private long lastSafeTime = 0;
@@ -66,6 +83,7 @@ public class ProximityRadarMonitor {
         this.context = context;
         this.triggerLevel = triggerLevel;
         Arrays.fill(sensorStates, RadarConstants.STATE_SAFE);
+        Arrays.fill(sensorObserved, false);
     }
     
     /**
@@ -140,6 +158,7 @@ public class ProximityRadarMonitor {
             radarDevice = null;
             radarListener = null;
             Arrays.fill(sensorStates, RadarConstants.STATE_SAFE);
+            Arrays.fill(sensorObserved, false);
             isTriggered = false;
         }
     }
@@ -187,9 +206,16 @@ public class ProximityRadarMonitor {
                     sensorStates[i] = states[i];
                 }
                 logger.info("Initial radar states: " + Arrays.toString(states));
-                
-                // Check if already triggered
-                checkTriggerCondition();
+
+                // NOTE: we intentionally do NOT mark these sensors as observed
+                // and do NOT arm a trigger from this snapshot. The boot snapshot
+                // is unreliable while the radar is still spinning up (observed
+                // [1,3,1,1,1,1,1,1,1] — a phantom YELLOW on one sensor that never
+                // produced a real change event). A sensor's state only becomes
+                // trigger-eligible once it delivers a genuine onRadarProbeStateChanged
+                // event (see sensorObserved / onRadarEvent). Trusting a stale
+                // snapshot value here is exactly what made the trigger latch
+                // un-clearable and recording run forever.
             }
         } catch (Exception e) {
             logger.warn("Could not get initial radar states: " + e.getMessage());
@@ -206,12 +232,14 @@ public class ProximityRadarMonitor {
         }
         
         // Log all radar events for debugging
-        logger.debug("Radar event: area=" + RadarConstants.areaToString(area) + 
+        logger.debug("Radar event: area=" + RadarConstants.areaToString(area) +
                     " state=" + RadarConstants.stateToString(state));
-        
-        // Update sensor state
+
+        // Update sensor state. A real change event proves this sensor is live
+        // and reporting, so its state is now trustworthy for the trigger scan.
         sensorStates[area] = state;
-        
+        sensorObserved[area] = true;
+
         // Check trigger condition
         boolean wasTriggered = isTriggered;
         boolean nowTriggered = checkTriggerCondition();
@@ -259,12 +287,22 @@ public class ProximityRadarMonitor {
     
     /**
      * Check if any sensor meets the trigger condition.
-     * 
+     *
      * Note: ABNORMAL state (1) indicates sensor malfunction or ADAS shutdown (gear=P).
      * We don't trigger on ABNORMAL - it's expected when parking.
+     *
+     * Only sensors that have delivered a real event since listening started
+     * ({@link #sensorObserved}) participate. This prevents a stale/phantom value
+     * from the boot snapshot — which never produces a clearing event — from
+     * permanently pinning the aggregate condition true and making the safe edge
+     * unreachable.
      */
     private boolean checkTriggerCondition() {
-        for (int state : sensorStates) {
+        for (int i = 0; i < sensorStates.length; i++) {
+            if (!sensorObserved[i]) {
+                continue;  // un-observed sensor: snapshot value is not trustworthy
+            }
+            int state = sensorStates[i];
             if (triggerLevel == TriggerLevel.RED) {
                 // Only trigger on RED
                 if (state == RadarConstants.STATE_RED) {
@@ -279,22 +317,26 @@ public class ProximityRadarMonitor {
         }
         return false;
     }
-    
+
     /**
-     * Get the highest trigger level currently detected.
+     * Get the highest trigger level currently detected (observed sensors only).
      */
     private String getHighestTriggerLevel() {
         boolean hasRed = false;
         boolean hasYellow = false;
-        
-        for (int state : sensorStates) {
+
+        for (int i = 0; i < sensorStates.length; i++) {
+            if (!sensorObserved[i]) {
+                continue;
+            }
+            int state = sensorStates[i];
             if (state == RadarConstants.STATE_RED) {
                 hasRed = true;
             } else if (state == RadarConstants.STATE_YELLOW) {
                 hasYellow = true;
             }
         }
-        
+
         // Priority: RED > YELLOW > SAFE
         if (hasRed) return "RED";
         if (hasYellow) return "YELLOW";

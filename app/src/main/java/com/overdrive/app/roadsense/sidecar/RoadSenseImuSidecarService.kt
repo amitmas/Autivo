@@ -66,6 +66,15 @@ class RoadSenseImuSidecarService : Service(), SensorEventListener {
     private var batchStartMs = 0L
     @Volatile private var currentRate = ImuRate.FAST
 
+    // Persistent IPC socket to the daemon (SurveillanceIpcServer 19877). At ~10
+    // batches/sec (TARGET_BATCH_MS=100) a connect-per-batch was ~10 TCP
+    // handshakes/sec, every second, while driving. We now hold ONE socket and
+    // stream batches over it; the daemon server loops per-connection, so this is
+    // zero connects in steady state. Only touched on ioHandler's single thread
+    // (flush/sendLine + the posted close in onDestroy), so no locking needed.
+    private var ipcSocket: Socket? = null
+    private var ipcOut: OutputStream? = null
+
     enum class ImuRate { FAST, SLOW }
 
     override fun onCreate() {
@@ -91,6 +100,9 @@ class RoadSenseImuSidecarService : Service(), SensorEventListener {
         super.onDestroy()
         try { sensorManager?.unregisterListener(this) } catch (_: Throwable) {}
         registeredRate = null
+        // Close the persistent IPC socket on the thread that owns it, before the
+        // looper quits. quitSafely() lets already-posted work (this close) run.
+        ioHandler?.post { closeIpcSocket() }
         ioThread?.quitSafely()
         ioThread = null
         ioHandler = null
@@ -171,25 +183,60 @@ class RoadSenseImuSidecarService : Service(), SensorEventListener {
         sendLine(line)
     }
 
-    /** One socket per batch, fire-and-forget — mirrors LocationSidecarService. */
+    /**
+     * Ship one batch over the PERSISTENT socket, reconnecting once on failure.
+     * Fire-and-forget: we don't read the daemon's ack (newline-delimited write
+     * is all the server needs). Runs on ioHandler's thread only.
+     */
     private fun sendLine(line: String) {
-        var socket: Socket? = null
+        val payload = (line + "\n").toByteArray()  // newline-delimit so the server's readLine() frames it
+        // First attempt on the existing connection; if the write fails (daemon
+        // restarted / socket reset), reconnect once and retry. A failure after
+        // reconnect just drops the batch — the next batch reconnects again.
+        if (writeWithReconnect(payload, allowReconnect = true)) return
+    }
+
+    /** @return true if the payload was written. */
+    private fun writeWithReconnect(payload: ByteArray, allowReconnect: Boolean): Boolean {
         try {
-            socket = Socket()
-            socket.connect(InetSocketAddress("127.0.0.1", DAEMON_IPC_PORT), 1000)
-            socket.soTimeout = 1000
-            val out: OutputStream = socket.getOutputStream()
-            out.write(line.toByteArray())
-            out.flush()
-            // Daemon replies with a JSON ack; we don't need it. Closing without
-            // reading is fine for localhost.
+            if (ipcSocket == null) {
+                if (!allowReconnect) return false
+                if (!openIpcSocket()) return false
+            }
+            ipcOut!!.write(payload)
+            ipcOut!!.flush()
+            return true
         } catch (_: java.net.ConnectException) {
             // Daemon not up yet / restarting — expected transient, drop the batch.
+            closeIpcSocket()
+            return false
         } catch (_: Throwable) {
-            // Never let IPC trouble crash the sensor pump.
-        } finally {
-            try { socket?.close() } catch (_: Throwable) {}
+            // Socket went bad (daemon restart, reset). Drop this connection and,
+            // if we haven't already retried, reconnect once and retry the write.
+            closeIpcSocket()
+            return if (allowReconnect) writeWithReconnect(payload, allowReconnect = false) else false
         }
+    }
+
+    private fun openIpcSocket(): Boolean {
+        return try {
+            val s = Socket()
+            s.connect(InetSocketAddress("127.0.0.1", DAEMON_IPC_PORT), 1000)
+            s.soTimeout = 1000
+            s.tcpNoDelay = true
+            ipcSocket = s
+            ipcOut = s.getOutputStream()
+            true
+        } catch (_: Throwable) {
+            closeIpcSocket()
+            false
+        }
+    }
+
+    private fun closeIpcSocket() {
+        try { ipcSocket?.close() } catch (_: Throwable) {}
+        ipcSocket = null
+        ipcOut = null
     }
 
     private fun wallClockFromElapsed(elapsedNs: Long): Long {

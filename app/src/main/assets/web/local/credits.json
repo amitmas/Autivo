@@ -6,7 +6,8 @@
     { "name": "Giovanni Mirulla", "github": "giovannimirulla" },
     { "name": "Galalike", "github": "Galalike" },
     { "name": "jkaberg", "github": "jkaberg" },
-    { "name": "Chiira", "github": "IOKernel" }
+    { "name": "Chiira", "github": "IOKernel" },
+    { "name": "tiagoclc", "github": "tiagoclc" }
   ],
   "supporters": [
     { "name": "Oizopower" },
@@ -27,6 +28,8 @@
     { "name": "John Shea" },
     { "name": "José Carlos" },
     { "name": "Xavier Colin" },
-    { "name": "Eugene Teo Jin Kiat" }
+    { "name": "Eugene Teo Jin Kiat" },
+    { "name": "Jan Bleckmann" },
+    { "name": "Syed Arslan Haider" }
   ]
 }

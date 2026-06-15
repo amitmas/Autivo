@@ -101,7 +101,12 @@
     "mqtt_not_initialized": "MQTT ยังไม่เริ่มทำงาน",
     "max_connections_reached": "เชื่อมต่อเต็มจำนวนแล้ว ({0})",
     "missing_connection_id": "ขาด ID เชื่อมต่อ",
-    "connection_not_found": "ไม่พบการเชื่อมต่อ: {0}"
+    "connection_not_found": "ไม่พบการเชื่อมต่อ: {0}",
+    "update_invalid_channel": "ช่องทางการอัปเดตไม่ถูกต้อง",
+    "update_channel_write_failed": "ไม่สามารถบันทึกช่องทางการอัปเดตได้",
+    "update_channel_tag_mismatch": "เวอร์ชันนั้นอยู่ในช่องทางอื่น โปรดเปลี่ยนช่องทางก่อน",
+    "logs_upload_unavailable": "การอัปโหลดบันทึกไม่สามารถใช้งานได้ในบิลด์นี้",
+    "logs_unknown_daemon": "เดมอนไม่รู้จัก ลอง: {0}"
   },
   "notifications": {
     "charging_started": "เริ่มชาร์จ",

@@ -4,20 +4,22 @@ import com.overdrive.app.daemon.CameraDaemon;
 
 import org.json.JSONObject;
 
-import java.io.BufferedReader;
-import java.io.InputStreamReader;
-import java.io.PrintWriter;
-import java.net.Socket;
-
 /**
- * Battery Monitor - fetches battery info from SurveillanceIpcServer.
- * 
+ * Battery Monitor - reads battery info from VehicleDataMonitor.
+ *
  * This class provides battery data to the HTTP status API for HTML UI display.
- * It queries the SurveillanceIpcServer (port 19877) for real-time battery telemetry.
+ *
+ * <p>It runs INSIDE the CameraDaemon process (HttpServer.sendStatus calls
+ * {@link #getBatteryInfo()} on a daemon HTTP worker thread). VehicleDataMonitor —
+ * the source of truth — is a singleton in that SAME process. Previously this
+ * opened a TCP socket to 127.0.0.1:19877 (SurveillanceIpcServer, also in this
+ * process) and sent GET_VEHICLE_DATA, i.e. a full TCP connect+handshake+teardown
+ * just to call a same-process singleton whose handler is literally
+ * {@code VehicleDataMonitor.getInstance().getAllData()}. We now call that
+ * directly — no socket, no loopback stack, no IPC server thread.
  */
 public class BatteryMonitor {
 
-    private static final int SURVEILLANCE_IPC_PORT = 19877;
     private static volatile double lastBatteryVoltage = 0.0;
     private static volatile String lastBatteryLevel = "UNKNOWN";
     private static volatile double lastBatterySoc = 0.0;
@@ -42,57 +44,43 @@ public class BatteryMonitor {
      */
     public static void fetchBatteryInfo() {
         try {
-            Socket socket = new Socket("127.0.0.1", SURVEILLANCE_IPC_PORT);
-            socket.setSoTimeout(3000);
-            
-            BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-            PrintWriter writer = new PrintWriter(socket.getOutputStream(), true);
-            
-            // Send GET_VEHICLE_DATA command to get all data
-            writer.println("{\"command\":\"GET_VEHICLE_DATA\"}");
-            
-            String response = reader.readLine();
-            if (response != null) {
-                JSONObject result = new JSONObject(response);
-                
-                if (result.optBoolean("success", false)) {
-                    JSONObject data = result.optJSONObject("data");
-                    
-                    if (data != null) {
-                        // Get battery power voltage (actual volts)
-                        JSONObject batteryPower = data.optJSONObject("batteryPower");
-                        if (batteryPower != null) {
-                            lastBatteryVoltage = batteryPower.optDouble("voltageVolts", 0.0);
-                        }
-                        
-                        // Get battery voltage level (LOW/NORMAL/INVALID)
-                        JSONObject batteryVoltage = data.optJSONObject("batteryVoltage");
-                        if (batteryVoltage != null) {
-                            String apiLevel = batteryVoltage.optString("levelName", "UNKNOWN");
-                            // If BYD API returns INVALID, derive level from actual voltage
-                            if ("INVALID".equals(apiLevel) || "UNKNOWN".equals(apiLevel)) {
-                                lastBatteryLevel = deriveLevelFromVoltage(lastBatteryVoltage);
-                            } else {
-                                lastBatteryLevel = apiLevel;
-                            }
-                        } else {
-                            // No API data, derive from voltage
-                            lastBatteryLevel = deriveLevelFromVoltage(lastBatteryVoltage);
-                        }
-                        
-                        // Get battery SOC percentage
-                        JSONObject batterySoc = data.optJSONObject("batterySoc");
-                        if (batterySoc != null) {
-                            lastBatterySoc = batterySoc.optDouble("socPercent", 0.0);
-                        }
-                        
-                        lastBatteryUpdate = System.currentTimeMillis();
-                        CameraDaemon.log("Battery updated: " + lastBatteryVoltage + "V (" + lastBatteryLevel + "), SOC: " + lastBatterySoc + "%");
-                    }
+            // Direct same-process read — VehicleDataMonitor is the singleton the
+            // SurveillanceIpcServer's GET_VEHICLE_DATA handler delegates to, and
+            // we run in the same process, so skip the loopback socket entirely.
+            JSONObject data =
+                com.overdrive.app.monitor.VehicleDataMonitor.getInstance().getAllData();
+
+            if (data != null) {
+                // Get battery power voltage (actual volts)
+                JSONObject batteryPower = data.optJSONObject("batteryPower");
+                if (batteryPower != null) {
+                    lastBatteryVoltage = batteryPower.optDouble("voltageVolts", 0.0);
                 }
+
+                // Get battery voltage level (LOW/NORMAL/INVALID)
+                JSONObject batteryVoltage = data.optJSONObject("batteryVoltage");
+                if (batteryVoltage != null) {
+                    String apiLevel = batteryVoltage.optString("levelName", "UNKNOWN");
+                    // If BYD API returns INVALID, derive level from actual voltage
+                    if ("INVALID".equals(apiLevel) || "UNKNOWN".equals(apiLevel)) {
+                        lastBatteryLevel = deriveLevelFromVoltage(lastBatteryVoltage);
+                    } else {
+                        lastBatteryLevel = apiLevel;
+                    }
+                } else {
+                    // No API data, derive from voltage
+                    lastBatteryLevel = deriveLevelFromVoltage(lastBatteryVoltage);
+                }
+
+                // Get battery SOC percentage
+                JSONObject batterySoc = data.optJSONObject("batterySoc");
+                if (batterySoc != null) {
+                    lastBatterySoc = batterySoc.optDouble("socPercent", 0.0);
+                }
+
+                lastBatteryUpdate = System.currentTimeMillis();
+                CameraDaemon.log("Battery updated: " + lastBatteryVoltage + "V (" + lastBatteryLevel + "), SOC: " + lastBatterySoc + "%");
             }
-            
-            socket.close();
         } catch (Exception e) {
             CameraDaemon.log("Battery info fetch: " + e.getMessage());
         }

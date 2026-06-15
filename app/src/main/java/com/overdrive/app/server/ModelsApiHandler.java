@@ -369,14 +369,13 @@ public class ModelsApiHandler {
      * or the manifest can't be read. Used by SohEstimator as a stronger-
      * than-heuristic capacity hint.
      *
-     * <p>For PHEV models the manifest carries BOTH {@code nominalKwh} (gross
-     * nameplate, e.g. 18.3) and {@code usableKwh} (usable EV-only frame, e.g.
-     * 15.2). The SOH/live formula compares {@code remainKwh / SOC} against this
-     * value, and the BMS reports {@code remainKwh} in the USABLE frame on Blade
-     * DM-i packs — so we MUST return the usable value when present, or a healthy
-     * pack reads ~83% SOH (15.2/18.3) and the frame-mismatch banner fires on a
-     * non-degraded battery. BEV models declare only {@code nominalKwh} (gross =
-     * usable for the SOH formula's purposes) and fall through to it.
+     * <p>This is always the GROSS nameplate ({@code nominalKwh}) for every
+     * drivetrain. The PHEV {@code remainKwh} is corrected to the gross frame at
+     * the read boundary (see {@code BydDataCollector.PHEV_ENERGY_HALF_SCALE_CORRECTION}
+     * — the BYD HAL reports PHEV energy at half scale), so the SOH/live formula's
+     * {@code remainKwh / SOC} is already gross-framed and its nominal must be gross
+     * too. (There is no separate "usable frame" — that was a rationalization of the
+     * same half-scale HAL artifact and has been removed.)
      */
     public static double nominalKwhForSelectedModel() {
         try {
@@ -386,10 +385,6 @@ public class ModelsApiHandler {
             if (manifest == null) return 0;
             JSONObject m = findModel(manifest, modelId);
             if (m == null) return 0;
-            // Prefer the usable frame (PHEV) — it matches the BMS remainKwh frame
-            // the SOH formula consumes. Falls back to gross nominal for BEVs.
-            double usable = m.optDouble("usableKwh", 0);
-            if (usable > 0) return usable;
             return m.optDouble("nominalKwh", 0);
         } catch (Throwable t) {
             return 0;
@@ -397,10 +392,11 @@ public class ModelsApiHandler {
     }
 
     /**
-     * Gross nameplate capacity (kWh) for the selected model — always the
-     * {@code nominalKwh} field, never the usable frame. Use for user-facing
-     * "pack size" display where the nameplate number is expected; the SOH
-     * pipeline uses {@link #nominalKwhForSelectedModel()} (usable) instead.
+     * Gross nameplate capacity (kWh) for the selected model — the {@code nominalKwh}
+     * field. Identical to {@link #nominalKwhForSelectedModel()} now that the SOH
+     * pipeline is gross-framed on every drivetrain; kept as a distinct name for
+     * call sites (e.g. the capacity-Ah anchor) that explicitly mean "gross
+     * nameplate for the physical coulomb-count comparison".
      */
     public static double grossNameplateKwhForSelectedModel() {
         try {

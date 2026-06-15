@@ -1016,6 +1016,41 @@ class WebViewFragment : Fragment() {
         }
 
         /**
+         * Start/stop the app-side RoadSense floating overlay to match the just-saved
+         * roadSense.overlayVisible (and master enabled) flags, without waiting for the
+         * next Activity onResume. The RoadSense web tab calls this after toggling the
+         * "Show overlay" switch so the pill/card appears or disappears instantly.
+         * Mirrors syncBlindSpotOverlay; uses overlayShouldShow() so hiding the overlay
+         * never touches detection/audio/crowdsource (all daemon-side). forceReload so the
+         * value we just wrote (app UID) is read back fresh. Posts to the UI thread —
+         * start/stopService must run on the main looper, and bridge calls arrive on a
+         * WebView worker thread.
+         */
+        @android.webkit.JavascriptInterface
+        fun syncRoadSenseOverlay(): String {
+            return try {
+                val ctx = context ?: return "no_context"
+                val shouldShow = com.overdrive.app.roadsense.config.RoadSenseConfig
+                    .snapshot(forceReload = true).overlayShouldShow()
+                ctx.mainExecutor.execute {
+                    try {
+                        if (shouldShow) {
+                            com.overdrive.app.roadsense.overlay.RoadSenseOverlayService.startIfPermitted(ctx)
+                        } else {
+                            com.overdrive.app.roadsense.overlay.RoadSenseOverlayService.stop(ctx)
+                        }
+                    } catch (e: Exception) {
+                        android.util.Log.w("WebViewFragment", "syncRoadSenseOverlay apply failed: ${e.message}")
+                    }
+                }
+                "ok"
+            } catch (e: Exception) {
+                android.util.Log.w("WebViewFragment", "syncRoadSenseOverlay bridge failed: ${e.message}")
+                "error"
+            }
+        }
+
+        /**
          * Launch the native RoadSense hazard map (GPU MapLibre Activity). Called
          * from the RoadSense web tab's "View Hazard Map" action. The map can't be
          * a WebView page — MapLibre GL needs WebGL2/modern Chrome the head-unit

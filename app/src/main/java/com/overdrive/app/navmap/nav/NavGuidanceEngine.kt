@@ -45,24 +45,63 @@ class NavGuidanceEngine {
 
         /**
          * Distance (meters) from the destination within which arrival is
-         * declared.
+         * declared. Sized for head-unit GPS (which can sit 20-30 m off the true
+         * position): too tight and the car parks "near" the pin without ever
+         * tripping arrival, so guidance keeps hunting a reroute around the last
+         * block. The Activity adds a speed-gated near-stop arrival on top.
          */
-        const val ARRIVAL_RADIUS_M = 25.0
+        const val ARRIVAL_RADIUS_M = 35.0
+
+        /** Lateral off-route distance (m) for the adaptive latch — tighter than the
+         *  legacy 50m because the heading gate + time budget now guard false trips. */
+        private const val OFF_ROUTE_LATERAL_M = 38.0
+        /** Heading divergence (deg) from the route tangent that counts as "wrong way". */
+        private const val OFF_ROUTE_HEADING_DEG = 45.0
+        /** Min lateral distance (m) before the heading gate engages (avoids tripping
+         *  on a normal lane offset while still pointed down the road). */
+        private const val HEADING_GATE_MIN_LATERAL_M = 14.0
+        /** Off-route confirm time budgets (ms), by severity of the divergence. */
+        private const val OFF_ROUTE_MS_WRONG_WAY = 1500L   // far + pointed away → fast
+        private const val OFF_ROUTE_MS_DIVERGING = 2000L   // far, heading unknown
+        private const val OFF_ROUTE_MS_DEFAULT = 3000L     // city default
+        private const val OFF_ROUTE_MS_HIGHWAY = 6000L     // ≥80 km/h → patient (ramps)
+        private const val HIGHWAY_SPEED_MPS = 22.2         // ~80 km/h
+        /** Forward search window (segments) for the monotonic matcher. */
+        private const val MATCH_FWD_WINDOW = 16
+        /** Allowed backward search (segments) — small, to recover from a bad fix
+         *  without letting the match jump back on a parallel/return leg. */
+        private const val MATCH_BACK_WINDOW = 3
+
+        /**
+         * Remaining along-route distance (m) within which a reroute is pointless:
+         * the driver is on the final approach, so a GPS wander that looks like an
+         * off-route excursion must NOT trigger a recompute (it would route the car
+         * in a loop around its own destination). Off-route latching is suppressed
+         * inside this band — guidance just waits for arrival. Sized to cover the
+         * whole "final 50-100 m" approach where a recompute is never useful.
+         */
+        const val NEAR_DEST_NO_REROUTE_M = 90.0
     }
 
     private var route: NavRoute? = null
 
-    /** Count of consecutive fixes whose route distance exceeded the threshold. */
+    /** Count of consecutive fixes whose route distance exceeded the threshold
+     *  (legacy count-based latch, used by the no-bearing update overload). */
     private var consecutiveOffRoute = 0
 
+    /** Carried matched-segment index for the windowed monotonic matcher (−1 = none). */
+    private var matchedSegIndex = -1
+    /** elapsedRealtime ms when the current off-route divergence began (0 = on route). */
+    private var offRouteSinceMs = 0L
+
     /**
-     * Begin guidance along [route]. Resets the off-route debounce counter.
-     *
-     * @param route the active route to guide along
+     * Begin guidance along [route]. Resets all per-route latch + matcher state.
      */
     fun start(route: NavRoute) {
         this.route = route
         this.consecutiveOffRoute = 0
+        this.matchedSegIndex = -1
+        this.offRouteSinceMs = 0L
         Log.i(TAG, "guidance started: ${route.points.size} pts, ${route.maneuvers.size} maneuvers")
     }
 
@@ -70,6 +109,8 @@ class NavGuidanceEngine {
     fun stop() {
         this.route = null
         this.consecutiveOffRoute = 0
+        this.matchedSegIndex = -1
+        this.offRouteSinceMs = 0L
         Log.i(TAG, "guidance stopped")
     }
 
@@ -89,7 +130,18 @@ class NavGuidanceEngine {
      * @param lng fix longitude in decimal degrees
      * @return the guidance state for this fix
      */
-    fun update(lat: Double, lng: Double): GuidanceState {
+    fun update(lat: Double, lng: Double): GuidanceState =
+        update(lat, lng, bearingDeg = null, speedMps = 0.0, nowMs = 0L)
+
+    /**
+     * Richer update: same as [update] but with the fix's heading + speed + a
+     * monotonic clock, enabling the windowed map-matcher (forward-biased snap that
+     * resists back-snapping on self-crossing/parallel routes) and the adaptive
+     * off-route latch (a speed/heading-scaled time budget instead of a fixed
+     * consecutive-count). Pass nowMs=0 to use the legacy count-based latch
+     * (the no-arg [update] does this — keeps existing callers/tests unchanged).
+     */
+    fun update(lat: Double, lng: Double, bearingDeg: Double?, speedMps: Double, nowMs: Long): GuidanceState {
         val r = route ?: return GuidanceState(
             snappedLat = lat,
             snappedLng = lng,
@@ -110,32 +162,74 @@ class NavGuidanceEngine {
             return GuidanceState(lat, lng, false, arrived, null, 0.0, 0.0, 0.0)
         }
 
-        // 1) Snap to the nearest segment. Track which segment and how far along it.
+        // 1) Snap. Windowed monotonic match when we have a carried index: search a
+        //    forward window (+small back window) around it so the snap advances along
+        //    the route and doesn't jump to a nearer-but-earlier/parallel segment.
+        //    First fix (no carried index) falls back to a full global scan.
         var bestDist = Double.MAX_VALUE
         var bestSegStart = 0
         var bestT = 0.0
         var bestLat = pts[0].lat
         var bestLng = pts[0].lng
-        for (i in 0 until pts.size - 1) {
-            val a = pts[i]
-            val b = pts[i + 1]
+        val lo: Int
+        val hi: Int
+        if (matchedSegIndex in 0 until pts.size - 1) {
+            lo = (matchedSegIndex - MATCH_BACK_WINDOW).coerceAtLeast(0)
+            hi = (matchedSegIndex + MATCH_FWD_WINDOW).coerceAtMost(pts.size - 2)
+        } else { lo = 0; hi = pts.size - 2 }
+        for (i in lo..hi) {
+            val a = pts[i]; val b = pts[i + 1]
             val snap = pointToSegment(lat, lng, a.lat, a.lng, b.lat, b.lng)
             if (snap.distMeters < bestDist) {
-                bestDist = snap.distMeters
-                bestSegStart = i
-                bestT = snap.t
-                bestLat = snap.lat
-                bestLng = snap.lng
+                bestDist = snap.distMeters; bestSegStart = i; bestT = snap.t
+                bestLat = snap.lat; bestLng = snap.lng
             }
         }
-
-        // 2) Off-route debounce: latch true after N consecutive far fixes.
-        if (bestDist > OFF_ROUTE_THRESHOLD_M) {
-            consecutiveOffRoute++
-        } else {
-            consecutiveOffRoute = 0
+        // If the windowed match is poor (we likely diverged or the window was wrong),
+        // do ONE global rescan so a real reroute/teleport re-acquires correctly.
+        if (matchedSegIndex >= 0 && bestDist > OFF_ROUTE_LATERAL_M) {
+            for (i in 0 until pts.size - 1) {
+                val a = pts[i]; val b = pts[i + 1]
+                val snap = pointToSegment(lat, lng, a.lat, a.lng, b.lat, b.lng)
+                if (snap.distMeters < bestDist) {
+                    bestDist = snap.distMeters; bestSegStart = i; bestT = snap.t
+                    bestLat = snap.lat; bestLng = snap.lng
+                }
+            }
         }
-        val offRoute = consecutiveOffRoute >= OFF_ROUTE_CONSECUTIVE
+        matchedSegIndex = bestSegStart
+
+        // 2) Off-route detection.
+        var offRoute: Boolean
+        if (nowMs <= 0L) {
+            // Legacy count-based latch (no bearing supplied).
+            if (bestDist > OFF_ROUTE_THRESHOLD_M) consecutiveOffRoute++ else consecutiveOffRoute = 0
+            offRoute = consecutiveOffRoute >= OFF_ROUTE_CONSECUTIVE
+        } else {
+            // Adaptive latch: lateral distance AND (when far enough) a heading that
+            // diverges from the route tangent, confirmed over a speed-scaled time
+            // budget. Wrong-way trips fast; highway is patient (ramps run parallel).
+            val routeBearing = bearingBetween(
+                pts[bestSegStart].lat, pts[bestSegStart].lng,
+                pts[bestSegStart + 1].lat, pts[bestSegStart + 1].lng
+            )
+            val headingDiverged = bearingDeg != null && bestDist > HEADING_GATE_MIN_LATERAL_M &&
+                kotlin.math.abs(shortestArcDelta(routeBearing, bearingDeg)) > OFF_ROUTE_HEADING_DEG
+            val diverging = bestDist > OFF_ROUTE_LATERAL_M
+            if (diverging || headingDiverged) {
+                if (offRouteSinceMs == 0L) offRouteSinceMs = nowMs
+                val budget = when {
+                    headingDiverged && diverging -> OFF_ROUTE_MS_WRONG_WAY
+                    speedMps >= HIGHWAY_SPEED_MPS -> OFF_ROUTE_MS_HIGHWAY
+                    headingDiverged -> OFF_ROUTE_MS_DIVERGING
+                    else -> OFF_ROUTE_MS_DEFAULT
+                }
+                offRoute = (nowMs - offRouteSinceMs) >= budget
+            } else {
+                offRouteSinceMs = 0L
+                offRoute = false
+            }
+        }
 
         // 3) Remaining distance: partial remainder of the current segment plus
         //    every subsequent full segment.
@@ -148,10 +242,23 @@ class NavGuidanceEngine {
             remaining += haversineMeters(pts[i].lat, pts[i].lng, pts[i + 1].lat, pts[i + 1].lng)
         }
 
-        // 4) Arrival: within the radius of the final route vertex.
+        // 2b) Final-approach guard: once the along-route remainder is inside the
+        //     near-destination band, suppress any off-route latch. A GPS wander
+        //     this close to the pin must NOT spawn a reroute (it would loop the car
+        //     around its own destination); guidance just waits for arrival.
+        if (remaining <= NEAR_DEST_NO_REROUTE_M) {
+            offRoute = false
+            offRouteSinceMs = 0L
+            consecutiveOffRoute = 0
+        }
+
+        // 4) Arrival: within the radius of the final route vertex, OR the
+        //    along-route remainder is effectively zero (snapped past the last
+        //    vertex). The straight-line check handles a GPS fix that's laterally
+        //    off the final segment; the remainder check handles overshooting it.
         val last = pts[pts.size - 1]
         val distToEnd = haversineMeters(lat, lng, last.lat, last.lng)
-        val arrived = distToEnd <= ARRIVAL_RADIUS_M
+        val arrived = distToEnd <= ARRIVAL_RADIUS_M || remaining <= ARRIVAL_RADIUS_M
 
         // 5) ETA: scale the route's total duration by the remaining fraction of
         //    its total distance (proportional model — robust when per-maneuver
@@ -171,6 +278,9 @@ class NavGuidanceEngine {
         } else {
             0.0
         }
+        // The "then …" preview maneuver — shown only once the current one is close
+        // (the Activity gates display), so a far-off second turn doesn't clutter.
+        val thenManeuver = maneuver?.let { maneuverAfter(r, it) }
 
         return GuidanceState(
             snappedLat = bestLat,
@@ -180,25 +290,113 @@ class NavGuidanceEngine {
             currentManeuver = maneuver,
             distanceToManeuverM = distanceToManeuver,
             remainingDistanceM = remaining,
-            etaSeconds = etaSeconds
+            etaSeconds = etaSeconds,
+            nextManeuver = thenManeuver
         )
     }
 
     /**
-     * The next maneuver to announce: the first maneuver strictly ahead of the
-     * current position. A maneuver at vertex `k` is "ahead" when `k` is beyond
-     * the current segment start, or equal to it while we have not yet passed it
-     * along the segment. The terminal destination maneuver is included.
+     * Snap an arbitrary point onto the active route for the per-FRAME render tick,
+     * returning the on-route position plus the route's tangent bearing there.
+     *
+     * <p>The 1 Hz [update] already snaps the truth fix, but the ~12 fps render loop
+     * dead-reckons forward BETWEEN fixes — left raw, that prediction drifts off the
+     * polyline (the puck reads as floating beside the road, and the heading-up camera
+     * chases noisy GPS heading). Snapping every frame keeps the puck glued to the line
+     * AND gives a perfectly smooth heading (the segment tangent) to steer the camera by.
+     *
+     * <p>It reuses the carried [matchedSegIndex] window so it stays cheap and forward-
+     * biased (no back-snapping on self-crossing routes). It does NOT mutate any latch
+     * state — it's a pure read against the current route + match window. Returns null
+     * when no route is active so the caller can fall back to the raw estimate.
+     *
+     * @param lat predicted latitude (decimal degrees)
+     * @param lng predicted longitude (decimal degrees)
+     * @return snapped position + tangent bearing, or null if no route / degenerate
+     */
+    fun snapToRoute(lat: Double, lng: Double): Snapped? {
+        val r = route ?: return null
+        val pts = r.points
+        if (pts.size < 2) return null
+        val lo: Int
+        val hi: Int
+        if (matchedSegIndex in 0 until pts.size - 1) {
+            lo = (matchedSegIndex - MATCH_BACK_WINDOW).coerceAtLeast(0)
+            hi = (matchedSegIndex + MATCH_FWD_WINDOW).coerceAtMost(pts.size - 2)
+        } else { lo = 0; hi = pts.size - 2 }
+        var bestDist = Double.MAX_VALUE
+        var bestSeg = lo
+        var bestLat = pts[lo].lat
+        var bestLng = pts[lo].lng
+        for (i in lo..hi) {
+            val a = pts[i]; val b = pts[i + 1]
+            val snap = pointToSegment(lat, lng, a.lat, a.lng, b.lat, b.lng)
+            if (snap.distMeters < bestDist) {
+                bestDist = snap.distMeters; bestSeg = i
+                bestLat = snap.lat; bestLng = snap.lng
+            }
+        }
+        // Tangent bearing along the matched segment — smooth by construction
+        // (it only changes at vertices), so the camera never chases GPS noise.
+        val tangent = bearingBetween(
+            pts[bestSeg].lat, pts[bestSeg].lng,
+            pts[bestSeg + 1].lat, pts[bestSeg + 1].lng
+        )
+        return Snapped(bestLat, bestLng, tangent, bestDist)
+    }
+
+    /** Result of [snapToRoute]: on-route position + the route tangent bearing there. */
+    data class Snapped(
+        val lat: Double,
+        val lng: Double,
+        /** Route tangent bearing at the snap point, 0..360°. */
+        val bearingDeg: Double,
+        /** Lateral distance (m) from the input point to the route. */
+        val offsetM: Double
+    )
+
+    /**
+     * The next maneuver to announce: the first SIGNIFICANT maneuver strictly ahead.
+     * A maneuver at vertex `k` is "ahead" when `k` is beyond the current segment
+     * start, or equal to it+1. Trivial maneuvers (continue / new-name / a bare
+     * notification) are SKIPPED so a "continue onto Main St" doesn't own the banner
+     * + voice slot the way a real turn does — the driver only cares about the next
+     * action. The terminal destination (arrive) is always significant.
      */
     private fun nextManeuver(r: NavRoute, segStart: Int, t: Double): RouteManeuver? {
         for (m in r.maneuvers) {
             val k = m.beginShapeIndex
-            if (k > segStart) return m
-            if (k == segStart + 1) return m
-            // k <= segStart: behind us; or k == segStart with t already moving
-            // off the vertex — treat as passed, keep scanning.
+            if ((k > segStart || k == segStart + 1) && maneuverImportance(m.type) >= 1) return m
         }
         return null
+    }
+
+    /**
+     * The maneuver AFTER [after] (same significance filter) — the "then …" preview,
+     * so the banner can show "Turn left, then turn right". Null if none remains.
+     */
+    private fun maneuverAfter(r: NavRoute, after: RouteManeuver): RouteManeuver? {
+        var seen = false
+        for (m in r.maneuvers) {
+            if (seen && maneuverImportance(m.type) >= 1) return m
+            if (m === after) seen = true
+        }
+        return null
+    }
+
+    /**
+     * Significance of a Valhalla maneuver type. 0 = trivial (continue, becomes/new
+     * road name, bare notification — filtered out); 1 = a real turn/keep/end-of-road
+     * /u-turn; 2 = high-attention (roundabout, ramp/merge/fork, ferry, and ARRIVE so
+     * the destination is never filtered). See Valhalla TripDirections::Maneuver::Type.
+     */
+    private fun maneuverImportance(type: Int): Int = when (type) {
+        0, 1, 8 -> 0                          // none, start, continue
+        // 4=destination, 5/6=dest left/right → ARRIVE (always significant)
+        4, 5, 6 -> 2
+        7 -> 0                                // becomes (road-name change)
+        26, 27, 28, 29, 30, 31, 32, 33 -> 2   // roundabout enter/exit + ramps/merge/fork
+        else -> 1                             // 9-25: turns, keeps, end-of-road, u-turns
     }
 
     /**
@@ -255,6 +453,18 @@ class NavGuidanceEngine {
         val c = 2 * atan2(sqrt(a), sqrt(1 - a))
         return EARTH_RADIUS_M * c
     }
+
+    /** Initial bearing (forward azimuth) from (lat1,lng1) to (lat2,lng2), 0..360°. */
+    private fun bearingBetween(lat1: Double, lng1: Double, lat2: Double, lng2: Double): Double {
+        val p1 = Math.toRadians(lat1); val p2 = Math.toRadians(lat2)
+        val dLng = Math.toRadians(lng2 - lng1)
+        val y = sin(dLng) * cos(p2)
+        val x = cos(p1) * sin(p2) - sin(p1) * cos(p2) * cos(dLng)
+        return (Math.toDegrees(atan2(y, x)) + 360.0) % 360.0
+    }
+
+    /** Shortest signed angular delta from→to, in -180..180. */
+    private fun shortestArcDelta(from: Double, to: Double): Double = ((to - from + 540.0) % 360.0) - 180.0
 
     /**
      * Perpendicular distance (meters) from point P to segment A-B, clamped to
@@ -343,6 +553,8 @@ class NavGuidanceEngine {
         val currentManeuver: RouteManeuver?,
         val distanceToManeuverM: Double,
         val remainingDistanceM: Double,
-        val etaSeconds: Double
+        val etaSeconds: Double,
+        /** The maneuver AFTER [currentManeuver] (the "then …" preview), or null. */
+        val nextManeuver: RouteManeuver? = null
     )
 }

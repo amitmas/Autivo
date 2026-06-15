@@ -146,7 +146,17 @@ public class ExternalStorageCleaner {
         // Restore monitoring across daemon restarts. Without this, the user has
         // to re-toggle the UI switch after every reboot to resume background
         // OEM-dashcam cleanup, even though `enabled=true` is persisted to disk.
-        if (enabled && sdCardAvailable) {
+        //
+        // Gate ONLY on `enabled`, not sdCardAvailable. On the BYD head-unit vold
+        // mounts the SD seconds AFTER the daemon starts (same boot-race as the
+        // ~70s SD-unmount window), so the ctor snapshot routinely sees
+        // sdCardAvailable=false. The old `&& sdCardAvailable` guard then left the
+        // monitor un-armed for the entire power cycle — refresh() (the only
+        // re-discover+re-arm path) is invoked only when the user opens the
+        // external-storage web page. The monitor tick now self-discovers (re-runs
+        // discoverPaths() while sdCardPath==null), so arming it before the SD is
+        // mounted is safe: it idles until vold mounts the card, then converges.
+        if (enabled) {
             startMonitoring();
         }
     }
@@ -360,31 +370,27 @@ public class ExternalStorageCleaner {
     
     /**
      * Save configuration to config file.
+     *
+     * <p>Routes the {@code externalCleanup} section persist through
+     * UnifiedConfigManager so there is ONE lock domain + ONE atomic writer over
+     * /data/local/tmp/overdrive_config.json. The previous body did its own
+     * read-modify-write (FileReader read + bare truncating FileWriter) guarded
+     * only by {@code synchronized(this)} — a disjoint mutex from UCM's
+     * cross-process FileLock + tmp+rename. The two schemes did not exclude each
+     * other, so a concurrent UCM updateSection on the same file (e.g.
+     * StorageManager writing the {@code storage} section's limits) could
+     * lost-update either side, torn-read a half-truncated file, or — worst — a
+     * SIGKILL between the truncate and flush could wipe the ENTIRE config.
+     * updateSection does loadConfigFresh + FileLock + atomic tmp+rename + .bak
+     * self-heal and refreshes the cache, so the old explicit forceReload() is
+     * now redundant. updateSection merges into the existing section, so omitting
+     * {@code cdrPath} when null preserves a previously-persisted value.
+     * Stay {@code synchronized(this)} so the in-memory fields are read
+     * consistently while assembling the JSON.
      */
     public synchronized void saveConfig() {
         try {
-            File configFile = new File(CONFIG_FILE);
-            JSONObject config;
-
-            if (configFile.exists()) {
-                BufferedReader reader = new BufferedReader(new FileReader(configFile));
-                StringBuilder sb = new StringBuilder();
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    sb.append(line);
-                }
-                reader.close();
-                config = new JSONObject(sb.toString());
-            } else {
-                config = new JSONObject();
-                config.put("version", 1);
-            }
-
-            JSONObject extCleanup = config.optJSONObject("externalCleanup");
-            if (extCleanup == null) {
-                extCleanup = new JSONObject();
-            }
-
+            JSONObject extCleanup = new JSONObject();
             extCleanup.put("enabled", enabled);
             extCleanup.put("reservedSpaceMb", reservedSpaceMb);
             extCleanup.put("protectedHours", protectedHours);
@@ -393,23 +399,12 @@ public class ExternalStorageCleaner {
                 extCleanup.put("cdrPath", cdrPath);
             }
 
-            config.put("externalCleanup", extCleanup);
-            config.put("lastModified", System.currentTimeMillis());
-
-            java.io.FileWriter writer = new java.io.FileWriter(configFile);
-            writer.write(config.toString(2));
-            writer.close();
-
-            configFile.setReadable(true, false);
-            configFile.setWritable(true, false);
-
-            // UnifiedConfigManager caches this same file; without invalidating
-            // its cache, the next updateSection() call within ~1s mtime
-            // granularity merges into a stale config and clobbers our write.
-            try {
-                com.overdrive.app.config.UnifiedConfigManager.forceReload();
-            } catch (Throwable t) {
-                logWarn("UnifiedConfigManager.forceReload() failed: " + t.getMessage());
+            boolean ok = com.overdrive.app.config.UnifiedConfigManager
+                    .updateSection("externalCleanup", extCleanup);
+            if (!ok) {
+                logError("Could not save external cleanup config: "
+                    + "UnifiedConfigManager.updateSection(\"externalCleanup\") failed");
+                return;
             }
 
             logInfo("Saved external cleanup config");
@@ -421,32 +416,56 @@ public class ExternalStorageCleaner {
     // ==================== Getters/Setters ====================
     
     public boolean isEnabled() { return enabled; }
-    public void setEnabled(boolean enabled) { 
-        this.enabled = enabled; 
+    public void setEnabled(boolean enabled) {
+        setEnabledNoSave(enabled);
         saveConfig();
+        applyMonitoringState();
+    }
+
+    /** Set the enabled flag WITHOUT persisting or touching monitoring; the
+     *  caller is responsible for {@link #saveConfig()} and
+     *  {@link #applyMonitoringState()} (used to batch a multi-field POST into
+     *  one persist + one monitoring transition). */
+    public void setEnabledNoSave(boolean enabled) {
+        this.enabled = enabled;
+    }
+
+    /** Start/stop the monitor to match the current {@link #enabled} flag.
+     *  Decoupled from the persist so a batched config update can save once and
+     *  apply the monitoring side-effect once. */
+    public void applyMonitoringState() {
         if (enabled) {
             startMonitoring();
         } else {
             stopMonitoring();
         }
     }
-    
+
     public long getReservedSpaceMb() { return reservedSpaceMb; }
-    public void setReservedSpaceMb(long mb) { 
+    public void setReservedSpaceMb(long mb) {
+        setReservedSpaceMbNoSave(mb);
+        saveConfig();
+    }
+    public void setReservedSpaceMbNoSave(long mb) {
         this.reservedSpaceMb = Math.max(100, Math.min(20000, mb));
-        saveConfig();
     }
-    
+
     public int getProtectedHours() { return protectedHours; }
-    public void setProtectedHours(int hours) { 
-        this.protectedHours = Math.max(0, Math.min(168, hours)); // 0-7 days
+    public void setProtectedHours(int hours) {
+        setProtectedHoursNoSave(hours);
         saveConfig();
     }
-    
+    public void setProtectedHoursNoSave(int hours) {
+        this.protectedHours = Math.max(0, Math.min(168, hours)); // 0-7 days
+    }
+
     public int getMinFilesKeep() { return minFilesKeep; }
     public void setMinFilesKeep(int count) {
-        this.minFilesKeep = Math.max(0, Math.min(100, count));
+        setMinFilesKeepNoSave(count);
         saveConfig();
+    }
+    public void setMinFilesKeepNoSave(int count) {
+        this.minFilesKeep = Math.max(0, Math.min(100, count));
     }
     
     public boolean isSdCardAvailable() { return sdCardAvailable; }
@@ -855,8 +874,12 @@ public class ExternalStorageCleaner {
      * Automatically triggers cleanup when space runs low.
      */
     public void startMonitoring() {
-        if (!enabled || !sdCardAvailable) return;
-        
+        // Gate only on `enabled` — the tick self-discovers the SD card, so the
+        // monitor may be armed before vold mounts it (boot-race) and will
+        // converge once the card appears. Requiring sdCardAvailable here would
+        // re-introduce the never-arms-after-late-mount bug.
+        if (!enabled) return;
+
         if (monitorScheduler != null && !monitorScheduler.isShutdown()) {
             return; // Already running
         }
@@ -872,6 +895,14 @@ public class ExternalStorageCleaner {
         
         monitorScheduler.scheduleAtFixedRate(() -> {
             try {
+                // Self-heal: if the SD wasn't mounted when the monitor armed
+                // (boot-race), re-run discovery here so the monitor re-arms
+                // automatically once vold mounts the card — at
+                // MONITOR_INTERVAL_SECONDS granularity, with no dependency on
+                // the user opening the external-storage web page.
+                if (sdCardPath == null) {
+                    discoverPaths();
+                }
                 if (enabled && sdCardAvailable) {
                     long freeSpace = getSdCardFreeSpace();
                     long reservedBytes = reservedSpaceMb * 1024L * 1024L;

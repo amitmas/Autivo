@@ -108,6 +108,31 @@ public final class ClusterProjectionController {
     private static final long DEFAULT_LINGER_CLOSE_MS = 8000;
     private static final long DEFAULT_MAX_PROJECTION_MS = 90000;
 
+    // ── Bounded present-edge re-notify (cold-open show-retry) ────────────────────
+    // commitReady declares ready at READY_SETTLE_MS even when the fission display is
+    // NOT yet present ("Committing anyway" — see pollReady) to avoid open/close
+    // thrash. On a COLD (first-after-idle) open the fission VirtualDisplay actually
+    // materializes ~1-3.5s AFTER OP_DI4_MODE — i.e. AFTER our ready edge. The
+    // pipeline's clusterShowWhenReady() re-resolves the cluster layerStack via
+    // dumpsys and, finding it UNRESOLVED, defers the show. The ONLY existing retry is
+    // bsTurnTick's 250ms loop while the turn signal is PHYSICALLY ON; once the signal
+    // clears the card is never re-driven, so on a cold open the BS card (and the
+    // ClusterSpeedOverlay, which shares the resolver) never appear even though the
+    // gauges stay blanked for the whole linger.
+    //
+    // Fix: when commitReady commits WITHOUT the display being present, keep polling
+    // genuine display presence on projThread (the same thread that owns dumpsys, so
+    // the 250ms BS loop and the GL thread are never blocked) for a bounded window.
+    // On the present-edge — and for a few re-drives after it — re-call
+    // notifyPipelineReady() so onClusterProjectionReady() re-runs clusterShowWhenReady
+    // with the now-resolvable stack. Signal-INDEPENDENT (driven by projThread, not the
+    // turn loop) so the card lands even if the signal already cleared and the
+    // projection is merely lingering. Every poll re-checks the supersession epoch +
+    // shuttingDown + ST_OPEN, so it can never re-drive a superseded/closed projection.
+    private static final long PRESENT_POLL_MS = 250;     // re-resolve cadence (matches BS loop feel)
+    private static final long PRESENT_POLL_WINDOW_MS = 4000;  // covers the worst cold materialize (~3.5s)
+    private static final int  PRESENT_REDRIVE_TICKS = 2;  // extra re-drives after the present-edge
+
     // UCM gate flags (under "surveillance") for SIGKILL recovery — mirror the
     // screenDeterrent* pattern so a respawned daemon can restore the gauges.
     private static final String GATE_FORCE_STOP = "clusterProjectionForceStop";
@@ -236,6 +261,48 @@ public final class ClusterProjectionController {
     public boolean isOpen()  { return projState == ST_OPEN; }
     public boolean isReady() { return ready && projState == ST_OPEN; }
 
+    /** True when the calling thread IS projThread (the dumpsys-owning thread). The
+     *  pipeline's clusterShowWhenReady uses this to keep its layerStack-resolving
+     *  dumpsys ON projThread (I9): when called from the 250ms BsTurnTrigger loop it
+     *  must NOT spawn dumpsys inline — it defers to {@link #requestShowRedrive()}. */
+    public boolean isOnProjThread() {
+        return android.os.Looper.myLooper() == projHandler.getLooper();
+    }
+
+    /** Re-drive the pipeline show on projThread (I9-safe). Posts a re-notify so
+     *  {@code onClusterProjectionReady → clusterShowWhenReady} re-runs on projThread,
+     *  where the layerStack-resolving dumpsys is legal. Called from the BsTurnTrigger
+     *  loop when the BS card needs (re)showing but the stack must be resolved off that
+     *  thread. Re-checks ST_OPEN at exec time (under the epoch the re-notify carries
+     *  nothing — notifyPipelineReady itself is a no-op when the pipeline declines), so
+     *  a close that lands between the post and exec simply hides the layer instead.
+     *  Cheap: one post; the dumpsys runs at most once per posted re-drive on projThread.
+     *  No-op if the projection isn't open/ready. */
+    public void requestShowRedrive() {
+        if (shuttingDown) return;
+        if (projState != ST_OPEN) return;   // not open → nothing to re-drive
+        projHandler.post(() -> {
+            if (shuttingDown) return;
+            if (projState != ST_OPEN) return;   // closed underneath us
+            notifyPipelineReady();              // re-runs onClusterProjectionReady on projThread
+        });
+    }
+
+    /**
+     * Current open/close-sequence epoch (the same {@link #seqEpoch} that every
+     * opcode-step lambda + the present-edge poll capture-and-compare). Exposed so the
+     * speed-overlay {@code start()} carrying the epoch of the open it was armed for can
+     * decline on the exec thread when a close/re-open has SUPERSEDED that open.
+     *
+     * <p>This closes the {@code startOnExec} show-after-close window that the bare
+     * {@code projectionOpen()} ({@code projState==ST_OPEN}) re-check cannot: forceClose
+     * bumps this epoch in the SAME synchronized block as {@code projState=ST_CLOSING}
+     * (the documented supersession marker), so a {@code start()} carrying the open-time
+     * epoch deterministically loses to the close — whereas a stale-visible volatile
+     * {@code projState} read could still see {@code ST_OPEN} and arm the badge after the
+     * projection began closing. A plain cheap volatile read; not a reflected entrypoint. */
+    int currentSeqEpoch() { return seqEpoch; }
+
     /**
      * Request the projection be open (idempotent). Called from the cluster branch
      * of the BS turn loop on signal-on. Cheap from the 250 ms loop: a volatile
@@ -287,6 +354,25 @@ public final class ClusterProjectionController {
         watchdogHandler.removeCallbacks(lingerTask);
         watchdogHandler.removeCallbacks(maxCapTask);
         maxCapLockout = false;
+        // RACE FIX ("projection ends on its own" at exactly 90s): acquireSustained
+        // runs on a FOREIGN thread (ClusterMapLaunch / IPC / HTTP), but commitReady
+        // — which posts the 90s maxCapTask gated on `!sustainedHeld` — runs on
+        // projThread. If a TRANSIENT blind-spot open is in flight (ST_OPENING) when
+        // the map acquires, commitReady's sustainedHeld read can land BEFORE this
+        // method sets it true, while this removeCallbacks(maxCapTask) lands BEFORE
+        // commitReady's postDelayed — so the cap is posted on a now-sustained map
+        // and never removed, force-closing it at 90s. The removeCallbacks above
+        // cannot win that interleave (different threads, no happens-before). Re-issue
+        // the removal ON projThread so it serialises in-order with commitReady's post
+        // (same looper) and cannot land in its read→post gap. Cheap idempotent no-op
+        // when no cap is pending. (commitReady additionally re-checks sustainedHeld
+        // after its post — belt and braces — but the in-order removal is the real fix.)
+        projHandler.post(() -> {
+            if (sustainedHeld) {
+                watchdogHandler.removeCallbacks(maxCapTask);
+                watchdogHandler.removeCallbacks(lingerTask);
+            }
+        });
         requestOpen();   // opens if closed; no-op if already up
     }
 
@@ -358,6 +444,12 @@ public final class ClusterProjectionController {
             ready = false;
             epoch = ++seqEpoch;   // supersede any in-flight open sequence
         }
+        // Retire the speed badge AFTER projState is ST_CLOSING (every close path —
+        // linger, max-cap, ACC-off, disable, error, retarget — funnels through here).
+        // Posting the stop only once projState != ST_OPEN means a racing commitReady's
+        // startOnExec re-check (projectionOpen()) deterministically fails, so the badge
+        // can't be armed after this stop — no reliance on the per-tick self-heal.
+        try { ClusterSpeedOverlay.stopIfActive(); } catch (Throwable ignored) {}
         logger.info("forceClose(" + reason + ")");
         // Tell the pipeline to hide the BS layer + drop the render gate NOW (every
         // close path goes through here: linger, max-cap, disarm, retarget). Without
@@ -403,7 +495,7 @@ public final class ClusterProjectionController {
         // Fast path: DisplayManager already shows the cluster display. (Often null
         // from the daemon's stale cache — see READY_SETTLE_MS — so this is a bonus,
         // not the contract.)
-        if (displayPresent()) { commitReady(epoch, "display present"); return; }
+        if (displayPresent()) { commitReady(epoch, "display present", true); return; }
         // Settle path: the display materializes ~280ms after OP_DI4_MODE but the
         // daemon's DisplayManager cache may never report it. Once past the settle
         // window, commit ready anyway (compositing is the proven path). NEVER
@@ -420,7 +512,7 @@ public final class ClusterProjectionController {
                     + "model may not support projection (small/non-fission cluster?). "
                     + "Committing anyway; if no video, this trim is unsupported.");
             }
-            commitReady(epoch, present ? "settle+present" : "settle+ABSENT");
+            commitReady(epoch, present ? "settle+present" : "settle+ABSENT", present);
             return;
         }
         projHandler.postDelayed(() -> pollReady(elapsed + READY_POLL_MS, epoch), READY_POLL_MS);
@@ -428,8 +520,13 @@ public final class ClusterProjectionController {
 
     /** Atomically claim ST_OPEN (re-checking epoch+state under the lock so a racing
      *  forceClose wins cleanly), then arm the max-cap and notify the pipeline to
-     *  retarget the layer onto the cluster. */
-    private void commitReady(int epoch, String why) {
+     *  retarget the layer onto the cluster.
+     *  @param presentAtCommit true if the fission display was genuinely present when
+     *         we committed. When FALSE we committed on the settle-timeout (cold open):
+     *         the display will materialize ~1-3.5s later, so arm the bounded
+     *         present-edge re-notify so the pipeline re-drives the show once the
+     *         display+stack resolve. */
+    private void commitReady(int epoch, String why, boolean presentAtCommit) {
         final long activeUntil;
         synchronized (this) {
             if (epoch != seqEpoch || projState != ST_OPENING) return;
@@ -447,9 +544,126 @@ public final class ClusterProjectionController {
         // is suppressed. Transient (blind-spot) sessions keep the cap.
         if (!sustainedHeld) {
             watchdogHandler.postDelayed(maxCapTask, maxProjectionMs);
+            // Re-check after the post: acquireSustained may have set sustainedHeld
+            // true on a foreign thread between the read above and this post (the
+            // narrow max-cap-on-sustained-map race). If so, pull the cap back off —
+            // a sustained map must never auto-close at 90s. acquireSustained ALSO
+            // posts a removal onto this same (projThread) looper, so the two cannot
+            // both miss; this is the cheaper in-line guard.
+            if (sustainedHeld) watchdogHandler.removeCallbacks(maxCapTask);
         }
         logger.info("projection OPEN + ready (" + why + (sustainedHeld ? ", sustained" : "") + ")");
         notifyPipelineReady();
+        // Show the current-speed glass badge over whatever is projected (map / BS /
+        // future content). Independent of the consumer; gated + drawn entirely inside
+        // ClusterSpeedOverlay (no-op when disabled via UCM). Cheap: posts onto its own
+        // thread. Hidden again on every close path (forceClose / shutdown). Pass the
+        // open's epoch so a forceClose that supersedes this open between the post and
+        // the overlay exec thread running startOnExec deterministically drops the arm
+        // (the bare projectionOpen() re-check can read a stale-visible ST_OPEN — see
+        // currentSeqEpoch()).
+        try { ClusterSpeedOverlay.getInstance().start(epoch); } catch (Throwable t) {
+            logger.debug("speed overlay start failed: " + t.getMessage());
+        }
+        // COLD-OPEN show-retry: we just committed ready but the fission display was
+        // NOT actually present yet (settle-timeout commit). The pipeline's first
+        // clusterShowWhenReady() will resolve STACK_UNRESOLVED and defer the show, and
+        // the only existing retry (bsTurnTick) stops the moment the turn signal clears.
+        // Arm a bounded, signal-INDEPENDENT poll on THIS thread (projThread owns
+        // dumpsys — never the GL/turn loop) that re-notifies the pipeline on the
+        // present-edge so the card + speed badge land once the display materializes.
+        // When the display WAS present at commit there is nothing to wait for.
+        if (!presentAtCommit) {
+            // Seed with the full re-drive budget: if the display has ALREADY
+            // materialized between the displayPresent() check in pollReady/commitReady
+            // and this first pollPresentEdge tick (a real race — each check spawns a
+            // dumpsys-display process, so there is latency between them), the present
+            // branch fires on tick 0 and must still issue PRESENT_REDRIVE_TICKS more
+            // re-drives to cover the layerStack line trailing the display add. Passing
+            // 0 here would short-circuit at "redrivesLeft <= 0" after a single show,
+            // matching the bug where the card + speed badge never appear because the
+            // first overlay start() landed before the stack resolved.
+            pollPresentEdge(0, false, PRESENT_REDRIVE_TICKS, epoch);
+        }
+    }
+
+    /**
+     * Bounded present-edge re-notify, run entirely on projThread (so the dumpsys in
+     * {@link #displayPresent()} never blocks the 250ms BS turn loop or the GL thread).
+     *
+     * <p>Armed by {@link #commitReady} ONLY when ready was committed on the
+     * settle-timeout (the fission display was not yet present — a cold open). Polls
+     * genuine display presence every {@link #PRESENT_POLL_MS}; on the first present
+     * tick (and {@link #PRESENT_REDRIVE_TICKS} more after it, in case the layerStack
+     * parse trails the display add) it re-calls {@link #notifyPipelineReady()}, which
+     * re-runs {@code onClusterProjectionReady → clusterShowWhenReady} with the now
+     * resolvable stack. Gives up after {@link #PRESENT_POLL_WINDOW_MS} (covers the
+     * worst cold materialize; an unsupported trim simply never shows, as before).
+     *
+     * <p>Every tick re-validates the lifecycle so a superseded/closed/teardown
+     * projection is NEVER re-driven:
+     * <ul>
+     *   <li>{@code shuttingDown} → abandon (terminal; restore already ran).</li>
+     *   <li>{@code epoch != seqEpoch} → a close/re-open superseded this open; abandon
+     *       (the new sequence owns its own re-notify if it cold-opens).</li>
+     *   <li>{@code projState != ST_OPEN} → forceClose/linger/max-cap closed it; abandon
+     *       (re-notify after close would risk a show-after-close).</li>
+     * </ul>
+     * Cheap: at most {@code PRESENT_POLL_WINDOW_MS / PRESENT_POLL_MS} dumpsys spawns,
+     * only on a cold open, and it short-circuits the instant the display resolves +
+     * the re-drives are spent.
+     */
+    private void pollPresentEdge(long elapsed, boolean sawPresent, int redrivesLeft, int epoch) {
+        if (shuttingDown) return;              // terminal — projection torn down
+        if (epoch != seqEpoch) return;         // superseded by a newer open/close
+        if (projState != ST_OPEN) return;      // closed underneath us (linger/cap/forceClose)
+        boolean present = sawPresent || displayPresent();
+        if (present) {
+            // (Re-)drive the pipeline show now that the display is resolvable. The
+            // pipeline decides whether to actually paint the BS card itself: it shows
+            // for a transient (BS-driven) open even after the turn signal cleared —
+            // that is the whole point of this cold-open re-notify, the projection is
+            // LINGERING for the card — but suppresses the card on a sustained-map-only
+            // open with no active BS signal (so this never spuriously paints the card
+            // over the nav map). The extra re-drives cover the case where the display
+            // add is visible to dumpsys a beat before its layerStack line is parseable.
+            logger.info("present-edge re-notify (cold open, display materialized, redrivesLeft="
+                    + redrivesLeft + ")");
+            notifyPipelineReady();
+            // Re-drive the speed badge too. commitReady's single start() (above) runs
+            // BEFORE the display materialized on a cold open, so createAndShow()
+            // declined (stack UNRESOLVED) and startOnExec scheduled NO retry — the
+            // badge silently no-shows for the whole first projection (confirmed in the
+            // on-device log: "createAndShow: cluster stack -1 ... skipping speed
+            // overlay" on the first open, success only from the second). notifyPipelineReady
+            // re-drives ONLY the BS card, never the overlay, so re-issue start() here.
+            // Idempotent + race-safe by construction: startOnExec re-checks running /
+            // projectionOpen() / enabledInConfig() on the overlay's OWN exec thread, so
+            // its dumpsys never touches projThread and a superseded/disabled start is
+            // dropped. We already passed shuttingDown/epoch/ST_OPEN above; passing the
+            // epoch lets startOnExec drop a start that a forceClose supersedes between
+            // this post and the overlay exec thread (closes the stale-projState window).
+            try { ClusterSpeedOverlay.getInstance().start(epoch); } catch (Throwable t) {
+                logger.debug("present-edge speed overlay start failed: " + t.getMessage());
+            }
+            if (redrivesLeft <= 0) return;     // present + re-drives spent → done
+            projHandler.postDelayed(
+                () -> pollPresentEdge(elapsed + PRESENT_POLL_MS, true, redrivesLeft - 1, epoch),
+                PRESENT_POLL_MS);
+            return;
+        }
+        if (elapsed >= PRESENT_POLL_WINDOW_MS) {
+            // Never materialized within the window — likely an unsupported/non-fission
+            // cluster trim. Stop polling (the projection stays up under its normal
+            // linger/cap restore paths; nothing here changes the gauge-restore net).
+            logger.warn("present-edge re-notify: fission display still absent after "
+                    + PRESENT_POLL_WINDOW_MS + "ms — giving up (trim may not support projection)");
+            return;
+        }
+        projHandler.postDelayed(
+            () -> pollPresentEdge(elapsed + PRESENT_POLL_MS, false,
+                    PRESENT_REDRIVE_TICKS, epoch),
+            PRESENT_POLL_MS);
     }
 
     private void doCloseSequence(int epoch) {
@@ -570,12 +784,21 @@ public final class ClusterProjectionController {
             if (projState == ST_CLOSED) {
                 // Nothing open. Best-effort clear (read-guarded no-op if already clear).
                 try { clearGateFlags(); } catch (Throwable ignored) {}
+                // Still retire the badge in case a stray arm slipped in (idempotent).
+                try { ClusterSpeedOverlay.stopIfActive(); } catch (Throwable ignored) {}
                 return;
             }
             projState = ST_CLOSING;
             ready = false;
             ++seqEpoch;   // supersede any in-flight open sequence
         }
+        // Tear down the speed badge on daemon exit (SIGTERM / normal). Posted AFTER
+        // projState→ST_CLOSING + ++seqEpoch (mirrors forceClose's ordering) so a racing
+        // commitReady's startOnExec projectionOpen() re-check deterministically fails and
+        // can't re-arm the badge after this stop. (shuttingDown also makes requestOpen a
+        // no-op, but the ordering closes the in-flight-commitReady window.) A SIGKILL'd
+        // daemon's layer dies with the process, so no boot-recovery path is needed.
+        try { ClusterSpeedOverlay.stopIfActive(); } catch (Throwable ignored) {}
         final CountDownLatch latch = new CountDownLatch(1);
         projHandler.post(() -> {
             try {
@@ -637,10 +860,23 @@ public final class ClusterProjectionController {
                 // Size-profile opcode (29=8.8" / 30=12.3" / 31=10.25" / 0=skip).
                 // Primary source is the blindspot section (where the web UI writes it
                 // via the layout dropdown, alongside target); fall back to the
-                // surveillance key (live-tuning) then the default.
-                int sizeFromSurv = s.optInt("clusterSizeProfile", OP_SIZE_PROFILE);
+                // surveillance key (live-tuning) then a MODEL-FINGERPRINT default seed
+                // (so a fresh install on a non-Seal trim gets the right aspect without
+                // the user touching the dropdown — the dropdown still overrides).
+                int seedDefault = fingerprintSizeProfile();
+                int sizeFromSurv = s.optInt("clusterSizeProfile", seedDefault);
                 org.json.JSONObject bs = UnifiedConfigManager.getBlindSpot();
                 sizeProfileOpcode = (bs != null) ? bs.optInt("clusterSizeProfile", sizeFromSurv) : sizeFromSurv;
+                // Safe-range guard: only 0 (skip) or the known size opcodes 29/30/31
+                // are valid here. A bad value (typo / stale config / out-of-range) would
+                // send a wrong opcode into the OEM container — clamp to the seed default.
+                // (NEVER opcode 1, and never outside the documented size set.)
+                if (sizeProfileOpcode != 0 && sizeProfileOpcode != 29
+                        && sizeProfileOpcode != 30 && sizeProfileOpcode != 31) {
+                    logger.warn("clusterSizeProfile " + sizeProfileOpcode
+                            + " out of range — using fingerprint default " + seedDefault);
+                    sizeProfileOpcode = seedDefault;
+                }
                 // Native profile to restore on close (29/30/31), for models whose
                 // native cluster size differs from the projection profile. 0 = none.
                 int rpSurv = s.optInt("clusterRestoreProfile", 0);
@@ -652,6 +888,31 @@ public final class ClusterProjectionController {
                 sizeStepMs = Math.max(0, Math.min(ss, 3000));
             }
         } catch (Throwable ignored) {}
+    }
+
+    /**
+     * Default size-profile opcode seeded from the vehicle model fingerprint, so a
+     * fresh install picks the right cluster aspect without the user touching the
+     * layout dropdown. Only a SEED — the UCM/web value always overrides. Conservative
+     * mapping (ro.product.model substrings): Atto/Yuan-class small cluster → 29 (8.8"),
+     * larger Han/Tang/Song/Seal-U/DM-i → 30 (12.3"), else the Seal 10.25" native → 31.
+     * Resolution-bucket guessing is deliberately NOT used (it mis-maps the 1920×720
+     * fission panel). Unknown → OP_SIZE_PROFILE (31, the verified-good Seal default).
+     */
+    private int fingerprintSizeProfile() {
+        String m;
+        try {
+            m = (String) Class.forName("android.os.SystemProperties")
+                    .getMethod("get", String.class, String.class)
+                    .invoke(null, "ro.product.model", "");
+        } catch (Throwable t) { m = ""; }
+        if (m == null) m = "";
+        String lo = m.toLowerCase(java.util.Locale.US);
+        if (lo.contains("atto") || lo.contains("yuan")) return 29;       // 8.8"
+        if (lo.contains("han") || lo.contains("tang") || lo.contains("song")
+                || lo.contains("seal-u") || lo.contains("seal u") || lo.contains("dm-i")
+                || lo.contains("dmi")) return 30;                         // 12.3"
+        return OP_SIZE_PROFILE;                                          // 31 (10.25" Seal native)
     }
 
     // ── Cluster display presence ────────────────────────────────────────────────
@@ -686,24 +947,33 @@ public final class ClusterProjectionController {
 
     /** Authoritative "is the fission cluster display live" via `dumpsys display`.
      *  Returns false when the model never materializes a fission display (e.g. an
-     *  Atto-3-class small cluster that may not support projection at all). */
+     *  Atto-3-class small cluster that may not support projection at all).
+     *
+     *  <p>PREDICATE-UNIFY FIX (root cause of "no video after 3-4 attempts"): this now
+     *  delegates to the SAME authoritative parser the show path already trusts —
+     *  {@link BsNativeLayer#resolveFissionDisplay()}.present() (true iff a displayId
+     *  OR a layerStack was parsed from a "fission" display block). The OLD predicate
+     *  here required "fission" AND "type VIRTUAL" AND "state ON" to all appear on a
+     *  SINGLE dumpsys line; on this firmware's layout those tokens sit on SEPARATE
+     *  lines, so it returned FALSE forever — even while {@link ClusterSpeedOverlay}
+     *  (which uses resolveFissionDisplay) successfully composited on the live stack.
+     *  That blindness made displayPresent() never true, so {@code pollReady} always
+     *  committed "settle+ABSENT" and the cold-open backstop {@code pollPresentEdge}
+     *  polled a predicate that could never go true → it "gave up after 4000ms" and
+     *  never re-drove the show → the warm BS layer was never re-tagged onto the live
+     *  (incrementing) cluster layerStack → black. Delegating to the proven resolver
+     *  makes presence detection consistent across ALL callers. Unsupported-trim
+     *  safety is preserved: present() is FALSE when no fission block parses at all
+     *  (no displayId, no layerStack), exactly as the old strict predicate intended —
+     *  and it does NOT go true on stray/partial "fission" diagnostic text, because it
+     *  requires a genuinely parsed id or stack. Still one `dumpsys display` spawn per
+     *  call, still only invoked on projThread (I9). */
     private boolean clusterDisplayPresentViaDumpsys() {
-        Process p = null;
         try {
-            p = new ProcessBuilder("dumpsys", "display").redirectErrorStream(true).start();
-            java.io.BufferedReader r = new java.io.BufferedReader(
-                new java.io.InputStreamReader(p.getInputStream()));
-            String line;
-            while ((line = r.readLine()) != null) {
-                if (line.contains("fission") && line.contains("type VIRTUAL") && line.contains("state ON")) {
-                    return true;
-                }
-            }
+            return BsNativeLayer.resolveFissionDisplay().present();
         } catch (Throwable ignored) {
-        } finally {
-            if (p != null) try { p.destroy(); } catch (Throwable ignored) {}
+            return false;
         }
-        return false;
     }
 
     // ── Pipeline ready callback (reflection, avoids surveillance→pipeline import cycle) ──

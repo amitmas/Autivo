@@ -72,7 +72,66 @@ data class GyroStats(
  * test-drive set (R-DET-7, G-1..G-4). They are named consts precisely so tuning
  * is a one-line edit per knob, not a logic rewrite.
  */
-class RejectionFilter {
+class RejectionFilter(
+    /**
+     * Minimum path radius (m) a rotation is allowed to imply before it's called
+     * "cornering". The speed-adaptive yaw bar is `ω = speedMps / cornerMinRadiusM`
+     * (clamped) — i.e. reject when the body is turning tighter than this radius.
+     * Smaller ⇒ only very tight turns reject (more recall, less cornering rejection);
+     * larger ⇒ gentler curves also reject. Default 40 m reproduces the legacy flat
+     * 0.25 rad/s bar at ~36 km/h, so an un-tuned install is unchanged in the cruise
+     * band; only the low- and high-speed tails shift in the recall-safe direction.
+     */
+    private val cornerMinRadiusM: Float = DEFAULT_CORNER_MIN_RADIUS_M,
+    /**
+     * Floor of the speed-adaptive yaw bar (rad/s). At crawl speed `v / R` would
+     * approach 0 and reject almost any wobble; the floor keeps the bar at a sane
+     * minimum (≈ the gentle-turn rate) so steady-line crawl jitter isn't vetoed.
+     */
+    private val yawRejectFloorRps: Float = DEFAULT_YAW_REJECT_FLOOR_RPS,
+    /**
+     * Ceil of the speed-adaptive yaw bar (rad/s). Caps the bar at high speed so it
+     * can never rise so far that a genuine committed turn slips under it. Set at/just
+     * below F-006's measured committed-turn rate (~0.347) so a real fast corner is
+     * always still rejected (G-4).
+     */
+    private val yawRejectCeilRps: Float = DEFAULT_YAW_REJECT_CEIL_RPS,
+    /**
+     * |steering angle| (deg) above which cornering is called from the steering
+     * witness alone (speed-invariant — direct driver input). Constructor-injected
+     * only so it's configurable alongside the yaw knobs; default unchanged.
+     */
+    private val steeringRejectDeg: Float = STEERING_REJECT_DEG,
+    /**
+     * When false, the speed-adaptive yaw bar is bypassed and Rule 3 uses the legacy
+     * flat [YAW_RATE_REJECT_RPS] — a one-flag kill switch back to exact pre-change
+     * behaviour if a marked drive ever shows a regression.
+     */
+    private val speedAdaptiveYaw: Boolean = true,
+) {
+
+    /**
+     * Speed-adaptive cornering-reject yaw threshold (rad/s) for the given speed.
+     * `ω = v / R_min`, clamped to [floor, ceil]. With [speedAdaptiveYaw] off, returns
+     * the legacy flat [YAW_RATE_REJECT_RPS] so behaviour is bit-identical. Pure;
+     * speedKmh is the EVENT-time speed (see [eventSpeedKmh]) since ω ∝ v must use the
+     * speed at the jolt, not a stale cached poll.
+     */
+    fun yawRejectThreshold(speedKmh: Float): Float {
+        if (!speedAdaptiveYaw) return YAW_RATE_REJECT_RPS
+        val v = (speedKmh / 3.6f).coerceAtLeast(0f)            // m/s
+        val r = cornerMinRadiusM.coerceAtLeast(1f)             // guard /0
+        return (v / r).coerceIn(yawRejectFloorRps, yawRejectCeilRps)
+    }
+
+    /**
+     * Speed to use for the ω ∝ v comparison: the EVENT-time speed carried on the
+     * candidate ([DetectionCandidate.speedMps], captured at the defining peak), which
+     * is the physically-correct instant for a rate test. Falls back to the (possibly
+     * ~stale) vehicle-bus speed only if the candidate didn't carry one.
+     */
+    private fun eventSpeedKmh(candidate: DetectionCandidate, dynamics: VehicleDynamics): Float =
+        if (candidate.speedMps > 0f) candidate.speedMps * 3.6f else dynamics.speedKmh
 
     /**
      * @param candidate     the raw event from [EventDetector] (morphology only).
@@ -186,8 +245,33 @@ class RejectionFilter {
         // precision/G-4 at the cost of dropping bumps taken mid-gentle-curve; real
         // straight-line hazards (the common case) are unaffected, and curve
         // hazards re-map on a straighter pass.
-        if (abs(dynamics.steeringAngleDeg) > STEERING_REJECT_DEG ||
-            recentGyro.peakYawRateRps > YAW_RATE_REJECT_RPS
+        // SPEED-ADAPTIVE yaw gate (the user's "higher gyro threshold at high speed,
+        // lower at low speed"): the yaw rate a GENUINE corner produces is ω = v / R
+        // (path radius R), so the SAME corner spins the body FASTER at high speed and
+        // SLOWER at low speed. A flat 0.25 rad/s bar therefore MISSES tight LOW-speed
+        // turns (a 15 m turn at 10 km/h is only 0.185 rad/s < 0.25 → leaks through).
+        // yawRejectThreshold() compares against ω = v / cornerMinRadiusM instead — i.e.
+        // reject when the body is turning TIGHTER than R_min — a bar that scales with
+        // speed (clamped to [floor, ceil]). This is NOT the Session-32 accel mistake:
+        // that was an OPEN/detect threshold (raising it with speed suppressed real
+        // bumps); this is a VETO threshold.
+        //
+        // G-4 GUARD (default ceil = legacy 0.25): the ceil caps the bar at the OLD flat
+        // value, so by default the adaptive bar can only ever reject cornering MORE than
+        // before (at low speed, where it drops toward the floor) and NEVER less (at high
+        // speed it sits exactly at the legacy 0.25). That deliberately ships only the
+        // SAFE half of the request — the low-speed tightening — because raising the
+        // high-speed bar above 0.25 would open a pass-band letting real high-speed
+        // sweeping curves (R≈52–72 m @65 km/h, ~0.5 g) leak past the veto. Raising
+        // cornerYawCeilRps (≤0.347) to enable the high-speed half is opt-in and must be
+        // marked-drive validated (sharp-turn ×10 at varied speeds) first. Straight-line
+        // bumps are unaffected at any speed: their gravity-projected yaw is ≈0 (the
+        // alongGravity isolation in RoadSenseController.onGyro), well under the floor.
+        // The STEERING_REJECT_DEG witness (direct driver input, speed-invariant) is an
+        // independent OR-arm that still catches committed turns regardless of speed.
+        val yawBar = yawRejectThreshold(eventSpeedKmh(candidate, dynamics))
+        if (abs(dynamics.steeringAngleDeg) > steeringRejectDeg ||
+            recentGyro.peakYawRateRps > yawBar
         ) {
             return RejectionVerdict(true, "cornering")
         }
@@ -307,6 +391,49 @@ class RejectionFilter {
          * catch turns steering might understate, e.g. fast lane changes).
          */
         const val YAW_RATE_REJECT_RPS = 0.25f
+
+        // ── Speed-adaptive cornering-reject yaw bar (ω = v / R_min, clamped) ──────
+        // The user's "higher gyro threshold at high speed, intelligently lower at low
+        // speed". A genuine corner's yaw rate is ω = v / R, so we reject when the body
+        // is turning tighter than R_min — a bar that RISES with speed (the requested,
+        // and physically-correct, behaviour). ALL PROVISIONAL, physics-seeded (F-006:
+        // at-rest ~1e-3, hard turn ramped 0.088→0.347 rad/s).
+        //
+        // DEFAULT IS MONOTONE-SAFE (G-4): the ceil is the LEGACY flat bar (0.25), so the
+        // adaptive bar NEVER rises above 0.25 — it can only reject cornering MORE than
+        // before (at low speed), never LESS (at high speed). This is the key G-4 guard:
+        // raising the high-speed bar above 0.25 would open a pass-band where real
+        // high-speed sweeping curves (e.g. R≈52–72 m at 65 km/h, ~0.5 g) leak past the
+        // cornering veto and a roll-contaminated transient gets mapped — a false-warning
+        // regression. So by default we ship ONLY the safe half of the request: the
+        // LOW-speed tightening (bar drops below 0.25 toward the floor, catching tight
+        // crawl turns the old flat 0.25 missed; straight low-speed bumps have ≈0
+        // gravity-projected yaw so they are NOT affected). To ALSO get the high-speed
+        // "higher bar" half, raise roadSense.cornerYawCeilRps (e.g. 0.30–0.347) and
+        // VALIDATE on a marked sharp-turn-×10-at-varied-speeds drive first (the codebase
+        // rule: no detection-threshold change that could regress G-4 ships unvalidated).
+        //
+        // DEFAULT IDENTITY: at R_min=40 m the bar = 0.25 rad/s at v=10 m/s (36 km/h),
+        // and the 0.25 ceil holds for every speed ≥36 km/h — so the cruise/highway band
+        // is byte-for-byte the legacy behaviour. Worked bar(speed): 0.12 (floor)
+        // ≤17.3 km/h; 0.139 @20; 0.25 @36; 0.25 (ceil) ≥36 km/h.
+
+        /** Min path radius (m) a rotation may imply before it's "cornering". 40 m
+         *  reproduces the legacy 0.25 rad/s bar at 36 km/h. */
+        const val DEFAULT_CORNER_MIN_RADIUS_M = 40f
+
+        /** Floor of the adaptive yaw bar (rad/s) — the bar at crawl speed. ≈ a gentle
+         *  turn rate; keeps steady-line crawl jitter from being vetoed while still
+         *  catching a genuinely tight low-speed turn (a 15 m turn at 10 km/h = 0.185 >
+         *  0.12, so it rejects — BETTER than the old flat 0.25 which missed it). */
+        const val DEFAULT_YAW_REJECT_FLOOR_RPS = 0.12f
+
+        /** Ceil of the adaptive yaw bar (rad/s). Capped at the LEGACY flat bar (0.25)
+         *  so the adaptive bar can never reject LESS cornering than before at high
+         *  speed — the G-4 invariant. Raising this (≤ F-006's 0.347 committed-turn
+         *  rate) is the opt-in "higher bar at high speed" half of the request and MUST
+         *  be marked-drive-validated before shipping as a default. */
+        const val DEFAULT_YAW_REJECT_CEIL_RPS = 0.25f
 
         /**
          * Window (seconds) the caller computes [evaluate]'s `eventsPerSec` over.

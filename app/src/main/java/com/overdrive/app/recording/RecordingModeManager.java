@@ -19,15 +19,15 @@ import org.json.JSONObject;
  * Modes:
  * - NONE: No recording, pipeline stopped (DEFAULT)
  * - CONTINUOUS: Always recording when ACC ON
- * - DRIVE_MODE: Recording when in driving gears (D/R/S/M), stops in P/N
- * - PROXIMITY_GUARD: Radar-triggered recording in non-P gears (D/R/S/M/N), disabled in P
- * 
+ * - DRIVE_MODE: Recording when in driving gears (D/R/S/M/N), stops in P
+ * - PROXIMITY_GUARD: ACC-ON in ALL gears (incl P); low-power pre-record ring + radar-triggered clips
+ *
  * Features:
  * - Mutual exclusivity enforcement
  * - Proper cleanup when switching modes
  * - Resource management (stops pipeline when NONE)
- * - Gear state awareness for DRIVE_MODE and PROXIMITY_GUARD
- * - ACC state awareness for CONTINUOUS mode
+ * - Gear state awareness for DRIVE_MODE (PROXIMITY_GUARD ignores gear)
+ * - ACC state awareness for CONTINUOUS and PROXIMITY_GUARD modes
  */
 public class RecordingModeManager {
     private static final DaemonLogger logger = DaemonLogger.getInstance("RecordingModeManager");
@@ -46,8 +46,8 @@ public class RecordingModeManager {
     public enum Mode {
         NONE,            // No recording - saves resources (DEFAULT)
         CONTINUOUS,      // Always recording when ACC ON
-        DRIVE_MODE,      // Recording when driving (not in P gear)
-        PROXIMITY_GUARD  // Recording on radar triggers when gear != P
+        DRIVE_MODE,      // Recording when driving (gear D/R/N/S/M, stops in P)
+        PROXIMITY_GUARD  // ACC-ON in ALL gears; low-power ring + record on radar triggers
     }
     
     private final Context context;
@@ -85,6 +85,15 @@ public class RecordingModeManager {
     // between ticks (slow-moving signal).
     private volatile boolean recordingWedged = false;
 
+    // True while activateMode is bringing up a camera-owning mode (CONTINUOUS /
+    // DRIVE_MODE / PROXIMITY_GUARD) — the window between pipeline.start() and
+    // modeActive=true. A concurrent BS turn-signal reconcile (turn-tick thread)
+    // would otherwise see modeActive==false + bsKeepWarmActive==true and disable
+    // the recorder lane / drop fps out from under the activating recorder.
+    // reconcileCameraProfileLocked treats this as "recording owns the camera."
+    // Set/cleared only inside activateMode (which runs under activationLock).
+    private volatile boolean activatingCameraOwner = false;
+
     public RecordingModeManager(Context context, GpuSurveillancePipeline pipeline) {
         this.context = context;
         this.pipeline = pipeline;
@@ -95,11 +104,34 @@ public class RecordingModeManager {
         // PROXIMITY_GUARD MONITORING needs the pipeline alive even when no
         // recording is in flight — without this hook a 30s WebSocket idle
         // would kill the camera between trigger windows.
+        //
+        // Blind-spot is an INDEPENDENT keep-warm reason: if BS is enabled it
+        // holds the camera/rails warm regardless of recording mode or gear (so
+        // the turn-signal blind-spot view is instant), at its OWN low recorder
+        // profile (see applyRecorderProfileForState). modeActive being false
+        // (e.g. proximity parked in P) must NOT tear the camera down while BS
+        // wants it.
         pipeline.setKeepAlivePredicate(() -> {
+            if (bsKeepWarmActive()) return true;
             if (!modeActive) return false;
             Mode m = currentMode;
             return m == Mode.CONTINUOUS || m == Mode.DRIVE_MODE || m == Mode.PROXIMITY_GUARD;
         });
+
+        // When the blind-spot view shows/hides (turn signal) AND BS is the sole
+        // reason the camera is up, ramp the GLOBAL camera fps: BS active fps on
+        // show, BS idle fps on hide. reconcileCameraProfile no-ops the fps change
+        // when a recording mode owns the camera (recording fps wins — BS just
+        // rides along at the recording rate). Fired off the BS turn-tick thread;
+        // reconcileCameraProfile only does cheap volatile/sub-frame writes and is
+        // internally guarded, so no lock is needed here.
+        pipeline.setBsVisibilityListener(this::reconcileCameraProfile);
+
+        // When live-view streaming turns on/off (incl. WS idle auto-close, which
+        // the HTTP handlers don't see), re-reconcile the global camera fps floor
+        // so the shared camera tracks max(recording/BS-idle, stream) and drops
+        // back when the stream goes away. Idempotent; self-serialized.
+        pipeline.setStreamStateListener(this::reconcileCameraProfile);
 
         // Load persisted mode from config
         loadPersistedMode();
@@ -243,7 +275,11 @@ public class RecordingModeManager {
                 logger.info("Boot auto-activate: DRIVE_MODE (gear=" + gearToString(gearNow)
                     + ", signalled=" + signalled + ")");
                 activateModeWithWarmup(targetMode, "boot-auto-activate");
-            } else if (targetMode == Mode.PROXIMITY_GUARD && gearNow != GEAR_P) {
+            } else if (targetMode == Mode.PROXIMITY_GUARD) {
+                // PROXIMITY_GUARD is ACC-gated in ALL gears (incl P) — the
+                // low-power ring stays warm parked so the first event has
+                // pre-roll. ACC-on is implied here (boot auto-activate only runs
+                // the recording-mode branch when ACC was probed ON).
                 logger.info("Boot auto-activate: PROXIMITY_GUARD (gear=" + gearToString(gearNow)
                     + ", signalled=" + signalled + ")");
                 activateModeWithWarmup(targetMode, "boot-auto-activate");
@@ -682,7 +718,9 @@ public class RecordingModeManager {
                     && (!modeActive || (wedgeDetected && wedgeRetryAllowed))
                     && (currentMode == Mode.CONTINUOUS
                         || (currentMode == Mode.DRIVE_MODE && isDrivingGear(currentGear))
-                        || (currentMode == Mode.PROXIMITY_GUARD && currentGear != GEAR_P));
+                        // PROXIMITY_GUARD is ACC-gated in ALL gears (incl P) — retry
+                        // whenever ACC is on and it's not active, regardless of gear.
+                        || currentMode == Mode.PROXIMITY_GUARD);
             // FIX (rmm Round 3, Finding 2): give the wedge budget back when a
             // tick observes healthy recording AND the previous tick was also
             // healthy (or this is the first observation). This way only
@@ -773,6 +811,26 @@ public class RecordingModeManager {
             logger.info("Re-sync retry: activating " + retryMode
                 + (wedgeRetryDriven ? " (wedge-driven, force=true)" : ""));
             activateModeWithWarmup(retryMode, "resync-retry", wedgeRetryDriven);
+        }
+
+        // CONVERGENCE BACKSTOP: reconcile the camera profile every tick (cheap —
+        // idempotent volatile/sub-frame writes, no-op when the profile already
+        // matches; early-returns if the pipeline isn't running). The reactive
+        // triggers (BS show/hide, stream enable/disable, lifecycle edges) keep
+        // latency low, but they each fire on ONE edge — so any state reached
+        // WITHOUT an edge (BS disabled while its view was hidden so no visibility
+        // edge fired; an activation rejected after a kept-alive mode switch; a
+        // debugPreview pin) would otherwise strand the profile until the next
+        // happenstance edge. Driving reconcile from this 30s cadence makes the
+        // single desiredCameraState() authority self-healing: the worst-case
+        // staleness for any un-triggered profile drift is one tick. This is why
+        // the design no longer needs a new special-case patch for each newly
+        // discovered no-edge path — the ladder + the tick cover them by
+        // construction. (Profile only; teardown stays with the existing owners.)
+        try {
+            reconcileCameraProfile();
+        } catch (Throwable t) {
+            logger.warn("Periodic reconcile error: " + t.getMessage());
         }
     }
 
@@ -1043,6 +1101,15 @@ public class RecordingModeManager {
                 }
                 logger.info("Activation aborted (" + reason + ", target=" + mode
                     + ") — gating state changed after monitor release: " + snapshot);
+                // A rejected activation can leave the pipeline running with NO
+                // owner — e.g. a mode switch kept it alive (nextModeWillOwnCamera)
+                // expecting this activate to take over, but the gate moved (gear
+                // shifted out of the driving range in the warmup window). Without
+                // a reconcile the camera would sit at whatever profile the
+                // previous state left (possibly recorder lane ON at full fps with
+                // nothing recording). reconcile lands it in the correct regime
+                // (no-owner baseline, or BS-only if BS is keeping it warm).
+                reconcileCameraProfile();
                 return;
             }
             activateMode(mode);
@@ -1166,10 +1233,10 @@ public class RecordingModeManager {
                         + gearToString(gearNow) + ") — " + reason);
                     return false;
                 }
-                if (mode == Mode.PROXIMITY_GUARD && gearNow == GEAR_P) {
-                    logger.info("PROXIMITY_GUARD waiting for gear != P — " + reason);
-                    return false;
-                }
+                // PROXIMITY_GUARD: no gear gate — ACC-on in ALL gears (incl P).
+                // (Previously returned false when gear==P; removed so the
+                // pre-record ring is warmed while parked, giving the first event
+                // pre-roll. ACC re-validation below still applies.)
                 if (!force && modeActive && pipeline.isRunning() && pipeline.isNormalRecordingMode()) {
                     logger.info("Mode " + mode + " already active — skipping re-activation ("
                         + reason + ")");
@@ -1368,7 +1435,8 @@ public class RecordingModeManager {
                     if (mode == Mode.DRIVE_MODE) {
                         shouldActivateReselect = isDrivingGear(currentGear);
                     } else if (mode == Mode.PROXIMITY_GUARD) {
-                        shouldActivateReselect = (currentGear != GEAR_P);
+                        // ACC-gated in ALL gears (incl P) — no gear condition.
+                        shouldActivateReselect = true;
                     } else {
                         shouldActivateReselect = true;
                     }
@@ -1382,12 +1450,17 @@ public class RecordingModeManager {
                 activateModeWithWarmup(mode, "user-reselect-" + mode);
                 return;
             }
+            // Sync ACC state — query hardware directly for authoritative state.
+            // Done OUTSIDE the manager monitor (mirrors the userRecoveryReselect Round-8
+            // refactor above): queryAccStateFromHardware may now sleep up to ~360ms in
+            // the rare contradicting-OFF confirm path (confirmHardwareAccOff), and we
+            // must not pin the manager monitor across that — it would briefly stall the
+            // resync ticker, gear/ACC IPC snapshots, and HTTP readers.
+            boolean actualAccState = queryAccStateFromHardware();
             synchronized (this) {
 
                 logger.info("Changing recording mode: " + currentMode + " -> " + mode);
 
-                // Sync ACC state — query hardware directly for authoritative state
-                boolean actualAccState = queryAccStateFromHardware();
                 if (actualAccState != accIsOn) {
                     logger.info("Syncing ACC state: " + accIsOn + " -> " + actualAccState);
                     accIsOn = actualAccState;
@@ -1425,9 +1498,18 @@ public class RecordingModeManager {
                         logger.info("Gear is " + gearToString(currentGear) + " - DRIVE_MODE will activate when in D/R/S/M");
                     }
                 } else if (mode == Mode.PROXIMITY_GUARD) {
-                    shouldActivate = (currentGear != GEAR_P);
+                    // PROXIMITY_GUARD is ACC-gated in ALL gears (incl. P). The
+                    // pre-record ring must be fed continuously while monitoring
+                    // so the FIRST radar event — typically while parked in P —
+                    // still has pre-event footage. The encode cost is kept low
+                    // by the adaptive low-power monitor profile (ProximityGuard
+                    // Controller: ~4fps/1.5Mbps ring, snap to full on trigger),
+                    // not by withholding the pipeline. (Was: gear != GEAR_P,
+                    // which left the ring empty in P → zero pre-roll on the
+                    // first parked event, defeating a "guard.")
+                    shouldActivate = accIsOn;
                     if (!shouldActivate) {
-                        logger.info("Gear is P - PROXIMITY_GUARD will activate when gear changes");
+                        logger.info("ACC is OFF - PROXIMITY_GUARD will activate when ACC turns ON");
                     }
                 } else if (mode == Mode.NONE) {
                     // NONE while ACC is OFF: do NOT call activateMode(NONE) — that
@@ -1552,6 +1634,7 @@ public class RecordingModeManager {
         boolean shouldStopAccOff = false;
         Mode modeToActivate = null;
         boolean stopPipelineOnAccOn = false;
+        boolean bsKeepWarmOnAccOn = false;
         synchronized (this) {
             // wasOn reflects "was ACC observed ON via a *prior IPC*?" — not the
             // hardware probe value seeded in the constructor. Without this guard,
@@ -1610,6 +1693,19 @@ public class RecordingModeManager {
                     } catch (Throwable ignored) {}
                     if (dilink4) {
                         logger.info("ACC ON with mode=NONE — keeping pipeline alive (dilink4 esco-parity)");
+                    } else if (bsKeepWarmActive()) {
+                        // Blind-spot is enabled and ACC is on: keep the camera
+                        // WARM for the BS lane even though no recording mode is
+                        // active. The app-side BlindSpotControl.sync() also POSTs
+                        // /api/bs/enable on this ACC edge (which would start the
+                        // pano anyway); marking keep-warm here prevents a
+                        // teardown/restart fight and lets reconcileCameraProfile
+                        // park the camera at the cheap BS-only profile (recorder
+                        // lane OFF, global fps = BS idle). If the pipeline isn't
+                        // up yet, the BS arm path cold-starts it; we just must
+                        // NOT tear it down.
+                        logger.info("ACC ON with mode=NONE — keeping pipeline warm for blind-spot");
+                        bsKeepWarmOnAccOn = true;
                     } else {
                         // CRITICAL legacy path: don't bare-return — without an
                         // explicit teardown, camera+GL+encoder stay allocated
@@ -1626,6 +1722,18 @@ public class RecordingModeManager {
         }
 
         // Heavy I/O outside the manager monitor (still under lifecycleSerializer).
+        if (bsKeepWarmOnAccOn) {
+            // ACC on, mode NONE, but blind-spot wants the camera warm. Don't
+            // tear down. If the pano is already up (e.g. survived from a prior
+            // cycle), reconcile it to the cheap BS-only profile now (recorder
+            // lane OFF, global fps = BS idle); the on-screen show/hide ramp is
+            // driven by the BS turn-tick. If the pano isn't up yet, the app's
+            // BlindSpotControl.sync() ARM path (POST /api/bs/enable) cold-starts
+            // it, and ensurePanoStartedNonBlocking's completion reconcile applies
+            // the same profile — so either way we converge without a teardown.
+            reconcileCameraProfile();
+            return;
+        }
         if (stopPipelineOnAccOn) {
             // Final guard: re-read accIsOn — if a sibling ACC IPC flipped
             // the state between snapshot and now, honor the latest.
@@ -1713,9 +1821,9 @@ public class RecordingModeManager {
     
     /**
      * Notify of gear state change.
-     * - DRIVE_MODE: activates on D/R/S/M, deactivates on P/N
-     * - PROXIMITY_GUARD: activates on D/R/S/M/N, deactivates on P
-     * 
+     * - DRIVE_MODE: activates on D/R/S/M, deactivates on P
+     * - PROXIMITY_GUARD: ignores gear (ACC-gated in all gears; see onAccStateChanged)
+     *
      * @param gear The new gear position (GEAR_P, GEAR_R, GEAR_N, GEAR_D, etc.)
      */
     public void onGearChanged(int gear) {
@@ -1754,53 +1862,38 @@ public class RecordingModeManager {
             int previousGear = currentGear;
             currentGear = gear;
 
-            // Only DRIVE_MODE and PROXIMITY_GUARD respond to gear changes
-            if (currentMode != Mode.DRIVE_MODE && currentMode != Mode.PROXIMITY_GUARD) {
+            // Only DRIVE_MODE responds to gear changes. PROXIMITY_GUARD is now
+            // ACC-gated in ALL gears (the low-power ring stays warm parked in P
+            // so the first event has pre-roll), so it ignores gear entirely —
+            // its start/stop is driven solely by ACC edges (onAccStateChanged).
+            if (currentMode != Mode.DRIVE_MODE) {
                 logger.debug("Mode " + currentMode + " does not respond to gear changes");
                 return;
             }
 
-            if (currentMode == Mode.DRIVE_MODE) {
-                // DRIVE_MODE: record when driving (D/R/S/M) AND ACC is ON
-                boolean wasDriving = isDrivingGear(previousGear);
-                boolean nowDriving = isDrivingGear(gear);
+            // DRIVE_MODE: record when driving (D/R/S/M) AND ACC is ON
+            boolean wasDriving = isDrivingGear(previousGear);
+            boolean nowDriving = isDrivingGear(gear);
 
-                // Use modeActive (not just gear edge) so cold-start — where
-                // GearMonitor's first real reading arrives after construction with
-                // currentGear default GEAR_P — also activates DRIVE_MODE on the
-                // first delivered driving gear, even though the "edge" condition
-                // (wasDriving=false → nowDriving=true) only fires once.
-                if (nowDriving && accIsOn && !modeActive) {
-                    logger.info("Driving gear with mode not yet active - activating DRIVE_MODE recording");
-                    // Route through warmup. If the user shifts D within the 4s
-                    // AVC warmup window after ACC ON, calling activateMode()
-                    // directly would open the camera before com.byd.avc finished
-                    // initializing the HAL → wedged camera, no recording. The
-                    // warmup helper short-circuits when the pipeline is already
-                    // running, so it's a no-op cost when not needed.
-                    activateAfter = () -> activateModeWithWarmup(Mode.DRIVE_MODE, "gear-to-driving");
-                } else if (!nowDriving && (wasDriving || modeActive)) {
-                    logger.info("Shifted to parked gear - deactivating DRIVE_MODE recording");
-                    toDeactivate = Mode.DRIVE_MODE;
-                } else if (nowDriving && !accIsOn) {
-                    logger.info("Driving gear but ACC OFF - DRIVE_MODE will activate when ACC turns ON");
-                }
-            } else if (currentMode == Mode.PROXIMITY_GUARD) {
-                // PROXIMITY_GUARD: active in all gears except P, only when ACC is ON
-                boolean wasInP = (previousGear == GEAR_P);
-                boolean nowInP = (gear == GEAR_P);
-
-                if (!nowInP && accIsOn && !modeActive) {
-                    logger.info("Out of P with mode not yet active - activating PROXIMITY_GUARD");
-                    // Same rationale as DRIVE_MODE above — protect against the
-                    // user shifting out of P before the AVC HAL is warmed up.
-                    activateAfter = () -> activateModeWithWarmup(Mode.PROXIMITY_GUARD, "gear-out-of-P");
-                } else if (nowInP && (!wasInP || modeActive)) {
-                    logger.info("Shifted to P - deactivating PROXIMITY_GUARD");
-                    toDeactivate = Mode.PROXIMITY_GUARD;
-                } else if (!nowInP && !accIsOn) {
-                    logger.info("Not in P but ACC OFF - PROXIMITY_GUARD will activate when ACC turns ON");
-                }
+            // Use modeActive (not just gear edge) so cold-start — where
+            // GearMonitor's first real reading arrives after construction with
+            // currentGear default GEAR_P — also activates DRIVE_MODE on the
+            // first delivered driving gear, even though the "edge" condition
+            // (wasDriving=false → nowDriving=true) only fires once.
+            if (nowDriving && accIsOn && !modeActive) {
+                logger.info("Driving gear with mode not yet active - activating DRIVE_MODE recording");
+                // Route through warmup. If the user shifts D within the 4s
+                // AVC warmup window after ACC ON, calling activateMode()
+                // directly would open the camera before com.byd.avc finished
+                // initializing the HAL → wedged camera, no recording. The
+                // warmup helper short-circuits when the pipeline is already
+                // running, so it's a no-op cost when not needed.
+                activateAfter = () -> activateModeWithWarmup(Mode.DRIVE_MODE, "gear-to-driving");
+            } else if (!nowDriving && (wasDriving || modeActive)) {
+                logger.info("Shifted to parked gear - deactivating DRIVE_MODE recording");
+                toDeactivate = Mode.DRIVE_MODE;
+            } else if (nowDriving && !accIsOn) {
+                logger.info("Driving gear but ACC OFF - DRIVE_MODE will activate when ACC turns ON");
             }
         }
 
@@ -1901,6 +1994,20 @@ public class RecordingModeManager {
     // ==================== MODE ACTIVATION ====================
     
     private void activateMode(Mode mode) {
+        // Mark a camera-owning activation in flight so a racing BS turn-signal
+        // reconcile (turn-tick thread) doesn't disable the recorder lane / drop
+        // fps in the window before modeActive is set true. Cleared in finally.
+        boolean ownerActivation = (mode == Mode.CONTINUOUS
+                || mode == Mode.DRIVE_MODE || mode == Mode.PROXIMITY_GUARD);
+        if (ownerActivation) activatingCameraOwner = true;
+        try {
+            activateModeBody(mode);
+        } finally {
+            if (ownerActivation) activatingCameraOwner = false;
+        }
+    }
+
+    private void activateModeBody(Mode mode) {
         logger.info("Activating mode: " + mode);
 
         // SOTA: Stop any manual recording before activating a mode
@@ -1954,15 +2061,29 @@ public class RecordingModeManager {
                     try {
                         dilink4None = com.overdrive.app.daemon.CameraDaemon.isDilink4ModeActiveStatic();
                     } catch (Throwable ignored) {}
-                    if (pipeline.isRunning() && !dilink4None) {
+                    // Blind-spot keep-warm is an INDEPENDENT consumer: if BS wants
+                    // the camera (enabled/debugPreview + ACC on), switching the
+                    // RECORDING mode to NONE must NOT blank the blind-spot lane.
+                    // Mirror the CONTINUOUS/DRIVE/PROXIMITY deactivate guards —
+                    // keep the pipeline alive and let reconcileCameraProfile park
+                    // it at the cheap BS-only profile. (Without this, mode→NONE
+                    // while BS is on tore the camera down until the next BS arm /
+                    // ACC edge cold-restarted the pano — a BS-availability gap.)
+                    if (pipeline.isRunning() && !dilink4None && !bsKeepWarmActive()) {
                         logger.info("Stopping pipeline for NONE mode (resource saving)");
                         pipeline.stop();
                         CameraDaemon.stopAvcKeepAlive();
                     } else if (dilink4None) {
                         logger.info("NONE mode requested — keeping pipeline alive (dilink4 esco-parity)");
+                    } else if (pipeline.isRunning()) {
+                        logger.info("NONE mode requested — keeping pipeline alive for blind-spot keep-warm");
                     }
                 }
                 modeActive = false;
+                // Reconcile so a BS-only keep-warm camera is parked at the BS
+                // profile (recorder lane OFF, fps idle/active) rather than left at
+                // the just-ended recording mode's full profile.
+                reconcileCameraProfile();
                 break;
                 
             case CONTINUOUS:
@@ -1994,6 +2115,13 @@ public class RecordingModeManager {
                     // wouldn't actually start until the surveillance segment
                     // closed (up to 5min). pipeline.startRecording() handles
                     // the SURVEILLANCE->NORMAL transition correctly.
+                    // Restore the FULL recording baseline BEFORE startRecording —
+                    // if the camera was warm ONLY for blind-spot, its recorder
+                    // lane was OFF and global fps was dropped to ~1, so the first
+                    // recorded frames would otherwise be BS-idle quality. Lane ON
+                    // + stride 1 + configured bitrate + recording fps; all
+                    // sub-frame (no codec reconfigure).
+                    applyFullRecordingProfile();
                     if (!pipeline.isNormalRecordingMode()) {
                         if (pipeline.isRecording()) {
                             logger.info("CONTINUOUS: pipeline recording but not in NORMAL mode "
@@ -2046,6 +2174,11 @@ public class RecordingModeManager {
                     // transition during gear-change activation actually drives
                     // startRecording (mirrors CONTINUOUS branch — see comment
                     // there for the surveillance-finalize race rationale).
+                    // Restore FULL recording baseline before startRecording (see
+                    // CONTINUOUS branch) so a BS-only keep-warm state (recorder
+                    // lane off, fps 1) doesn't bleed into the first recorded
+                    // frames.
+                    applyFullRecordingProfile();
                     if (!pipeline.isNormalRecordingMode()) {
                         if (pipeline.isRecording()) {
                             logger.info("DRIVE_MODE: pipeline recording but not in NORMAL mode "
@@ -2096,6 +2229,17 @@ public class RecordingModeManager {
                         modeActive = false;
                         break;
                     }
+                    // Restore the FULL recording baseline (lane ON + stride 1 +
+                    // configured bitrate + recording fps) BEFORE starting the
+                    // proximity controller. Critical: the controller's MONITORING
+                    // profile derives its draw stride as round(cameraFps /
+                    // monitorFps); if the camera were still at the BS-idle ~1 fps
+                    // (camera came up only for blind-spot), that math would
+                    // compute stride 1 against 1 fps and starve the pre-record
+                    // ring. applyFullRecordingProfile sets the camera to the real
+                    // recording fps first; the controller then layers its own
+                    // low-power MONITORING stride/bitrate on top.
+                    applyFullRecordingProfile();
                     proximityController.start();
                     // Start AVC keep-alive (pipeline is now running with ACC ON)
                     CameraDaemon.startAvcKeepAliveIfNeeded();
@@ -2131,12 +2275,27 @@ public class RecordingModeManager {
         } catch (Throwable ignored) {}
         boolean keepPipelineRunning = !accIsOn || dilink4Persistent;
 
+        // MODE-SWITCH NO-CHURN: setMode sets currentMode=NEW before deactivating
+        // the OLD mode here. If the NEW mode also owns the camera right now
+        // (CONTINUOUS / DRIVE-while-driving / PROXIMITY, ACC on), tearing the
+        // pipeline down only to immediately cold-restart it (~4-6s AVC warmup +
+        // GL init, and the pre-record ring is lost) is pure churn. Keep it alive
+        // and let the NEW mode's activate (applyFullRecordingProfile) re-profile
+        // sub-frame. Guard on currentMode != mode so this ONLY applies to a real
+        // A→B switch — a gear→P DRIVE deactivate (currentMode still DRIVE, gear P
+        // ⇒ modeWouldOwnCameraNow false anyway) and an ACC-off deactivate fall
+        // through to the normal teardown logic.
+        boolean nextModeWillOwnCamera = (currentMode != mode) && modeWouldOwnCameraNow(currentMode);
+
         if (keepPipelineRunning) {
             if (dilink4Persistent && accIsOn) {
                 logger.info("dilink4 + ACC ON — keeping pipeline alive across deactivate (esco-parity)");
             } else {
                 logger.info("ACC is OFF — keeping pipeline running for surveillance");
             }
+        } else if (nextModeWillOwnCamera) {
+            logger.info("Mode switch " + mode + " -> " + currentMode
+                + " (both own camera) — keeping pipeline alive, re-profiling sub-frame (no cold restart)");
         }
         
         switch (mode) {
@@ -2145,31 +2304,437 @@ public class RecordingModeManager {
                 break;
                 
             case CONTINUOUS:
-                // Stop recording but keep pipeline if ACC is OFF (surveillance running)
+                // Stop recording but keep pipeline if ACC is OFF (surveillance
+                // running), dilink4 (esco-parity), blind-spot keep-warm, or a
+                // switch to another camera-owning mode (no cold-restart churn).
                 pipeline.stopRecording();
                 OemDashcamMirror.onPanoRecordingStopped();
-                if (pipeline.isRunning() && !keepPipelineRunning) {
+                if (pipeline.isRunning() && !keepPipelineRunning && !bsKeepWarmActive()
+                        && !nextModeWillOwnCamera) {
                     pipeline.stop();
                     CameraDaemon.stopAvcKeepAlive();
                 }
                 break;
 
             case DRIVE_MODE:
-                // Stop recording only — keep pipeline alive for quick resume on next gear change.
-                // Full pipeline teardown (camera/EGL/encoder release) makes restart unreliable
-                // and slow. Only stop the pipeline on full ACC OFF (handled by onAccStateChanged).
+                // Stop recording AND tear down the pipeline when no consumer
+                // still needs the camera. Previously this kept the camera warm
+                // unconditionally for "quick resume" — but a parked-in-P car
+                // (DRIVE_MODE shifted to P) then burned full-quality GPU+encode
+                // for a recording that can't happen until a driving gear. Now we
+                // stop unless ACC is off (surveillance owns it), dilink4 (esco-
+                // parity), or blind-spot is keeping the rails warm. When BS keeps
+                // it warm, throttle the recorder lane to the BS profile so it
+                // isn't running at full recording quality (applyRecorderProfileForState).
                 pipeline.stopRecording();
                 OemDashcamMirror.onPanoRecordingStopped();
-                break;
-                
-            case PROXIMITY_GUARD:
-                // Stop proximity controller but keep pipeline if ACC is OFF (surveillance running)
-                proximityController.stop();
-                if (pipeline.isRunning() && !keepPipelineRunning) {
+                if (pipeline.isRunning() && !keepPipelineRunning && !bsKeepWarmActive()
+                        && !nextModeWillOwnCamera) {
                     pipeline.stop();
                     CameraDaemon.stopAvcKeepAlive();
                 }
                 break;
+
+            case PROXIMITY_GUARD:
+                // Stop proximity controller but keep pipeline if ACC is OFF (surveillance running)
+                proximityController.stop();
+                // FIX (false-GREEN PROX pill at next ACC-ON): finalize any
+                // in-flight / leftover proximity clip, symmetric with the
+                // CONTINUOUS/DRIVE_MODE cases above. proximityController.stop()
+                // halts the radar monitor but does NOT itself drain the
+                // recorder's `recording` flag if a triggered clip (or its
+                // POST_RECORD tail) is still open. Without this, the stale
+                // recorder.recording=true survives the ACC-OFF→ON transition
+                // and /status reports isRecording=true while the next session
+                // is merely armed-idle → the overlay paints a false GREEN
+                // "PROX" until the first real trigger's stop clears it.
+                // Idempotent: stopRecording() is a no-op when not recording.
+                pipeline.stopRecording();
+                if (pipeline.isRunning() && !keepPipelineRunning && !bsKeepWarmActive()
+                        && !nextModeWillOwnCamera) {
+                    pipeline.stop();
+                    CameraDaemon.stopAvcKeepAlive();
+                }
+                break;
+        }
+
+        // If we kept the pipeline warm ONLY for blind-spot (recording mode just
+        // deactivated but BS still wants the camera), reconcile the camera
+        // profile: switch the H.265 recorder lane OFF (BS has no encoder) and
+        // drop global camera fps to the BS idle/active rate. No-op if the
+        // pipeline actually stopped above (camera gone) or if a recording mode
+        // is still active (in which case it gets the full-rate baseline).
+        reconcileCameraProfile();
+    }
+
+    /**
+     * True when blind-spot should keep the shared camera/rails warm independently
+     * of any recording mode or gear. BS renders to its own SurfaceControl layer
+     * (NO encoder), so this only governs pipeline LIFETIME — when BS is the SOLE
+     * reason the camera is up, the H.265 recorder lane is switched OFF and the
+     * global camera fps is dropped (see {@link #reconcileCameraProfile}).
+     * Runs in the daemon process (same UID that writes blindspot config), so a
+     * plain read is fresh enough; gated on ACC so a powered-down car never keeps
+     * the camera up.
+     */
+    private boolean bsKeepWarmActive() {
+        try {
+            // Mirror the ARM authority (StreamingApiHandler.resolveBlindSpotLifecycle
+            // + BlindSpotControl.sync), which arm the lane on (enabled OR
+            // debugPreview). The profile/lifetime authority MUST agree: a
+            // debugPreview-only calibration session (enabled=false) genuinely wants
+            // the camera warm for the BS lane, so it should be parked at the cheap
+            // BS-only profile (recorder lane OFF, fps=active) and kept alive — not
+            // classified as no-owner (which would run the H.265 recorder lane at
+            // full fps for a feature that records nothing) nor torn down by the
+            // WS-idle shutdown. Reading debugPreview off the same getBlindSpot()
+            // object keeps it a single mtime-cached read.
+            org.json.JSONObject bs = UnifiedConfigManager.getBlindSpot();
+            boolean enabled = bs != null && (bs.optBoolean("enabled", false)
+                    || bs.optBoolean("debugPreview", false));
+            return accIsOn && enabled;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /**
+     * Public entry point invoked when the pano pipeline was started OUTSIDE the
+     * recording-mode lifecycle — specifically the blind-spot cold-start path
+     * (StreamingApiHandler.ensurePanoStartedNonBlocking → pano.start()). That
+     * path warms the camera at the pipeline's default full profile; if BS is the
+     * only consumer we must immediately reconcile it down to the cheap BS-only
+     * profile (recorder lane OFF, global fps = BS idle/active). reconcileCameraProfile
+     * self-serializes on reconcileLock. No-op if a recording mode is active (its
+     * own activate path already set the full-recording baseline) or if the
+     * pipeline isn't running.
+     */
+    public void onPipelineStartedExternally() {
+        reconcileCameraProfile();
+    }
+
+    /** True when an active recording mode is the OWNER of the camera (it wants the
+     *  H.265 recorder lane running at full rate). PROXIMITY_GUARD counts: it owns
+     *  the pre-record ring even between triggers (its own controller refines the
+     *  monitor-window stride/bitrate on top of this). */
+    private boolean recordingModeOwnsCamera() {
+        return modeActive
+                && (currentMode == Mode.CONTINUOUS
+                    || currentMode == Mode.DRIVE_MODE
+                    || currentMode == Mode.PROXIMITY_GUARD);
+    }
+
+    /** Whether the given mode WOULD own the camera under the CURRENT ACC/gear
+     *  state right now, independent of modeActive (which the new mode hasn't set
+     *  yet during a mode switch). Used by deactivateMode to decide whether a
+     *  switch to {@code m} should keep the pipeline alive (no cold-restart churn):
+     *  CONTINUOUS needs ACC on; DRIVE needs ACC on AND a driving gear;
+     *  PROXIMITY_GUARD needs ACC on (any gear). NONE never owns. */
+    private boolean modeWouldOwnCameraNow(Mode m) {
+        if (!accIsOn) return false;
+        switch (m) {
+            case CONTINUOUS:      return true;
+            case DRIVE_MODE:      return isDrivingGear(currentGear);
+            case PROXIMITY_GUARD: return true;
+            default:              return false;
+        }
+    }
+
+    /**
+     * Single authority for the camera's runtime profile (global fps + recorder
+     * lane on/off), reconciled against who actually needs the camera. Called
+     * after every lifecycle transition (activate/deactivate) and on BS
+     * show/hide. No-op when the pipeline isn't running.
+     *
+     * <p>Two regimes:
+     * <ul>
+     *   <li><b>A recording mode owns the camera</b> → recorder lane ON, stride 1,
+     *       configured recording bitrate, and global camera fps restored to the
+     *       user's configured recording fps. Recording ALWAYS wins the rate.
+     *       (ProximityGuardController layers its own low-power MONITORING stride
+     *       /bitrate on top — see {@link #applyRecorderProfileForState}-era note;
+     *       this method only sets the full-rate baseline it snaps back to.)</li>
+     *   <li><b>Camera up ONLY for blind-spot keep-warm</b> → recorder lane OFF
+     *       (BS has no encoder; no ring to feed), and global camera fps set to
+     *       the BS idle/active fps depending on whether the BS view is currently
+     *       shown (turn signal). BS's sole cost lever is the shared camera fps.</li>
+     * </ul>
+     *
+     * <p>Serialized by callers under lifecycleSerializer; the underlying pipeline
+     * setters are lockless volatile writes consumed by the GL thread.
+     */
+    // Dedicated lock for reconcileCameraProfile. NOT lifecycleSerializer and NOT
+    // activationLock: reconcile is called both from the BS turn-tick thread
+    // (bsVisibilityListener, holds no lock) and from inside deactivateMode (which
+    // already holds activationLock) — routing reconcile through lifecycleSerializer
+    // would create activationLock→lifecycleSerializer ordering against the normal
+    // lifecycleSerializer→activationLock order and could deadlock. A dedicated
+    // lock participates in no other ordering: it only guarantees the read-decide-
+    // write sequence of one reconcile is atomic w.r.t. a peer reconcile (the
+    // pipeline setters are volatile + idempotent, so cross-reconcile coherence is
+    // the only requirement). Always innermost — reconcile takes no other lock.
+    private final Object reconcileLock = new Object();
+
+    private void reconcileCameraProfile() {
+        // Serialize against peer reconciles so the setter group (lane/stride/
+        // bitrate/fps) is applied coherently — never interleaved into an
+        // incoherent combo (lane OFF + recording fps, or lane ON + 1 fps) when a
+        // BS show/hide edge races a lifecycle transition. See reconcileLock.
+        synchronized (reconcileLock) {
+            reconcileCameraProfileLocked();
+        }
+    }
+
+    // ==================== CAMERA STATE: SINGLE AUTHORITY ====================
+    // The camera's runtime PROFILE (recorder lane on/off, global fps, and — for
+    // continuous-style recording — stride/bitrate) is decided in ONE place:
+    // desiredCameraState() computes the intent from a single priority ladder, and
+    // reconcileCameraProfileLocked() is the ONLY writer that applies it. Every
+    // trigger (BS show/hide, stream enable/disable, lifecycle edges, the 30s
+    // resync tick) routes through reconcileCameraProfile() → this pair. This
+    // replaced a set of ad-hoc reactive branches that each re-derived partial
+    // state and drifted out of agreement (the "every audit round finds a new
+    // combo" problem). Adding a new consumer = add ONE rung to the ladder here.
+    //
+    // SCOPE: this owns the PROFILE only, not pipeline START/STOP. Teardown stays
+    // with the existing owners (mode deactivate gates + WS idle-shutdown +
+    // ACC-off), which already gate on bsKeepWarmActive()/keepAlivePredicate — so
+    // a profile reconcile can never tear down a live recording or surveillance.
+
+    /** Immutable camera profile intent produced by {@link #desiredCameraState}. */
+    private static final class CameraIntent {
+        final boolean laneEnabled;   // recorder PASS 1A on/off
+        final int fps;               // global camera HAL fps
+        final boolean ownStrideBitrate; // true = set stride 1 + recording bitrate;
+                                         // false = leave them to whoever owns them
+                                         // (ProximityGuardController, or nobody for BS-only)
+        final String why;            // for the log line
+        CameraIntent(boolean laneEnabled, int fps, boolean ownStrideBitrate, String why) {
+            this.laneEnabled = laneEnabled; this.fps = fps;
+            this.ownStrideBitrate = ownStrideBitrate; this.why = why;
+        }
+    }
+
+    /**
+     * THE single source of truth for what the camera profile should be right now.
+     * Pure (no side effects) — reads state, returns intent. Priority ladder, most
+     * authoritative first:
+     *
+     *  1. RECORDING owns the camera — any RMM recording mode active, OR a live/
+     *     deferred recording of any origin (manual, sentry, OEM via the shared
+     *     recorder), OR an activation in flight. Lane ON, fps = max(recordingFps,
+     *     streamFps). PROXIMITY_GUARD is special: its controller owns stride/bitrate
+     *     (the low-power ring), so ownStrideBitrate=false for it.
+     *  2. BLIND-SPOT keep-warm (enabled/debugPreview + ACC) — lane OFF (BS has no
+     *     encoder), fps = max(bsIdle/Active, streamFps).
+     *  3. STREAM-ONLY — a live-view stream is the only consumer. Lane OFF, fps =
+     *     streamFps.
+     *  4. NO OWNER — pipeline is up but nobody needs it (transient: BS just
+     *     disabled, or an activation was rejected after a kept-alive switch).
+     *     Restore a sane baseline (lane ON, recording fps) so the next consumer
+     *     isn't starved; teardown of a truly idle pipeline is the other owners' job.
+     */
+    private CameraIntent desiredCameraState() {
+        int streamFps = activeStreamFps();
+        // Rung 1: recording (broadest ownership — see pipelineIsRecording()).
+        boolean activationInFlight = activatingCameraOwner
+                && (currentMode == Mode.CONTINUOUS
+                    || currentMode == Mode.DRIVE_MODE
+                    || currentMode == Mode.PROXIMITY_GUARD);
+        if (recordingModeOwnsCamera() || pipelineIsRecording() || activationInFlight) {
+            boolean proximity = (currentMode == Mode.PROXIMITY_GUARD);
+            int fps = Math.max(configuredRecordingFps(), streamFps);
+            if (proximity) {
+                // PROXIMITY detection is RADAR-driven, not camera-driven. While
+                // the controller is MONITORING (the common parked-idle state) it
+                // only needs the camera lightly warm to keep the pre-record ring
+                // filling — so drop the GLOBAL camera HAL fps to the monitor rate
+                // (measured: the OEM camera stack mm-qcamera-daemon was pinned at
+                // ~50% of a little core capturing 15fps while ~3/4 of those frames
+                // were stride-skipped anyway). The controller returns its desired
+                // HAL fps: monitorFps (~4) while MONITORING, 0 ("no opinion = full
+                // rate") while RECORDING/POST_RECORD so an event clip snaps back to
+                // the configured recording fps. We still honor an active live-view
+                // stream's floor. Leave stride/bitrate to the controller; it
+                // re-derives its stride against this HAL fps via
+                // reapplyMonitorProfileIfMonitoring (driven below on an fps change).
+                int proxWant = (proximityController != null) ? proximityController.desiredCameraFps() : 0;
+                int proxFps = (proxWant > 0) ? proxWant : configuredRecordingFps();
+                // The shared camera must satisfy EVERY consumer, not just
+                // proximity. While proximity sits MONITORING at the low ~4fps
+                // monitor rate, a SHOWN blind-spot view (driver flicked the turn
+                // signal) needs the BS active fps — otherwise the safety view the
+                // driver is actively looking at would render at the choppy 4fps
+                // monitor rate. Likewise a live-view stream needs its rate. So
+                // take the max of all live demands. (When a radar event fires the
+                // controller returns 0 => configuredRecordingFps, already >= BS.)
+                int bsDemand = (bsKeepWarmActive() && bsViewShown())
+                        ? UnifiedConfigManager.getBlindSpotActiveFps() : 0;
+                int camFps = Math.max(proxFps, Math.max(streamFps, bsDemand));
+                return new CameraIntent(true, camFps, false,
+                        "recording:PROXIMITY (cam fps=" + camFps
+                                + (proxWant > 0 ? " monitor" : " full")
+                                + (bsDemand > 0 ? "+BS" : "") + (streamFps > 0 ? "+stream" : "")
+                                + ", controller owns stride/bitrate)");
+            }
+            // Continuous-style: own stride/bitrate (stride 1 + full bitrate).
+            return new CameraIntent(true, fps, true, "recording:continuous-style");
+        }
+        // Rung 2: blind-spot keep-warm.
+        if (bsKeepWarmActive()) {
+            int bsFps = bsViewShown()
+                    ? UnifiedConfigManager.getBlindSpotActiveFps()
+                    : UnifiedConfigManager.getBlindSpotIdleFps();
+            return new CameraIntent(false, Math.max(bsFps, streamFps), false,
+                    "blind-spot keep-warm (view " + (bsViewShown() ? "SHOWN" : "hidden") + ")");
+        }
+        // Rung 3: live-view stream is the only consumer.
+        if (streamFps > 0) {
+            return new CameraIntent(false, streamFps, false, "stream-only");
+        }
+        // Rung 4: NO owner — the pipeline is up but nothing records, surveillance
+        // isn't armed, blind-spot isn't keep-warm, no stream, no activation in
+        // flight. Reachable transiently when BS was the sole consumer and got
+        // disabled (its lane torn down but the pipeline kept alive), or an
+        // activation was rejected after a kept-alive mode switch. Keep the
+        // recorder lane OFF at a low idle fps: running PASS 1A (H.265 encode) for
+        // a camera nobody consumes is pure Venus/GPU burn on the shared bus, and
+        // there is NOT always a teardown owner for a BS-only-cold-started pipeline
+        // (no WS idle timer exists unless a stream was opened), so a lane-ON
+        // baseline would burn until the next ACC-off. The black-frame backstop is
+        // preserved regardless: startRecording() unconditionally re-enables the
+        // lane, and every RMM activation runs applyFullRecordingProfile first — so
+        // the instant ANY consumer (record/sentry/stream/BS) appears, the
+        // appropriate higher rung re-profiles the camera. Idle = cheapest safe
+        // state for "nobody needs it."
+        return new CameraIntent(false, UnifiedConfigManager.getBlindSpotIdleFps(), false,
+                "no active consumer (idle)");
+    }
+
+    /** The ONLY writer of the camera profile. Always run under {@link #reconcileLock}.
+     *  Applies {@link #desiredCameraState()}. No START/STOP here (see SCOPE note). */
+    private void reconcileCameraProfileLocked() {
+        try {
+            if (!pipeline.isRunning()) return;
+            CameraIntent want = desiredCameraState();
+            // fps change detection for the proximity stride re-derive (below).
+            int prevFps = pipeline.getCameraTargetFps();
+            pipeline.setRecorderLaneEnabled(want.laneEnabled);
+            pipeline.setCameraTargetFps(want.fps);
+            if (want.ownStrideBitrate) {
+                pipeline.setRecorderFrameStride(1);
+                pipeline.setRecordingBitrate(pipeline.getConfiguredRecordingBitrate());
+            } else if (currentMode == Mode.PROXIMITY_GUARD && want.fps != prevFps
+                    && proximityController != null) {
+                // Proximity owns its stride, computed as round(cameraFps/monitorFps)
+                // at MONITORING-entry. If we just CHANGED the camera fps (a stream
+                // opened/closed), that stride is stale — ask the controller to
+                // re-derive it (no-op unless it is currently MONITORING).
+                proximityController.reapplyMonitorProfileIfMonitoring();
+            }
+            logger.info("Camera profile: " + want.why + " — lane "
+                    + (want.laneEnabled ? "ON" : "OFF") + ", fps=" + want.fps
+                    + (activeStreamFps() > 0 ? " (stream " + activeStreamFps() + ")" : ""));
+        } catch (Throwable t) {
+            logger.warn("reconcileCameraProfile failed: " + t.getMessage());
+        }
+    }
+
+    /** True if the pipeline currently has ANY live OR DESIRED recording (RMM mode,
+     *  manual, sentry, OEM, or a DEFERRED start waiting on encoder format/storage)
+     *  feeding the recorder lane — so reconcile must never disable the lane or drop
+     *  below recording fps. The pending/desired check matters because a manual or
+     *  TCP start that DEFERS (encoder format not ready yet — the usual case when
+     *  the camera was BS-only-warmed with the lane off, so the encoder was never
+     *  fed) has recordingMode=true + pendingRecordingPrefix!=null but isRecording()
+     *  is still false; without recognizing that, a BS-hide reconcile in the
+     *  deferral window would drop the camera back to BS-idle ~1 fps and the
+     *  deferred clip would record at 1 fps. Guarded against transient nulls. */
+    private boolean pipelineIsRecording() {
+        try {
+            return pipeline.isRecording()
+                    || pipeline.isNormalRecordingMode()
+                    || pipeline.isRecordingMode()
+                    || pipeline.getPendingRecordingPrefix() != null
+                    // ARMED-IDLE SURVEILLANCE (ACC-off sentry between motion
+                    // events): the sentry shares the primary recorder and relies
+                    // on PASS 1A continuously feeding the pre-record ring so a
+                    // motion trigger has its pre-event lead-in. It is NOT
+                    // isRecording()/NORMAL_RECORDING while armed-idle, so without
+                    // this term a live-view stream opened for remote monitoring
+                    // would drop the camera to the stream-only rung (lane OFF) and
+                    // starve the ring → empty pre-roll on the next event. Treating
+                    // SURVEILLANCE as recording-owns keeps the lane ON.
+                    || pipeline.isSurveillanceMode();
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /** The fps a currently-enabled live-view stream needs, or 0 if streaming is
+     *  off. Used as a floor for the BS-only global-fps drop so the shared camera
+     *  never starves an active stream lane. */
+    private int activeStreamFps() {
+        try {
+            return pipeline.getActiveStreamFps();
+        } catch (Throwable t) {
+            return 0;
+        }
+    }
+
+    /**
+     * Assert the FULL recording baseline on the shared camera: recorder lane ON,
+     * draw stride 1, configured recording bitrate, and global camera fps at the
+     * user's configured recording rate. Called at the start of every recording-
+     * mode activation BEFORE startRecording (CONTINUOUS/DRIVE) or BEFORE
+     * proximityController.start() (PROXIMITY) so that:
+     *   - if the camera was kept warm ONLY for blind-spot, the recorder lane
+     *     (which BS turned OFF) and the global fps (which BS dropped to ~1) are
+     *     restored before any frame is recorded — otherwise the first frames are
+     *     BS-idle quality, AND proximity's monitor-stride math (cameraFps /
+     *     monitorFps) would be computed against the stale 1 fps and under-feed
+     *     the pre-record ring;
+     *   - proximity then layers its own low-power MONITORING stride/bitrate on
+     *     top of this full-rate baseline.
+     * No-op-safe: all setters are cheap volatile writes / sub-frame MediaCodec
+     * params, no codec reconfigure. Guarded so a missing camera can't throw.
+     */
+    private void applyFullRecordingProfile() {
+        try {
+            pipeline.setRecorderLaneEnabled(true);
+            pipeline.setRecorderFrameStride(1);
+            pipeline.setRecordingBitrate(pipeline.getConfiguredRecordingBitrate());
+            // Floor at the live-view stream fps: the stream (PASS 1B) shares the
+            // one camera, so the camera HAL rate must satisfy max(recording,
+            // stream) or a SMOOTH(25)/MAX(30) stream opened during recording (incl.
+            // PROXIMITY, whose reconcile branch leaves fps to the controller) would
+            // play at the lower recording rate. The recorder draw-stride still
+            // sub-samples the recorder lane to the record rate; proximity then
+            // layers its MONITORING stride on top (recomputed against this fps).
+            int recFps = Math.max(configuredRecordingFps(), activeStreamFps());
+            pipeline.setCameraTargetFps(recFps);
+        } catch (Throwable t) {
+            logger.warn("applyFullRecordingProfile failed: " + t.getMessage());
+        }
+    }
+
+    /** User-configured recording fps from unified config (BYD-supported {8,15,25},
+     *  clamped to 15 by the settings API). Falls back to 15. */
+    private int configuredRecordingFps() {
+        try {
+            org.json.JSONObject cam = UnifiedConfigManager.loadConfig().optJSONObject("camera");
+            if (cam != null) return cam.optInt("targetFps", 15);
+        } catch (Throwable ignored) {}
+        return 15;
+    }
+
+    /** Whether the blind-spot view is currently being shown on screen (turn
+     *  signal active / debug preview). Drives the BS idle↔active fps ramp. */
+    private boolean bsViewShown() {
+        try {
+            return pipeline.isBlindSpotLayerVisible();
+        } catch (Throwable t) {
+            return false;
         }
     }
     
@@ -2236,53 +2801,88 @@ public class RecordingModeManager {
         resolveBodyworkReflection();
         if (bodyworkReflectionResolved) {
             try {
-                Object device = bodyworkGetInstanceMethod.invoke(null, context);
-                if (device != null) {
-                    int level = (Integer) bodyworkGetPowerLevelMethod.invoke(device);
-                    // Only trust the four legitimate states. INVALID (255),
-                    // FAKE_OK (4), or any unexpected value → fall through to
-                    // the IPC-backed AccMonitor.
-                    if (level >= 0 && level <= 3) {
-                        boolean isOn = level >= 2;
-                        logger.debug("Hardware power level: " + level + " (ACC " + (isOn ? "ON" : "OFF") + ")");
-                        // Write-through to AccMonitor so the daemon-wide
-                        // static reflects the truth: peer code paths that
-                        // read AccMonitor.isAccOn() (e.g., NotificationGate)
-                        // would otherwise see a stale value if AccSentry
-                        // crashed and never delivered an IPC. Definitive
-                        // hardware reads (0..3) are authoritative; sentinel
-                        // values (4 / 255) intentionally fall through to
-                        // the existing AccMonitor read below.
-                        //
-                        // FIX (rmm: queryAccStateFromHardware write-through
-                        // races AccSentry IPC + acc-sentry: accOnAuthoritative
-                        // flag is dead code): gate the write-through on
-                        // (a) AccMonitor not yet authoritative (no IPC has
-                        // landed) OR (b) probe disagrees with current
-                        // AccMonitor value. If AccSentry has spoken AND we
-                        // agree, skip the write — avoids stamping a stale
-                        // level=0 mid-edge over a just-written true. Wires
-                        // the previously-dead accOnAuthoritative gate.
-                        boolean ipcAuthoritative =
-                            com.overdrive.app.monitor.AccMonitor.isAccStateAuthoritative();
-                        boolean ipcCurrent =
-                            com.overdrive.app.monitor.AccMonitor.isAccOn();
-                        if (!ipcAuthoritative || ipcCurrent != isOn) {
-                            if (ipcAuthoritative) {
-                                logger.info("HW probe disagrees with AccMonitor (ipc="
-                                    + ipcCurrent + ", hw=" + isOn + ", level=" + level
-                                    + ") — write-through");
-                            }
-                            com.overdrive.app.monitor.AccMonitor.setAccState(isOn);
-                        } else {
-                            logger.debug("HW probe agrees with authoritative AccMonitor — skipping write-through");
+                int level = readPowerLevelOnce();
+                // Only trust the four legitimate states. INVALID (255),
+                // FAKE_OK (4), or any unexpected value → fall through to
+                // the IPC-backed AccMonitor.
+                if (level >= 0 && level <= 3) {
+                    boolean isOn = level >= 2;
+                    logger.debug("Hardware power level: " + level + " (ACC " + (isOn ? "ON" : "OFF") + ")");
+                    // Write-through to AccMonitor so the daemon-wide
+                    // static reflects the truth: peer code paths that
+                    // read AccMonitor.isAccOn() (e.g., NotificationGate)
+                    // would otherwise see a stale value if AccSentry
+                    // crashed and never delivered an IPC. Definitive
+                    // hardware reads (0..3) are authoritative; sentinel
+                    // values (4 / 255) intentionally fall through to
+                    // the existing AccMonitor read below.
+                    //
+                    // FIX (rmm: queryAccStateFromHardware write-through
+                    // races AccSentry IPC + acc-sentry: accOnAuthoritative
+                    // flag is dead code): gate the write-through on
+                    // (a) AccMonitor not yet authoritative (no IPC has
+                    // landed) OR (b) probe disagrees with current
+                    // AccMonitor value. If AccSentry has spoken AND we
+                    // agree, skip the write — avoids stamping a stale
+                    // level=0 mid-edge over a just-written true. Wires
+                    // the previously-dead accOnAuthoritative gate.
+                    boolean ipcAuthoritative =
+                        com.overdrive.app.monitor.AccMonitor.isAccStateAuthoritative();
+                    boolean ipcCurrent =
+                        com.overdrive.app.monitor.AccMonitor.isAccOn();
+
+                    // FIX (spurious projection close — "projection ends on its
+                    // own"): a SINGLE transient genuine-low power-level read
+                    // (level 0/1) that CONTRADICTS an authoritative ACC=ON must
+                    // NOT dispatch an ACC-OFF edge. setAccState(false) here
+                    // flows through AccMonitor.notifyAccEdge → ClusterProjection
+                    // Controller.forceCloseIfActive("acc-off"), which tears down
+                    // a SUSTAINED cluster-map projection (and a held turn-signal
+                    // projection) and restores the gauges — a manually-launched
+                    // map is then NOT re-acquired, so it stays dead for the rest
+                    // of the drive. The HAL power level momentarily dips during
+                    // normal driving; the authoritative ACC source is AccSentry's
+                    // sys.accanim.status (shutdown-animation flag, which does not
+                    // flap), so this resync probe is the only flapping ACC-edge
+                    // source. Confirm a contradicting OFF across a couple of
+                    // re-reads before trusting it; a REAL power-down stays low,
+                    // so the gauge-restore on a genuine ACC-off is delayed only
+                    // by ~ACC_OFF_CONFIRM_RETRIES × ACC_OFF_CONFIRM_SPACING_MS
+                    // (≤400ms). Only the DISAGREES-with-authoritative-ON case is
+                    // debounced; an agreeing read, a non-authoritative AccMonitor
+                    // (post-restart stale-false, the NotificationGate case the
+                    // write-through was added for), and a confirmed OFF all
+                    // write through unchanged. NEVER applied to the AccSentry IPC
+                    // path (CameraDaemon.onAccStateChanged), which stays immediate.
+                    if (ipcAuthoritative && ipcCurrent && !isOn) {
+                        if (!confirmHardwareAccOff()) {
+                            logger.info("HW probe read ACC-OFF (level=" + level
+                                + ") contradicting authoritative ACC-ON, but it did "
+                                + "NOT confirm across re-reads — treating as a "
+                                + "transient dip, keeping ACC-ON (no spurious edge)");
+                            return true;   // authoritative ON stands
                         }
-                        return isOn;
+                        logger.info("HW probe ACC-OFF CONFIRMED across re-reads "
+                            + "(was authoritative ON) — write-through");
+                        com.overdrive.app.monitor.AccMonitor.setAccState(false);
+                        return false;
                     }
-                    // Sentinel / out-of-range — log and fall through.
-                    logger.debug("Hardware power level=" + level
-                            + " (sentinel/unknown — falling back to AccMonitor)");
+
+                    if (!ipcAuthoritative || ipcCurrent != isOn) {
+                        if (ipcAuthoritative) {
+                            logger.info("HW probe disagrees with AccMonitor (ipc="
+                                + ipcCurrent + ", hw=" + isOn + ", level=" + level
+                                + ") — write-through");
+                        }
+                        com.overdrive.app.monitor.AccMonitor.setAccState(isOn);
+                    } else {
+                        logger.debug("HW probe agrees with authoritative AccMonitor — skipping write-through");
+                    }
+                    return isOn;
                 }
+                // Sentinel / out-of-range — log and fall through.
+                logger.debug("Hardware power level=" + level
+                        + " (sentinel/unknown — falling back to AccMonitor)");
             } catch (Exception e) {
                 // Per-call failure (e.g., device service died briefly) — fall
                 // through to AccMonitor. Don't mark reflection failed; the
@@ -2294,6 +2894,62 @@ public class RecordingModeManager {
         // Fallback to AccMonitor (last IPC-pushed value from AccSentryDaemon)
         return com.overdrive.app.monitor.AccMonitor.isAccOn();
     }
+
+    /** Single raw power-level read via the cached bodywork reflection, or -1 on
+     *  failure. Caller interprets 0..3 as definitive (isOn = level>=2) and
+     *  4/255/other as sentinel. Split out so {@link #confirmHardwareAccOff} can
+     *  re-poll without re-running the dispatch/write-through logic. */
+    private int readPowerLevelOnce() throws Exception {
+        Object device = bodyworkGetInstanceMethod.invoke(null, context);
+        if (device == null) return -1;
+        return (Integer) bodyworkGetPowerLevelMethod.invoke(device);
+    }
+
+    /** Re-read the HAL power level a few times to confirm a genuine ACC-OFF that
+     *  contradicts an authoritative ACC-ON, rejecting a single transient dip
+     *  (the "projection ends on its own" cause). Returns true only if a
+     *  definitive OFF read (level 0/1) persists across the re-reads; a single ON
+     *  (level≥2) or a recovered/sentinel read short-circuits to false (keep ON).
+     *  Total added latency ≤ {@link #ACC_OFF_CONFIRM_RETRIES} ×
+     *  {@link #ACC_OFF_CONFIRM_SPACING_MS}. */
+    private boolean confirmHardwareAccOff() {
+        for (int i = 0; i < ACC_OFF_CONFIRM_RETRIES; i++) {
+            try {
+                Thread.sleep(ACC_OFF_CONFIRM_SPACING_MS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;   // don't dispatch OFF on an interrupt — keep ON
+            }
+            try {
+                int level = readPowerLevelOnce();
+                if (level >= 0 && level <= 3) {
+                    if (level >= 2) {
+                        logger.debug("confirmHardwareAccOff: re-read " + (i + 1)
+                            + " came back ON (level=" + level + ") — transient dip");
+                        return false;
+                    }
+                    // still a definitive OFF — keep confirming
+                } else {
+                    // sentinel / unreadable — inconclusive; do not confirm OFF
+                    logger.debug("confirmHardwareAccOff: re-read " + (i + 1)
+                        + " sentinel/unreadable (level=" + level + ") — inconclusive");
+                    return false;
+                }
+            } catch (Exception e) {
+                logger.debug("confirmHardwareAccOff: re-read failed (" + e.getMessage()
+                    + ") — inconclusive, keeping ON");
+                return false;
+            }
+        }
+        return true;   // OFF persisted across every re-read
+    }
+
+    /** Confirmation re-reads for a contradicting ACC-OFF (see {@link
+     *  #confirmHardwareAccOff}). 2 re-reads × 180ms ≈ 360ms worst-case added
+     *  latency on a GENUINE ACC-off — short enough that gauge-restore stays
+     *  prompt, long enough to ride out a momentary HAL power-level dip. */
+    private static final int ACC_OFF_CONFIRM_RETRIES = 2;
+    private static final long ACC_OFF_CONFIRM_SPACING_MS = 180L;
 
     private void loadPersistedMode() {
         try {

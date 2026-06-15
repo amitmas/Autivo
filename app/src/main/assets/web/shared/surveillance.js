@@ -58,6 +58,11 @@ BYD.surveillance = {
         // (plain rolling 4-cam recording, no motion, no AI). Backward-compat:
         // installs that pre-date this key see the smart default.
         accOffMode: 'smart',
+        // Keep ONLY the USB/data rail powered after ACC OFF (e.g. to charge a phone
+        // while parked). Default true (unchanged out-of-box behaviour); turning it
+        // off lets just that rail sleep on the next ACC-OFF cycle to save the 12V
+        // battery. Does NOT affect the cameras — parked surveillance is unaffected.
+        keepUsbPowerOnAccOff: true,
         // OEM dashcam surveillance mode mirror — 'off' | 'continuous' | 'smart'.
         // Hydrated by loadOemDashcam() from /api/oem-dashcam/config and
         // pushed back to the same endpoint on Apply (oem-tab branch in
@@ -1275,6 +1280,47 @@ BYD.surveillance = {
         });
     },
 
+    /**
+     * Toggle "Keep USB powered while parked". Governs ONLY the USB/data rail on the
+     * daemon side — cameras / parked surveillance are unaffected. Optimistic UI +
+     * immediate persist (same pattern as setAccOffMode), reverting the checkbox if
+     * the save fails. The daemon reads this on the NEXT ACC-OFF cycle.
+     */
+    toggleKeepUsbPower() {
+        const el = document.getElementById('survKeepUsbPower');
+        if (!el) return;
+        const on = el.checked;
+        const prev = !on;
+        this.config.keepUsbPowerOnAccOff = on;
+        const self = this;
+        fetch('/api/surveillance/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ keepUsbPowerOnAccOff: on })
+        }).then(r => r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status)))
+          .then(() => {
+              if (self.savedConfig) self.savedConfig.keepUsbPowerOnAccOff = on;
+              self.markChanged();
+              if (BYD.utils && BYD.utils.toast) {
+                  const k = on ? 'surveillance.keep_usb_saved_on' : 'surveillance.keep_usb_saved_off';
+                  const fallback = on
+                      ? 'USB will stay powered while parked'
+                      : 'USB will sleep while parked (next ACC-OFF)';
+                  const localized = BYD.i18n && BYD.i18n.t ? BYD.i18n.t(k) : null;
+                  BYD.utils.toast(localized || fallback, 'success');
+              }
+          })
+          .catch(() => {
+              self.config.keepUsbPowerOnAccOff = prev;
+              el.checked = prev;
+              if (BYD.utils && BYD.utils.toast) {
+                  const localized = BYD.i18n && BYD.i18n.t
+                      ? BYD.i18n.t('surveillance.keep_usb_save_failed') : null;
+                  BYD.utils.toast(localized || 'Could not save setting', 'error');
+              }
+          });
+    },
+
     setEnvironmentPreset(preset) {
         this.config.environmentPreset = preset;
         document.querySelectorAll('#envPresetBtns .btn-toggle').forEach(btn =>
@@ -1931,6 +1977,11 @@ BYD.surveillance = {
         document.querySelectorAll('#accOffModeBtns .btn-toggle').forEach(btn =>
             btn.classList.toggle('active', btn.dataset.value === accOffMode));
         this.applyAccOffModeUI();
+
+        // Keep USB powered while parked — default true when the server omits the
+        // field (older daemon build) so the switch shows the real out-of-box default.
+        const keepUsb = document.getElementById('survKeepUsbPower');
+        if (keepUsb) keepUsb.checked = (this.config.keepUsbPowerOnAccOff !== false);
 
         // Environment preset — check if current values match the saved preset
         // If user customized sliders after selecting a preset, don't highlight any preset

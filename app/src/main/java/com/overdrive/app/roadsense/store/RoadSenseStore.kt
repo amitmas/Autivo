@@ -409,6 +409,18 @@ class RoadSenseStore private constructor() {
             // then updated_ms (the range + the ORDER BY) is the exact access path.
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_rs_source_updated ON $TABLE(source, updated_ms);")
 
+            // Compound (lat, lng) index for the map's bbox query (queryByBbox):
+            // WHERE lat >= ? AND lat <= ? AND lng >= ? AND lng <= ?. Without it,
+            // every map poll full-scans + sorts the whole hazard table — and
+            // because ALL store access funnels through one synchronized H2
+            // connection, that scan serializes against the live IMU detection
+            // upserts happening many times/min while driving. The native map
+            // polls this endpoint ~1-2x/s (auto-follow), so it is a hot path
+            // despite the queryByBbox comment. Leading on lat (the range H2 can
+            // seek) bounds the scan to the visible latitude band; lng is then a
+            // cheap residual filter. idx_rs_tile cannot serve a lat/lng range.
+            stmt.execute("CREATE INDEX IF NOT EXISTS idx_rs_lat_lng ON $TABLE(lat, lng);")
+
             logger.info("$TABLE table + indices ready")
         }
     }
@@ -893,8 +905,19 @@ class RoadSenseStore private constructor() {
      */
     private fun ensureOpen(): Boolean {
         if (!initialized) {
-            logger.debug("Store not initialized")
-            return false
+            // Lazy open (on-demand): RoadSense is no longer start()'d at daemon boot when
+            // the feature is disabled, so the store isn't pre-opened. But read/delete paths
+            // that DON'T depend on roadSense.enabled — the map's queryByBbox and the
+            // delete-local wipe — can still arrive while disabled. Open the connection on
+            // demand so those keep working, WITHOUT the always-on retention-prune scheduler
+            // that start() owns (there's nothing to prune while disabled anyway; enabling
+            // the feature later runs start() → the prune scheduler as before). init() is
+            // idempotent and reentrant on [lock] (the caller already holds it).
+            init()
+            if (!initialized) {
+                logger.debug("Store not initialized (lazy open failed)")
+                return false
+            }
         }
         try {
             if (connection == null || connection!!.isClosed) {

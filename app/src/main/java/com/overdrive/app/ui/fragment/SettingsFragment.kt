@@ -349,11 +349,21 @@ class SettingsFragment : Fragment() {
      */
     private fun setupFooter(view: View) {
         val tv = view.findViewById<TextView>(R.id.tvSettingsFooter) ?: return
-        tv.text = getString(
-            R.string.settings_footer_format,
-            AppUpdater.getDisplayVersion(requireContext()),
-            BuildConfig.APPLICATION_ID
-        )
+        val pkg = BuildConfig.APPLICATION_ID
+        // Paint the in-memory BuildConfig identity instantly (no I/O), then
+        // resolve the authoritative file-backed label OFF the main thread and
+        // post it back — so the footer matches the file-first label every other
+        // surface shows (incl. same-tag GitHub republishes where versionName
+        // wasn't bumped), without doing the /data/local/tmp read on the looper.
+        // Mirrors SettingsAboutFragment's paint-then-replace pattern.
+        tv.text = getString(R.string.settings_footer_format, AppUpdater.getInstalledVersion(), pkg)
+        val appCtx = requireContext().applicationContext
+        Thread {
+            val resolved = AppUpdater.getDisplayVersion(appCtx)
+            // View.post hops to the main thread and is a no-op if the view is
+            // detached — no leak, no isAdded race.
+            tv.post { tv.text = getString(R.string.settings_footer_format, resolved, pkg) }
+        }.start()
     }
 
     private companion object {

@@ -178,7 +178,11 @@
     "map_cluster_layout": "ขนาดหน้าจอเรือนไมล์",
     "map_cluster_layout_desc": "จับคู่สิ่งนี้กับหน้าจอเรือนไมล์ของคุณ ใช้ร่วมกับมุมมองมุมอับสายตาบนหน้าจอเรือนไมล์ หากการฉายภาพดูยืดหรือถูกตัด ให้ลองเลือกตัวเลือกอื่น",
     "map_cluster_projecting": "กำลังฉายภาพ",
-    "map_cluster_off": "ปิด"
+    "map_cluster_off": "ปิด",
+    "overlay_title": "การซ้อนทับบนหน้าจอ",
+    "overlay_show": "แสดงการซ้อนทับบนหน้าจอ",
+    "overlay_show_desc": "แสดง RoadSense pill และการ์ดแจ้งเตือนอันตรายแบบลอยบนหน้าจอ ปิดเพื่อซ่อนสิ่งนี้ — การตรวจจับ, การเตือนด้วยเสียง และการระดมข้อมูลยังคงทำงานในพื้นหลัง; เฉพาะการแสดงผลบนหน้าจอเท่านั้นที่ถูกซ่อน",
+    "unit_seconds": "{n} วินาที"
   },
   "status": {
     "device": "อุปกรณ์",
@@ -811,7 +815,10 @@
     "layout_windshield_unavailable": "ไม่มีกล้องหน้ารถที่กำหนดไว้สำหรับโปรไฟล์/การกำหนดค่ากล้องที่ใช้งานอยู่",
     "layout_standard_toast": "เปิดใช้งานรูปแบบมาตรฐาน 360 องศาแล้ว",
     "layout_dashcam_toast": "เปิดใช้งานรูปแบบ Dashcam แล้ว",
-    "layout_update_failed": "ไม่สามารถอัปเดตรูปแบบการบันทึกได้"
+    "layout_update_failed": "ไม่สามารถอัปเดตรูปแบบการบันทึกได้",
+    "storage_indexing": "กำลังจัดทำดัชนี — {done} / {total} ({pct}%)",
+    "storage_fallback_internal": "SD/USB ไม่พร้อมใช้งาน — กำลังบันทึกลงในที่เก็บข้อมูลภายใน",
+    "storage_fallback_enforcing": "SD/USB ไม่พร้อมใช้งาน — กำลังบันทึกลงในที่เก็บข้อมูลภายใน, เก็บข้อมูลล่าสุด {mb} MB"
   },
   "events": {
     "select_date": "เลือกวันที่",
@@ -893,7 +900,8 @@
     "videos_count_initial": "0 วิดีโอ",
     "selected_count_initial": "เลือกไว้ 0 รายการ",
     "page_initial": "หน้า 1 จาก 1",
-    "calendar_title_initial": "ปฏิทิน"
+    "calendar_title_initial": "ปฏิทิน",
+    "index_warming": "กำลังสร้างดัชนีไลบรารี — {done} / {total} ({pct}%)"
   },
   "surveillance": {
     "tab_general": "ทั่วไป",
@@ -1251,7 +1259,13 @@
     "oem_record_desc": "Captures a synchronized dvr_*.mp4 from the forward sensor alongside the panoramic event clip. Honors the same Safe Locations, Schedule, and per-camera filters as the panoramic surveillance.",
     "oem_record_enabled": "OEM Dashcam recording on events enabled",
     "oem_record_disabled": "OEM Dashcam recording on events disabled",
-    "oem_id_unset_hint": "Open Diagnostics → Camera Probe to pick the OEM Dashcam camera id first."
+    "oem_id_unset_hint": "Open Diagnostics → Camera Probe to pick the OEM Dashcam camera id first.",
+    "storage_indexing": "กำลังจัดทำดัชนี — {done} / {total} ({pct}%)",
+    "keep_usb_power": "เปิดไฟเลี้ยง USB ขณะจอดรถ",
+    "keep_usb_power_desc": "เปิดไฟเลี้ยงพอร์ต USB หลังจากดับเครื่องยนต์ (เช่น เพื่อชาร์จโทรศัพท์หรือจ่ายไฟให้อุปกรณ์เสริม) ปิดเพื่อให้พอร์ต USB เข้าสู่โหมดพักและประหยัดแบตเตอรี่ 12V สิ่งนี้ไม่มีผลต่อกล้อง — การเฝ้าระวังขณะจอดรถยังคงทำงานอยู่เสมอ มีผลในครั้งถัดไปที่ดับเครื่องยนต์",
+    "keep_usb_saved_on": "USB จะยังคงมีไฟเลี้ยงขณะจอดรถ",
+    "keep_usb_saved_off": "USB จะเข้าสู่โหมดพักขณะจอดรถ (เมื่อดับ ACC ครั้งถัดไป)",
+    "keep_usb_save_failed": "ไม่สามารถบันทึกการตั้งค่าได้"
   },
   "mqtt": {
     "tab_connections": "การเชื่อมต่อ",
@@ -1621,7 +1635,30 @@
     "title_update_to": "ต้องการอัปเดต OverDrive เป็นเวอร์ชัน <span class=\"upd-newv\">{version}</span> หรือไม่?",
     "currently_on": "เวอร์ชันปัจจุบัน {version}",
     "downtime_warning": "<strong>การเข้าถึงระยะไกลจะออฟไลน์ประมาณ ~{minutes} นาที</strong> ระบบเบื้องหลังจะรีสตาร์ทและ Tunnel จะเชื่อมต่อใหม่หลังติดตั้ง",
-    "fallback_check_label": "ตรวจสอบการอัปเดต"
+    "fallback_check_label": "ตรวจสอบการอัปเดต",
+    "channel_alpha": "Alpha",
+    "channel_braveheart": "Braveheart",
+    "channel_alpha_desc": "เวอร์ชันเสถียร ทุกเวอร์ชันที่เผยแพร่จะถูกเก็บไว้ที่นี่ — เลือกเวอร์ชันใดก็ได้เพื่อติดตั้ง (อนุญาตให้ดาวน์เกรดได้) แนะนำสำหรับการใช้งานทั่วไป",
+    "channel_braveheart_desc": "บิลด์ใหม่ล่าสุดที่เผยแพร่ทันทีที่คุณได้รับ คุณจะได้รับฟีเจอร์ใหม่ก่อนใคร แต่อาจไม่เสถียรหรือมีข้อผิดพลาด หากมีสิ่งผิดปกติเกิดขึ้น ให้ส่งบันทึก daemon จาก เกี่ยวกับ → การวินิจฉัย และรายงาน (ดูด้านล่าง)",
+    "report_how": "พบข้อผิดพลาดใน Braveheart? ส่งบันทึก daemon จาก เกี่ยวกับ → การวินิจฉัย จากนั้นแชร์รหัสกับเรา:",
+    "report_discord": "Discord",
+    "report_github": "GitHub Issues",
+    "report_whatsapp": "WhatsApp",
+    "report_discord_url": "https://discord.gg/PZutk9fg4h",
+    "report_github_url": "https://github.com/yash-srivastava/Overdrive-release/issues",
+    "report_whatsapp_url": "https://chat.whatsapp.com/HChmriCWgr9KwAtE6OEkiM",
+    "catalog_title": "เลือกเวอร์ชัน",
+    "catalog_empty": "ยังไม่มีเวอร์ชันที่เผยแพร่",
+    "catalog_retry": "ลองอีกครั้ง",
+    "pill_installed": "ติดตั้งแล้ว",
+    "pill_older": "เก่ากว่า",
+    "install_downgrade": "ดาวน์เกรด",
+    "downgrade_note": "นี่เป็นเวอร์ชันที่เก่ากว่าเวอร์ชันที่ติดตั้งของคุณ การติดตั้งเวอร์ชันนี้จะแทนที่บิลด์ปัจจุบันด้วยเวอร์ชันนี้",
+    "switched_to_channel": "เปลี่ยนเป็น {channel}",
+    "switched_to_braveheart_warn": "เปลี่ยนเป็น Braveheart บิลด์อาจไม่เสถียร — หากมีสิ่งผิดปกติเกิดขึ้น ให้ส่งบันทึก daemon จาก เกี่ยวกับ → การวินิจฉัย และรายงานบน Discord/GitHub",
+    "switch_channel_failed": "ไม่สามารถเปลี่ยนช่องได้: {error}",
+    "notify_available": "มีการอัปเดต: {version} เปิด ตรวจสอบการอัปเดต เพื่อติดตั้ง",
+    "badge_new": "ใหม่"
   },
   "vehicle": {
     "car_locked": "ล็อกรถเรียบร้อยแล้ว",
@@ -2063,5 +2100,16 @@
     "native_dvr_disable_toast": "Native DVR disabled. OverDrive now owns the camera.",
     "native_dvr_enable_toast": "Native DVR re-enabled.",
     "start_timeout": "Pipeline start timed out — check daemon logs"
+  },
+  "logs": {
+    "section_title": "การวินิจฉัย",
+    "section_sub": "พบข้อผิดพลาด? ส่งบันทึก daemon ที่นี่ — คุณจะได้รับรหัสสั้นๆ จากนั้นแชร์กับเราบน Discord, GitHub Issues หรือ WhatsApp และบอกเราว่าเกิดอะไรขึ้น",
+    "send": "ส่ง",
+    "uploading": "กำลังอัปโหลด…",
+    "upload_failed": "อัปโหลดล้มเหลว",
+    "uploaded_title": "อัปโหลดบันทึกแล้ว",
+    "uploaded_body": "แชร์รหัสนี้กับผู้ดูแล พร้อมกับสิ่งที่คุณกำลังทำเมื่อเกิดข้อผิดพลาด:",
+    "uploaded_where": "โพสต์บน Discord, GitHub Issues หรือ WhatsApp:",
+    "copy_code": "คัดลอกรหัส"
   }
 }

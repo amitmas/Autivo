@@ -30,7 +30,6 @@ import com.overdrive.app.launcher.AdbDaemonLauncher
 import com.google.android.material.appbar.MaterialToolbar
 import android.widget.ImageView
 import android.widget.LinearLayout
-import com.overdrive.app.BuildConfig
 import com.overdrive.app.R
 import com.overdrive.app.util.BydDataCacheWhitelist
 
@@ -229,20 +228,36 @@ class MainActivity : AppCompatActivity() {
                 override fun onError(error: String) {}
             })
 
-            // Surface failed-install errors first (consumeJustUpdatedVersion
-            // returns null when a failure marker is present, so the success
-            // toast never fires on a failed install).
-            val installError = com.overdrive.app.updater.AppUpdater.consumeFailedUpdateError(this)
-            if (installError != null) {
-                Toast.makeText(this, getString(R.string.toast_update_install_failed, installError), Toast.LENGTH_LONG).show()
-                logsViewModel.warn("Update", "Install failed: $installError")
-            }
+            // Post-update toasts are consumed by EXACTLY ONE path. On a
+            // post-update launch the hardResetDaemons callback drives
+            // showPostUpdateToasts(); consuming the same one-shot markers here
+            // too could double-fire the toast (the markers clear via async
+            // apply()). So only consume here on a NORMAL launch (where the
+            // post-update path won't run). The markers survive to the next
+            // launch if neither path ran.
+            if (!com.overdrive.app.updater.UpdateLifecycle.isPostUpdateLaunch(this, intent)) {
+                // Surface failed-install errors first (consumeJustUpdatedVersion
+                // returns null when a failure marker is present, so the success
+                // toast never fires on a failed install).
+                val installError = com.overdrive.app.updater.AppUpdater.consumeFailedUpdateError(this)
+                if (installError != null) {
+                    Toast.makeText(this, getString(R.string.toast_update_install_failed, installError), Toast.LENGTH_LONG).show()
+                    logsViewModel.warn("Update", "Install failed: $installError")
+                }
 
-            // Show post-update message if app was just updated
-            val updatedVersion = com.overdrive.app.updater.AppUpdater.consumeJustUpdatedVersion(this)
-            if (updatedVersion != null) {
-                Toast.makeText(this, getString(R.string.toast_updated_to, updatedVersion), Toast.LENGTH_LONG).show()
-                logsViewModel.info("Update", "App updated to $updatedVersion")
+                // Show post-update message if app was just updated.
+                // consumeJustUpdatedVersion is the success MARKER (non-null only
+                // when the just-updated flag was set); but DISPLAY the running
+                // build's BuildConfig identity (getInstalledVersion) — the new
+                // APK is already running, and this keeps the toast consistent
+                // with the About row / status, instead of the GitHub asset label
+                // which can differ on a braveheart in-place re-upload.
+                val justUpdated = com.overdrive.app.updater.AppUpdater.consumeJustUpdatedVersion(this)
+                if (justUpdated != null) {
+                    val shown = com.overdrive.app.updater.AppUpdater.getInstalledVersion()
+                    Toast.makeText(this, getString(R.string.toast_updated_to, shown), Toast.LENGTH_LONG).show()
+                    logsViewModel.info("Update", "App updated to $shown")
+                }
             }
 
             checkForAppUpdate()
@@ -502,14 +517,18 @@ class MainActivity : AppCompatActivity() {
                 logsViewModel.warn("Update", "Install failed: $installError")
             }
         }
-        val updatedVersion = com.overdrive.app.updater.AppUpdater
+        val justUpdated = com.overdrive.app.updater.AppUpdater
             .consumeJustUpdatedVersion(this)
-        if (updatedVersion != null) {
+        if (justUpdated != null) {
+            // Marker non-null = update succeeded; DISPLAY the running build's
+            // BuildConfig identity (consistent with About/status), not the
+            // GitHub asset label which can differ on braveheart re-uploads.
+            val shown = com.overdrive.app.updater.AppUpdater.getInstalledVersion()
             runOnUiThread {
                 Toast.makeText(this,
-                    getString(R.string.toast_updated_to, updatedVersion),
+                    getString(R.string.toast_updated_to, shown),
                     Toast.LENGTH_LONG).show()
-                logsViewModel.info("Update", "App updated to $updatedVersion")
+                logsViewModel.info("Update", "App updated to $shown")
             }
             try {
                 // Reuse the shared adbLauncher; see comment at the rm site
@@ -517,7 +536,7 @@ class MainActivity : AppCompatActivity() {
                 val hintFile = com.overdrive.app.updater
                     .UpdateLifecycle.TELEGRAM_POST_UPDATE_HINT_FILE
                 daemonStartupManager.adbLauncher.executeShellCommand(
-                    "echo '$updatedVersion' > $hintFile",
+                    "echo '$shown' > $hintFile",
                     object : com.overdrive.app.launcher
                         .AdbDaemonLauncher.LaunchCallback {
                         override fun onLog(message: String) {}
@@ -575,9 +594,13 @@ class MainActivity : AppCompatActivity() {
      */
     private fun syncRoadSenseOverlay() {
         try {
-            val enabled = com.overdrive.app.roadsense.config.RoadSenseConfig
-                .snapshot(forceReload = true).enabled
-            if (enabled) {
+            // overlayShouldShow() = feature ENABLED and the user hasn't hidden the overlay
+            // (roadSense.overlayVisible, default ON). Hiding it is an on-screen-only opt-out
+            // — detection/audio/crowdsource keep running daemon-side — so we just stop the
+            // app-side window without touching the master enable.
+            val shouldShow = com.overdrive.app.roadsense.config.RoadSenseConfig
+                .snapshot(forceReload = true).overlayShouldShow()
+            if (shouldShow) {
                 com.overdrive.app.roadsense.overlay.RoadSenseOverlayService.startIfPermitted(this)
             } else {
                 com.overdrive.app.roadsense.overlay.RoadSenseOverlayService.stop(this)
@@ -712,7 +735,7 @@ class MainActivity : AppCompatActivity() {
      * Check GitHub for app updates and show dialog if available.
      */
     private fun checkForAppUpdate() {
-        logsViewModel.info("Update", "Checking for updates (channel: ${BuildConfig.UPDATE_CHANNEL})...")
+        logsViewModel.info("Update", "Checking for updates (channel: ${com.overdrive.app.config.UnifiedConfigManager.getUpdateChannel()})...")
         val updater = com.overdrive.app.updater.AppUpdater(this)
         appUpdater = updater
         updater.checkForUpdate(object : com.overdrive.app.updater.AppUpdater.UpdateCallback {
@@ -740,11 +763,24 @@ class MainActivity : AppCompatActivity() {
 
     /**
      * Manual update check — shows toast if already up to date.
+     *
+     * Forks on the resolved channel: braveheart keeps the timestamp-based
+     * "is an update available?" flow; alpha opens the pick-any version
+     * catalog (there is no single "the update" on the archive channel).
      */
     fun checkForAppUpdateManual() {
         Toast.makeText(this, getString(R.string.toast_checking_for_updates), Toast.LENGTH_SHORT).show()
         val updater = com.overdrive.app.updater.AppUpdater(this)
         appUpdater = updater
+
+        val channel = com.overdrive.app.config.UnifiedConfigManager.let {
+            it.forceReload(); it.getUpdateChannel()
+        }
+        if (channel == com.overdrive.app.updater.AppUpdater.CHANNEL_ALPHA) {
+            checkAlphaVersions(updater)
+            return
+        }
+
         updater.checkForUpdate(object : com.overdrive.app.updater.AppUpdater.UpdateCallback {
             override fun onUpdateAvailable(currentVersion: String, newVersion: String, releaseNotes: String) {
                 com.overdrive.app.updater.UpdateDialog.showUpdateAvailable(
@@ -767,6 +803,40 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
+     * Alpha channel: list the archive, show the single-choice picker, then
+     * resolve the chosen tag SERVER-SIDE (prepareInstall, off the UI thread —
+     * it does network I/O) before handing off to the shared install flow.
+     */
+    private fun checkAlphaVersions(updater: com.overdrive.app.updater.AppUpdater) {
+        updater.listVersions(object : com.overdrive.app.updater.AppUpdater.VersionListCallback {
+            override fun onResult(
+                versions: MutableList<com.overdrive.app.updater.AppUpdater.VersionEntry>,
+                currentVersion: String
+            ) {
+                com.overdrive.app.updater.UpdateDialog.showVersionPicker(
+                    this@MainActivity, versions,
+                    object : com.overdrive.app.updater.UpdateDialog.VersionPickListener {
+                        override fun onPick(entry: com.overdrive.app.updater.AppUpdater.VersionEntry) {
+                            // Pass the chosen tag straight to performAppUpdate —
+                            // the daemon's INSTALL_UPDATE resolves it server-side
+                            // (prepareInstall) before downloading, so no app-side
+                            // prepareInstall is needed (and the app UID's resolve
+                            // would just be redundant work the daemon repeats).
+                            performAppUpdate(updater, entry.tag)
+                        }
+                        override fun onDismiss() { updater.close() }
+                    })
+            }
+
+            override fun onError(error: String) {
+                Toast.makeText(this@MainActivity,
+                    getString(R.string.toast_update_check_failed, error), Toast.LENGTH_LONG).show()
+                updater.close()
+            }
+        })
+    }
+
+    /**
      * Schedule periodic update checks (every 6 hours).
      */
     private fun schedulePeriodicUpdateCheck() {
@@ -780,65 +850,179 @@ class MainActivity : AppCompatActivity() {
         updateCheckRunnable = null
     }
 
-    private fun performAppUpdate(updater: com.overdrive.app.updater.AppUpdater) {
+    /**
+     * Run the install in the DAEMON (UID 2000) via IPC, then poll progress —
+     * the same INSTALL_UPDATE → /overdrive_update_progress.json path the webapp
+     * and Telegram already use. Why not download in-process: the app UID can't
+     * write /data/local/tmp/, so the old in-process path fell back to a shell
+     * `wget` that emits no parseable progress — the bar pinned at 15% for the
+     * whole download ("stuck at 15%"). The daemon's OkHttp download streams real
+     * percent into the shared progress file. This unifies app/web/Telegram on
+     * one download+install engine.
+     *
+     * @param versionTag alpha-pick tag (e.g. "alpha-v26.1"), or null for the
+     *                   braveheart available-check install.
+     */
+    private fun performAppUpdate(updater: com.overdrive.app.updater.AppUpdater,
+                                 versionTag: String? = null) {
+        // The whole flow runs in the daemon now, so this app-side AppUpdater is
+        // only here for its lifecycle (close releases the lazily-allocated ADB
+        // executor + tunnel scheduler). Release it once the IPC handoff is done.
         val progress = com.overdrive.app.updater.UpdateDialog.showProgress(this) {
-            // Cancel-only — do NOT call updater.close() here. The
-            // background downloadAndInstall task is still in flight; it
-            // observes the cancelled flag and calls runShell("rm -f
-            // APK_PATH") which routes back into getAdbLauncher(). If we
-            // null'd adbLauncher via close() before that runs, the lazy
-            // reallocation strands a fresh AdbDaemonLauncher's executor +
-            // tunnel-poll scheduler. The downloadAndInstall onError path
-            // ("cancelled") already calls updater.close() — let it run.
-            updater.cancel()
+            // "Hide" — the daemon download/install can't be cancelled from here
+            // (it runs in another process, mirroring the webapp which also has
+            // no mid-install cancel once scheduled). Just stop polling + dismiss;
+            // the install continues and the app restarts when it lands.
+            updatePollRunnable?.let { mainHandler.removeCallbacks(it) }
+            updatePollRunnable = null
         }
+        progress.setStep(R.string.update_step_queued, R.drawable.ic_update, 0)
 
-        updater.downloadAndInstall(object : com.overdrive.app.updater.AppUpdater.InstallCallback {
-            override fun onProgress(message: String) {
-                runOnUiThread {
-                    when {
-                        message.contains("Downloading") -> progress.setStep("\u2B07\uFE0F Downloading update...", 15)
-                        message.contains("Verifying") -> progress.setStep("\uD83D\uDD0D Verifying download...", 75)
-                        message.contains("Stopping") -> progress.setStep("\u23F9\uFE0F Stopping daemons...", 80)
-                        message.contains("Installing") -> progress.setStep("\uD83D\uDCE6 Installing update...", 90)
-                        message.contains("installed") -> progress.setStep("\u2705 Update installed!", 100)
-                        else -> progress.setStatus(message)
-                    }
+        // Kick off the install via IPC OFF the main thread (DaemonIpcClient.send
+        // is synchronous: connect + up to 20s read for the pre-install check).
+        Thread {
+            val req = org.json.JSONObject().apply {
+                put("command", "INSTALL_UPDATE")
+                if (!versionTag.isNullOrEmpty()) put("version", versionTag)
+            }
+            // 25s > daemon's 20s pre-install checkForUpdate wait, so the IPC read
+            // doesn't time out before INSTALL_UPDATE replies {status:"scheduled"}.
+            val resp = com.overdrive.app.server.DaemonIpcClient.send(req, 25_000)
+            runOnUiThread {
+                // Activity tore down during the ~25s IPC window (rotation,
+                // back-out, recreate) — runOnUiThread does NOT auto-cancel, so
+                // bail before touching the progress dialog whose window token is
+                // gone (showError on a detached window throws/leaks). Mirrors
+                // startUpdateProgressPolling and onReconfigureCameraClicked.
+                // Close the updater so its lazy ADB executor/scheduler doesn't
+                // leak; the daemon-side install gate self-recovers regardless.
+                if (isFinishing || isDestroyed) {
+                    updater.close()
+                    return@runOnUiThread
                 }
-            }
-
-            override fun onDownloadProgress(percent: Int) {
-                // Map the download's 0..100 into the bar's [15, 75) range so
-                // the bar advances continuously while the APK streams in.
-                // The non-download steps (Verifying / Stopping / Installing)
-                // own the 75..100 range above. percent < 0 means indeterminate
-                // — leave the bar at 15 (the step set by onProgress).
-                // Without this mapping the bar held at 15 for the entire
-                // download phase, which is what produced the "stuck at 15%"
-                // user reports.
-                if (percent < 0) return
-                val clamped = percent.coerceIn(0, 100)
-                val mapped = 15 + ((clamped * 60) / 100)
-                runOnUiThread { progress.setProgress(mapped) }
-            }
-
-            override fun onSuccess() {
-                runOnUiThread {
-                    progress.setStep("\u2705 Restarting app...", 100)
-                    android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                        progress.dismiss()
-                    }, 2000)
+                if (resp == null) {
+                    // Daemon down / IPC refused — can't delegate. Surface clearly.
+                    progress.showError(getString(R.string.update_error_daemon_down))
+                    updater.close()
+                    return@runOnUiThread
                 }
-            }
-
-            override fun onError(error: String) {
-                runOnUiThread { progress.showError(error) }
-                // Install failed; release per-instance resources. (onSuccess
-                // path doesn't need this — the app is being restarted by
-                // pm install and process death tears everything down.)
+                val ok = resp.optBoolean("success", false)
+                    || "scheduled" == resp.optString("status")
+                if (!ok) {
+                    val err = resp.optString("error", getString(R.string.errors_network))
+                    progress.showError(getString(R.string.update_error_start_failed, err))
+                    updater.close()
+                    return@runOnUiThread
+                }
+                // Scheduled. The app-side updater has no more work — the daemon
+                // owns download+install. Release its per-instance resources now.
                 updater.close()
+                startUpdateProgressPolling(progress)
             }
-        })
+        }.start()
+    }
+
+    /** Handle for the active update progress poll loop (so Hide can stop it). */
+    private var updatePollRunnable: Runnable? = null
+
+    /**
+     * Poll GET_UPDATE_PROGRESS every 1.5s and drive the progress dialog.
+     * Mirrors the webapp's startProgressPolling: render {phase, percent},
+     * treat `error` as a hard failure, and treat a daemon disconnect AFTER a
+     * terminal phase (stopping_daemons / installing) as success — the install
+     * is underway and pm install is tearing the daemon (and soon us) down.
+     */
+    private fun startUpdateProgressPolling(progress: com.overdrive.app.updater.UpdateDialog.ProgressHandle) {
+        updatePollRunnable?.let { mainHandler.removeCallbacks(it) }
+        var consecutiveFailures = 0
+        var sawTerminalPhase = false
+        var barLatchedAt100 = false
+
+        val poll = object : Runnable {
+            override fun run() {
+                Thread {
+                    val resp = com.overdrive.app.server.DaemonIpcClient.send(
+                        org.json.JSONObject().put("command", "GET_UPDATE_PROGRESS"), 5_000)
+                    runOnUiThread {
+                        // Activity gone (rotation/finish) — stop, don't touch the
+                        // dialog (would leak / throw on a dead window).
+                        if (isFinishing || isDestroyed) {
+                            updatePollRunnable = null
+                            return@runOnUiThread
+                        }
+                        // If Hide stopped us between dispatch and reply, drop it.
+                        if (updatePollRunnable == null) return@runOnUiThread
+
+                        if (resp == null || !resp.optBoolean("success", false)) {
+                            consecutiveFailures++
+                            // Daemon dying mid-install → after a terminal phase
+                            // (stopping_daemons/installing) a disconnect IS the
+                            // success signal: pm install is tearing the daemon
+                            // (and soon this app) down. 2 failures (~3s) is enough.
+                            if (consecutiveFailures >= 2 && sawTerminalPhase) {
+                                updatePollRunnable = null
+                                progress.setStep(R.string.update_step_installing, R.drawable.ic_download_log, 100)
+                                mainHandler.postDelayed({ progress.dismiss() }, 2000)
+                                return@runOnUiThread
+                            }
+                            // Non-terminal disconnect (still queued/downloading/
+                            // verifying): give up at 4 failures (~6s), matching
+                            // the web poller's threshold (update-flow.js
+                            // startProgressPolling) so both surfaces declare the
+                            // failure at the same point. Unlike the web client
+                            // (a separate device that can outlive the head unit's
+                            // reinstall and watch for a version bump), this poller
+                            // runs ON the head unit — a SUCCESSFUL update kills
+                            // this very process, so a non-terminal disconnect that
+                            // leaves us alive can only mean the install did NOT
+                            // complete. Surface the head-unit-lost copy, aligned
+                            // with the web's cannot_reach_headunit message.
+                            if (consecutiveFailures >= 4) {
+                                updatePollRunnable = null
+                                progress.showError(getString(R.string.update_error_lost_headunit))
+                                return@runOnUiThread
+                            }
+                            mainHandler.postDelayed(this, 1500)
+                            return@runOnUiThread
+                        }
+                        consecutiveFailures = 0
+
+                        val phase = resp.optString("phase", "")
+                        val percent = resp.optInt("percent", -1)
+                        if (phase == "stopping_daemons" || phase == "installing") sawTerminalPhase = true
+
+                        when (phase) {
+                            "error" -> {
+                                updatePollRunnable = null
+                                progress.showError(resp.optString("error",
+                                    resp.optString("message", getString(R.string.errors_network))))
+                                return@runOnUiThread
+                            }
+                            "downloading" -> {
+                                if (percent < 0) {
+                                    // No Content-Length (CDN/proxy) → indeterminate
+                                    // rather than a frozen 15%.
+                                    progress.setIndeterminate(getString(R.string.update_step_downloading))
+                                } else {
+                                    // Map 0..100 download into the bar's [15,75).
+                                    val mapped = 15 + (percent.coerceIn(0, 100) * 60 / 100)
+                                    progress.setStep(R.string.update_step_downloading, R.drawable.ic_arrow_down, mapped)
+                                    if (percent >= 100) barLatchedAt100 = true
+                                }
+                            }
+                            "verifying" -> progress.setStep(R.string.update_step_verifying, R.drawable.ic_check_circle, 75)
+                            "stopping_daemons" -> progress.setStep(R.string.update_step_stopping, R.drawable.ic_update, 85)
+                            "installing" -> progress.setStep(R.string.update_step_installing, R.drawable.ic_download_log, if (percent == 100) 100 else 95)
+                            "queued" -> progress.setStep(R.string.update_step_queued, R.drawable.ic_update, 0)
+                            "idle" -> { /* no active install yet — keep polling */ }
+                        }
+                        mainHandler.postDelayed(this, 1500)
+                    }
+                }.start()
+            }
+        }
+        updatePollRunnable = poll
+        mainHandler.post(poll)
     }
 
     /**
@@ -2145,8 +2329,14 @@ class MainActivity : AppCompatActivity() {
                     // /api/oem-dashcam/config endpoint with restart:true so
                     // the daemon does the stop+start cycle on its worker.
                     try {
+                        // openConnection() WITHOUT Proxy.NO_PROXY routes this
+                        // loopback POST through the system HTTP proxy when
+                        // sing-box is active (it sets 127.0.0.1:8119 as the
+                        // global proxy), so the request to our own daemon fails.
+                        // Force a direct connection — every other daemon call
+                        // goes through DaemonHttpClient which already does this.
                         val daemon = java.net.URL("http://127.0.0.1:8080/api/oem-dashcam/config")
-                            .openConnection() as java.net.HttpURLConnection
+                            .openConnection(java.net.Proxy.NO_PROXY) as java.net.HttpURLConnection
                         daemon.requestMethod = "POST"
                         daemon.doOutput = true
                         daemon.connectTimeout = 2000
@@ -3122,6 +3312,11 @@ class MainActivity : AppCompatActivity() {
         // activity reference after recreate.
         updateCheckRunnable?.let { mainHandler.removeCallbacks(it) }
         updateCheckRunnable = null
+        // Stop the install-progress poll loop (Hide normally clears it, but a
+        // destroy mid-install would otherwise leave the reposting Runnable
+        // holding this activity until the next tick no-ops on isDestroyed).
+        updatePollRunnable?.let { mainHandler.removeCallbacks(it) }
+        updatePollRunnable = null
         // Cancel any in-flight post-update watchdog. Without this the
         // Handler.postDelayed lambda holds a reference to this@MainActivity
         // for up to 30 seconds, leaking the activity if the user backs out

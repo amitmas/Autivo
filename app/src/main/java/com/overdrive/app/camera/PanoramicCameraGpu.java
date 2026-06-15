@@ -267,6 +267,13 @@ public class PanoramicCameraGpu {
     private volatile com.overdrive.app.streaming.GpuStreamScaler bsStreamScaler;
     private volatile HardwareEventRecorderGpu bsStreamEncoder;
     private volatile boolean bsLayerVisible = false;
+    // BS render diagnostics (throttled): counts PASS-1C drawFrame calls + records why
+    // it was skipped, so a "card composites but stays BLACK" report can be triaged from
+    // the log (is drawFrame even running? is the texture valid?) instead of guessing.
+    private long bsDiagFrames = 0L;
+    private long bsDiagLastLogMs = 0L;
+    private long bsDiagSkipScaler = 0L;   // skipped: scaler null
+    private long bsDiagSkipHidden = 0L;   // skipped: bsLayerVisible false
     private GpuDownscaler downscaler;
     /** Lazy-allocated full-resolution sampler for the camera-mapping dialog.
      *  Lives on the GL handler; allocates GL resources on first use. */
@@ -286,7 +293,16 @@ public class PanoramicCameraGpu {
     // The encoder GL thread now does ONLY consume→draw→swap; the readback
     // and foveated crops live here, on a separate hardware-queue submission
     // path that no longer stalls eglSwapBuffers when YOLO OpenCL is busy.
-    private AiLaneGl aiLaneGl;
+    // volatile: written on the GL thread (ensure/release), read on the GL
+    // thread in renderLoop. volatile is belt-and-suspenders for the rare
+    // cross-thread reader (releaseGl runs the shutdown net) — see note there.
+    private volatile AiLaneGl aiLaneGl;
+    // CameraState captured at start() for the LAZY AI-lane bring-up. The lane
+    // is created on the first surveillance-active frame, not at pipeline start.
+    private AiLaneGl.CameraState aiCameraStateRef;
+    // Single-flight guard so ensure/release toggle cleanly and two near-
+    // simultaneous arm frames can't double-start the lane. GL-thread-confined.
+    private boolean aiLaneStarting = false;
     // Monotonic per-bound-frame counter. AiLaneGl polls this via the
     // CameraState callback to detect "is there a new frame to read?"; we
     // bump it after every successful HAL bind in consumeLatestImageAndBind.
@@ -435,6 +451,41 @@ public class PanoramicCameraGpu {
     private static final int AI_READBACK_FRAME_MODULO = 3;
 
     private int targetFps = 15;  // Desired frame rate for camera
+
+    // Recorder draw stride. The render loop draws into the RECORDING encoder's
+    // input surface (PASS 1A) only on every Nth camera frame; stream (PASS 1B)
+    // and blind-spot (PASS 1C) are unaffected (separate encoders, drawn every
+    // frame). MediaCodec encodes exactly the frames rendered into its Surface,
+    // so a stride of N yields an effective ~cameraFps/N recording rate without
+    // touching KEY_FRAME_RATE (which Android can't change at runtime). Used by
+    // Proximity Guard to keep a low-rate, low-bitrate pre-record ring while
+    // MONITORING and snap to full rate the instant a trigger fires.
+    //
+    // 1 = draw every frame (default; ZERO behaviour change for every other
+    // mode). Always >= 1. Volatile: written by the proximity controller's
+    // state thread (via pipeline), read by the GL render thread — same
+    // single-writer/single-reader visibility pattern as bsLayerVisible.
+    private volatile int recorderFrameStride = 1;
+    // Master on/off for PASS 1A (the H.265 recorder mosaic). true = normal
+    // (default; ZERO behaviour change for every recording mode). false = skip
+    // the recorder drawFrame + drainEncoder ENTIRELY this frame — used when the
+    // camera is kept warm ONLY for blind-spot (PASS 1C, no encoder): there is no
+    // recording mode and no pre-record ring to feed, so running the encoder is
+    // pure wasted Venus/GPU. Distinct from recorderFrameStride (which sub-samples
+    // the lane); this gates it off completely. Stream (1B) + BS (1C) unaffected.
+    // Volatile: written by RecordingModeManager's lifecycle thread (via pipeline),
+    // read by the GL render thread — same single-writer/single-reader pattern as
+    // bsLayerVisible / recorderFrameStride.
+    private volatile boolean recorderLaneEnabled = true;
+    // Counter that advances every consumed camera frame and selects which
+    // frames clear the stride gate (drawn when counter % stride == 0). The GL
+    // render thread increments it; setRecorderFrameStride resets it to 0 from
+    // the control thread so a stride change starts on a drawn frame. Volatile
+    // so that cross-thread reset is atomic (no 32-bit long tearing) and visible
+    // — the GL increment racing a reset can at worst drop one increment, which
+    // is benign for a phase counter read as `% stride`.
+    private volatile long recorderStrideCounter = 0;
+
     private final float[] quadrantStripOffsetX;
     private final float[] quadrantCornerOffsetsXY;
 
@@ -726,23 +777,17 @@ public class PanoramicCameraGpu {
                     cameraCoordinator.setupEventCallback(cameraObj);
                 }
 
-                // Tier 1: bring up the AI-lane GL thread now that the
-                // encoder EGL context (eglCore) exists. start() blocks
-                // until the shared context is current on its thread —
-                // that's what guarantees the parent context is observed
-                // alive at the moment of share-group create. After that,
-                // initialize the AI-lane GL state (foveated cropper) on
-                // the AI-lane thread.
-                aiLaneGl = new AiLaneGl(eglCore, aiCameraState);
-                aiLaneGl.start();
-                aiLaneGl.setConsumers(downscaler, foveatedCropper, sentry, aiLaneWorker);
-
-                final boolean cropperReady = aiLaneGl.runOnGlThreadBlocking(() -> {
-                    if (foveatedCropper != null) foveatedCropper.init();
-                }, 1500);
-                if (!cropperReady) {
-                    logger.warn("FoveatedCropper init on AI-lane thread did not complete in 1.5s");
-                }
+                // Tier 1: the AI-lane GL thread + its second EGL context +
+                // FoveatedCropper FBO/PBO ring (~6.5MB GPU + ~2.8MB CPU) are
+                // brought up LAZILY on the first surveillance-active frame
+                // (see ensureAiLaneStarted in renderLoop), NOT eagerly here.
+                // Both AI consumers are surveillance-only, so in every ACC-ON
+                // recording mode where sentry never activates (CONTINUOUS /
+                // DRIVE_MODE / PROXIMITY_GUARD) the lane + its memory + its
+                // idle thread/context never exist. It is created when sentry
+                // arms and torn back down when sentry disarms. The CameraState
+                // (aiCameraState) is captured into a field for the lazy path.
+                this.aiCameraStateRef = aiCameraState;
 
                 running = true;
 
@@ -760,6 +805,72 @@ public class PanoramicCameraGpu {
         });
     }
     
+    /**
+     * Bring up the AI lane (AiLaneGl thread + shared EGL context + FoveatedCropper
+     * FBO/PBO ring) lazily on the first surveillance-active frame. MUST run on the
+     * GL thread with eglCore current (it is — called from renderLoop) so the
+     * share-group context create + cropper GL alloc happen against a live parent
+     * context. Single-flight via aiLaneStarting + the aiLaneGl null check so it's
+     * a cheap no-op once up. Mirrors the old eager block at start() verbatim.
+     */
+    private void ensureAiLaneStarted() {
+        if (aiLaneGl != null || aiLaneStarting) return;
+        if (eglCore == null || aiCameraStateRef == null) return;  // pipeline not fully up yet
+        aiLaneStarting = true;
+        try {
+            // This block can stall the GL render thread for up to ~start()'s 3s
+            // latch + 1.5s cropper.init() in the degraded-driver tail. The GL
+            // watchdog (GL_THREAD_TIMEOUT_MS=3000) would otherwise System.exit
+            // the recording process mid-bring-up. Refresh the heartbeat right
+            // before AND after so a legitimate one-time lane warmup can never be
+            // mistaken for a wedged GL thread. (A genuinely hung warmup is still
+            // bounded by start()'s/runOnGlThreadBlocking's own internal timeouts.)
+            lastGlThreadHeartbeat = System.currentTimeMillis();
+            AiLaneGl lane = new AiLaneGl(eglCore, aiCameraStateRef);
+            lane.start();  // blocks until the shared context is current on its thread
+            lastGlThreadHeartbeat = System.currentTimeMillis();
+            lane.setConsumers(downscaler, foveatedCropper, sentry, aiLaneWorker);
+            boolean cropperReady = lane.runOnGlThreadBlocking(() -> {
+                if (foveatedCropper != null) foveatedCropper.init();
+            }, 1500);
+            lastGlThreadHeartbeat = System.currentTimeMillis();
+            if (!cropperReady) {
+                logger.warn("Lazy AI-lane: FoveatedCropper init did not complete in 1.5s");
+            }
+            aiLaneGl = lane;
+            logger.info("AI lane started lazily (surveillance armed)");
+        } catch (Throwable t) {
+            logger.warn("Lazy AI-lane start failed: " + t.getMessage());
+            // Leave aiLaneGl null so the next active frame retries.
+        } finally {
+            aiLaneStarting = false;
+        }
+    }
+
+    /**
+     * Tear the AI lane back down when surveillance disarms, freeing the thread,
+     * the shared EGL context, and the cropper's ~6.5MB GPU + ~2.8MB CPU buffers.
+     * MUST run on the GL thread (called from renderLoop). aiLaneGl.shutdown()
+     * releases the cropper + downscaler direct resources on the AI-lane context,
+     * so afterwards we null sentry's cropper ref so AiLaneGl.processOnce re-attaches
+     * a freshly-re-init'd cropper on the NEXT arm (the cropper OBJECT is reused;
+     * only its GL state was released, and ensureAiLaneStarted re-init()s it).
+     */
+    private void releaseAiLaneOnGlThread() {
+        AiLaneGl lane = aiLaneGl;
+        if (lane == null) return;
+        aiLaneGl = null;
+        try { lane.shutdown(); } catch (Throwable ignored) {}
+        // Clear the stale cropper ref the sentry captured so the lazy re-attach
+        // (AiLaneGl.processOnce: getFoveatedCropper()==null -> setFoveatedCropper)
+        // re-fires on the next arm instead of holding a released-GL-state cropper.
+        try {
+            SurveillanceEngineGpu s = sentry;
+            if (s != null) s.setFoveatedCropper(null, cameraTextureId);
+        } catch (Throwable ignored) {}
+        logger.info("AI lane released (surveillance disarmed) — freed thread + EGL context + cropper buffers");
+    }
+
     /**
      * Initializes OpenGL context and textures.
      */
@@ -2581,7 +2692,29 @@ public class PanoramicCameraGpu {
             GpuMosaicRecorder localRecorder = recorder;
             HardwareEventRecorderGpu localEncoder = encoder;
             long stageBeforeMosaicNs = System.nanoTime();
-            if (localRecorder != null) {
+            // Recorder lane master gate around ALL of PASS 1A (windshield consume
+            // + recorder draw + drain). When the camera is kept warm ONLY for
+            // blind-spot (PASS 1C, no encoder, no recording mode), the H.265
+            // recorder lane is switched OFF: skip the windshield 2nd-camera
+            // consume/drain AND the mosaic draw/encode so we burn zero Venus/GPU
+            // on footage nothing will flush. A windshield camera that was already
+            // STARTED is torn down in the `else if (windshieldStarted)` branch
+            // below (it would otherwise gralloc-stall undrained) and re-opened by
+            // updateWindshieldCameraOnGlThread() when PASS 1A resumes.
+            //
+            // SAFETY OVERRIDE — `|| localRecorder.isRecording()`: this single
+            // GpuMosaicRecorder instance is SHARED by every recording consumer
+            // (RecordingModeManager modes AND the ACC-off SurveillanceEngineGpu
+            // sentry path, which holds the same recorder via setRecorder() and
+            // triggers clips through recorder.triggerEventRecording() WITHOUT
+            // routing through GpuSurveillancePipeline.startRecording()'s lane
+            // re-assert — likewise OEM dashcam). Gating PASS 1A purely on
+            // recorderLaneEnabled would let a sentry/OEM clip that started while
+            // the camera was BS-only-warmed (lane OFF) record BLACK. Drawing
+            // whenever the recorder is ACTUALLY recording closes every such
+            // bypass at this one gate, by construction — recorderLaneEnabled then
+            // only governs the idle pre-record-ring feed (no live clip open).
+            if (localRecorder != null && (recorderLaneEnabled || localRecorder.isRecording())) {
                 // Publish per-frame transform matrix to recorder before draw.
                 // Cheap (16-float arraycopy); matches esco's per-frame
                 // getTransformMatrix → uTexMatrix flow.
@@ -2645,12 +2778,35 @@ public class PanoramicCameraGpu {
                         }
                     }
                 }
-                localRecorder.drawFrame(cameraTextureId, windshieldTextureId,
-                    windshieldStarted && windshieldFrameReady, currentFrameTimestampNs);
+                // Recorder draw stride gate (Proximity Guard low-rate pre-record).
+                // We draw into the encoder surface only on selected frames; on
+                // skipped frames MediaCodec simply receives no input, lowering
+                // the effective recording rate. The windshield drain above
+                // intentionally runs EVERY frame (gralloc-slot starvation guard)
+                // and is outside this gate. Stride 1 = every frame (default).
+                // The counter advances per consumed camera frame so the cadence
+                // is uniform; frame 0 always draws so a freshly-applied stride
+                // starts with a frame rather than a gap.
+                // Recorder draw stride gate (Proximity Guard low-rate pre-record):
+                // draw into the encoder surface only every stride-th frame; on
+                // skipped frames MediaCodec gets no input, lowering the effective
+                // recording rate. Stride 1 = every frame (default).
+                int stride = recorderFrameStride;
+                boolean drawThisFrame = stride <= 1 || (recorderStrideCounter % stride) == 0;
+                recorderStrideCounter++;
+                if (drawThisFrame) {
+                    localRecorder.drawFrame(cameraTextureId, windshieldTextureId,
+                        windshieldStarted && windshieldFrameReady, currentFrameTimestampNs);
 
-                // CRITICAL: Drain encoder immediately after frame submission
-                // This prevents eglSwapBuffers from blocking when encoder buffers fill up
-                if (localEncoder != null) {
+                    // CRITICAL: Drain encoder immediately after frame submission
+                    // This prevents eglSwapBuffers from blocking when encoder buffers fill up
+                    if (localEncoder != null) {
+                        localEncoder.drainEncoder();
+                    }
+                } else if (localEncoder != null) {
+                    // Even on a skipped draw, keep draining any already-queued
+                    // output so the codec's output buffers can't back up while
+                    // we're feeding it sparsely.
                     localEncoder.drainEncoder();
                 }
 
@@ -2701,6 +2857,18 @@ public class PanoramicCameraGpu {
                         restartInProgress.set(false);
                     }
                 }
+            } else if (windshieldStarted) {
+                // PASS 1A is skipped (recorder lane OFF and nothing recording —
+                // e.g. camera kept warm ONLY for blind-spot). The recorder is the
+                // ONLY consumer of the 2nd (windshield) AVMCamera, so with PASS 1A
+                // gated off nothing drains its 4-slot ImageReader — the gralloc
+                // slots fill, the HAL producer stalls, and a 2nd physical camera
+                // stays powered on the shared SDM665 bus for the whole idle
+                // window. Tear it down here; updateWindshieldCameraOnGlThread()
+                // re-opens it the moment PASS 1A resumes (windshieldEnabled is
+                // unchanged). Only reached when the OEM windshield dual-cam feature
+                // is on (default off), so normally a no-op.
+                stopWindshieldCameraOnGlThread();
             }
 
             // PASS 1B: Streaming (Parallel Zero-Copy GPU Path)
@@ -2741,11 +2909,38 @@ public class PanoramicCameraGpu {
                     localBsScaler.setTextureMatrix(currentTexMatrix);
                 }
                 localBsScaler.drawFrame(cameraTextureId);
+                bsDiagFrames++;
                 // Drain only if an encoder is wired (legacy path). Native path has
                 // none — the swapBuffers in drawFrame presented straight to screen.
                 // Identity re-check guards a concurrent disable nulling the field.
                 if (localBsEncoder != null && bsStreamEncoder == localBsEncoder) {
                     localBsEncoder.drainEncoder();
+                }
+            } else if (localBsScaler == null) {
+                bsDiagSkipScaler++;
+            } else {
+                bsDiagSkipHidden++;
+            }
+            // Throttled BS render diagnostic (~5s). Logs whether PASS 1C is actually
+            // drawing the BS lane and, when not, WHY — so "card shows but black" is
+            // triageable from the log. cameraTextureId==0 here means the external
+            // camera texture isn't allocated → drawFrame would sample nothing = black.
+            // od.isReady()==false means the view-7/8 sampler coefficients are zero-filled
+            // (license/authorize gate) = black even with frames + a valid texture.
+            {
+                long nowDiagMs = android.os.SystemClock.elapsedRealtime();
+                if (nowDiagMs - bsDiagLastLogMs >= 5000L
+                        && (bsDiagFrames > 0 || bsDiagSkipScaler > 0 || bsDiagSkipHidden > 0)) {
+                    boolean odReady = false;
+                    try { odReady = com.overdrive.app.od.Od.INSTANCE.isReady(); } catch (Throwable ignored) {}
+                    logger.info("BS render diag: drawn=" + bsDiagFrames
+                            + " skipNoScaler=" + bsDiagSkipScaler
+                            + " skipHidden=" + bsDiagSkipHidden
+                            + " camTex=" + cameraTextureId
+                            + " bsVisible=" + bsLayerVisible
+                            + " odReady=" + odReady);
+                    bsDiagLastLogMs = nowDiagMs;
+                    bsDiagFrames = 0; bsDiagSkipScaler = 0; bsDiagSkipHidden = 0;
                 }
             }
 
@@ -2782,9 +2977,26 @@ public class PanoramicCameraGpu {
             // ACC-ON load back at v17/v18 levels.
             // AI lane notify (publish-only; AI work runs on AiLaneGl's
             // own thread).
-            AiLaneGl localAiLane = aiLaneGl;
             SurveillanceEngineGpu localSentry = sentry;
-            boolean aiLaneNeeded = localSentry != null && localSentry.isActive();
+            // AI lane is needed only when surveillance is active AND actually
+            // consuming AI output. CONTINUOUS (always-record) ACC-OFF mode sets
+            // active=true but uses no motion/YOLO/mosaic-readback — recording is
+            // fed by the GL→encoder chain directly — so excluding it keeps the
+            // lane (thread + EGL context + ~6.5MB cropper) from being created and
+            // per-frame-fed for nothing in that sub-mode.
+            boolean aiLaneNeeded = localSentry != null && localSentry.isActive()
+                    && !localSentry.isContinuousMode();
+            // Lazy lifecycle: bring the AI lane UP on the first surveillance-
+            // active frame, tear it DOWN (freeing thread + EGL context + ~6.5MB
+            // GPU + ~2.8MB CPU) when surveillance disarms. Both run here on the
+            // GL thread with eglCore current — the only safe place to create the
+            // share-group context + alloc the cropper FBO/PBO.
+            if (aiLaneNeeded) {
+                ensureAiLaneStarted();
+            } else if (aiLaneGl != null) {
+                releaseAiLaneOnGlThread();
+            }
+            AiLaneGl localAiLane = aiLaneGl;
             if (localAiLane != null && localAiLane.isRunning() && aiLaneNeeded) {
                 android.opengl.GLES20.glFlush();
                 localAiLane.notifyFrame(cameraFrameSeq.get());
@@ -3608,7 +3820,7 @@ public class PanoramicCameraGpu {
 
     /**
      * SOTA: Restarts the camera after a HAL error event or frame stall.
-     * 
+     *
      * Called on GL thread. Does a full close→reopen cycle with proper cleanup.
      * This is faster than the watchdog kill+restart because it doesn't require
      * a full process restart — just a camera reopen.
@@ -4264,6 +4476,14 @@ public class PanoramicCameraGpu {
      *            method just stores and applies)
      */
     public void setTargetFps(int fps) {
+        // Idempotent: skip the work (and the reflective HAL call) when the rate
+        // is unchanged. RecordingModeManager.reconcileCameraProfile may re-assert
+        // the same fps on every BS show/hide edge and lifecycle transition; with
+        // a sustained turn signal that's many calls, and a reflective
+        // setCameraFps each time would be needless churn on the HAL thread.
+        if (fps == this.targetFps) {
+            return;
+        }
         this.targetFps = fps;
         logger.info("Target FPS set to: " + fps);
         // Keep the AI-lane GL-hop budget in sync with the new rate.
@@ -4289,6 +4509,64 @@ public class PanoramicCameraGpu {
      */
     public int getTargetFps() {
         return targetFps;
+    }
+
+    /**
+     * Set the recorder draw stride. The render loop draws into the recording
+     * encoder's input surface only every {@code stride}-th camera frame, giving
+     * an effective recording rate of ~cameraFps/stride WITHOUT a codec
+     * reconfigure. Streaming and blind-spot lanes are unaffected. {@code 1}
+     * restores full-rate recording (the default). Values &lt; 1 are clamped to 1.
+     *
+     * <p>Thread-safe: writes a volatile read by the GL render thread.
+     */
+    public void setRecorderFrameStride(int stride) {
+        int clamped = Math.max(1, stride);
+        if (clamped != recorderFrameStride) {
+            recorderFrameStride = clamped;
+            // Reset the phase so the FIRST frame after a stride change always
+            // draws (counter % stride == 0), rather than waiting up to the old
+            // phase offset. The counter is GL-thread-confined; this write from
+            // the control thread is a benign racy hint — worst case the first
+            // post-change draw lands one frame early/late, cosmetic. It is read
+            // as `% stride` so no torn-value hazard.
+            recorderStrideCounter = 0;
+            logger.info("Recorder frame stride set to " + clamped
+                + " (effective recording rate ≈ cameraFps/" + clamped + ")");
+        }
+    }
+
+    /**
+     * Gets the current recorder draw stride (1 = every frame).
+     */
+    public int getRecorderFrameStride() {
+        return recorderFrameStride;
+    }
+
+    /**
+     * Master enable/disable for the recorder lane (PASS 1A H.265 mosaic). When
+     * {@code false}, the render loop skips the recorder drawFrame + drainEncoder
+     * entirely; the stream (PASS 1B) and blind-spot (PASS 1C) lanes are
+     * unaffected. {@code true} is the default — ZERO behaviour change for every
+     * recording mode. Used when the camera is kept warm ONLY for blind-spot (no
+     * encoder, no pre-record ring to feed) so the H.265 encoder doesn't burn
+     * Venus for footage nothing will flush.
+     *
+     * <p>Thread-safe: writes a volatile read by the GL render thread.
+     */
+    public void setRecorderLaneEnabled(boolean enabled) {
+        if (enabled != recorderLaneEnabled) {
+            recorderLaneEnabled = enabled;
+            // Reset the stride phase so re-enabling starts on a drawn frame
+            // (mirrors setRecorderFrameStride's reset rationale).
+            if (enabled) recorderStrideCounter = 0;
+            logger.info("Recorder lane " + (enabled ? "ENABLED" : "DISABLED (PASS 1A skipped)"));
+        }
+    }
+
+    /** @return whether the recorder lane (PASS 1A) is currently drawing. */
+    public boolean isRecorderLaneEnabled() {
+        return recorderLaneEnabled;
     }
 
     /**

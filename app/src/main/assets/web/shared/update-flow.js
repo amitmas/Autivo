@@ -63,6 +63,39 @@
         /* Sidebar entry — match existing .nav-link visual treatment */
         .nav-link.nav-link-update .upd-badge { margin-left:auto; background:#3b82f6; color:#fff; font-size:10px; font-weight:700; padding:2px 7px; border-radius:9px; line-height:1.2; }
         .nav-link.nav-link-update.has-update svg { color:#3b82f6; }
+        /* Quiet dot for the alpha "newer exists" hint — subtler than the badge. */
+        .nav-link.nav-link-update .upd-dot { margin-left:auto; width:8px; height:8px; border-radius:50%; background:#3b82f6; flex:none; }
+
+        /* Channel switcher (segmented control) */
+        .upd-channel { display:flex; border:1px solid #232a35; border-radius:10px; overflow:hidden; margin-bottom:16px; }
+        .upd-channel-seg { flex:1; padding:10px 8px; background:#0a0d12; color:#9aa6b3; font-size:13px; font-weight:600; text-align:center; cursor:pointer; border:0; font-family:inherit; }
+        .upd-channel-seg + .upd-channel-seg { border-left:1px solid #232a35; }
+        .upd-channel-seg.active { background:#16202c; color:#fff; }
+        .upd-channel-seg:disabled { cursor:default; opacity:0.7; }
+        .upd-channel-desc { font-size:11px; color:#9aa6b3; line-height:1.5; margin:-8px 0 16px; }
+
+        /* Report-a-bug block (Braveheart beta channel) */
+        .upd-report { background:rgba(245,158,11,0.06); border:1px solid rgba(245,158,11,0.28); border-radius:10px; padding:12px 14px; margin:0 0 16px; }
+        .upd-report-how { font-size:12px; color:#cdd6e0; line-height:1.5; margin-bottom:10px; }
+        .upd-report-links { display:flex; flex-wrap:wrap; }
+        .upd-report-link { font-size:12px; font-weight:600; color:#f59e0b; text-decoration:none; padding:6px 12px; border:1px solid rgba(245,158,11,0.4); border-radius:8px; }
+        /* Margin-based gap (Chrome 58 head unit lacks flex gap) */
+        .upd-report-link + .upd-report-link { margin-left:8px; }
+
+        /* Alpha version catalog */
+        .upd-catalog { display:block; max-height:48vh; overflow:auto; margin:4px 0 4px; }
+        .upd-ver { display:block; width:100%; text-align:left; background:#0a0d12; border:1px solid #1a1f28; border-radius:10px; padding:12px 14px; color:#e8eef5; font-family:inherit; cursor:pointer; }
+        /* Sibling spacing via margin (NOT flex gap — Chrome 58 head-unit). */
+        .upd-ver + .upd-ver { margin-top:8px; }
+        .upd-ver:hover { background:#11161d; border-color:#2a3340; }
+        .upd-ver-top { display:flex; align-items:center; }
+        .upd-ver-name { font-size:14px; font-weight:600; color:#fff; }
+        .upd-ver-pill { margin-left:8px; font-size:10px; font-weight:700; padding:1px 7px; border-radius:9px; line-height:1.4; }
+        .upd-ver-pill.current { background:#1f6f4a; color:#d6ffe8; }
+        .upd-ver-pill.older { background:#3a2a18; color:#f3c98b; }
+        .upd-ver-date { margin-left:auto; font-size:11px; color:#9aa6b3; }
+        .upd-ver-notes { font-size:11px; color:#9aa6b3; line-height:1.5; margin-top:6px; max-height:54px; overflow:hidden; white-space:pre-wrap; }
+        .upd-catalog-empty { padding:18px 4px; font-size:13px; color:#9aa6b3; text-align:center; }
         `;
         var s = document.createElement('style');
         s.textContent = css;
@@ -163,11 +196,21 @@
                 toast(BYD.i18n.t('update.check_failed', {error: res.error}), 'error');
                 return;
             }
-            if (!res.available) {
-                toast(BYD.i18n.t('update.latest_version', {version: res.currentVersion || ''}), 'success');
+            // Alpha (archive): "Check for Updates" opens the version catalog
+            // rather than a single install prompt. The /check response tells
+            // us the channel so we don't need a second round-trip to decide.
+            if (res.channel === 'alpha') {
+                startCatalogFlow();
                 return;
             }
-            // Update available — fetch preview metadata + show modal.
+            if (!res.available) {
+                // Braveheart, up to date. Show a small modal (not just a toast)
+                // so the channel switcher is reachable — this is where a
+                // braveheart user goes to switch back to Alpha.
+                showUpToDateModal(res.currentVersion || '', res.channel || 'braveheart');
+                return;
+            }
+            // Braveheart update available — fetch preview metadata + show modal.
             // Same defensive body parse on the preview endpoint.
             fetch('/api/update/preview').then(function (r) {
                 return r.text().then(function (text) { return text; });
@@ -186,6 +229,10 @@
 
     function showConfirmModal(res, preview) {
         injectStyles();
+        // Replace any existing modal (e.g. the alpha catalog) rather than
+        // stacking a second #updModalBg — duplicate ids would make $() and
+        // the Cancel/close handlers target the wrong element.
+        closeModal();
         var bg = document.createElement('div');
         bg.className = 'upd-modal-bg';
         bg.id = 'updModalBg';
@@ -223,6 +270,13 @@
               '</div>' +
             '</div>' : '';
 
+        // Downgrade note — only for an alpha pick that's older than installed.
+        var downgradeRowHtml = res._isDowngrade ?
+            '<div class="upd-row">' +
+              '<span class="upd-icon">⬇️</span>' +
+              '<div>' + BYD.i18n.t('update.downgrade_note') + '</div>' +
+            '</div>' : '';
+
         bg.innerHTML =
             '<div class="upd-modal" role="dialog" aria-labelledby="updTitle">' +
               '<h2 id="updTitle">' + BYD.i18n.t('update.title_update_to', {version: escapeHtml(res.remoteVersion || '')}) + '</h2>' +
@@ -235,6 +289,7 @@
                 '</div>' +
                 rotationRowHtml +
                 lanRowHtml +
+                downgradeRowHtml +
                 recommendRowHtml +
               '</div>' +
               '<div class="upd-actions">' +
@@ -246,7 +301,7 @@
         document.body.appendChild(bg);
         $('updCancel').addEventListener('click', closeModal);
         $('updConfirm').addEventListener('click', function () {
-            startInstall(res.currentVersion, res.remoteVersion);
+            startInstall(res.currentVersion, res.remoteVersion, res._targetTag);
         });
         bg.addEventListener('click', function (e) { if (e.target === bg) closeModal(); });
     }
@@ -256,18 +311,309 @@
         if (bg) bg.remove();
     }
 
+    // Braveheart "up to date" — a small modal carrying the channel switcher so
+    // the user can drop back to Alpha (the switcher is otherwise only in the
+    // alpha catalog / braveheart confirm).
+    function showUpToDateModal(currentVersion, channel) {
+        injectStyles();
+        closeModal();
+        var bg = document.createElement('div');
+        bg.className = 'upd-modal-bg';
+        bg.id = 'updModalBg';
+        bg.innerHTML =
+            '<div class="upd-modal" role="dialog">' +
+              '<h2>' + escapeHtml(BYD.i18n.t('update.latest_version', {version: currentVersion})) + '</h2>' +
+              '<div id="updChannelMount"></div>' +
+              '<div class="upd-channel-desc">' + escapeHtml(BYD.i18n.t('update.channel_braveheart_desc')) + '</div>' +
+              '<div id="updReportMount"></div>' +
+              '<div class="upd-actions">' +
+                '<button class="upd-btn upd-btn-cancel" id="updCatClose">' + escapeHtml(BYD.i18n.t('common.close')) + '</button>' +
+              '</div>' +
+            '</div>';
+        document.body.appendChild(bg);
+        $('updCatClose').addEventListener('click', closeModal);
+        bg.addEventListener('click', function (e) { if (e.target === bg) closeModal(); });
+        var mount = $('updChannelMount');
+        if (mount) {
+            mount.appendChild(buildChannelSwitcher(channel, function (newCh) {
+                closeModal();
+                // Re-run the check on the newly-selected channel.
+                startCheckFlow();
+            }));
+        }
+        // Report-a-bug links (braveheart only).
+        var reportMount = $('updReportMount');
+        var report = buildReportBlock(channel);
+        if (reportMount && report) reportMount.appendChild(report);
+    }
+
+    // ─────────────────────── Channel switcher ───────────────────────
+
+    // Build the segmented channel control. onSwitch(newChannel) is called
+    // after the server confirms the change. Rendered at the top of the alpha
+    // catalog and the braveheart confirm modal so the user can flip channels
+    // from either surface.
+    function buildChannelSwitcher(activeChannel, onSwitch) {
+        var wrap = document.createElement('div');
+        wrap.className = 'upd-channel';
+        var channels = [
+            { id: 'alpha', label: BYD.i18n.t('update.channel_alpha') },
+            { id: 'braveheart', label: BYD.i18n.t('update.channel_braveheart') }
+        ];
+        channels.forEach(function (c) {
+            var b = document.createElement('button');
+            b.type = 'button';
+            b.className = 'upd-channel-seg' + (c.id === activeChannel ? ' active' : '');
+            b.textContent = c.label;
+            b.addEventListener('click', function () {
+                if (c.id === activeChannel) return;
+                // Disable both segments while the switch is in flight.
+                var segs = wrap.querySelectorAll('.upd-channel-seg');
+                for (var i = 0; i < segs.length; i++) segs[i].disabled = true;
+                fetch('/api/update/channel?value=' + encodeURIComponent(c.id), { method: 'POST' })
+                    .then(function (r) { return r.json(); })
+                    .then(function (res) {
+                        if (res && res.channel === c.id) {
+                            // Braveheart gets an instability heads-up instead of
+                            // the bland "switched" confirmation.
+                            if (c.id === 'braveheart') {
+                                toast(BYD.i18n.t('update.switched_to_braveheart_warn'), 'info');
+                            } else {
+                                toast(BYD.i18n.t('update.switched_to_channel', {channel: c.label}), 'success');
+                            }
+                            onSwitch(c.id);
+                        } else {
+                            for (var i = 0; i < segs.length; i++) segs[i].disabled = false;
+                            toast(BYD.i18n.t('update.switch_channel_failed', {error: (res && res.error) || BYD.i18n.t('common.unknown')}), 'error');
+                        }
+                    })
+                    .catch(function (e) {
+                        for (var i = 0; i < segs.length; i++) segs[i].disabled = false;
+                        toast(BYD.i18n.t('update.switch_channel_failed', {error: (e && e.message) ? e.message : BYD.i18n.t('errors.network')}), 'error');
+                    });
+            });
+            wrap.appendChild(b);
+        });
+        return wrap;
+    }
+
+    // Report-a-bug block for the Braveheart (beta) channel: the "send logs →
+    // share the code" instruction + the community links. Returns null for
+    // non-braveheart channels (no clutter on the stable channel).
+    function buildReportBlock(channel) {
+        if (channel !== 'braveheart') return null;
+        var wrap = document.createElement('div');
+        wrap.className = 'upd-report';
+        var how = document.createElement('div');
+        how.className = 'upd-report-how';
+        how.textContent = BYD.i18n.t('update.report_how');
+        wrap.appendChild(how);
+
+        var links = document.createElement('div');
+        links.className = 'upd-report-links';
+        var defs = [
+            { key: 'report_discord', url: 'report_discord_url', fb: 'https://discord.gg/PZutk9fg4h' },
+            { key: 'report_github', url: 'report_github_url', fb: 'https://github.com/yash-srivastava/Overdrive-release/issues' },
+            { key: 'report_whatsapp', url: 'report_whatsapp_url', fb: 'https://chat.whatsapp.com/HChmriCWgr9KwAtE6OEkiM' }
+        ];
+        defs.forEach(function (d) {
+            var url = BYD.i18n.t('update.' + d.url);
+            if (!url || url === ('update.' + d.url)) url = d.fb; // fall back if key missing
+            if (!url) return;
+            var a = document.createElement('a');
+            a.className = 'upd-report-link';
+            a.href = url;
+            a.target = '_blank';
+            a.rel = 'noopener noreferrer';
+            a.textContent = BYD.i18n.t('update.' + d.key);
+            links.appendChild(a);
+        });
+        wrap.appendChild(links);
+        return wrap;
+    }
+
+    // ─────────────────────── Alpha version catalog ───────────────────────
+
+    function startCatalogFlow() {
+        injectStyles();
+        var bg = document.createElement('div');
+        bg.className = 'upd-modal-bg';
+        bg.id = 'updModalBg';
+        bg.innerHTML =
+            '<div class="upd-modal" role="dialog" aria-labelledby="updCatTitle">' +
+              '<h2 id="updCatTitle">' + escapeHtml(BYD.i18n.t('update.catalog_title')) + '</h2>' +
+              '<div id="updChannelMount"></div>' +
+              '<div class="upd-channel-desc">' + escapeHtml(BYD.i18n.t('update.channel_alpha_desc')) + '</div>' +
+              '<div class="upd-catalog" id="updCatalog">' +
+                '<div class="upd-catalog-empty">' + escapeHtml(BYD.i18n.t('update.checking')) + '</div>' +
+              '</div>' +
+              '<div class="upd-actions">' +
+                '<button class="upd-btn upd-btn-cancel" id="updCatClose">' + escapeHtml(BYD.i18n.t('common.close') || 'Close') + '</button>' +
+              '</div>' +
+            '</div>';
+        document.body.appendChild(bg);
+        $('updCatClose').addEventListener('click', closeModal);
+        bg.addEventListener('click', function (e) { if (e.target === bg) closeModal(); });
+
+        var mount = $('updChannelMount');
+        if (mount) {
+            mount.appendChild(buildChannelSwitcher('alpha', function (newCh) {
+                // Switched to braveheart from the catalog — close and run the
+                // braveheart check so the user immediately sees its flow.
+                closeModal();
+                if (newCh === 'braveheart') startCheckFlow();
+            }));
+        }
+        loadCatalog();
+    }
+
+    function loadCatalog() {
+        fetch('/api/update/versions').then(function (r) {
+            return r.text().then(function (t) { return t; });
+        }).then(function (text) {
+            var data = null;
+            try { data = text ? JSON.parse(text) : null; } catch (e) {}
+            var cat = $('updCatalog');
+            if (!cat) return;
+            if (!data || data.error) {
+                renderCatalogMessage(cat, BYD.i18n.t('update.check_failed', {error: (data && data.error) || BYD.i18n.t('errors.network')}), true);
+                return;
+            }
+            var versions = data.versions || [];
+            if (!versions.length) {
+                renderCatalogMessage(cat, BYD.i18n.t('update.catalog_empty'), false);
+                return;
+            }
+            renderCatalog(cat, versions, data.currentVersion || '');
+        }).catch(function (e) {
+            var cat = $('updCatalog');
+            if (cat) renderCatalogMessage(cat, BYD.i18n.t('update.check_failed', {error: (e && e.message) ? e.message : BYD.i18n.t('errors.network')}), true);
+        });
+    }
+
+    function renderCatalogMessage(cat, msg, withRetry) {
+        cat.innerHTML = '';
+        var empty = document.createElement('div');
+        empty.className = 'upd-catalog-empty';
+        empty.textContent = msg;
+        cat.appendChild(empty);
+        if (withRetry) {
+            var retry = document.createElement('button');
+            retry.type = 'button';
+            retry.className = 'upd-btn upd-btn-cancel';
+            retry.style.marginTop = '10px';
+            retry.textContent = BYD.i18n.t('update.catalog_retry') || BYD.i18n.t('common.retry') || 'Retry';
+            retry.addEventListener('click', function () {
+                cat.innerHTML = '<div class="upd-catalog-empty">' + escapeHtml(BYD.i18n.t('update.checking')) + '</div>';
+                loadCatalog();
+            });
+            cat.appendChild(retry);
+        }
+    }
+
+    function renderCatalog(cat, versions, currentVersion) {
+        cat.innerHTML = '';
+        versions.forEach(function (v) {
+            var row = document.createElement('button');
+            row.type = 'button';
+            row.className = 'upd-ver';
+
+            var top = document.createElement('div');
+            top.className = 'upd-ver-top';
+
+            var name = document.createElement('span');
+            name.className = 'upd-ver-name';
+            name.textContent = v.version || v.tag || '';
+            top.appendChild(name);
+
+            // Relation pill: only "current" and "older" get a chip; "newer"
+            // and "unknown" stay unmarked to avoid clutter.
+            if (v.relation === 'current') {
+                top.appendChild(makePill('current', BYD.i18n.t('update.pill_installed')));
+            } else if (v.relation === 'older') {
+                top.appendChild(makePill('older', BYD.i18n.t('update.pill_older') || BYD.i18n.t('update.install_downgrade')));
+            }
+
+            if (v.publishedAt) {
+                var date = document.createElement('span');
+                date.className = 'upd-ver-date';
+                date.textContent = formatDate(v.publishedAt);
+                top.appendChild(date);
+            }
+            row.appendChild(top);
+
+            if (v.releaseNotes) {
+                var notes = document.createElement('div');
+                notes.className = 'upd-ver-notes';
+                notes.textContent = firstLines(v.releaseNotes, 3);
+                row.appendChild(notes);
+            }
+
+            row.addEventListener('click', function () {
+                // Installing the currently-installed version is a no-op for
+                // the user; still allow it (re-install) but make downgrades
+                // explicit via the confirm modal's downgrade note.
+                var isDowngrade = v.relation === 'older';
+                showCatalogConfirm(v, currentVersion, isDowngrade);
+            });
+            cat.appendChild(row);
+        });
+    }
+
+    function makePill(cls, text) {
+        var pill = document.createElement('span');
+        pill.className = 'upd-ver-pill ' + cls;
+        pill.textContent = text;
+        return pill;
+    }
+
+    // A specific archived version was tapped — reuse the confirm modal shape,
+    // then install with &version=<tag>. Fetches preview for the tunnel/LAN
+    // warnings, same as the braveheart path.
+    function showCatalogConfirm(v, currentVersion, isDowngrade) {
+        fetch('/api/update/preview').then(function (r) {
+            return r.text().then(function (t) { return t; });
+        }).then(function (text) {
+            var preview = null;
+            try { preview = text ? JSON.parse(text) : null; } catch (e) {}
+            var res = {
+                currentVersion: currentVersion,
+                remoteVersion: v.version || v.tag,
+                releaseNotes: v.releaseNotes || '',
+                _targetTag: v.tag,
+                _isDowngrade: isDowngrade
+            };
+            showConfirmModal(res, preview || {});
+        }).catch(function () {
+            showConfirmModal({
+                currentVersion: currentVersion,
+                remoteVersion: v.version || v.tag,
+                releaseNotes: v.releaseNotes || '',
+                _targetTag: v.tag,
+                _isDowngrade: isDowngrade
+            }, {});
+        });
+    }
+
     // ─────────────────────── Install + Progress ───────────────────────
 
-    function startInstall(currentVersion, newVersion) {
+    // targetTag is set for alpha picks (a specific archived version) and
+    // omitted for braveheart (rolling head). When present it is appended as
+    // &version=<tag> so the server resolves that exact release.
+    function startInstall(currentVersion, newVersion, targetTag) {
         var btn = $('updConfirm');
         if (btn) { btn.disabled = true; btn.textContent = BYD.i18n.t('update.starting'); }
 
         // Remember the pre-install version so we can detect the bump on
-        // reconnect even if the install marker is gone by then.
+        // reconnect even if the install marker is gone by then. For a
+        // downgrade the target is "older" than current — store it so the
+        // reconnect banner fires on ANY version change, not just an increase.
         try { localStorage.setItem('upd_preInstallVersion', currentVersion || ''); } catch (e) {}
         try { localStorage.setItem('upd_targetVersion', newVersion || ''); } catch (e) {}
 
-        fetch('/api/update/install?confirm=true', { method: 'POST' })
+        var url = '/api/update/install?confirm=true';
+        if (targetTag) url += '&version=' + encodeURIComponent(targetTag);
+        fetch(url, { method: 'POST' })
             .then(function (r) { return r.json(); })
             .then(function (res) {
                 if (res && res.status === 'scheduled') {
@@ -312,6 +658,17 @@
         pollTimer = setInterval(function () {
             fetch('/api/update/progress').then(function (r) { return r.json(); }).then(function (p) {
                 consecutiveFailures = 0;
+                // The idle sentinel is what both progress readers return for a
+                // torn / empty / malformed / stale-recovered read (the r1/r4
+                // alignment so a torn read is a harmless keep-polling no-op, not
+                // a connection failure). The non-atomic writeProgress truncates-
+                // then-rewrites every ~500ms during download, so a poll can land
+                // mid-install on the zero-length file. Skip the render for idle
+                // (mirrors MainActivity's `"idle" -> {}` branch): keep the prior
+                // phase label and bar fill instead of flashing the untranslated
+                // word "idle" and collapsing a held-100 bar to indeterminate for
+                // one tick. The poll already counted as healthy above.
+                if (p.phase === 'idle') { return; }
                 renderProgress(p);
                 if (p.phase === 'stopping_daemons' || p.phase === 'installing') {
                     sawTerminalPhase = true;
@@ -329,10 +686,10 @@
                 // without false-positive "lost" state on a healthy daemon.
                 if (consecutiveFailures >= 2 && sawTerminalPhase) {
                     clearInterval(pollTimer); pollTimer = null;
-                    enterReconnectMode();
+                    enterReconnectMode(true);  // install was underway → reconnect = success
                 } else if (consecutiveFailures >= 4) {
                     clearInterval(pollTimer); pollTimer = null;
-                    enterReconnectMode();
+                    enterReconnectMode(sawTerminalPhase);
                 }
             });
         }, 1500);
@@ -416,7 +773,15 @@
 
     // ─────────────────────── Reconnect ───────────────────────
 
-    function enterReconnectMode() {
+    // installWasUnderway: true when the progress poll saw stopping_daemons /
+    // installing before the daemon died — i.e. the install actually started, so
+    // a successful reconnect means SUCCESS even if the version string is
+    // unchanged. This matters for the braveheart rolling channel: it replaces
+    // the APK on the same tag and often keeps the same versionName, so
+    // appVersion (now BuildConfig-derived) does NOT change across a successful
+    // in-place update. Keying success on a version change would falsely report
+    // "install may have failed" on every braveheart update.
+    function enterReconnectMode(installWasUnderway) {
         var disc = $('updDisconnect');
         if (disc) disc.style.display = 'block';
         var phaseEl = $('updPhase');
@@ -442,14 +807,47 @@
                 .then(function (s) {
                     if (!s) return;
                     var newV = s.appVersion || '';
-                    // Reconnected. If the version actually advanced, show success.
+                    // The daemon is back online.
+                    if (installWasUnderway) {
+                        // Install had started (we saw stopping_daemons/installing)
+                        // and the daemon came back. On the braveheart rolling
+                        // channel a successful in-place update keeps the same
+                        // versionName, so a version compare can't confirm success
+                        // — BUT the daemon's detached install script relaunches
+                        // the daemon on FAILURE too (old APK + phase=error written
+                        // to /api/update/progress), so "reachable again" alone is
+                        // not proof of success. Re-read the progress file once:
+                        // phase=error means the pm install actually failed and we
+                        // must surface it (matching the app's consumeFailedUpdateError
+                        // toast), not falsely report "✅ updated". Anything else
+                        // (idle / install kept polling but progress already cleared)
+                        // falls through to the optimistic success path.
+                        clearInterval(reconnectTimer); reconnectTimer = null;
+                        fetch('/api/update/progress', { cache: 'no-store' })
+                            .then(function (pr) { return pr.ok ? pr.json() : null; })
+                            .then(function (p) {
+                                if (p && p.phase === 'error') {
+                                    toast(BYD.i18n.t('update.install_failed', {error: p.error || p.message || BYD.i18n.t('common.unknown')}), 'error');
+                                    return;
+                                }
+                                showSuccessAndReload(newV || preInstallVersion);
+                            })
+                            .catch(function () {
+                                // Progress unreadable on the race (relaunched
+                                // activity may have already cleared it). The
+                                // version-unchanged hint below can't run from here,
+                                // so keep the existing optimistic behaviour.
+                                showSuccessAndReload(newV || preInstallVersion);
+                            });
+                        return;
+                    }
+                    // Install never reached a terminal phase. A version change
+                    // still proves something landed; otherwise it's a rejected /
+                    // no-op install — stop the spinner with the unchanged note.
                     if (newV && (newV !== preInstallVersion || preInstallVersion === '')) {
                         clearInterval(reconnectTimer); reconnectTimer = null;
                         showSuccessAndReload(newV);
-                    }
-                    // Same version reachable = daemon came back without an
-                    // install. Could be a rejected install. Stop the spinner.
-                    if (newV && preInstallVersion && newV === preInstallVersion && attempts > 6) {
+                    } else if (newV && preInstallVersion && newV === preInstallVersion && attempts > 6) {
                         clearInterval(reconnectTimer); reconnectTimer = null;
                         var phEl = $('updPhase');
                         if (phEl) phEl.textContent = BYD.i18n.t('update.version_unchanged');
@@ -500,9 +898,117 @@
                     }
                     localStorage.setItem('upd_lastSeenVersion', status.appVersion);
                 }
+                // Passive update notification — piggybacks on the status poll
+                // so we don't add another timer. ACC state from /status gates
+                // the auto-modal (never interrupt while driving).
+                maybePassiveCheck(status);
             } catch (e) {}
             return status;
         };
+    }
+
+    // ─────────────────────── Passive notify ───────────────────────
+    //
+    // Channel decides the posture (the channel toggle IS the opt-in):
+    //   braveheart → throttled notify-only check: light the sidebar badge,
+    //                fire a one-shot toast per new build, and auto-open the
+    //                install modal when next foregrounded AND parked (ACC off).
+    //   alpha      → pull-only: only a quiet dot when a newer alpha version
+    //                exists. No toast, no modal.
+    // NOTE: a passive check NEVER installs — it stops at "available" and the
+    // user still taps to install, so the disabled-auto-update footgun (which
+    // auto-installed) does not recur.
+
+    var CHECK_THROTTLE_MS = 6 * 60 * 60 * 1000; // 6h
+
+    function maybePassiveCheck(status) {
+        var now = Date.now();
+        var last = 0;
+        try { last = parseInt(localStorage.getItem('upd_lastAutoCheck') || '0', 10) || 0; } catch (e) {}
+        if (now - last < CHECK_THROTTLE_MS) return;
+        try { localStorage.setItem('upd_lastAutoCheck', String(now)); } catch (e) {}
+
+        var accOff = !(status && status.acc);
+        fetch('/api/update/check').then(function (r) { return r.text(); }).then(function (text) {
+            var res = null;
+            try { res = text ? JSON.parse(text) : null; } catch (e) {}
+            if (!res || res.error) return;
+            if (res.channel === 'braveheart') {
+                if (res.available) {
+                    setBadge(true, false);
+                    notifyBraveheartAvailable(res, accOff);
+                } else {
+                    setBadge(false, false);
+                }
+            } else {
+                // Alpha — quiet dot only when a newer version exists. We must
+                // enumerate to know "newer", but only do so cheaply when the
+                // throttle just elapsed (we're already here).
+                checkAlphaNewer();
+            }
+        }).catch(function () { /* offline — try again next throttle window */ });
+    }
+
+    function notifyBraveheartAvailable(res, accOff) {
+        var target = res.remoteVersion || '';
+        var lastNotified = '', lastModal = '';
+        try { lastNotified = localStorage.getItem('upd_lastNotifiedVersion') || ''; } catch (e) {}
+        try { lastModal = localStorage.getItem('upd_lastModalVersion') || ''; } catch (e) {}
+
+        // Toast: one-shot per build, fired whether parked or driving.
+        if (lastNotified !== target) {
+            try { localStorage.setItem('upd_lastNotifiedVersion', target); } catch (e) {}
+            toast(BYD.i18n.t('update.notify_available', {version: target}), 'info');
+        }
+
+        // Auto-open the install modal the FIRST time we're parked for this
+        // build — tracked by a SEPARATE key so a first check that happens
+        // while driving (modal correctly skipped) doesn't permanently suppress
+        // the modal on the next parked check. While driving (ACC on) the badge
+        // is the only surface.
+        if (accOff && lastModal !== target && !$('updModalBg')) {
+            try { localStorage.setItem('upd_lastModalVersion', target); } catch (e) {}
+            fetch('/api/update/preview').then(function (r) { return r.text(); }).then(function (t) {
+                var preview = null;
+                try { preview = t ? JSON.parse(t) : null; } catch (e) {}
+                if (!$('updModalBg')) showConfirmModal(res, preview || {});
+            }).catch(function () {
+                if (!$('updModalBg')) showConfirmModal(res, {});
+            });
+        }
+    }
+
+    function checkAlphaNewer() {
+        fetch('/api/update/versions').then(function (r) { return r.text(); }).then(function (text) {
+            var data = null;
+            try { data = text ? JSON.parse(text) : null; } catch (e) {}
+            if (!data || !data.versions) { setBadge(false, false); return; }
+            var hasNewer = false;
+            for (var i = 0; i < data.versions.length; i++) {
+                if (data.versions[i].relation === 'newer') { hasNewer = true; break; }
+            }
+            setBadge(false, hasNewer); // dot, not badge
+        }).catch(function () {});
+    }
+
+    // badge = prominent braveheart "update available"; dot = quiet alpha hint.
+    function setBadge(showBadge, showDot) {
+        var link = $('navUpdateLink');
+        if (!link) return;
+        link.classList.toggle('has-update', !!(showBadge || showDot));
+        // Remove any prior indicator.
+        var prev = link.querySelector('.upd-badge, .upd-dot');
+        if (prev) prev.parentNode.removeChild(prev);
+        if (showBadge) {
+            var b = document.createElement('span');
+            b.className = 'upd-badge';
+            b.textContent = BYD.i18n.t('update.badge_new') || 'NEW';
+            link.appendChild(b);
+        } else if (showDot) {
+            var d = document.createElement('span');
+            d.className = 'upd-dot';
+            link.appendChild(d);
+        }
     }
 
     // ─────────────────────── Utility ───────────────────────
@@ -512,6 +1018,32 @@
         return String(s)
             .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
             .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    }
+
+    // "2026-05-29T10:00:00Z" → a short locale date; falls back to the raw
+    // date portion if Date parsing isn't reliable on this WebView.
+    function formatDate(iso) {
+        if (!iso) return '';
+        try {
+            var d = new Date(iso);
+            if (!isNaN(d.getTime())) {
+                return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+            }
+        } catch (e) {}
+        return String(iso).split('T')[0];
+    }
+
+    // First N non-empty lines of release notes, joined — keeps the catalog
+    // row compact without rendering full markdown.
+    function firstLines(text, n) {
+        if (!text) return '';
+        var lines = String(text).split('\n');
+        var out = [];
+        for (var i = 0; i < lines.length && out.length < n; i++) {
+            var t = lines[i].trim().replace(/^#+\s*/, '').replace(/^[-*]\s*/, '• ');
+            if (t) out.push(t);
+        }
+        return out.join('\n');
     }
 
     // ─────────────────────── Bootstrap ───────────────────────

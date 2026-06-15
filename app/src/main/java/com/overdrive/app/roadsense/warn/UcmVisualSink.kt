@@ -89,18 +89,19 @@ class UcmVisualSink(
         lastJson = comparable
         lastWriteMs = now
         try {
-            // forceReload BEFORE the merge-write (cross-UID lost-update fix). We (the
-            // daemon) only own the `overlayState` key, but updateSection rewrites the
-            // WHOLE roadSense section by merging our key onto the daemon's CACHED
-            // config. The APP owns warnMode / pendingConfirmResult and writes them on
-            // user taps; if our cache is stale (ext4 mtime has 1 s granularity, so a
-            // just-written app change can be invisible to our mtime-gated loadConfig),
-            // our rewrite would clobber the user's just-toggled warnMode back to the
-            // stale value — the "enable audio then visual → audio shows OFF" bug. A
-            // forceReload here rebuilds the merge from fresh disk, so app-owned keys
-            // survive. Cost is one ~6 KB read+parse per ≤3 s heartbeat (daemon tick,
-            // off the 100 Hz path) — cheap.
-            UnifiedConfigManager.forceReload()
+            // Cross-UID lost-update protection: we (the daemon) only own the
+            // `overlayState` key, but updateSection rewrites the WHOLE roadSense
+            // section by merging our key onto a re-read config. The APP owns
+            // warnMode / pendingConfirmResult and writes them on user taps; a
+            // stale-snapshot merge would clobber a just-toggled warnMode (the
+            // "enable audio then visual → audio shows OFF" bug). updateSection
+            // ALREADY guarantees this: it does loadConfigFresh() (full fresh-disk
+            // re-read) INSIDE withConfigFileLock, so the merge is against the
+            // latest committed bytes with no TOCTOU window. The explicit
+            // forceReload() that used to precede this call is therefore REDUNDANT
+            // (and was strictly worse — it read+parsed the ~6KB file a SECOND time
+            // per write, outside the lock, fired up to 2 Hz while a hazard closes).
+            // Removed. See UnifiedConfigManager.updateSection.
             UnifiedConfigManager.updateSection(
                 OverlayState.SECTION,
                 JSONObject().put(OverlayState.KEY, json),

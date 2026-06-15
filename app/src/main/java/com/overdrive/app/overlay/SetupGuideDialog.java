@@ -67,8 +67,13 @@ public class SetupGuideDialog {
         TextView tvVersionBanner = view.findViewById(R.id.tvVersionBanner);
         if (tvVersionBanner != null) {
             if (isUpdate) {
+                // getInstalledVersion() = in-memory BuildConfig identity, no
+                // disk I/O — this runs on the main thread (post-update relaunch
+                // banner). getDisplayVersion() would read /data/local/tmp on the
+                // looper; the just-relaunched build's BuildConfig identity is
+                // the correct value to show here anyway.
                 tvVersionBanner.setText(context.getString(R.string.setup_version_banner,
-                        com.overdrive.app.updater.AppUpdater.getDisplayVersion(context)));
+                        com.overdrive.app.updater.AppUpdater.getInstalledVersion()));
                 tvVersionBanner.setVisibility(View.VISIBLE);
             } else {
                 tvVersionBanner.setVisibility(View.GONE);

@@ -309,6 +309,44 @@ class DaemonStartupManager(
     }
 
 
+    /**
+     * Run [onAllowed] only if [type]'s durable disable sentinel is absent —
+     * i.e. the user has NOT stopped it. Used to gate the OPTIONAL-daemon
+     * startup paths (boot + app-launch), which otherwise decide solely on
+     * PreferencesManager.isDaemonEnabled. That pref is insufficient: a Telegram
+     * `/daemon zrok stop` records the stop ONLY in the cross-UID sentinel (it
+     * never touches the app's SharedPreferences), so without this probe a
+     * Telegram-stopped optional daemon is resurrected on the next launch/boot.
+     * Core daemons don't need this gate — clearStaleSentinels intentionally
+     * re-arms them — so this is only wired into the optional starts.
+     *
+     * Probe runs as the app's shared launcher (UID lets it stat
+     * /data/local/tmp). On probe error we bias toward starting (same
+     * availability bias as relaunchDaemon): a missed start is recoverable by
+     * the user, and the daemon is already pref-enabled here.
+     */
+    private fun ifNotUserStopped(type: DaemonType, onAllowed: () -> Unit) {
+        adbLauncher.executeShellCommand(
+            "test -f ${type.sentinelPath} && echo STOPPED || echo OK",
+            object : AdbDaemonLauncher.LaunchCallback {
+                override fun onLog(message: String) {
+                    if (message.trim().contains("STOPPED")) {
+                        log.info(TAG, "Optional startup: ${type.displayName} has a user-stop " +
+                            "sentinel — not auto-starting")
+                    } else {
+                        handler.post { onAllowed() }
+                    }
+                }
+                override fun onLaunched() {}
+                override fun onError(error: String) {
+                    log.warn(TAG, "Optional startup sentinel probe failed for " +
+                        "${type.displayName} ($error) — starting (pref-enabled)")
+                    handler.post { onAllowed() }
+                }
+            }
+        )
+    }
+
     private fun startOptionalDaemonsFromPreferences() {
         val vm = daemonsViewModel ?: run {
             log.warn(TAG, "ViewModel not available, using ADB launcher")
@@ -317,27 +355,32 @@ class DaemonStartupManager(
         }
         log.info(TAG, "Starting optional daemons from preferences...")
 
-        // Singbox starts iff the user enabled it. Tunnels are independent toggles.
+        // Singbox starts iff the user enabled it AND hasn't stopped it via a
+        // sentinel. Tunnels are independent toggles.
         if (PreferencesManager.isDaemonEnabled(DaemonType.SINGBOX_PROXY)) {
             vm.singboxController.isRunning { isRunning ->
                 if (isRunning) {
                     log.info(TAG, "Singbox already running, skipping start")
                     handler.postDelayed({ startTunnelFromPreferences(vm) }, 1000)
                 } else {
-                    log.info(TAG, "Starting Singbox (user enabled)...")
-                    handler.post { vm.startDaemon(DaemonType.SINGBOX_PROXY) }
+                    ifNotUserStopped(DaemonType.SINGBOX_PROXY) {
+                        log.info(TAG, "Starting Singbox (user enabled)...")
+                        vm.startDaemon(DaemonType.SINGBOX_PROXY)
+                    }
                     handler.postDelayed({ startTunnelFromPreferences(vm) }, 5000)
                 }
             }
         } else {
             startTunnelFromPreferences(vm)
         }
-        
-        // Start Telegram Bot daemon if user enabled it
+
+        // Start Telegram Bot daemon if user enabled it and hasn't stopped it.
         if (PreferencesManager.isDaemonEnabled(DaemonType.TELEGRAM_DAEMON)) {
             handler.postDelayed({
-                log.info(TAG, "Starting Telegram Bot daemon (user enabled)...")
-                vm.startDaemon(DaemonType.TELEGRAM_DAEMON)
+                ifNotUserStopped(DaemonType.TELEGRAM_DAEMON) {
+                    log.info(TAG, "Starting Telegram Bot daemon (user enabled)...")
+                    vm.startDaemon(DaemonType.TELEGRAM_DAEMON)
+                }
             }, 15000)
         }
     }
@@ -353,8 +396,10 @@ class DaemonStartupManager(
                 if (isRunning) {
                     log.info(TAG, "Cloudflared already running, skipping start")
                 } else {
-                    log.info(TAG, "Starting Cloudflared (user enabled)...")
-                    handler.post { vm.startDaemon(DaemonType.CLOUDFLARED_TUNNEL) }
+                    ifNotUserStopped(DaemonType.CLOUDFLARED_TUNNEL) {
+                        log.info(TAG, "Starting Cloudflared (user enabled)...")
+                        vm.startDaemon(DaemonType.CLOUDFLARED_TUNNEL)
+                    }
                 }
             }
         } else if (zrokEnabled) {
@@ -362,8 +407,10 @@ class DaemonStartupManager(
                 if (isRunning) {
                     log.info(TAG, "Zrok already running, skipping start")
                 } else {
-                    log.info(TAG, "Starting Zrok (user enabled)...")
-                    handler.post { vm.startDaemon(DaemonType.ZROK_TUNNEL) }
+                    ifNotUserStopped(DaemonType.ZROK_TUNNEL) {
+                        log.info(TAG, "Starting Zrok (user enabled)...")
+                        vm.startDaemon(DaemonType.ZROK_TUNNEL)
+                    }
                 }
             }
         } else if (!tailscaleEnabled) {
@@ -376,8 +423,10 @@ class DaemonStartupManager(
                 if (isRunning) {
                     log.info(TAG, "Tailscale already running, skipping start")
                 } else {
-                    log.info(TAG, "Starting Tailscale (user enabled)...")
-                    handler.post { vm.startDaemon(DaemonType.TAILSCALE_TUNNEL) }
+                    ifNotUserStopped(DaemonType.TAILSCALE_TUNNEL) {
+                        log.info(TAG, "Starting Tailscale (user enabled)...")
+                        vm.startDaemon(DaemonType.TAILSCALE_TUNNEL)
+                    }
                 }
             }
         }
@@ -386,10 +435,13 @@ class DaemonStartupManager(
     private fun startOptionalDaemonsViaAdb() {
         log.info(TAG, "Starting optional daemons via ADB...")
         try {
-            // Singbox is gated only by its own user toggle now.
+            // Singbox is gated by its own user toggle AND the disable sentinel
+            // (a Telegram stop writes only the sentinel, never the pref).
             if (PreferencesManager.isDaemonEnabled(DaemonType.SINGBOX_PROXY)) {
-                log.info(TAG, "Boot: Starting Singbox (user enabled)...")
-                adbLauncher.startSingbox(createLogCallback("Singbox"))
+                ifNotUserStopped(DaemonType.SINGBOX_PROXY) {
+                    log.info(TAG, "Boot: Starting Singbox (user enabled)...")
+                    adbLauncher.startSingbox(createLogCallback("Singbox"))
+                }
             }
 
             val tunnelDelay = 0L
@@ -397,29 +449,37 @@ class DaemonStartupManager(
             handler.postDelayed({
                 // Cloudflared and Zrok are mutually exclusive
                 if (PreferencesManager.isDaemonEnabled(DaemonType.CLOUDFLARED_TUNNEL)) {
-                    log.info(TAG, "Boot: Starting Cloudflared...")
-                    adbLauncher.launchTunnel(object : AdbDaemonLauncher.TunnelCallback {
-                        override fun onLog(message: String) { log.debug(TAG, "[Cloudflared] $message") }
-                        override fun onTunnelUrl(url: String) { log.info(TAG, "Boot: Cloudflared URL: $url") }
-                        override fun onError(error: String) { log.error(TAG, "Boot: Cloudflared error: $error") }
-                    })
+                    ifNotUserStopped(DaemonType.CLOUDFLARED_TUNNEL) {
+                        log.info(TAG, "Boot: Starting Cloudflared...")
+                        adbLauncher.launchTunnel(object : AdbDaemonLauncher.TunnelCallback {
+                            override fun onLog(message: String) { log.debug(TAG, "[Cloudflared] $message") }
+                            override fun onTunnelUrl(url: String) { log.info(TAG, "Boot: Cloudflared URL: $url") }
+                            override fun onError(error: String) { log.error(TAG, "Boot: Cloudflared error: $error") }
+                        })
+                    }
                 } else if (PreferencesManager.isDaemonEnabled(DaemonType.ZROK_TUNNEL)) {
-                    log.info(TAG, "Boot: Starting Zrok...")
-                    startZrokOnBoot()
+                    ifNotUserStopped(DaemonType.ZROK_TUNNEL) {
+                        log.info(TAG, "Boot: Starting Zrok...")
+                        startZrokOnBoot()
+                    }
                 }
 
                 // Tailscale runs independently of cloudflared/zrok
                 if (PreferencesManager.isDaemonEnabled(DaemonType.TAILSCALE_TUNNEL)) {
-                    log.info(TAG, "Boot: Starting Tailscale...")
-                    startTailscaleOnBoot()
+                    ifNotUserStopped(DaemonType.TAILSCALE_TUNNEL) {
+                        log.info(TAG, "Boot: Starting Tailscale...")
+                        startTailscaleOnBoot()
+                    }
                 }
             }, tunnelDelay)
-            
-            // Start Telegram Bot daemon if user enabled it
+
+            // Start Telegram Bot daemon if user enabled it and hasn't stopped it.
             if (PreferencesManager.isDaemonEnabled(DaemonType.TELEGRAM_DAEMON)) {
                 handler.postDelayed({
-                    log.info(TAG, "Boot: Starting Telegram Bot daemon...")
-                    adbLauncher.launchTelegramDaemon(createLogCallback("TelegramBot"))
+                    ifNotUserStopped(DaemonType.TELEGRAM_DAEMON) {
+                        log.info(TAG, "Boot: Starting Telegram Bot daemon...")
+                        adbLauncher.launchTelegramDaemon(createLogCallback("TelegramBot"))
+                    }
                 }, 15000) // Start after core daemons are up
             }
         } catch (e: Exception) {
@@ -709,16 +769,24 @@ class DaemonStartupManager(
                             override fun onLog(message: String) {}
                             override fun onTunnelUrl(url: String) {
                                 // stopTunnel emits onTunnelUrl("") on success.
+                                // Bypass the sentinel gate (doRelaunchDaemon, not
+                                // relaunchDaemon): this is health-check-internal
+                                // recovery on an ALIVE process — never a user
+                                // stop — and stopTunnel just wrote the zrok
+                                // sentinel, which the gate would otherwise trip
+                                // on. launchZrok's cleanup rm's that sentinel as
+                                // it brings the fresh session up.
                                 handler.post {
                                     log.info(TAG, "Edge-stale recovery: relaunching Zrok after stop completed")
-                                    relaunchDaemon(type)
+                                    doRelaunchDaemon(type)
                                 }
                             }
                             override fun onError(error: String) {
                                 // stopTunnel onError still means the kill
-                                // script ran — proceed with relaunch.
+                                // script ran — proceed with relaunch (gate
+                                // bypassed, same rationale as onTunnelUrl).
                                 log.warn(TAG, "stopTunnel during edge-stale recovery returned error: $error (continuing relaunch)")
-                                handler.post { relaunchDaemon(type) }
+                                handler.post { doRelaunchDaemon(type) }
                             }
                         })
                     }
@@ -738,9 +806,59 @@ class DaemonStartupManager(
     }
 
     private fun relaunchDaemon(type: DaemonType) {
+        // FINAL cross-UID gate before any actual relaunch. The death we
+        // detected might be a crash (no sentinel → revive, the whole point of
+        // the health-check) OR a user-initiated stop from the Daemons UI or
+        // Telegram (sentinel present → leave it down). This probe is the only
+        // check that works regardless of which UID wrote the stop: the
+        // sentinel is `chmod 666` in /data/local/tmp, readable by both the app
+        // and the UID-2000 daemon family. The in-memory userStoppedDaemons set
+        // is wiped on app relaunch, and the legacy Telegram .properties file is
+        // unreadable across the UID boundary — so without this probe a
+        // Telegram or post-restart stop gets resurrected within 30s.
+        //
+        // Every relaunch path (generic dead-process, zrok PROCESS_DEAD, zrok
+        // EDGE_STALE, boot-path ADB fallback) funnels through here, so gating
+        // once at this chokepoint covers them all.
+        adbLauncher.executeShellCommand(
+            "test -f ${type.sentinelPath} && echo STOPPED || echo OK",
+            object : com.overdrive.app.launcher.AdbDaemonLauncher.LaunchCallback {
+                override fun onLog(message: String) {
+                    if (message.trim().contains("STOPPED")) {
+                        log.info(TAG, "Health check: ${type.displayName} is user-stopped " +
+                            "(disable sentinel present) — NOT relaunching")
+                    } else {
+                        doRelaunchDaemon(type)
+                    }
+                }
+                override fun onLaunched() {}
+                override fun onError(error: String) {
+                    // Probe failed (transport hiccup). Bias toward availability:
+                    // relaunch rather than leave a crashed daemon dead on a
+                    // false negative. A user-stopped daemon whose sentinel we
+                    // couldn't read will be re-killed on the user's next stop;
+                    // a crashed safety daemon left dead is the worse outcome.
+                    log.warn(TAG, "Health check: sentinel probe failed for " +
+                        "${type.displayName} ($error) — relaunching defensively")
+                    doRelaunchDaemon(type)
+                }
+            }
+        )
+    }
+
+    private fun doRelaunchDaemon(type: DaemonType) {
         val vm = daemonsViewModel
         if (vm != null) {
-            handler.post { vm.startDaemon(type) }
+            // userInitiated=false: a health-check revival must NOT clear the
+            // disable sentinel, flip the enabled-pref, or run tunnel mutual-
+            // exclusion. Those are destructive to durable stop intent — if the
+            // sentinel probe upstream false-negatived a real user stop (e.g.
+            // transient ADB error → defensive relaunch), the old unconditional
+            // vm.startDaemon(type) would wipe the sentinel AND flip the pref
+            // ON, making the false negative permanent for OPTIONAL daemons.
+            // The non-user path relaunches the process only and re-gates on the
+            // in-memory user-stopped set as a same-process race backstop.
+            handler.post { vm.startDaemon(type, userInitiated = false) }
         } else {
             // Fallback: ADB-only launch for when ViewModel is not available (boot path)
             when (type) {
@@ -777,13 +895,24 @@ class DaemonStartupManager(
     }
 
     /**
-     * Defensive sentinel cleanup on app launch. If the previous process died
-     * mid-stop (or post-update phase 3 was dropped due to an ADB hiccup),
-     * per-daemon disable sentinels can be left on disk; the watchdogs would
-     * then exit on their next iteration and never recover until manual rm.
-     * User stop-intent is persisted in SharedPreferences (PreferencesManager
-     * .isDaemonEnabled), not in the .disabled files — so clearing them here
-     * only undoes stale crash-debris, never user choice. Idempotent.
+     * Re-arm the CORE surveillance daemons (camera / sentry / acc-sentry) by
+     * clearing their disable sentinels on every startup (boot AND app launch).
+     *
+     * Product decision: a user stop of a core daemon is honored for the rest
+     * of the session (the health-check sees the sentinel and won't relaunch),
+     * but core surveillance ALWAYS re-arms on the next boot / app restart — we
+     * never want the dashcam backbone to stay silently dead across a park.
+     * Clearing the core sentinel here is what implements that re-arm.
+     *
+     * OPTIONAL daemons (tunnels, telegram, singbox) are deliberately NOT
+     * cleared here: their stop is meant to PERSIST across restarts. They are
+     * additionally pref-gated for UI stops, but a Telegram `/daemon zrok stop`
+     * records intent ONLY in the sentinel (it never touches the app's
+     * SharedPreferences, and its legacy .properties file is unreadable across
+     * the UID boundary) — so wiping their sentinel here is exactly what used
+     * to resurrect a Telegram-stopped tunnel on the next launch. Leaving it in
+     * place is the fix. The user re-starting the daemon from the UI clears it
+     * via DaemonsViewModel.clearDisableSentinel.
      *
      * Routes through this manager's shared AdbDaemonLauncher rather than
      * letting callers allocate a fresh one — a fresh AdbDaemonLauncher
@@ -795,11 +924,9 @@ class DaemonStartupManager(
         // is async and won't throw synchronously except on
         // RejectedExecutionException (executor already shut down).
         try {
+            val coreSentinels = CORE_DAEMONS.joinToString(" ") { it.sentinelPath }
             adbLauncher.executeShellCommand(
-                "rm -f /data/local/tmp/camera_daemon.disabled " +
-                    "/data/local/tmp/acc_sentry_daemon.disabled " +
-                    "/data/local/tmp/telegram_bot_daemon.disabled " +
-                    "/data/local/tmp/zrok.disabled 2>/dev/null; echo cleared",
+                "rm -f $coreSentinels 2>/dev/null; echo cleared",
                 object : AdbDaemonLauncher.LaunchCallback {
                     override fun onLog(message: String) {}
                     override fun onLaunched() {

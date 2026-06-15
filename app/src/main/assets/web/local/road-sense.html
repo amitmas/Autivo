@@ -236,6 +236,33 @@
                     </div>
                 </div>
 
+                <!-- On-screen overlay (R-OVL): show/hide the floating RoadSense pill/card.
+                     Hiding it is display-only — detection, audio warnings, and crowdsource
+                     all keep running (audio is daemon-side, independent of this overlay).
+                     Mirrors the status-pill camera/trip visibility toggles. Default ON. -->
+                <div class="card" data-tab="general">
+                    <div class="card-header">
+                        <div class="card-title">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+                            <span data-i18n="road_sense.overlay_title">On-screen overlay</span>
+                        </div>
+                    </div>
+                    <div class="card-body">
+                        <div class="setting-row" style="border-bottom:none;">
+                            <div class="setting-info">
+                                <div class="setting-name" data-i18n="road_sense.overlay_show">Show overlay on screen</div>
+                                <div class="setting-desc" data-i18n="road_sense.overlay_show_desc">Shows the floating RoadSense pill and hazard card on the screen. Turn this off to hide it — detection, audio warnings, and crowdsourcing keep running in the background; only the on-screen display is hidden.</div>
+                            </div>
+                            <div class="setting-control">
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="rsOverlayVisible" onchange="RoadSenseSettings.toggleOverlayVisible()">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- Warnings -->
                 <div class="card" data-tab="warnings">
                     <div class="card-header">

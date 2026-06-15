@@ -483,11 +483,12 @@ public class SocHistoryDatabase {
                             if (vd != null && !Double.isNaN(vd.capacityAh) && vd.capacityAh > 0) {
                                 // The capacity-Ah anchor works in the GROSS frame: the
                                 // BMS Ah is a physical coulomb count, and cellCount /
-                                // factory-Ah must match the nameplate pack. On PHEV the
-                                // nominal field may be USABLE (e.g. 15.2) — which maps to
-                                // no cell count and mis-derives the factory Ah. Prefer the
-                                // model's gross nameplate; fall back to the (usable or
-                                // gross) nominal field when no model is selected.
+                                // factory-Ah must match the nameplate pack. The nominal
+                                // field is gross on every drivetrain now (PHEV energy is
+                                // corrected to gross at the HAL read boundary), so the
+                                // model's gross nameplate and the nominal field agree;
+                                // we still prefer the explicit model gross and fall back
+                                // to the nominal field when no model is selected.
                                 double grossKwh = com.overdrive.app.server.ModelsApiHandler
                                         .grossNameplateKwhForSelectedModel();
                                 double cellLookupKwh = grossKwh > 0

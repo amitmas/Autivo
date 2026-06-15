@@ -377,6 +377,14 @@ public class BydCloudApiHandler {
     private static void handleClear(OutputStream out) throws Exception {
         BydCloudConfig.clearCredentials();
         BydCloudDeterrent.getInstance().reset();
+        // Tear down a live MQTT subscriber too — clearCredentials() flips the
+        // enabled flag but the running subscriber captured its credentials by
+        // value and never re-reads config, so without this it keeps a
+        // 5s→300s reconnect loop + 25-min session-refresh churning against
+        // now-stale creds until daemon exit. reset() → stopSubscriber()
+        // cancels the scheduler, disconnects Paho, and stops the REST poller.
+        // Mirrors the setup path which already calls reset() before re-arming.
+        com.overdrive.app.byd.cloud.BydCloudDataProvider.getInstance().reset();
 
         JSONObject response = new JSONObject();
         response.put("success", true);

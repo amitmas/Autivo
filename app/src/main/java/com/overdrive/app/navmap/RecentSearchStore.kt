@@ -90,6 +90,23 @@ object RecentSearchStore {
         }
     }
 
+    /**
+     * Remove a single recent entry matching [result] (same-place rule — see the
+     * class KDoc / [isSamePlace]) and persist. A no-op if no entry matches.
+     * Never throws.
+     */
+    fun remove(context: Context, result: SearchResult) {
+        try {
+            val current = getAll(context)
+            val updated = current.filterNot { isSamePlace(it, result) }
+            if (updated.size != current.size) {
+                persist(context, updated)
+            }
+        } catch (e: Throwable) {
+            Log.w(TAG, "remove failed: ${e.message}")
+        }
+    }
+
     /** Wipe all recent searches. Never throws. */
     fun clear(context: Context) {
         try {

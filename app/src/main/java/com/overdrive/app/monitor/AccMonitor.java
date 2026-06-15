@@ -136,7 +136,10 @@ public class AccMonitor {
      * holder and a TRANSIENT blind-spot projection close via different paths:
      * <ul>
      *   <li>SUSTAINED map: {@code ClusterMapProjector.stop()} releases the holder
-     *       (and tears down the launched cluster Activity).</li>
+     *       and signals the launched cluster Activity to self-finish (it polls
+     *       navMap.clusterMapActive and finishes within ~500ms — the OEM 18→0
+     *       close never destroys the fission display, so its onDisplayRemoved
+     *       self-finish does not fire on a normal stop).</li>
      *   <li>TRANSIENT blind-spot: there is NO ACC-off path inside the BS turn loop
      *       — {@code bsTurnTick} has no ACC guard and the pipeline stays alive in
      *       sentry mode, so {@code disableBlindSpot()} (the only BS forceClose) is
@@ -157,6 +160,8 @@ public class AccMonitor {
             try {
                 if (com.overdrive.app.navmap.ClusterMapProjector.isActive()) {
                     CameraDaemon.log("ACC-off edge: stopping cluster map projection");
+                    // Releases the sustained hold AND clears navMap.clusterMapActive
+                    // so the launched cluster Activity self-finishes (~500ms poll).
                     com.overdrive.app.navmap.ClusterMapProjector.stop();
                 }
             } catch (Throwable t) {

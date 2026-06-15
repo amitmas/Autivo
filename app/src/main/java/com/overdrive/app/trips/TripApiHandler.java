@@ -356,6 +356,17 @@ public class TripApiHandler {
             return errorResponse("Trip not found", 404);
         }
 
+        // Delete the database record FIRST, then the file. This ordering is
+        // self-healing across a crash between the two steps: an orphaned FILE
+        // (row gone, file left) is reaped by the storage disk-walk reaper, but an
+        // orphaned ROW (file gone, row left) would keep the trips size SUM inflated
+        // and wedge the limit gate (it fires every 30s freeing nothing). The
+        // previous file-then-row order created exactly that orphan-row window.
+        boolean deleted = db.deleteTrip(tripId);
+        if (!deleted) {
+            return errorResponse("Failed to delete trip", 500);
+        }
+
         // Delete telemetry file if it exists
         if (trip.telemetryFilePath != null && !trip.telemetryFilePath.isEmpty()) {
             File telemetryFile = new File(trip.telemetryFilePath);
@@ -366,12 +377,6 @@ public class TripApiHandler {
                     logger.warn("Failed to delete telemetry file: " + telemetryFile.getName());
                 }
             }
-        }
-
-        // Delete database record
-        boolean deleted = db.deleteTrip(tripId);
-        if (!deleted) {
-            return errorResponse("Failed to delete trip", 500);
         }
 
         JSONObject response = new JSONObject();
@@ -685,8 +690,9 @@ public class TripApiHandler {
             storage.put("storageType", sm.getTripsStorageType().name());
             storage.put("storageTypeActive", sm.getActiveTripsStorageType().name());
             storage.put("limitMb", sm.getTripsLimitMb());
-            // Per-volume effective max so the slider stays accurate when the
-            // user swaps cards or moves between SD/USB/internal.
+            // Per-volume max = the FULL usable volume (total − headroom). No
+            // per-category /N division (removed 2026-06) — the slider tops out at
+            // the real volume capacity, accurate across card swaps / SD/USB/internal.
             // Both names emitted: `maxLimitMb` matches the recording/surveillance
             // response (internal volume's ceiling); `maxLimitMbInternal` is kept
             // for older clients that consumed the trips-only naming.
@@ -695,6 +701,9 @@ public class TripApiHandler {
             storage.put("maxLimitMbInternal", maxInternal);
             storage.put("maxLimitMbSdCard",   sm.getEffectiveMaxLimitMb(StorageManager.StorageType.SD_CARD));
             storage.put("maxLimitMbUsb",      sm.getEffectiveMaxLimitMb(StorageManager.StorageType.USB));
+            // Effective enforced limit = configured clamped to the active volume's
+            // capacity (differs from limitMb only during a fallback to internal).
+            storage.put("effectiveLimitMb",   sm.getEffectiveLimitMb("trips"));
             double usedBytes = sm.getTripsSize();
             double usedMb = usedBytes / (1024.0 * 1024.0);
             if (usedMb < 0.1 && usedBytes > 0) {

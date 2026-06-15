@@ -39,11 +39,87 @@ public class AppUpdater {
     private static final String TAG = "AppUpdater";
     private static final String GITHUB_REPO = "yash-srivastava/Overdrive-release";
     private static final String PREFS_NAME = "app_updater";
+    // LEGACY (pre-channel) baseline key/file. Still read once by
+    // migrateBaseline() to seed the per-channel "alpha" slot, then unused.
+    // The live baseline is per-channel — see prefKeyForChannel /
+    // timestampFileForChannel — so a braveheart asset timestamp can never
+    // false-suppress against a stored alpha timestamp (or vice-versa).
     private static final String PREF_LAST_UPDATE_TIME = "last_update_timestamp";
     private static final String PREF_JUST_UPDATED = "just_updated";
     private static final String PREF_UPDATED_VERSION = "updated_version";
+    // The `ts` of the last failed-install progress record this app process has
+    // already surfaced. consumeFailedUpdateError leaves the phase=error record
+    // in /data/local/tmp/overdrive_update_progress.json IN PLACE (the
+    // app-process unlink in a sticky shell-owned dir is a no-op anyway, and the
+    // record must survive for the web's reconnect re-read once the daemon is
+    // back up — otherwise the web falls through to a false "Updated to X").
+    // This flag is the one-shot guard so a later NORMAL launch doesn't re-toast
+    // the same failure; a NEW failure carries a different `ts` and re-arms.
+    private static final String PREF_LAST_CONSUMED_FAILURE_TS = "last_consumed_failure_ts";
     // Also persist to filesystem (survives app reinstall, unlike SharedPreferences)
     private static final String UPDATE_TIMESTAMP_FILE = "/data/local/tmp/overdrive_update_timestamp";
+
+    /** Per-channel SharedPreferences baseline key. */
+    private static String prefKeyForChannel(String channel) {
+        return PREF_LAST_UPDATE_TIME + "_" + channel;
+    }
+    /** Per-channel filesystem baseline path (survives app reinstall). */
+    private static String timestampFileForChannel(String channel) {
+        return UPDATE_TIMESTAMP_FILE + "_" + channel;
+    }
+
+    /** Channels the app understands. Used to validate runtime selection. */
+    public static final String CHANNEL_ALPHA = "alpha";
+    public static final String CHANNEL_BRAVEHEART = "braveheart";
+
+    // ==================== SHARED INSTALL GATE ====================
+    //
+    // One install at a time, ACROSS all three trigger surfaces (web HTTP,
+    // app IPC, Telegram IPC) — they all run downloadAndInstall in the SAME
+    // camera-daemon JVM, so a single static gate serializes them. Before this
+    // existed, only the web path (UpdateApiHandler) had an installInFlight
+    // flag; the IPC path (app + Telegram) ignored it, so two near-simultaneous
+    // installs could each spawn the detached install script + pkill cascade,
+    // and a queued second downloadAndInstall could rm the APK the first was
+    // about to pm-install (spurious INSTALL_PARSE_FAILED + bogus rollback).
+    //
+    // tryBeginInstall() CAS-acquires; endInstall() releases. The detached
+    // install path deliberately never calls onSuccess (the process dies first),
+    // so the flag would latch — INSTALL_STALE_MS self-recovers it, mirroring the
+    // progress-file staleness window. Callers MUST endInstall() on every
+    // pre-spawn bail and on onError so a failed install before process death
+    // doesn't wedge the gate.
+    private static volatile boolean installInFlight = false;
+    private static volatile long installStartedAt = 0;
+    private static final long INSTALL_STALE_MS = 5 * 60 * 1000L;
+
+    /**
+     * Try to acquire the single-install gate. Returns true if the caller now
+     * owns the install (must pair with {@link #endInstall()} on failure paths),
+     * false if an install is already in flight and not yet stale.
+     */
+    public static synchronized boolean tryBeginInstall() {
+        if (installInFlight) {
+            // Self-recover a wedged flag: if the prior install started more than
+            // INSTALL_STALE_MS ago and this process is still alive, the kill
+            // cascade clearly missed us — let a new attempt through.
+            if (installStartedAt > 0
+                    && System.currentTimeMillis() - installStartedAt > INSTALL_STALE_MS) {
+                Log.w(TAG, "Clearing stale installInFlight (started "
+                        + (System.currentTimeMillis() - installStartedAt) + "ms ago)");
+            } else {
+                return false;
+            }
+        }
+        installInFlight = true;
+        installStartedAt = System.currentTimeMillis();
+        return true;
+    }
+
+    /** Release the install gate (call on pre-spawn bail or onError). */
+    public static synchronized void endInstall() {
+        installInFlight = false;
+    }
     // Version file readable by daemon process (SharedPreferences are per-process)
     public static final String VERSION_FILE = "/data/local/tmp/overdrive_version";
     // Sentinels for the post-update handshake (see UpdateLifecycle).
@@ -139,6 +215,16 @@ public class AppUpdater {
     private String releaseNotes;
     private String remoteVersion;
     private String remoteUpdatedAt;
+    /**
+     * Channel the pending install BELONGS to, captured at the SEED point
+     * (checkForUpdate = the resolved channel; prepareInstall = alpha, since the
+     * catalog only surfaces alpha tags). downloadAndInstall keys its
+     * per-channel baseline advance/rollback on THIS, not a re-resolve at
+     * install start — otherwise a channel toggle racing an in-flight install,
+     * or an alpha-pick whose tag's channel differs from the live channel, would
+     * advance/roll back the WRONG channel's baseline.
+     */
+    private volatile String pendingChannel;
 
     /**
      * Build an OkHttpClient that routes through whichever proxy the rest of
@@ -399,18 +485,60 @@ public class AppUpdater {
     }
 
     /**
-     * Check GitHub Releases for a newer APK on the configured channel.
-     * Skips check if channel is empty (debug builds).
+     * Locate the first {@code .apk} asset in a release's {@code assets} array.
+     * Returns {@code {browser_download_url, name, updated_at}} or {@code null}
+     * when the release carries no APK (notes-only / draft). Shared by
+     * {@link #checkForUpdate} (braveheart) and {@link #listVersions} (alpha)
+     * so the single-asset find lives in exactly one place.
+     */
+    private static String[] firstApkAsset(JSONArray assets) {
+        if (assets == null) return null;
+        for (int i = 0; i < assets.length(); i++) {
+            JSONObject asset = assets.optJSONObject(i);
+            if (asset == null) continue;
+            String name = asset.optString("name", "");
+            if (name.endsWith(".apk")) {
+                String url = asset.optString("browser_download_url", "");
+                if (url.isEmpty()) continue;
+                return new String[]{url, name, asset.optString("updated_at", "")};
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Check GitHub Releases for a newer APK on the resolved channel.
+     *
+     * BRAVEHEART (and any future single-tag rolling channel): the historical
+     * timestamp-based "is the asset newer?" detection, unchanged. This method
+     * is the SOLE caller of the first-run / fresh-deploy suppression below —
+     * keeping that single-asset assumption intact and regression-free.
+     *
+     * ALPHA: there is no single "the update" — alpha is a pick-any catalog
+     * (see {@link #listVersions}). A passive check on alpha therefore always
+     * reports {@code onNoUpdate}; the web/native entry points open the catalog
+     * instead. Skips the check entirely when the channel is empty (debug).
      */
     public void checkForUpdate(UpdateCallback callback) {
-        String channel = BuildConfig.UPDATE_CHANNEL;
+        String channel = resolveChannel();
         if (channel == null || channel.isEmpty()) {
             runCallback(() -> callback.onNoUpdate(getDisplayVersion(context)));
+            return;
+        }
+        // Alpha is browse-and-pick — no passive "an update is available".
+        // Run the (one-time) baseline migration off the caller's thread so a
+        // main-thread invoker never eats the SharedPreferences commit / shell.
+        if (CHANNEL_ALPHA.equals(channel)) {
+            executor.execute(() -> {
+                migrateBaseline(channel);
+                runCallback(() -> callback.onNoUpdate(getDisplayVersion(context)));
+            });
             return;
         }
 
         executor.execute(() -> {
             try {
+                migrateBaseline(channel);
                 String apiUrl = "https://api.github.com/repos/" + GITHUB_REPO +
                         "/releases/tags/" + channel;
 
@@ -433,56 +561,68 @@ public class AppUpdater {
                     releaseNotes = release.optString("body", "Bug fixes and improvements.");
 
                     // Find the APK asset
-                    JSONArray assets = release.optJSONArray("assets");
-                    if (assets == null || assets.length() == 0) {
-                        postError(callback, "No assets in release");
-                        return;
-                    }
-
-                    String apkUrl = null;
-                    String apkName = null;
-                    String updatedAt = null;
-
-                    for (int i = 0; i < assets.length(); i++) {
-                        JSONObject asset = assets.getJSONObject(i);
-                        String name = asset.optString("name", "");
-                        if (name.endsWith(".apk")) {
-                            apkUrl = asset.optString("browser_download_url", "");
-                            apkName = name;
-                            updatedAt = asset.optString("updated_at", "");
-                            break;
-                        }
-                    }
-
-                    if (apkUrl == null || apkUrl.isEmpty()) {
+                    String[] apk = firstApkAsset(release.optJSONArray("assets"));
+                    if (apk == null) {
                         postError(callback, "No APK found in release");
                         return;
                     }
+                    String apkUrl = apk[0];
+                    String apkName = apk[1];
+                    String updatedAt = apk[2];
 
                     latestDownloadUrl = apkUrl;
                     remoteUpdatedAt = updatedAt;
+                    // Bind the pending install to THIS channel at the seed
+                    // point so downloadAndInstall advances the right baseline
+                    // even if the channel toggle flips mid-install.
+                    pendingChannel = channel;
 
-                    // Extract version from APK filename
-                    remoteVersion = extractVersion(apkName);
+                    // Extract version from APK filename, canonicalized to
+                    // "<channel>-v<semver>" so a filename missing the channel
+                    // prefix still persists a label the read-side shape guard
+                    // trusts (else About/web revert to the BuildConfig identity).
+                    remoteVersion = canonicalVersionLabel(extractVersion(apkName), channel);
                     // Report what AppUpdater previously persisted so the
                     // user-facing "you're on version X" matches what
                     // SettingsAboutFragment shows. BuildConfig.VERSION_NAME
                     // is the gradle stub and unrelated to GitHub releases.
                     String currentVersion = getDisplayVersion(context);
 
+                    // CROSS-CHANNEL OFFER (checked FIRST, before any baseline
+                    // gate): if the build actually running belongs to a
+                    // DIFFERENT channel than the one now selected (e.g. running
+                    // alpha-v26, switched to braveheart), the remote build IS an
+                    // update — offer it unconditionally. This must NOT depend on
+                    // the per-channel timestamp baseline: a stale _braveheart
+                    // baseline left by an earlier check would otherwise make the
+                    // timestamp compare say "up to date" and suppress the offer.
+                    // getInstalledVersion() is BuildConfig-derived (the true
+                    // running identity), so this is reliable. Don't advance the
+                    // baseline here — the install path does, on success.
+                    String installedChannel = channelOfLabel(getInstalledVersion());
+                    if (installedChannel != null && !installedChannel.equals(channel)) {
+                        Log.i(TAG, "Channel switch (" + installedChannel + "→" + channel
+                                + ") — offering " + remoteVersion);
+                        runCallback(() -> callback.onUpdateAvailable(
+                                currentVersion, remoteVersion, releaseNotes));
+                        return;
+                    }
+
                     // Update detection: compare asset updated_at timestamp only.
                     // Version comparison is unreliable since versionName may not be bumped
                     // when the APK is replaced on the same release tag.
-                    String lastInstalledTimestamp = getLastUpdateTimestamp();
+                    String lastInstalledTimestamp = getLastUpdateTimestamp(channel);
                     boolean apkUpdated = !updatedAt.isEmpty() && !updatedAt.equals(lastInstalledTimestamp);
 
-                    // First install or fresh Android Studio install: no stored timestamp
-                    // or app was just reinstalled — save current and don't prompt
+                    // No baseline for THIS channel yet AND we're already running
+                    // this channel (cross-channel was handled+returned above).
+                    // Genuine first run / fresh sideload of this channel's build:
+                    // the user already has it → seed the baseline + suppress.
                     if (lastInstalledTimestamp.isEmpty()) {
-                        saveLastUpdateTimestamp(updatedAt);
-                        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                                .edit().putString(PREF_UPDATED_VERSION, remoteVersion).apply();
-                        persistVersionToFile(remoteVersion);
+                        saveLastUpdateTimestamp(channel, updatedAt);
+                        // Display label is BuildConfig-derived (getInstalledVersion),
+                        // so a check NEVER needs to seed it — just record the
+                        // per-channel timestamp baseline and report up-to-date.
                         Log.i(TAG, "First run — saved baseline timestamp: " + updatedAt + ", version: " + remoteVersion);
                         runCallback(() -> callback.onNoUpdate(currentVersion));
                         return;
@@ -495,24 +635,22 @@ public class AppUpdater {
                     try {
                         long appInstallTime = context.getPackageManager()
                                 .getPackageInfo(context.getPackageName(), 0).lastUpdateTime;
-                        
+
                         // Parse the REMOTE asset timestamp (not the stored one)
                         java.text.SimpleDateFormat sdf = new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'");
                         sdf.setTimeZone(java.util.TimeZone.getTimeZone("UTC"));
                         long remoteAssetTime = 0;
                         try { remoteAssetTime = sdf.parse(updatedAt).getTime(); } catch (Exception ignored) {}
-                        
+
                         // Parse the stored timestamp to detect if app was reinstalled since last check
                         long storedTime = 0;
                         try { storedTime = sdf.parse(lastInstalledTimestamp).getTime(); } catch (Exception ignored) {}
-                        
+
                         // Fresh deploy: app was installed AFTER the remote APK was uploaded AND
                         // app was also installed after the last update check (i.e. a sideload happened)
                         if (appInstallTime > remoteAssetTime && appInstallTime > storedTime && apkUpdated) {
-                            saveLastUpdateTimestamp(updatedAt);
-                            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                                    .edit().putString(PREF_UPDATED_VERSION, remoteVersion).apply();
-                            persistVersionToFile(remoteVersion);
+                            saveLastUpdateTimestamp(channel, updatedAt);
+                            // Display label is BuildConfig-derived — no seed needed.
                             Log.i(TAG, "Fresh deploy detected (app install " + appInstallTime +
                                     " > remote asset " + remoteAssetTime + ") — updated baseline");
                             runCallback(() -> callback.onNoUpdate(currentVersion));
@@ -684,14 +822,34 @@ public class AppUpdater {
                 // "lastInstalled == latest" → reports no update available
                 // until GitHub re-uploads the asset. The user is silently
                 // stuck on the old build.
-                final String priorUpdateTimestamp = getLastUpdateTimestamp();
-                context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                        .edit()
-                        .putBoolean(PREF_JUST_UPDATED, true)
-                        .putString(PREF_UPDATED_VERSION, remoteVersion)
-                        .commit();
+                // Use the channel bound at the SEED point (where
+                // latestDownloadUrl was resolved) — NOT a re-resolve here. The
+                // seed-bound value is the channel the installed APK actually
+                // belongs to, so a channel toggle racing the install, or an
+                // alpha-pick whose tag's channel differs from the live channel,
+                // can't advance/roll back the wrong baseline. Falls back to a
+                // live resolve only if a caller invoked downloadAndInstall
+                // without going through checkForUpdate/prepareInstall (defensive).
+                final String channel = pendingChannel != null ? pendingChannel : resolveChannel();
+                final String priorUpdateTimestamp = getLastUpdateTimestamp(channel);
+                // Snapshot the prior display label too, so a failed install can
+                // restore VERSION_FILE / PREF_UPDATED_VERSION — otherwise the
+                // About/web "current version" shows the build that DIDN'T land.
+                final String priorDisplayVersion = getDisplayVersion(context);
+                // Set the just-updated MARKER. Only store remoteVersion as the
+                // label when it's canonical — a bare/version-less "unknown"
+                // must not clobber a prior valid label (persistVersionToFile
+                // guards the file half identically; the displayed value is
+                // getInstalledVersion() regardless).
+                android.content.SharedPreferences.Editor ie =
+                        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                                .edit().putBoolean(PREF_JUST_UPDATED, true);
+                if (!"unknown".equals(remoteVersion)) {
+                    ie.putString(PREF_UPDATED_VERSION, remoteVersion);
+                }
+                ie.commit();
                 persistVersionToFile(remoteVersion);
-                saveLastUpdateTimestamp(remoteUpdatedAt);
+                saveLastUpdateTimestamp(channel, remoteUpdatedAt);
 
                 // Step 4 & 5: Stop daemons + install + relaunch. The control flow
                 // splits here based on which process we're in:
@@ -709,7 +867,7 @@ public class AppUpdater {
                 //   on its own; our death is fine.
                 if (canWriteLocalTmp()) {
                     postProgress(callback, "Stopping daemons & installing...");
-                    runDetachedInstall(callback, priorUpdateTimestamp);
+                    runDetachedInstall(callback, channel, priorUpdateTimestamp, priorDisplayVersion);
                     return;
                 }
 
@@ -750,19 +908,58 @@ public class AppUpdater {
                 String output = result[0] != null ? result[0] : "";
                 if (!output.toLowerCase().contains("success")) {
                     // Roll back the prefs we set pre-install. Critically,
-                    // restore PREF_LAST_UPDATE_TIME — without this, a
+                    // restore the PER-CHANNEL baseline — without this, a
                     // failed install silently advances the baseline and
                     // checkForUpdate would report "no update" forever.
-                    context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                    android.content.SharedPreferences.Editor pe =
+                            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
                             .edit()
                             .putBoolean(PREF_JUST_UPDATED, false)
-                            .remove(PREF_UPDATED_VERSION)
-                            .putString(PREF_LAST_UPDATE_TIME, priorUpdateTimestamp)
-                            .commit();
-                    // Wipe the post-update sentinels — install never landed, so
-                    // there's nothing for the next launch to recover from.
+                            .putString(prefKeyForChannel(channel), priorUpdateTimestamp);
+                    // Mirror consumeFailedUpdateError: restore a real prior
+                    // label, but REMOVE (not store the literal fallback) when
+                    // there was no prior real build — keeps PREF_UPDATED_VERSION
+                    // consistent across all three rollback paths.
+                    if (priorDisplayVersion != null && !priorDisplayVersion.isEmpty()
+                            && !DISPLAY_VERSION_FALLBACK.equals(priorDisplayVersion)) {
+                        pe.putString(PREF_UPDATED_VERSION, priorDisplayVersion);
+                    } else {
+                        pe.remove(PREF_UPDATED_VERSION);
+                    }
+                    pe.commit();
+                    // Restore the per-channel timestamp FILE too (the pref
+                    // edit above only fixes the SharedPreferences half; the
+                    // /data/local/tmp file would otherwise stay advanced and
+                    // re-seed the stale baseline on the next reinstall-read).
+                    if (priorUpdateTimestamp != null && !priorUpdateTimestamp.isEmpty()) {
+                        saveLastUpdateTimestamp(channel, priorUpdateTimestamp);
+                    } else {
+                        // Empty prior = first install on this (freshly-toggled)
+                        // channel. We advanced the file at install start, so we
+                        // MUST delete it on failure — otherwise getLastUpdateTimestamp
+                        // keeps returning the failed build's timestamp, the
+                        // first-install branch never re-fires, and the channel is
+                        // permanently stuck at onNoUpdate. Mirrors the detached
+                        // path's empty-prior rm. App UID can't write
+                        // /data/local/tmp directly, so route through runShell.
+                        runShell("rm -f " + timestampFileForChannel(channel),
+                                new com.overdrive.app.launcher.AdbDaemonLauncher.LaunchCallback() {
+                                    @Override public void onLog(String m) {}
+                                    @Override public void onLaunched() {}
+                                    @Override public void onError(String e) {}
+                                });
+                    }
+                    // Restore VERSION_FILE to the prior display label so the
+                    // About/web "current version" doesn't show the build that
+                    // failed to install. (persistVersionToFile skips empty.)
+                    if (priorDisplayVersion != null && !DISPLAY_VERSION_FALLBACK.equals(priorDisplayVersion)) {
+                        persistVersionToFile(priorDisplayVersion);
+                    }
+                    // Wipe the post-update sentinels + the leftover APK — install
+                    // never landed, so there's nothing for the next launch to
+                    // recover from (rm APK mirrors the cancel/size-fail paths).
                     runShell(
-                            "rm -f " + UPDATE_IN_PROGRESS_FILE + " " + POST_UPDATE_FILE,
+                            "rm -f " + UPDATE_IN_PROGRESS_FILE + " " + POST_UPDATE_FILE + " " + APK_PATH,
                             new com.overdrive.app.launcher.AdbDaemonLauncher.LaunchCallback() {
                                 @Override public void onLog(String m) {}
                                 @Override public void onLaunched() {}
@@ -959,7 +1156,8 @@ public class AppUpdater {
      * back online; the SharedPreferences `PREF_JUST_UPDATED` flag we wrote
      * in step 3 is what the new MainActivity reads to confirm.
      */
-    private void runDetachedInstall(InstallCallback callback, String priorUpdateTimestamp) {
+    private void runDetachedInstall(InstallCallback callback, String channel, String priorUpdateTimestamp,
+                                    String priorDisplayVersion) {
         String scriptPath = "/data/local/tmp/overdrive_install.sh";
         String logPath = "/data/local/tmp/overdrive_install.log";
 
@@ -979,18 +1177,21 @@ public class AppUpdater {
         // "no such process" exit doesn't abort the script.
         script.append("echo \"disabled for update at $(date)\" > /data/local/tmp/camera_daemon.disabled\n");
         script.append("chmod 666 /data/local/tmp/camera_daemon.disabled 2>/dev/null\n");
-        // Plant zrok + acc-sentry sentinels so their shell watchdogs
-        // (start_zrok.sh, start_acc_sentry.sh) bail out on their next
-        // iteration if our pkill misses a respawn race. Cleared below
-        // alongside camera_daemon.disabled. World-readable so the watchdogs
-        // (UID 2000) can stat the file when it was written by the install
-        // script (running as the app UID).
-        script.append("echo \"disabled for update at $(date)\" > /data/local/tmp/zrok.disabled\n");
-        script.append("chmod 666 /data/local/tmp/zrok.disabled 2>/dev/null\n");
+        // Plant the acc-sentry sentinel so its shell watchdog
+        // (start_acc_sentry.sh) bails out on its next iteration if our pkill
+        // misses a respawn race. Cleared below alongside camera_daemon.disabled.
+        // World-readable so the watchdog (UID 2000) can stat the file when it
+        // was written by the install script (running as the app UID).
+        //
+        // We deliberately do NOT plant the OPTIONAL-daemon sentinels
+        // (zrok.disabled, telegram_bot_daemon.disabled, tailscale.disabled,
+        // singbox.disabled): they encode a DURABLE user stop that must survive
+        // the update, and overwriting them here (then rm-ing below) would
+        // destroy that record and resurrect a user-stopped tunnel/bot. The
+        // pkill cascade below takes those daemons out regardless. Mirrors
+        // UpdateLifecycle's core-only sentinel handling.
         script.append("echo \"disabled for update at $(date)\" > /data/local/tmp/acc_sentry_daemon.disabled\n");
         script.append("chmod 666 /data/local/tmp/acc_sentry_daemon.disabled 2>/dev/null\n");
-        script.append("echo \"disabled for update at $(date)\" > /data/local/tmp/telegram_bot_daemon.disabled\n");
-        script.append("chmod 666 /data/local/tmp/telegram_bot_daemon.disabled 2>/dev/null\n");
         script.append(psAwkKillLine("cam_daemon"));
         script.append(psAwkKillLine("acc_sentry"));
         script.append(psAwkKillLine("start_telegram"));
@@ -1019,15 +1220,18 @@ public class AppUpdater {
         script.append("rm -f /data/local/tmp/telegram_bot_daemon.lock 2>/dev/null\n");
         script.append("rm -f /data/local/tmp/*_daemon.lock 2>/dev/null\n");
         script.append("rm -f /data/local/tmp/cam_watchdog.pid 2>/dev/null\n");
-        // Clear the cam + zrok + acc-sentry disable sentinels — we needed
-        // them set above so any surviving watchdog exits, but the new
-        // MainActivity must not see them on startup or it'll leave those
-        // daemons disabled. POST_UPDATE_FILE / UPDATE_IN_PROGRESS_FILE
-        // stay in place; the new process consumes them via UpdateLifecycle.
+        // Clear ONLY the CORE disable sentinels (camera + acc-sentry) — we
+        // needed them set above so any surviving watchdog exits, but the new
+        // MainActivity must not see them on startup or it'll leave those CORE
+        // daemons disabled (core re-arms on app-launch). The OPTIONAL-daemon
+        // sentinels (zrok.disabled, telegram_bot_daemon.disabled,
+        // tailscale.disabled, singbox.disabled) are NOT touched here — they
+        // encode a durable user stop that must survive the update, and a
+        // broad `*.disabled` glob would resurrect a user-stopped tunnel/bot.
+        // POST_UPDATE_FILE / UPDATE_IN_PROGRESS_FILE stay in place; the new
+        // process consumes them via UpdateLifecycle.
         script.append("rm -f /data/local/tmp/camera_daemon.disabled 2>/dev/null\n");
-        script.append("rm -f /data/local/tmp/zrok.disabled 2>/dev/null\n");
         script.append("rm -f /data/local/tmp/acc_sentry_daemon.disabled 2>/dev/null\n");
-        script.append("rm -f /data/local/tmp/telegram_bot_daemon.disabled 2>/dev/null\n");
         script.append("sleep 2\n");
         // Step 4: install. `pm install -r -d` allows downgrades (-d) so a
         // bad release doesn't strand the user, and replaces the existing app
@@ -1061,26 +1265,112 @@ public class AppUpdater {
         script.append("  PM_ESC=$(printf %s \"$PM_OUT\" | tr -d '\\000-\\037' | ");
         script.append("sed 's/\\\\/\\\\\\\\/g;s/\"/\\\\\"/g')\n");
         script.append("  TS=$(($(date +%s) * 1000))\n");
-        // Embed the prior PREF_LAST_UPDATE_TIME so consumeFailedUpdateError
-        // can roll it back. Without rollback, a failed install permanently
-        // advances the baseline timestamp and the next checkForUpdate
-        // reports "no update available" — user is silently stuck on the
-        // old version until the GitHub asset is re-uploaded.
-        // priorTs comes from a Java-side String; we URL-escape minimally
-        // (it's already an ISO timestamp like 2026-05-29T10:00:00Z, no
-        // backslashes/quotes/control chars) so direct interpolation is safe.
+        // Embed the prior per-channel baseline + the channel itself so
+        // consumeFailedUpdateError can roll back the CORRECT per-channel key.
+        // Without rollback, a failed install permanently advances the
+        // baseline timestamp and the next checkForUpdate reports "no update
+        // available" — user is silently stuck on the old version until the
+        // GitHub asset is re-uploaded. priorTs is an ISO timestamp like
+        // 2026-05-29T10:00:00Z and channel is a fixed enum ("alpha" /
+        // "braveheart") — no backslashes/quotes/control chars, so direct
+        // interpolation is safe.
+        // These values are interpolated into the printf FORMAT string literal,
+        // so a stray '%' would be read as a directive and a quote would break
+        // the literal. shellSafe() restricts them to [A-Za-z0-9._-]; the
+        // values are already constrained (ISO ts, enum channel, strict-tag /
+        // dotted version) so this only strips the space in the "Manually
+        // Installed" fallback (harmless — that case has no real prior build).
         script.append("  printf '{\"phase\":\"error\",\"percent\":-1,");
         script.append("\"message\":\"Install failed\",\"error\":\"%s\",");
         script.append("\"priorUpdateTs\":\"")
-              .append(priorUpdateTimestamp != null ? priorUpdateTimestamp : "")
+              .append(isoSafe(priorUpdateTimestamp))   // colons preserved; "" if malformed
+              .append("\",\"priorUpdateChannel\":\"")
+              .append(shellSafe(channel))
+              .append("\",\"priorDisplayVersion\":\"")
+              .append(shellSafe(priorDisplayVersion))
               .append("\",\"ts\":%s}' ");
         script.append("\"$PM_ESC\" \"$TS\" > /data/local/tmp/overdrive_update_progress.json\n");
         script.append("  echo \"[install] FAILED rc=$INSTALL_RC\"\n");
+        // Roll back the on-disk baseline + display files the daemon advanced
+        // before pm install (the app-process consumeFailedUpdateError only
+        // fixes the SharedPreferences half — these /data/local/tmp files need a
+        // UID-2000 write, which we have right here). Restore the per-channel
+        // timestamp file and VERSION_FILE to their pre-attempt values so a
+        // later reinstall-read or daemon-side display doesn't surface the build
+        // that didn't land. Empty prior → remove the file (the legitimate
+        // "no prior install" / sentinel state).
+        // shellSafe() on every interpolated value — defense-in-depth against a
+        // quote/`%` breakout even though the inputs are already constrained
+        // (ISO timestamp, dotted-numeric/strict-tag version, enum channel).
+        String safeChannel = shellSafe(channel);
+        // isoSafe (NOT shellSafe) for the timestamp — preserve the colons so
+        // the restored baseline still matches the remote updated_at. Empty/
+        // malformed → remove the file (the legitimate no-prior-baseline case).
+        String safePriorTs = isoSafe(priorUpdateTimestamp);
+        if (!safePriorTs.isEmpty()) {
+            script.append("  echo '").append(safePriorTs).append("' > ")
+                  .append(timestampFileForChannel(safeChannel)).append("\n");
+        } else {
+            script.append("  rm -f ").append(timestampFileForChannel(safeChannel)).append("\n");
+        }
+        if (priorDisplayVersion != null && !priorDisplayVersion.isEmpty()
+                && !DISPLAY_VERSION_FALLBACK.equals(priorDisplayVersion)) {
+            script.append("  echo '").append(shellSafe(priorDisplayVersion)).append("' > ")
+                  .append(VERSION_FILE).append("\n");
+            // World-readable so the app process can read it (cross-UID).
+            script.append("  chmod 644 ").append(VERSION_FILE).append(" 2>/dev/null\n");
+        } else {
+            script.append("  rm -f ").append(VERSION_FILE).append("\n");
+        }
         // Clear the in-progress sentinel so the new MainActivity doesn't run a
         // post-update hard-reset for an install that never landed. Keep
         // POST_UPDATE_FILE — its presence on a still-old-version app is the
         // signal MainActivity uses to read PROGRESS_FILE and show the error.
         script.append("  rm -f ").append(UPDATE_IN_PROGRESS_FILE).append("\n");
+        // Telegram failure surfacing: if this was an IPC-triggered install
+        // (handleInstallUpdate plants TELEGRAM_POST_UPDATE_HINT_FILE before pm
+        // install — the web path does NOT), then on FAILURE we hand the reborn
+        // Telegram bot a FAILURE hint so it tells the owner the install failed,
+        // symmetric with the web (toast install_failed) and app (showError +
+        // post-update toast) surfaces. Without this the bot would fall through
+        // to the generic "Tunnel URL Changed" copy and the user — still on the
+        // OLD version — would never learn the install they tapped failed.
+        // Gate on the success hint's presence so a web/app-triggered failure
+        // doesn't message the owner about an install they didn't trigger from
+        // Telegram. Write the escaped pm error ($PM_ESC, control-chars already
+        // stripped, single-line) so the bot can quote the reason. Plant the
+        // failure hint BEFORE deleting the success hint (mutually exclusive:
+        // the success "updated to X" message is then impossible for this run).
+        script.append("  if [ -f ")
+              .append(UpdateLifecycle.TELEGRAM_POST_UPDATE_HINT_FILE)
+              .append(" ]; then printf %s \"$PM_ESC\" > ")
+              .append(UpdateLifecycle.TELEGRAM_INSTALL_FAILED_HINT_FILE)
+              .append("; fi\n");
+        // Delete the Telegram post-update hint planted at install-time (it's
+        // written unconditionally BEFORE pm install in handleInstallUpdate).
+        // On FAILURE it would otherwise survive, and the reborn Telegram bot's
+        // consumePostUpdateHint() would send a FALSE "Overdrive updated to X"
+        // confirmation for an install that never landed. Remove it so a failed
+        // Telegram-triggered install stays silent on the SUCCESS channel (the
+        // failure is instead surfaced via the FAILURE hint planted just above,
+        // plus the app's PROGRESS_FILE path).
+        script.append("  rm -f ").append(UpdateLifecycle.TELEGRAM_POST_UPDATE_HINT_FILE).append("\n");
+        script.append("else\n");
+        // SUCCESS path: on the detached (daemon UID-2000) flow AppUpdater never
+        // calls onSuccess (it returns right after spawning this script — see
+        // the "DO NOT call onSuccess here" note below), so the last on-disk
+        // progress record is writeProgress("installing", -1) from
+        // UpdateApiHandler.onProgress classifying the "Installing..." message
+        // (installing@100 is only written by the SYNCHRONOUS app-process
+        // onSuccess path, never reached here). Nothing else overwrites it until
+        // the NEXT install's "queued" write, so delete it now — pure hygiene so
+        // a fresh poll doesn't see a stale terminal record.
+        script.append("  rm -f /data/local/tmp/overdrive_update_progress.json\n");
+        // Clear any stale FAILURE hint from a PRIOR failed install so the reborn
+        // bot doesn't send a failure message on top of this success. (The
+        // success hint is intentionally KEPT here so notifyTunnel frames the
+        // "Overdrive updated to X" message.)
+        script.append("  rm -f ").append(UpdateLifecycle.TELEGRAM_INSTALL_FAILED_HINT_FILE).append("\n");
         script.append("fi\n");
         // Step 5: relaunch. Runs in both success and failure cases so the user
         // gets the app back either way (with the new APK on success, or with
@@ -1337,6 +1627,46 @@ public class AppUpdater {
         Log.i(TAG, "All daemons and watchdogs stopped");
     }
 
+    /** Strict alpha tag allowlist: bare "alpha" or "alpha-v<semver>". */
+    private static final java.util.regex.Pattern VALID_ALPHA_TAG =
+            java.util.regex.Pattern.compile("^alpha(-v\\d+\\.\\d+(\\.\\d+)?)?$");
+
+    public static boolean isValidAlphaTag(String tag) {
+        return tag != null && VALID_ALPHA_TAG.matcher(tag).matches();
+    }
+
+    /**
+     * Make a value safe to interpolate into a single-quoted shell string or a
+     * printf format. Defense-in-depth: the tag is already strictly validated
+     * and version labels come from extractVersion's dotted-numeric regex, but
+     * any value that reaches `echo '<v>' > file` / printf in the detached
+     * install script is scrubbed to [A-Za-z0-9._-] so a stray quote or '%'
+     * can never break out. Drops everything else.
+     */
+    static String shellSafe(String s) {
+        if (s == null) return "";
+        return s.replaceAll("[^A-Za-z0-9._-]", "");
+    }
+
+    /** Strict ISO-8601 instant the GitHub asset updated_at uses. */
+    private static final java.util.regex.Pattern ISO_INSTANT =
+            java.util.regex.Pattern.compile("^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$");
+
+    /**
+     * Return an ISO-8601 timestamp VERBATIM iff it matches the exact GitHub
+     * updated_at shape, else "". Used instead of shellSafe() for timestamps:
+     * shellSafe strips the ':' (its charset is for version labels), which would
+     * mangle 2026-05-29T10:00:00Z → 2026-05-29T100000Z and permanently break
+     * baseline .equals() matching + the SimpleDateFormat parse. A string that
+     * matches ISO_INSTANT has no quote/backslash/% so it's safe to interpolate
+     * into a single-quoted echo or a printf format literal as-is; anything else
+     * is dropped (caller treats "" as the no-prior-baseline / remove-file case).
+     */
+    static String isoSafe(String ts) {
+        if (ts == null) return "";
+        return ISO_INSTANT.matcher(ts).matches() ? ts : "";
+    }
+
     /**
      * Extract version from APK filename including channel.
      * "overdrive-release-alpha-v6.1.apk" → "alpha-v6.1"
@@ -1346,7 +1676,7 @@ public class AppUpdater {
         if (apkName != null) {
             // Try to match channel-version pattern: alpha-v6.1, prod-v2.0
             java.util.regex.Matcher m = java.util.regex.Pattern
-                    .compile("(alpha|debug|prod|beta)-v?(\\d+\\.\\d+(?:\\.\\d+)?)")
+                    .compile("(alpha|debug|prod|beta|braveheart)-v?(\\d+\\.\\d+(?:\\.\\d+)?)")
                     .matcher(apkName);
             if (m.find()) return m.group(1) + "-v" + m.group(2);
 
@@ -1355,6 +1685,43 @@ public class AppUpdater {
             if (m.find()) return "v" + m.group(1);
         }
         return "unknown";
+    }
+
+    /**
+     * Canonicalize an extractVersion() result to the "<channel>-v<semver>" form
+     * the persisted-label shape guard (persistedGithubVersion) trusts. If the
+     * extracted label already carries a channel prefix it's returned as-is;
+     * if it's a bare "v<semver>" (APK filename lacked the channel) we prepend
+     * the KNOWN install channel so the value we persist isn't silently rejected
+     * on read (which would revert About/web to the BuildConfig identity). An
+     * unparseable "unknown" stays "unknown".
+     */
+    static String canonicalVersionLabel(String extracted, String channel) {
+        if (extracted == null || extracted.isEmpty() || "unknown".equals(extracted)) {
+            return extracted;
+        }
+        if (channelOfLabel(extracted) != null) return extracted;          // already <channel>-v...
+        if (channel == null || channel.isEmpty()) return extracted;       // no channel to add
+        // bare "v26.1" (or "26.1") → "<channel>-v26.1"
+        String num = numericVersion(extracted);
+        return num.isEmpty() ? extracted : channel + "-v" + num;
+    }
+
+    /**
+     * Channel a display label belongs to ("alpha-v25.4" → "alpha",
+     * "braveheart-v26.0" → "braveheart"), or null when the label carries no
+     * channel prefix (bare "v6.1", "unknown", or the "Manually Installed"
+     * fallback). Used by checkForUpdate to tell a CHANNEL SWITCH apart from a
+     * genuine first run — a null here means "can't tell", so we fall through to
+     * the safe (suppress-and-seed) first-run path rather than risk a spurious
+     * prompt.
+     */
+    public static String channelOfLabel(String label) {
+        if (label == null) return null;
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("^(alpha|debug|prod|beta|braveheart)-v")
+                .matcher(label);
+        return m.find() ? m.group(1) : null;
     }
 
     static boolean isNewerVersion(String local, String remote) {
@@ -1374,15 +1741,73 @@ public class AppUpdater {
         }
     }
 
-    private String getLastUpdateTimestamp() {
+    /**
+     * Resolve the active update channel for THIS process.
+     *
+     * forceReload() before the read is mandatory: the web channel toggle is
+     * written by the daemon (UID 2000) but checkForUpdate / listVersions may
+     * run in the app process (UID 10xxx) and vice-versa, and the in-memory
+     * config is per-UID. Falls back to the build-time seed
+     * ({@link BuildConfig#UPDATE_CHANNEL}, "alpha") on any failure so a
+     * config read error can never strand the updater with no channel.
+     */
+    private String resolveChannel() {
+        try {
+            com.overdrive.app.config.UnifiedConfigManager.forceReload();
+            String ch = com.overdrive.app.config.UnifiedConfigManager.getUpdateChannel();
+            if (ch != null && !ch.isEmpty()) return ch;
+        } catch (Throwable t) {
+            Log.w(TAG, "resolveChannel fell back to BuildConfig: " + t.getMessage());
+        }
+        return BuildConfig.UPDATE_CHANNEL;
+    }
+
+    /**
+     * One-time, idempotent: seed the per-channel "alpha" baseline from the
+     * legacy unsuffixed baseline so a current user who updated to this build
+     * via the bare "alpha" tag keeps their detection baseline. No-op for any
+     * channel other than alpha (braveheart has no legacy baseline — its first
+     * check hits the empty-baseline seed branch and stores a fresh one).
+     *
+     * SharedPreferences half runs in-process (both UIDs). The filesystem half
+     * routes through runShell (the app UID cannot write /data/local/tmp
+     * directly) and only copies when the legacy file exists AND the
+     * per-channel file does not, so a re-run never clobbers a live baseline.
+     */
+    private void migrateBaseline(String channel) {
+        if (!CHANNEL_ALPHA.equals(channel)) return;
+        try {
+            SharedPreferences prefs =
+                    context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+            String perChannelKey = prefKeyForChannel(channel);
+            if (!prefs.getString(perChannelKey, "").isEmpty()) return; // already migrated
+            String legacy = prefs.getString(PREF_LAST_UPDATE_TIME, "");
+            if (!legacy.isEmpty()) {
+                prefs.edit().putString(perChannelKey, legacy).commit();
+            }
+            final String src = UPDATE_TIMESTAMP_FILE;
+            final String dst = timestampFileForChannel(channel);
+            runShell("[ -f " + src + " ] && [ ! -f " + dst + " ] && cp " + src + " " + dst
+                            + " 2>/dev/null; echo done",
+                    new com.overdrive.app.launcher.AdbDaemonLauncher.LaunchCallback() {
+                        @Override public void onLog(String m) {}
+                        @Override public void onLaunched() {}
+                        @Override public void onError(String e) {}
+                    });
+        } catch (Exception ignored) {}
+    }
+
+    private String getLastUpdateTimestamp(String channel) {
+        String prefKey = prefKeyForChannel(channel);
+        String tsFile = timestampFileForChannel(channel);
         // Try SharedPreferences first (fast)
         String ts = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                .getString(PREF_LAST_UPDATE_TIME, "");
+                .getString(prefKey, "");
         if (!ts.isEmpty()) return ts;
 
         // Fall back to filesystem (survives app reinstall)
         try {
-            File f = new File(UPDATE_TIMESTAMP_FILE);
+            File f = new File(tsFile);
             if (f.exists()) {
                 java.io.BufferedReader r = new java.io.BufferedReader(new java.io.FileReader(f));
                 ts = r.readLine();
@@ -1390,7 +1815,7 @@ public class AppUpdater {
                 if (ts != null && !ts.isEmpty()) {
                     // Sync back to SharedPreferences
                     context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                            .edit().putString(PREF_LAST_UPDATE_TIME, ts).apply();
+                            .edit().putString(prefKey, ts).apply();
                     return ts;
                 }
             }
@@ -1398,14 +1823,24 @@ public class AppUpdater {
         return "";
     }
 
-    private void saveLastUpdateTimestamp(String timestamp) {
+
+    private void saveLastUpdateTimestamp(String channel, String timestamp) {
         if (timestamp == null) return;
+        String prefKey = prefKeyForChannel(channel);
+        final String tsFile = timestampFileForChannel(channel);
         // Use commit() (synchronous) — process may be killed right after
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                .edit().putString(PREF_LAST_UPDATE_TIME, timestamp).commit();
-        // Also save to filesystem via ADB shell (survives reinstall, app can't write /data/local/tmp directly)
+                .edit().putString(prefKey, timestamp).commit();
+        // Also save to filesystem via ADB shell (survives reinstall, app can't write /data/local/tmp directly).
+        // isoSafe (NOT shellSafe) — this file is read back byte-for-byte and
+        // compared via .equals() against the GitHub updated_at, so the colons
+        // MUST survive. isoSafe emits a valid ISO instant verbatim (no shell
+        // metachars) or "" if malformed. The SP value at L1645 is already raw,
+        // so SP and file stay byte-identical for a valid timestamp.
+        String safeTs = isoSafe(timestamp);
+        if (safeTs.isEmpty()) return; // don't write a malformed/empty baseline file
         try {
-            runShell("echo '" + timestamp + "' > " + UPDATE_TIMESTAMP_FILE,
+            runShell("echo '" + safeTs + "' > " + tsFile,
                     new com.overdrive.app.launcher.AdbDaemonLauncher.LaunchCallback() {
                 @Override public void onLog(String m) {}
                 @Override public void onLaunched() {}
@@ -1421,9 +1856,25 @@ public class AppUpdater {
      * SharedPreferences are per-process and may not be accessible from the daemon.
      */
     private void persistVersionToFile(String version) {
-        if (version == null || version.isEmpty()) return;
+        // Reject empty AND the "unknown" sentinel — this is the single
+        // chokepoint enforcing the "only canonical <channel>-v<semver> labels
+        // get persisted" invariant. Writing "unknown" would clobber a
+        // previously-valid label with a value the read side rejects anyway
+        // (channelOfLabel("unknown")==null), silently degrading same-tag-
+        // republish tracking. Matches the IPC-hint + rollback write guards.
+        if (version == null || version.isEmpty() || "unknown".equals(version)) return;
         try {
-            runShell("echo '" + version + "' > " + VERSION_FILE,
+            // shellSafe: version flows into a single-quoted echo; scrub a stray
+            // quote/metachar (extractVersion output is already constrained, but
+            // this is the value-write twin of the detached-script path).
+            // chmod 644: the file is read CROSS-UID — written by ONE UID (daemon
+            // 2000 or app 10xxx) and read by the OTHER for the version display.
+            // Without world-read the reader EACCEs, readVersionFile() returns
+            // "", and getDisplayVersion falls back to the BuildConfig identity
+            // (correct, but loses the persisted GitHub label for same-tag
+            // republishes). Same chmod precedent as the .byd_device_id file.
+            runShell("echo '" + shellSafe(version) + "' > " + VERSION_FILE
+                            + "; chmod 644 " + VERSION_FILE + " 2>/dev/null",
                     new com.overdrive.app.launcher.AdbDaemonLauncher.LaunchCallback() {
                 @Override public void onLog(String m) {}
                 @Override public void onLaunched() {}
@@ -1491,6 +1942,9 @@ public class AppUpdater {
         if (!hasFailedUpdateMarker()) return null;
         String err = null;
         String priorUpdateTs = null;
+        String priorUpdateChannel = null;
+        String priorDisplayVersion = null;
+        long recordTs = 0;
         try {
             java.io.File f = new java.io.File("/data/local/tmp/overdrive_update_progress.json");
             StringBuilder sb = new StringBuilder();
@@ -1503,33 +1957,96 @@ public class AppUpdater {
             err = j.optString("error", null);
             if (err == null || err.isEmpty()) err = j.optString("message", "Install failed");
             priorUpdateTs = j.optString("priorUpdateTs", null);
+            priorUpdateChannel = j.optString("priorUpdateChannel", null);
+            priorDisplayVersion = j.optString("priorDisplayVersion", null);
+            recordTs = j.optLong("ts", 0);
         } catch (Exception ignored) {}
-        // One-shot: clear the just-updated flag AND delete the progress file
-        // and post-update sentinel so the next launch is clean. The retry
-        // will write a fresh record.
+        // One-shot guard. The phase=error record is deliberately LEFT in place
+        // below (so the web's reconnect re-read can observe it after the daemon
+        // restarts — see the no-delete note further down), which means a later
+        // NORMAL launch's onCreate consume call would otherwise re-surface the
+        // same stale failure on every launch until the next install overwrites
+        // it. Gate on the record's `ts`: if we've already surfaced this exact
+        // failure, return null (no re-toast). A retry that fails again writes a
+        // fresh record with a new `ts`, so this re-arms naturally. The marker
+        // lives in SharedPreferences (always app-writable), NOT the progress
+        // JSON (a UID-2000 0644 file the app process can't truncate).
+        SharedPreferences guardPrefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+        if (recordTs > 0 && guardPrefs.getLong(PREF_LAST_CONSUMED_FAILURE_TS, 0) == recordTs) {
+            // Already surfaced this failure. Still clear the just-updated flag so
+            // a (now impossible, but defensive) success toast can't fire, then
+            // bail without re-toasting.
+            guardPrefs.edit().putBoolean(PREF_JUST_UPDATED, false).apply();
+            return null;
+        }
+        if (recordTs > 0) {
+            guardPrefs.edit().putLong(PREF_LAST_CONSUMED_FAILURE_TS, recordTs).apply();
+        }
+        // Clear the just-updated flag and the post-update sentinel so the next
+        // launch is clean. The progress JSON itself is intentionally KEPT (see
+        // the no-delete note at the end of this method); the next retry's
+        // writeProgress("queued") overwrites it.
         //
-        // Roll back PREF_LAST_UPDATE_TIME so the failed-install retry path
+        // Roll back the PER-CHANNEL baseline so the failed-install retry path
         // sees the correct baseline. Without this, the daemon-process
         // detached install advances the baseline before pm install runs;
         // on failure the baseline is still pointing at the version that
         // didn't land, and checkForUpdate reports "no update available"
-        // — user is silently stuck.
+        // — user is silently stuck. Channel comes from the progress JSON the
+        // install script embedded; fall back to the build seed for records
+        // written before this field existed.
+        if (priorUpdateChannel == null || priorUpdateChannel.isEmpty()) {
+            priorUpdateChannel = BuildConfig.UPDATE_CHANNEL;
+        }
         try {
             android.content.SharedPreferences.Editor e =
                 context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
                     .edit()
-                    .putBoolean(PREF_JUST_UPDATED, false)
-                    .remove(PREF_UPDATED_VERSION);
+                    .putBoolean(PREF_JUST_UPDATED, false);
+            // Restore PREF_UPDATED_VERSION (display label) to the prior build.
+            // Only act when the progress record actually CARRIES prior-state
+            // (priorDisplayVersion key present == the detached daemon path,
+            // which advanced the label before pm install). A sync-path failure
+            // record has NO prior* fields because the sync path already rolled
+            // back PREF_UPDATED_VERSION + VERSION_FILE inline — so a null here
+            // means "already handled", and we must NOT remove() (that would wipe
+            // the label the sync path just restored). Within a carrying record:
+            // a real prior label is restored; the fallback/empty sentinel means
+            // "no prior real build" → remove.
+            if (priorDisplayVersion != null) {
+                if (!priorDisplayVersion.isEmpty()
+                        && !DISPLAY_VERSION_FALLBACK.equals(priorDisplayVersion)) {
+                    e.putString(PREF_UPDATED_VERSION, priorDisplayVersion);
+                } else {
+                    e.remove(PREF_UPDATED_VERSION);
+                }
+            }
             // Empty string is the legitimate "no prior install" sentinel
             // (saveLastUpdateTimestamp always writes a value after first
             // success). Restore even if empty so the field reverts to the
-            // exact pre-attempt state.
+            // exact pre-attempt state. The SharedPreferences half is the
+            // load-bearing rollback (getLastUpdateTimestamp reads it before
+            // the /data/local/tmp file); the daemon re-writes the file on its
+            // next successful check.
             if (priorUpdateTs != null) {
-                e.putString(PREF_LAST_UPDATE_TIME, priorUpdateTs);
+                e.putString(prefKeyForChannel(priorUpdateChannel), priorUpdateTs);
             }
             e.apply();
         } catch (Exception ignored) {}
-        try { new java.io.File("/data/local/tmp/overdrive_update_progress.json").delete(); } catch (Exception ignored) {}
+        // Do NOT delete the phase=error progress record here. The web runs its
+        // reconnect re-read of /api/update/progress only AFTER the camera daemon
+        // is back online (it polls /status first), and on a post-kill failure
+        // the relaunched MainActivity calls this method BEFORE it restarts the
+        // daemon (showPostUpdateToasts runs before startDaemons.run()). Deleting
+        // the record here would guarantee the web's re-read sees the idle
+        // sentinel and falls through to a false "Updated to X". Leaving the
+        // terminal phase=error record in place lets the web surface the real
+        // failure (handleProgress treats phase=error as terminal and never ages
+        // it out); the PREF_LAST_CONSUMED_FAILURE_TS guard above stops the app
+        // from re-toasting it, and the next install's writeProgress("queued")
+        // overwrites it. (This app-process unlink was also a no-op in practice
+        // — the file is a UID-2000 0644 entry in a sticky shell-owned dir the
+        // app UID can neither truncate nor unlink.)
         try { new java.io.File(POST_UPDATE_FILE).delete(); } catch (Exception ignored) {}
         return err;
     }
@@ -1571,7 +2088,11 @@ public class AppUpdater {
     }
 
     public void fetchLatestReleaseVersion(RemoteVersionCallback callback) {
-        String channel = BuildConfig.UPDATE_CHANNEL;
+        // The published label for the resolved channel. For alpha this is the
+        // bare rolling-head tag (the legacy "alpha" release); for braveheart
+        // it's the "braveheart" tag. Both expose a single .apk whose name
+        // extractVersion parses into the display label.
+        String channel = resolveChannel();
         if (channel == null || channel.isEmpty()) {
             runCallback(() -> callback.onError("No channel configured"));
             return;
@@ -1627,53 +2148,381 @@ public class AppUpdater {
         });
     }
 
+    // ==================== Alpha catalog (pick-any) ====================
+
+    /** One selectable version in the alpha archive. */
+    public static class VersionEntry {
+        public final String version;       // display label, e.g. "alpha-v25.4"
+        public final String tag;           // GitHub tag_name, e.g. "alpha-v25.4" or "alpha"
+        public final String downloadUrl;   // asset browser_download_url
+        public final String updatedAt;     // asset updated_at (ISO)
+        public final String publishedAt;   // release published_at (ISO)
+        public final String releaseNotes;  // capped release body
+        public final String relation;      // "current" | "newer" | "older" | "unknown"
+
+        VersionEntry(String version, String tag, String downloadUrl, String updatedAt,
+                     String publishedAt, String releaseNotes, String relation) {
+            this.version = version;
+            this.tag = tag;
+            this.downloadUrl = downloadUrl;
+            this.updatedAt = updatedAt;
+            this.publishedAt = publishedAt;
+            this.releaseNotes = releaseNotes;
+            this.relation = relation;
+        }
+
+        public JSONObject toJson() {
+            JSONObject o = new JSONObject();
+            try {
+                o.put("version", version);
+                o.put("tag", tag);
+                o.put("downloadUrl", downloadUrl);
+                o.put("updatedAt", updatedAt != null ? updatedAt : "");
+                o.put("publishedAt", publishedAt != null ? publishedAt : "");
+                o.put("releaseNotes", releaseNotes != null ? releaseNotes : "");
+                o.put("relation", relation);
+            } catch (Exception ignored) {}
+            return o;
+        }
+    }
+
+    public interface VersionListCallback {
+        void onResult(java.util.List<VersionEntry> versions, String currentVersion);
+        void onError(String error);
+    }
+
+    private static final int RELEASE_NOTES_CAP = 4096;
+
     /**
-     * Sentinel returned when neither the SharedPreferences entry nor the
-     * version file has been populated yet — i.e. a fresh sideloaded install
-     * that has never run an update check. We deliberately do NOT fall back
-     * to BuildConfig.VERSION_NAME here because that value is the gradle
-     * stub ("11.0") and is unrelated to the GitHub release the user is
-     * actually running. "Manually Installed" makes the install path
-     * explicit; once the user runs check-for-updates the real channel-
-     * versioned string takes over.
+     * Enumerate the alpha archive: one immutable GitHub release per version
+     * (tag {@code alpha-v<semver>}) plus the retained legacy {@code alpha}
+     * rolling head. Newest-first, de-duped by parsed version so the legacy
+     * "alpha" entry doesn't double up with a same-version "alpha-v*" release.
+     *
+     * This is alpha's SOLE detection entry point — {@link #checkForUpdate}
+     * stays braveheart-only, so its first-run/fresh-deploy suppression keeps
+     * exactly one caller. Selection is explicit (see {@link #prepareInstall});
+     * the {@code relation} field is for LABELLING only and never gates a
+     * prompt.
+     *
+     * Runs on the shared executor (network). Best-effort: a release with no
+     * APK asset (notes-only/draft) is skipped rather than erroring.
+     */
+    public void listVersions(VersionListCallback callback) {
+        executor.execute(() -> {
+            try {
+                String apiUrl = "https://api.github.com/repos/" + GITHUB_REPO +
+                        "/releases?per_page=100";
+                OkHttpClient client = buildClient(15, 15);
+                Request request = new Request.Builder()
+                        .url(apiUrl)
+                        .header("Accept", "application/vnd.github.v3+json")
+                        .build();
+                try (Response response = client.newCall(request).execute()) {
+                    if (!response.isSuccessful()) {
+                        String err = "GitHub API HTTP " + response.code();
+                        runCallback(() -> callback.onError(err));
+                        return;
+                    }
+                    JSONArray releases = new JSONArray(response.body().string());
+                    String currentVersion = getDisplayVersion(context);
+
+                    // De-dupe by parsed numeric version; prefer an explicit
+                    // alpha-v* release over the legacy "alpha" rolling head
+                    // when both resolve to the same version.
+                    java.util.LinkedHashMap<String, VersionEntry> byVersion =
+                            new java.util.LinkedHashMap<>();
+
+                    for (int i = 0; i < releases.length(); i++) {
+                        JSONObject rel = releases.optJSONObject(i);
+                        if (rel == null) continue;
+                        String tag = rel.optString("tag_name", "");
+                        boolean isAlphaArchive = tag.startsWith("alpha-v");
+                        boolean isLegacyAlpha = tag.equals("alpha");
+                        if (!isAlphaArchive && !isLegacyAlpha) continue;
+
+                        String[] apk = firstApkAsset(rel.optJSONArray("assets"));
+                        if (apk == null) continue; // notes-only / draft — skip
+
+                        String label = extractVersion(apk[1]);
+                        if (label == null || label.isEmpty() || "unknown".equals(label)) {
+                            label = tag;
+                        }
+                        // Numeric key for de-dupe (strip channel prefix).
+                        String numeric = numericVersion(label);
+
+                        String notes = rel.optString("body", "");
+                        if (notes.length() > RELEASE_NOTES_CAP) {
+                            notes = notes.substring(0, RELEASE_NOTES_CAP);
+                        }
+                        String relation = relationTo(currentVersion, label, numeric);
+                        VersionEntry entry = new VersionEntry(
+                                label, tag, apk[0], apk[2],
+                                rel.optString("published_at", ""), notes, relation);
+
+                        VersionEntry existing = byVersion.get(numeric);
+                        // First wins, UNLESS the incumbent is the legacy bare
+                        // "alpha" and this one is an explicit alpha-v* — prefer
+                        // the immutable per-version release.
+                        if (existing == null) {
+                            byVersion.put(numeric, entry);
+                        } else if (existing.tag.equals("alpha") && isAlphaArchive) {
+                            byVersion.put(numeric, entry);
+                        }
+                    }
+
+                    java.util.List<VersionEntry> out =
+                            new java.util.ArrayList<>(byVersion.values());
+                    // Newest-first by parsed semver (reuse isNewerVersion). A
+                    // proper 3-way comparator (equal → 0) keeps the sort total
+                    // and stable even if two entries ever share a numeric key.
+                    java.util.Collections.sort(out, (a, b) -> {
+                        String na = numericVersion(a.version), nb = numericVersion(b.version);
+                        if (na.equals(nb)) return 0;
+                        // isNewerVersion(local, remote) is true when remote>local.
+                        // nb newer than na → a sorts AFTER b → newest first.
+                        return isNewerVersion(na, nb) ? 1 : -1;
+                    });
+
+                    final java.util.List<VersionEntry> result = out;
+                    final String cur = currentVersion;
+                    runCallback(() -> callback.onResult(result, cur));
+                }
+            } catch (Exception e) {
+                String err = e.getMessage() != null ? e.getMessage() : "Unknown error";
+                runCallback(() -> callback.onError(err));
+            }
+        });
+    }
+
+    /**
+     * Strip a channel prefix to the numeric version: "alpha-v25.4" → "25.4",
+     * "braveheart-v26" → "26". Accepts a single token OR dotted form so a
+     * non-dotted versionName ("26") still parses (isNewerVersion splits on "."
+     * and zero-pads, so "26" vs "26.1" compares correctly) — this avoids
+     * silently neutralizing every alpha catalog chip if a future release bumps
+     * versionName to a bare integer. "26.0-rc1" parses to "26.0"; a bare word
+     * yields "". relationTo() treats "" as "unknown" (neutral chip, never a
+     * wrong "current"/"newer").
+     */
+    private static String numericVersion(String label) {
+        if (label == null) return "";
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("v?(\\d+(?:\\.\\d+)*)").matcher(label);
+        return m.find() ? m.group(1) : "";
+    }
+
+    /**
+     * Label-only relation of a catalog entry to the installed version.
+     * Returns "unknown" when the installed version is unparseable (e.g. a
+     * fresh sideload showing {@link #DISPLAY_VERSION_FALLBACK}) so the UI
+     * shows a neutral chip rather than a misleading "older".
+     */
+    private static String relationTo(String installed, String label, String numeric) {
+        if (installed == null || installed.isEmpty()
+                || DISPLAY_VERSION_FALLBACK.equals(installed)) {
+            return "unknown";
+        }
+        // listVersions only enumerates ALPHA entries. If the installed build is
+        // NOT an alpha-channel label (e.g. "braveheart-v6.1" after a braveheart
+        // install, then the user toggled to alpha and opened the catalog),
+        // comparing only the dotted-numeric part would mislabel a same-number
+        // alpha entry as "current"/"older". Channels are distinct builds, so
+        // mark cross-channel as "unknown" (label-only; never gates anything).
+        if (!installed.startsWith("alpha")) {
+            return "unknown";
+        }
+        String instNum = numericVersion(installed);
+        if (instNum.isEmpty()) return "unknown";
+        if (instNum.equals(numeric)) return "current";
+        return isNewerVersion(instNum, numeric) ? "newer" : "older";
+    }
+
+    /**
+     * Resolve a specific alpha release tag SERVER-SIDE and seed the three
+     * install fields ({@link #latestDownloadUrl}, {@link #remoteVersion},
+     * {@link #remoteUpdatedAt}) so the EXISTING {@link #downloadAndInstall}
+     * runs verbatim. Never trusts a client-supplied URL — the caller passes
+     * only a tag, which we re-fetch and re-validate here.
+     *
+     * Runs SYNCHRONOUSLY on the calling thread (the API handler invokes this
+     * inside its own latch, off the HTTP worker). Returns the resolved
+     * version label on success, or throws on any failure so the caller can
+     * surface a clean error before kicking the install.
+     */
+    public String prepareInstall(String tag) throws Exception {
+        if (tag == null || tag.isEmpty()) {
+            throw new IllegalArgumentException("No version tag");
+        }
+        // STRICT allowlist: bare "alpha" head or "alpha-v<semver>" only. The old
+        // startsWith("alpha-v") prefix check left the suffix unbounded, so a tag
+        // like alpha-v';reboot;' passed — and since it has no dotted-numeric
+        // version, extractVersion returned "unknown" and the raw tag became
+        // remoteVersion, which then flowed verbatim into `echo '<v>' > FILE`
+        // (quote breakout) and a printf format string in the detached install
+        // script. A strict regex closes that taint at the entry point.
+        if (!isValidAlphaTag(tag)) {
+            throw new IllegalArgumentException("Unsupported version tag: " + tag);
+        }
+        String apiUrl = "https://api.github.com/repos/" + GITHUB_REPO +
+                "/releases/tags/" + tag;
+        OkHttpClient client = buildClient(15, 15);
+        Request request = new Request.Builder()
+                .url(apiUrl)
+                .header("Accept", "application/vnd.github.v3+json")
+                .build();
+        try (Response response = client.newCall(request).execute()) {
+            if (!response.isSuccessful()) {
+                throw new java.io.IOException("GitHub API HTTP " + response.code());
+            }
+            JSONObject release = new JSONObject(response.body().string());
+            String[] apk = firstApkAsset(release.optJSONArray("assets"));
+            if (apk == null) {
+                throw new java.io.IOException("No APK in release " + tag);
+            }
+            releaseNotes = release.optString("body", "");
+            latestDownloadUrl = apk[0];
+            remoteUpdatedAt = apk[2];
+            // Canonicalize to "alpha-v<semver>" (this path is alpha-only) so a
+            // filename missing the channel prefix still persists a label the
+            // read-side shape guard trusts.
+            remoteVersion = canonicalVersionLabel(extractVersion(apk[1]), CHANNEL_ALPHA);
+            // If the filename had no parseable version, try the TAG (e.g.
+            // "alpha-v6.1" → "alpha-v6.1"); a bare "alpha" tag canonicalizes to
+            // "unknown" and STAYS "unknown" — the established no-persist
+            // sentinel — rather than writing junk "alpha" that the read-side
+            // shape guard would just reject. Both forms are shell-safe.
+            if ("unknown".equals(remoteVersion)) {
+                remoteVersion = canonicalVersionLabel(extractVersion(tag), CHANNEL_ALPHA);
+            }
+            // The catalog only surfaces alpha tags (alpha / alpha-v*), so a
+            // prepared install always belongs to the alpha channel — bind it
+            // here so the baseline keys on alpha regardless of the live channel.
+            pendingChannel = CHANNEL_ALPHA;
+            Log.i(TAG, "prepareInstall resolved " + tag + " → " + remoteVersion
+                    + " (" + latestDownloadUrl + ")");
+            return remoteVersion;
+        }
+    }
+
+    /**
+     * Last-resort sentinel for {@link #getInstalledVersion()} — only returned
+     * if BuildConfig.VERSION_NAME is somehow empty (never in a normal build,
+     * where versionName is a real per-release value bumped in build.gradle.kts).
+     * Version identity is now BuildConfig-derived, so this fallback is
+     * effectively unreachable for a built APK; it's kept as a defensive default.
      */
     public static final String DISPLAY_VERSION_FALLBACK = "Manually Installed";
 
     /**
-     * Get the display version string (channel + version from APK name).
-     * Returns {@link #DISPLAY_VERSION_FALLBACK} when no AppUpdater-tracked
-     * version exists yet (fresh sideload before first update check).
+     * The build's TRUE self-identity, derived from BuildConfig baked into the
+     * running binary: "<channel>-v<versionName>" (e.g. "alpha-v26.0",
+     * "braveheart-v26.0"). This is the only version string that is ALWAYS
+     * correct for the build actually running — unlike the persisted
+     * VERSION_FILE / PREF_UPDATED_VERSION, which are written only by the
+     * in-app updater and survive reinstall/sideload/cross-channel flashes, so
+     * they go STALE (the "About shows alpha-v26 on a braveheart build" +
+     * "check says already-updated" bugs). versionName must be bumped per
+     * release in build.gradle.kts.
      */
-    public static String getDisplayVersion(Context context) {
-        String stored = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                .getString(PREF_UPDATED_VERSION, null);
-        if (stored != null && !stored.isEmpty()) {
-            return stored;
-        }
-        // Try the file too — daemon-side updates may have written it without
-        // the app-process SharedPreferences also being populated yet.
-        return getDisplayVersionFromFile();
+    public static String getInstalledVersion() {
+        String channel = BuildConfig.UPDATE_CHANNEL;
+        String ver = BuildConfig.VERSION_NAME;
+        if (ver == null || ver.isEmpty()) return DISPLAY_VERSION_FALLBACK;
+        if (channel == null || channel.isEmpty()) return "v" + ver;
+        return channel + "-v" + ver;
     }
 
     /**
-     * Get the display version without requiring a Context.
-     * Reads from the persisted version file (written by the updater after
-     * a successful install). Returns {@link #DISPLAY_VERSION_FALLBACK} when
-     * the file is missing or empty — used by the daemon process where
-     * SharedPreferences may not be accessible.
+     * The GitHub release label that was actually downloaded+installed, as the
+     * update flow recorded it (PREF_UPDATED_VERSION for the app process,
+     * VERSION_FILE for the daemon — both written from {@link #extractVersion}
+     * of the installed APK's filename, e.g. "alpha-v26.1"). This is the version
+     * the USER cares about: when an APK is re-published on the same release tag
+     * without bumping gradle's versionName, BuildConfig.VERSION_NAME goes stale
+     * but this label tracks the real GitHub build. Returns "" when nothing has
+     * been installed via the in-app updater yet (fresh sideload / Studio run).
+     *
+     * Staleness guard: VERSION_FILE / PREF_UPDATED_VERSION survive a
+     * cross-channel flash, so we ONLY trust the persisted label when its channel
+     * prefix matches the running build's channel (BuildConfig.UPDATE_CHANNEL).
+     * On a mismatch (ran alpha, persisted label is braveheart, or vice-versa)
+     * the persisted value is stale-for-this-build and we fall back to
+     * BuildConfig — this is exactly the "About showed the wrong channel after a
+     * cross-channel install" case the BuildConfig-only path was guarding.
+     */
+    private static String persistedGithubVersion(Context context) {
+        // SINGLE cross-process source of truth: the world-readable FILE
+        // /data/local/tmp/overdrive_version, written by EVERY install path
+        // (chmod 644) regardless of which process ran it. We deliberately do
+        // NOT consult per-UID SharedPreferences here: PREF_UPDATED_VERSION is
+        // per-process, so a daemon-run install (web/Telegram) updates the
+        // daemon's prefs + the file but NOT the app's prefs — reading the app's
+        // prefs is exactly what made the About row show a stale label while the
+        // webapp was correct. File-only ⇒ app, daemon, web, Telegram, IPC all
+        // resolve identically. If the file is absent/unreadable we fall back to
+        // the BuildConfig identity (caller), never to a per-UID pref.
+        // (context is unused now; kept for call-site compatibility.)
+        String label = readVersionFile();
+        if (label == null || label.isEmpty()
+                || DISPLAY_VERSION_FALLBACK.equals(label)) {
+            return "";
+        }
+        // SHAPE GUARD: only trust a label in the canonical "<channel>-v<semver>"
+        // form. A malformed value left by an OLD build — e.g. the historical
+        // "v26.0alpha" (version-then-channel suffix) — would otherwise leak
+        // straight to the About row, because channelOfLabel() returns null for
+        // it so the cross-channel guard below never trips. Anything that
+        // doesn't parse as channel-prefix + dotted version is rejected → caller
+        // falls back to the always-correct BuildConfig identity.
+        String labelChannel = channelOfLabel(label);   // matches ^<channel>-v
+        if (labelChannel == null || numericVersion(label).isEmpty()) {
+            return "";   // malformed/legacy label — fall back to BuildConfig
+        }
+        // Only trust it for the channel we're actually running (a stale
+        // cross-channel label must not leak through).
+        String runningChannel = BuildConfig.UPDATE_CHANNEL;
+        if (runningChannel != null && !runningChannel.isEmpty()
+                && !labelChannel.equals(runningChannel)) {
+            return "";   // stale cross-channel label — let the caller fall back
+        }
+        return label;
+    }
+
+    /** Read VERSION_FILE (the daemon-readable persisted GitHub version). "" if absent. */
+    private static String readVersionFile() {
+        try {
+            File f = new File(VERSION_FILE);
+            if (!f.exists()) return "";
+            java.io.BufferedReader r = new java.io.BufferedReader(new java.io.FileReader(f));
+            String line = r.readLine();
+            r.close();
+            return line != null ? line.trim() : "";
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    /**
+     * Get the display version string shown to the user (About screen, "up to
+     * date" toast, post-update banner, web/Telegram status). Prefers the GitHub
+     * release label actually installed ({@link #persistedGithubVersion}); falls
+     * back to the BuildConfig identity ({@link #getInstalledVersion}) only when
+     * nothing has been installed via the updater yet, or the persisted label is
+     * a stale cross-channel value. This way the number the user sees always
+     * matches the GitHub build they're on, even when versionName wasn't bumped.
+     */
+    public static String getDisplayVersion(Context context) {
+        String github = persistedGithubVersion(context);
+        return !github.isEmpty() ? github : getInstalledVersion();
+    }
+
+    /**
+     * Context-free display version (daemon process). Same resolution as
+     * {@link #getDisplayVersion}: prefer the persisted GitHub label (read from
+     * VERSION_FILE since the daemon has no SharedPreferences), else BuildConfig.
      */
     public static String getDisplayVersionFromFile() {
-        try {
-            java.io.File f = new java.io.File(VERSION_FILE);
-            if (f.exists()) {
-                java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.FileReader(f));
-                String version = reader.readLine();
-                reader.close();
-                if (version != null && !version.trim().isEmpty()) {
-                    return version.trim();
-                }
-            }
-        } catch (Exception ignored) {}
-        return DISPLAY_VERSION_FALLBACK;
+        return getDisplayVersion(null);
     }
 }

@@ -1045,6 +1045,13 @@ public class HardwareEventRecorderGpu {
     // guaranteed atomic 64-bit reads/writes for `volatile long` and
     // `volatile double`, even on 32-bit ARM. (JLS §17.7 only relaxes
     // atomicity for non-volatile longs/doubles.)
+    // Max age for a GPS fix to be tag-worthy at capture time. Mirrors the 5-minute
+    // fallback window already enforced in EventTimelineCollector / LocationSidecarWriter,
+    // applied here at the SOURCE so the primary recorder-captured snapshot is gated too
+    // (not just the cold-start fallback). A fix older than this — or one still loaded
+    // from the persisted cache — is rejected, leaving startGeo* at NaN (no tag).
+    private static final long GEO_FIX_MAX_AGE_MS = 5L * 60L * 1000L;
+
     private volatile double startGeoLat = Double.NaN;
     private volatile double startGeoLng = Double.NaN;
     private volatile float  startGeoAccuracy = 0f;
@@ -2448,12 +2455,32 @@ public class HardwareEventRecorderGpu {
             com.overdrive.app.monitor.GpsMonitor gps =
                 com.overdrive.app.monitor.GpsMonitor.getInstance();
             if (!gps.hasLocation()) return;
+            // FRESHNESS GATE — the single source of truth for "is this fix tag-worthy".
+            // GpsMonitor.hasLocation() is true for ANY non-(0,0) fix, INCLUDING a
+            // cache-loaded one from a previous drive/boot (loadedFromCache) and one
+            // whose live updates have simply gone stale. Surveillance (event_*) fires
+            // ACC-OFF / parked, exactly when the GPS sidecar is least likely to be
+            // feeding fresh fixes — so without this gate a parked sentry clip would be
+            // tagged with the last drive's destination (e.g. yesterday's home address).
+            // Reject both vectors here at the SOURCE so hasStartGeo() is honest and every
+            // downstream consumer (surveillance segments, continuous/rotated segments,
+            // recording sidecars) inherits the guarantee — leaving the fields NaN means
+            // the sidecar writer omits the geo block entirely (no wrong pin), and
+            // EventTimelineCollector's own fallback re-poll then governs the cold-start case.
+            long lastUpdate = gps.getLastUpdate();
+            long nowMs = System.currentTimeMillis();
+            long ageMs = lastUpdate > 0 ? Math.max(0L, nowMs - lastUpdate) : -1L;
+            boolean fresh = !gps.isLoadedFromCache()
+                    && ageMs >= 0L
+                    && ageMs <= GEO_FIX_MAX_AGE_MS;
+            if (!fresh) {
+                // Leave startGeo* at the NaN sentinel set above → no tag.
+                return;
+            }
             startGeoLat = gps.getLatitude();
             startGeoLng = gps.getLongitude();
             startGeoAccuracy = gps.getAccuracy();
-            long lastUpdate = gps.getLastUpdate();
-            long nowMs = System.currentTimeMillis();
-            startGeoAgeMs = lastUpdate > 0 ? Math.max(0L, nowMs - lastUpdate) : -1L;
+            startGeoAgeMs = ageMs;
             startGeoCapturedAtMs = nowMs;
         } catch (Throwable t) {
             // Reset defensively so a partial snapshot never lands in a sidecar.

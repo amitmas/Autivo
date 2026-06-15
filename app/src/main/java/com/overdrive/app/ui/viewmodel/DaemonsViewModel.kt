@@ -91,38 +91,84 @@ class DaemonsViewModel(app: Application) : AndroidViewModel(app) {
         }, 30000)
     }
     
-    fun startDaemon(type: DaemonType) {
+    /**
+     * Start (or revive) a daemon.
+     *
+     * @param userInitiated true when the USER asked to start it (UI tap, or a
+     *   Telegram start). This is the only case that may CLEAR durable stop
+     *   intent: it rm's the disable sentinel, flips the optional-daemon
+     *   enabled-pref back ON, clears the in-memory user-stopped flag, and
+     *   applies tunnel mutual-exclusion.
+     *
+     *   false when the HEALTH-CHECK is reviving a daemon it believes crashed.
+     *   A revival must NEVER clear stop intent: if the death was actually a
+     *   user stop that a probe false-negatived (transient ADB error), wiping
+     *   the sentinel + flipping the pref would make that false negative
+     *   PERMANENT (the daemon would never re-suppress). So a non-user start
+     *   relaunches the process ONLY — it leaves the sentinel, the pref, and
+     *   the user-stopped set untouched. The relaunch is gated upstream in
+     *   DaemonStartupManager.relaunchDaemon (sentinel probe) AND re-gated here
+     *   on the in-memory set as a same-process race backstop.
+     */
+    @JvmOverloads
+    fun startDaemon(type: DaemonType, userInitiated: Boolean = true) {
         val controller = controllers[type] ?: return
-        
-        // Clear user-stopped flag so health check can manage this daemon
-        DaemonStartupManager.clearUserStopped(type)
-        
-        // Cloudflared and Zrok are mutually exclusive - stop the other one first
-        if (type == DaemonType.CLOUDFLARED_TUNNEL) {
-            // Stop zrok if running before starting cloudflared
-            val zrokState = _daemonStates.value?.get(DaemonType.ZROK_TUNNEL)
-            if (zrokState?.status == DaemonStatus.RUNNING) {
-                LogManager.getInstance().info("Daemons", "Stopping Zrok (mutually exclusive with Cloudflared)")
-                stopDaemonSilent(DaemonType.ZROK_TUNNEL)
-                // Also update preference for zrok since we're stopping it
-                startupManager?.onDaemonToggled(DaemonType.ZROK_TUNNEL, false)
+
+        if (userInitiated) {
+            // Clear user-stopped flag so health check can manage this daemon
+            DaemonStartupManager.clearUserStopped(type)
+
+            // Clear the durable disable sentinel — the user is explicitly
+            // (re)starting this daemon, so the watchdog + health-check should
+            // be free to keep it alive again. Centralized here so EVERY UI
+            // start path clears it uniformly, regardless of whether the
+            // per-daemon controller's start flow also does its own sentinel
+            // rm. See DaemonType.sentinelPath for the cross-UID rationale.
+            clearDisableSentinel(type)
+
+            // Cloudflared and Zrok are mutually exclusive - stop the other one
+            // first. ONLY on a user start: a health-check revival must not
+            // silently kill the sibling tunnel.
+            if (type == DaemonType.CLOUDFLARED_TUNNEL) {
+                // Stop zrok if running before starting cloudflared
+                val zrokState = _daemonStates.value?.get(DaemonType.ZROK_TUNNEL)
+                if (zrokState?.status == DaemonStatus.RUNNING) {
+                    LogManager.getInstance().info("Daemons", "Stopping Zrok (mutually exclusive with Cloudflared)")
+                    stopDaemonSilent(DaemonType.ZROK_TUNNEL)
+                    // Also update preference for zrok since we're stopping it
+                    startupManager?.onDaemonToggled(DaemonType.ZROK_TUNNEL, false)
+                }
+            } else if (type == DaemonType.ZROK_TUNNEL) {
+                // Stop cloudflared if running before starting zrok
+                val cloudflaredState = _daemonStates.value?.get(DaemonType.CLOUDFLARED_TUNNEL)
+                if (cloudflaredState?.status == DaemonStatus.RUNNING) {
+                    LogManager.getInstance().info("Daemons", "Stopping Cloudflared (mutually exclusive with Zrok)")
+                    stopDaemonSilent(DaemonType.CLOUDFLARED_TUNNEL)
+                    // Also update preference for cloudflared since we're stopping it
+                    startupManager?.onDaemonToggled(DaemonType.CLOUDFLARED_TUNNEL, false)
+                }
             }
-        } else if (type == DaemonType.ZROK_TUNNEL) {
-            // Stop cloudflared if running before starting zrok
-            val cloudflaredState = _daemonStates.value?.get(DaemonType.CLOUDFLARED_TUNNEL)
-            if (cloudflaredState?.status == DaemonStatus.RUNNING) {
-                LogManager.getInstance().info("Daemons", "Stopping Cloudflared (mutually exclusive with Zrok)")
-                stopDaemonSilent(DaemonType.CLOUDFLARED_TUNNEL)
-                // Also update preference for cloudflared since we're stopping it
-                startupManager?.onDaemonToggled(DaemonType.CLOUDFLARED_TUNNEL, false)
+
+            // For optional daemons, save the enabled state so they auto-start
+            // on app restart.
+            if (type in DaemonStartupManager.OPTIONAL_DAEMONS) {
+                startupManager?.onDaemonToggled(type, true)
+            }
+        } else {
+            // Health-check revival. Same-process race backstop: if the user
+            // tapped Stop after this tick's probe was queued but before this
+            // relaunch runs, markUserStopped() is already set synchronously on
+            // the UI thread — honor it and abort the revival rather than
+            // resurrect the daemon the user just stopped. (The cross-UID
+            // sentinel probe in relaunchDaemon covers the cross-process case;
+            // this covers the in-process TOCTOU.)
+            if (type in DaemonStartupManager.userStoppedDaemons) {
+                LogManager.getInstance().info("Daemons",
+                    "Skipping health-check revival of ${type.displayName} — user-stopped flag set")
+                return
             }
         }
-        
-        // For optional daemons, save the enabled state so they auto-start on app restart
-        if (type in DaemonStartupManager.OPTIONAL_DAEMONS) {
-            startupManager?.onDaemonToggled(type, true)
-        }
-        
+
         updateState(type, DaemonStatus.STARTING, "Starting...")
         
         controller.start(object : DaemonCallback {
@@ -136,6 +182,57 @@ class DaemonsViewModel(app: Application) : AndroidViewModel(app) {
         })
     }
     
+    /**
+     * Plant the durable, cross-UID "user stopped it" sentinel for [type].
+     * Written `chmod 666` so the UID-2000 daemon family (watchdog scripts)
+     * and the app's own health-check probe can both read it. See
+     * [DaemonType.sentinelPath]. Fire-and-forget — the kill that follows is
+     * the user-visible action; the sentinel just gates future auto-restart.
+     */
+    private fun writeDisableSentinel(type: DaemonType) {
+        val path = type.sentinelPath
+        adbLauncher.executeShellCommand(
+            "echo \"disabled by ui at \$(date)\" > $path; chmod 666 $path 2>/dev/null; echo done",
+            object : AdbDaemonLauncher.LaunchCallback {
+                override fun onLog(message: String) {}
+                override fun onLaunched() {}
+                override fun onError(error: String) {
+                    LogManager.getInstance().warn("Daemons",
+                        "Failed to write disable sentinel for ${type.displayName}: $error")
+                }
+            }
+        )
+    }
+
+    /**
+     * Remove [type]'s disable sentinel so the watchdog + health-check are
+     * free to keep it alive again. Called on every UI start.
+     *
+     * If this rm fails (transient ADB transport hiccup) the daemon still
+     * starts, but a STALE .disabled file is now left on disk — and for
+     * daemons whose launch path does NOT rm their own sentinel (sentry,
+     * singbox, tailscale, cloudflared, unlike camera/acc which re-rm it in
+     * their watchdog deploy) that stale file will make the health-check
+     * relaunchDaemon gate refuse to revive a LATER crash, wedging the daemon
+     * dead for the rest of the session. We can't block the start on this
+     * fire-and-forget rm, so at minimum WARN-log the failure so the wedge is
+     * diagnosable rather than silent.
+     */
+    private fun clearDisableSentinel(type: DaemonType) {
+        adbLauncher.executeShellCommand(
+            "rm -f ${type.sentinelPath} 2>/dev/null; echo done",
+            object : AdbDaemonLauncher.LaunchCallback {
+                override fun onLog(message: String) {}
+                override fun onLaunched() {}
+                override fun onError(error: String) {
+                    LogManager.getInstance().warn("Daemons",
+                        "Failed to clear disable sentinel for ${type.displayName}: $error" +
+                            " — a later crash of this daemon may not auto-restart until next app launch")
+                }
+            }
+        )
+    }
+
     /**
      * Stop daemon silently (used for mutual exclusion between tunnels).
      * Doesn't update preferences or show stopping state.
@@ -155,17 +252,29 @@ class DaemonsViewModel(app: Application) : AndroidViewModel(app) {
     
     fun stopDaemon(type: DaemonType) {
         val controller = controllers[type] ?: return
-        
-        // Mark as user-stopped so health check doesn't auto-restart
+
+        // Mark as user-stopped so the in-session health check doesn't fight
+        // the user (fast, in-memory; cleared on app relaunch).
         DaemonStartupManager.markUserStopped(type)
-        
+
+        // Plant the DURABLE, cross-UID disable sentinel BEFORE the controller
+        // kills the process. This is what makes a user stop survive across an
+        // app restart and — critically — what the health-check now checks
+        // before relaunching (the in-memory set above is wiped on relaunch,
+        // and the old Telegram .properties file is unreadable across the UID
+        // boundary). Writing it before the kill also means any watchdog that
+        // races the kill sees the sentinel on its next loop and exits instead
+        // of respawning. Per-controller stop flows still write their own
+        // sentinel too where they already did; this is idempotent.
+        writeDisableSentinel(type)
+
         updateState(type, DaemonStatus.STOPPING, "Stopping daemon and related processes...")
-        
+
         // For optional daemons, save the disabled state so they don't auto-start on app restart
         if (type in DaemonStartupManager.OPTIONAL_DAEMONS) {
             startupManager?.onDaemonToggled(type, false)
         }
-        
+
         controller.stop(object : DaemonCallback {
             override fun onStatusChanged(status: DaemonStatus, message: String) {
                 updateState(type, status, message)

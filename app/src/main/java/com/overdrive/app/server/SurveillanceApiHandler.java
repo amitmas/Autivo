@@ -96,6 +96,18 @@ public class SurveillanceApiHandler {
         }
         if (cleanPath.equals("/api/surveillance/screen-deterrent/test") && method.equals("POST")) {
             try {
+                // SAFETY (deterrent-while-driving): never fire the full-screen
+                // z=MAX deterrent layer while ACC is on / the car is in use —
+                // it would occlude nav, the reversing camera, and controls.
+                // ScreenDeterrent.onMotionDetected() now self-guards on this too
+                // (the load-bearing fix), but reject here as well so the web
+                // "Test on Screen" button reports WHY it didn't run instead of
+                // silently no-op'ing.
+                if (com.overdrive.app.monitor.AccMonitor.isAccOn()) {
+                    HttpResponse.sendJsonError(out,
+                        "Deterrent test blocked while ACC is on / vehicle in use");
+                    return true;
+                }
                 com.overdrive.app.surveillance.ScreenDeterrent.getInstance().onMotionDetected();
                 HttpResponse.sendJsonSuccess(out);
             } catch (Exception e) {
@@ -435,6 +447,9 @@ public class SurveillanceApiHandler {
         // ACC-OFF mode: "smart" (motion + YOLO) | "continuous" (plain rolling).
         // Branched at SurveillanceEngineGpu.enable(). Default smart.
         config.put("accOffMode", survConfig.optString("accOffMode", "smart"));
+        // Keep ONLY the USB/data rail powered after ACC OFF (cameras unaffected).
+        // Default true; read by AccSentryDaemon on the next ACC-OFF cycle.
+        config.put("keepUsbPowerOnAccOff", survConfig.optBoolean("keepUsbPowerOnAccOff", true));
         // Verify the file actually exists before claiming hasImage=true.
         // Without this check, a stale UCM pointer (file deleted out-of-band)
         // makes the UI show a broken preview spinner forever.
@@ -988,6 +1003,24 @@ public class SurveillanceApiHandler {
                 } else {
                     CameraDaemon.log("Rejected accOffMode: " + mode);
                 }
+            }
+
+            // Keep ONLY the USB/data rail powered after ACC OFF (cameras unaffected).
+            // Pure persist — no mid-session restart: AccSentryDaemon reads this fresh
+            // on the next ACC-OFF setup, so the change takes effect on the next cycle
+            // exactly as the user expects (the current parked session, if any, already
+            // configured its rail). Default true; only a real boolean is accepted.
+            if (configJson.has("keepUsbPowerOnAccOff")) {
+                boolean keepUsb = configJson.optBoolean("keepUsbPowerOnAccOff", true);
+                boolean persisted = com.overdrive.app.config.UnifiedConfigManager.updateValues(
+                        "surveillance", java.util.Collections.singletonMap("keepUsbPowerOnAccOff", keepUsb));
+                if (!persisted) {
+                    CameraDaemon.log("Failed to persist keepUsbPowerOnAccOff=" + keepUsb);
+                    HttpResponse.sendJsonError(out, "Failed to save USB-power setting");
+                    return;
+                }
+                CameraDaemon.log("Keep USB powered while parked set to: " + keepUsb
+                        + " (takes effect next ACC-OFF cycle)");
             }
 
             if (configJson.has("clearScreenDeterrentImage") && configJson.optBoolean("clearScreenDeterrentImage", false)) {

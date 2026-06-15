@@ -306,8 +306,10 @@ public class AccSentryDaemon {
      *   - PowerDevice  -1442840502 = 0 (release power hold)
      *
      * ENABLE path (MCU status 1 or 10):
-     *   - SpecialDevice 782237711 = 1 (sentry keep-alive ON)
-     *   - SpecialDevice 782237728 = 1 (wake request ON)
+     *   - SpecialDevice 782237711 = {@link #remotePowerModeEnableValue()} (5V rail:
+     *     1=hold when USB toggle ON, 0=release when OFF)
+     *   - SpecialDevice 782237728 = {@link #dataModulePowerEnableValue()} (USB sub-rail:
+     *     1=on when USB toggle ON, 2=sleep when OFF)
      *   - PowerDevice  -1442840502 = 1 ON dilink4 ONLY — esco kh/C6861d.java:344
      *     writes this on its sentry wake path. Without it the byd_apa MCU
      *     drops the AVM/ISP rail seconds after ACC OFF and any subsequent
@@ -316,6 +318,23 @@ public class AccSentryDaemon {
      *
      * ENABLE path (MCU needs wake):
      *   - wakeUpMcu() loop, then signals + dilink4 power hold are set when MCU is ready.
+     *
+     * <p><b>USB rail is user-configurable and the 5 V parent rail moves with it.</b>
+     * The "Keep USB powered" toggle governs the 5 V peripheral rail
+     * ({@link #SPECIAL_CONFIG_REMOTE_POWER_MODE}, 782237711) AND its USB/modem sub-rail
+     * ({@link #SPECIAL_CONFIG_DATA_MODULE_POWER}, 782237728) together. Toggle ON holds
+     * both (5V=1, USB=1); toggle OFF releases both (5V=0, USB=2). Releasing the 5 V
+     * PARENT is what actually cuts USB — the sub-rail "allow sleep" (2) alone is
+     * ignored by the BCM/MCU while the parent is held at 1 (root-caused on-device:
+     * disabling only wrote 782237728=2 while 782237711=1 kept USB powered). Mirrors the
+     * reference USB-release path exactly (C1310c: 782237711=0, 782237728=2).
+     *
+     * <p>The esco AVM keys (1901/1902), the MCU power hold (-1442840502), and the OEM
+     * 409 camera/ISP vote still fire UNCONDITIONALLY, so cameras keep running on any
+     * trim whose ISP/AVM rail is independent of the 5 V rail. On trims where the camera
+     * rail is derived from the 5 V rail, turning the USB toggle OFF can also stop parked
+     * surveillance — the accepted trade-off for a toggle that genuinely cuts USB rather
+     * than silently leaving it powered.
      *
      * @param enable true to keep peripherals powered, false to restore stock behavior
      */
@@ -330,14 +349,26 @@ public class AccSentryDaemon {
             applyEscoSentrySpecialConfig(false);                    // dilink4-only esco-parity disable
             applySentryIspPowerVote(false);                         // release OEM 409 camera/ISP power vote (fleet-wide)
         } else {
-            // ENABLE — check MCU state first
+            // ENABLE — check MCU state first. The "Keep USB powered" toggle governs
+            // TWO writes that move together: the 5 V peripheral rail
+            // (SPECIAL_CONFIG_REMOTE_POWER_MODE) and its USB/data sub-rail
+            // (SPECIAL_CONFIG_DATA_MODULE_POWER). Toggle ON  → 5V=1, USB=1 (hold both).
+            // Toggle OFF → 5V=0, USB=2 (release both) — releasing the 5 V PARENT is
+            // what actually cuts USB; the sub-rail "allow sleep" alone is ignored while
+            // the parent is held. Mirrors the reference USB-release path exactly
+            // (C1310c: 782237711=0, 782237728=2). The esco/AVM keys, MCU hold, and OEM
+            // 409 camera/ISP vote below stay unconditional so cameras survive on trims
+            // whose ISP rail is independent of this 5 V rail.
+            final int usbVal = dataModulePowerEnableValue();
+            final int remoteVal = remotePowerModeEnableValue();
             int mcuStatus = getMcuStatus();
-            log("MCU status for peripheral power: " + mcuStatus);
+            log("MCU status for peripheral power: " + mcuStatus
+                + " (USB/5V rail " + (usbVal == 1 ? "ON" : "released to sleep") + ")");
 
             if (mcuStatus == 1 || mcuStatus == 10) {
                 // MCU is in normal standby — use signal-based path
-                setSpecialConfig(SPECIAL_CONFIG_REMOTE_POWER_MODE, 1);  // Sentry keep-alive ON
-                setSpecialConfig(SPECIAL_CONFIG_DATA_MODULE_POWER, 1);  // Wake request ON
+                setSpecialConfig(SPECIAL_CONFIG_REMOTE_POWER_MODE, remoteVal);  // 5V rail: 1=hold (default), 0=release (cuts USB)
+                setSpecialConfig(SPECIAL_CONFIG_DATA_MODULE_POWER, usbVal);     // USB sub-rail: 1=on (default), 2=sleep
                 applyEscoSentrySpecialConfig(true);                    // dilink4-only esco-parity enable
                 applyEscoMcuPowerHold(true);                           // dilink4-only McuStatus=1
                 applySentryIspPowerVote(true);                         // OEM 409 camera/ISP power vote (fleet-wide)
@@ -351,8 +382,8 @@ public class AccSentryDaemon {
                     int retryStatus = getMcuStatus();
                     log("MCU status after wake: " + retryStatus);
                     if (retryStatus == 1 || retryStatus == 10) {
-                        setSpecialConfig(SPECIAL_CONFIG_REMOTE_POWER_MODE, 1);
-                        setSpecialConfig(SPECIAL_CONFIG_DATA_MODULE_POWER, 1);
+                        setSpecialConfig(SPECIAL_CONFIG_REMOTE_POWER_MODE, remoteVal);
+                        setSpecialConfig(SPECIAL_CONFIG_DATA_MODULE_POWER, usbVal);
                         applyEscoSentrySpecialConfig(true);
                         applyEscoMcuPowerHold(true);
                         applySentryIspPowerVote(true);
@@ -360,8 +391,8 @@ public class AccSentryDaemon {
                         // One more attempt
                         wakeUpMcu();
                         try { Thread.sleep(1000); } catch (InterruptedException ignored) {}
-                        setSpecialConfig(SPECIAL_CONFIG_REMOTE_POWER_MODE, 1);
-                        setSpecialConfig(SPECIAL_CONFIG_DATA_MODULE_POWER, 1);
+                        setSpecialConfig(SPECIAL_CONFIG_REMOTE_POWER_MODE, remoteVal);
+                        setSpecialConfig(SPECIAL_CONFIG_DATA_MODULE_POWER, usbVal);
                         applyEscoSentrySpecialConfig(true);
                         applyEscoMcuPowerHold(true);
                         applySentryIspPowerVote(true);
@@ -370,6 +401,47 @@ public class AccSentryDaemon {
                 }).start();
             }
         }
+    }
+
+    /**
+     * Value to write to {@link #SPECIAL_CONFIG_DATA_MODULE_POWER} (the Modem/USB
+     * sub-rail) on the ENABLE path: 1 = keep the USB rail powered (default), 2 = allow
+     * that rail to sleep (user opted out to save the 12 V battery). Value 2 (NOT 0) is
+     * the verified "allow sleep" request for this rail — mirrors the reference's USB
+     * release path (C1310c: 782237728=2). On its own this is only a soft request: the
+     * BCM/MCU honors it only when the PARENT 5 V rail ({@link
+     * #SPECIAL_CONFIG_REMOTE_POWER_MODE}) is ALSO released — see {@link
+     * #remotePowerModeEnableValue()}. Read fresh each ACC-OFF; defaults to 1 (keep on)
+     * on any config-read failure.
+     */
+    private static int dataModulePowerEnableValue() {
+        return isKeepUsbPowerOnAccOff() ? 1 : 2;
+    }
+
+    /**
+     * Value to write to {@link #SPECIAL_CONFIG_REMOTE_POWER_MODE} (the 5 V peripheral
+     * rail / sentry keep-alive) on the ENABLE path: 1 = hold the 5 V rail active
+     * (default), 0 = release it.
+     *
+     * <p><b>This is the lever that actually cuts USB.</b> USB hangs off the 5 V
+     * peripheral rail; the {@link #SPECIAL_CONFIG_DATA_MODULE_POWER}=2 sub-rail "allow
+     * sleep" request is overridden by the BCM/MCU as long as this parent rail is held
+     * at 1. So when the user turns "Keep USB powered" OFF we release this rail (0),
+     * exactly as the reference's USB-release path does (C1310c: 782237711=0,
+     * 782237728=2). This is the same value the ACC-ON teardown (DISABLE branch) writes.
+     *
+     * <p><b>Trade-off (intentional):</b> on trims where the camera/ISP power is derived
+     * from this same 5 V rail, releasing it can also stop parked surveillance while the
+     * toggle is OFF. That is the accepted behaviour for this toggle — it genuinely cuts
+     * USB rather than silently leaving it powered. The OEM 409 camera/ISP vote and the
+     * dilink4 esco/AVM keys still fire unconditionally below, so cameras survive on any
+     * trim where the ISP rail is independent of this 5 V rail.
+     *
+     * <p>Defaults to 1 (keep on) on any config-read failure so a transient read error
+     * can never disable parked surveillance unexpectedly.
+     */
+    private static int remotePowerModeEnableValue() {
+        return isKeepUsbPowerOnAccOff() ? 1 : 0;
     }
 
     // ==================== ESCO-PARITY MCU POWER HOLD (DILINK 4) ====================
@@ -1304,9 +1376,14 @@ public class AccSentryDaemon {
                 // 2. Wake MCU immediately (triggers DC-DC converter for stable power)
                 immediateWakeUpMcu();
                 
-                // 3. Configure peripheral power to keep USB/data rails active
+                // 3. Configure peripheral power to keep camera/ISP/AVM rails active.
+                // ALWAYS enabled — surveillance must run while parked. The ONLY
+                // user-configurable part is the USB/data-module rail, handled INSIDE
+                // configurePeripheralPower via isKeepUsbPowerOnAccOff(); the camera
+                // power writes (esco AVM keys, MCU hold, 409 ISP vote, 5V sentry
+                // keep-alive) are unconditional so cameras never go dark.
                 configurePeripheralPower(true);
-                
+
                 // 4. Small delay to let MCU stabilize power rails
                 try { Thread.sleep(300); } catch (InterruptedException ignored) {}
                 
@@ -2130,7 +2207,8 @@ public class AccSentryDaemon {
                     // best-effort SpecialDevice writes; no-op on trims that
                     // don't expose the key. Fires on the first tick too
                     // (tick==0) as a belt-and-suspenders re-cast after the
-                    // enterSentryMode vote.
+                    // enterSentryMode vote. ALWAYS on — this is the CAMERA/ISP
+                    // rail, not the USB rail; the USB toggle never gates it.
                     if (tick % ISP_VOTE_REASSERT_EVERY_TICKS == 0) {
                         try {
                             applySentryIspPowerVote(true);
@@ -2208,6 +2286,38 @@ public class AccSentryDaemon {
             return "dilink4".equalsIgnoreCase(c.optString("cameraMode", "default"));
         } catch (Throwable t) {
             return false;
+        }
+    }
+
+    /**
+     * User toggle (Surveillance → General → "Keep USB powered while parked"):
+     * whether to hold the 5 V peripheral rail ({@link #SPECIAL_CONFIG_REMOTE_POWER_MODE})
+     * and its USB/modem sub-rail ({@link #SPECIAL_CONFIG_DATA_MODULE_POWER}) active
+     * after ACC OFF. DEFAULT TRUE so the out-of-box behaviour is byte-for-byte
+     * identical to the pre-toggle build (and any install whose config predates this
+     * key). When the user turns it OFF, the daemon releases BOTH rails on the next
+     * ACC-OFF cycle (5V=0, USB=2) so USB power actually drops, saving the 12 V battery.
+     *
+     * <p><b>Trade-off:</b> on trims whose camera/ISP rail is derived from the 5 V rail,
+     * turning this OFF can also stop parked surveillance — see
+     * {@link #remotePowerModeEnableValue()}. The OEM 409 camera/ISP vote and dilink4
+     * esco/AVM/MCU keys still fire unconditionally in {@link #configurePeripheralPower},
+     * so cameras survive on any trim whose ISP rail is independent of the 5 V rail.
+     *
+     * <p>Read fresh on the ACC-OFF setup path so a change applies on the NEXT ACC-OFF
+     * cycle (never mid-session — the rail is already configured for the current
+     * session). Reads the same cross-UID mtime-gated loadConfig() cache the other
+     * gates here use (no forceReload churn); returns the safe DEFAULT (true) on any
+     * failure so a transient read error can never cut the USB/5 V rail unexpectedly.
+     */
+    private static boolean isKeepUsbPowerOnAccOff() {
+        try {
+            org.json.JSONObject s = com.overdrive.app.config.UnifiedConfigManager.loadConfig()
+                    .optJSONObject("surveillance");
+            if (s == null) return true;
+            return s.optBoolean("keepUsbPowerOnAccOff", true);
+        } catch (Throwable t) {
+            return true;
         }
     }
 
@@ -3287,7 +3397,35 @@ public class AccSentryDaemon {
             return;
         }
         
-        // Check if user explicitly stopped it via Telegram command
+        // Check if the user explicitly stopped it. Two signals:
+        //  (1) the durable disable sentinel — written by BOTH the UI stop and
+        //      the Telegram stop, the single cross-UID source of truth. We're
+        //      UID 2000 here so we can stat it directly.
+        //  (2) the legacy daemon_telegram_state.properties — Telegram-only,
+        //      kept for back-compat.
+        // The sentinel is the important one: without this check, a daemon the
+        // user stopped from the Daemons UI (which never wrote the .properties
+        // file) would get silently resurrected on the next ACC-on.
+        //
+        // BUT the sentinel file is overloaded: this daemon's own ACC-on
+        // auto-stop (stopTelegramDaemonIfAutoStarted) writes the SAME file
+        // with content "disabled by ACC-on …". That is an ACC-arbitration
+        // pause, NOT a user stop, and must not suppress the next park.
+        // So we discriminate by CONTENT: only "disabled by ui" / "disabled
+        // by telegram" are real user stops. An ACC-on pause falls through to
+        // launchTelegramDaemon(), which rm's the sentinel (line ~3489) before
+        // redeploying. (A missing/unreadable file also falls through.)
+        java.io.File telegramSentinel =
+            new java.io.File("/data/local/tmp/telegram_bot_daemon.disabled");
+        if (telegramSentinel.exists()) {
+            String reason = readSentinelReason(telegramSentinel);
+            if (reason != null && reason.contains("ACC-on")) {
+                log("Telegram disable sentinel is an ACC-on pause, not a user stop; proceeding to auto-start");
+            } else {
+                log("Telegram daemon disable sentinel present (user-stopped), not auto-starting");
+                return;
+            }
+        }
         try {
             if (com.overdrive.app.daemon.telegram.DaemonCommandHandler.isDaemonStoppedViaTelegram("telegram")) {
                 log("Telegram daemon was stopped via Telegram command, not auto-starting");
@@ -3333,7 +3471,21 @@ public class AccSentryDaemon {
         
         log("WARN: Telegram daemon failed to start after 2 attempts");
     }
-    
+
+    /**
+     * Read the first line of a disable sentinel so callers can tell a real
+     * user stop ("disabled by ui"/"disabled by telegram") from an ACC-on
+     * arbitration pause ("disabled by ACC-on"). Returns null if unreadable.
+     */
+    private static String readSentinelReason(java.io.File sentinel) {
+        try (BufferedReader reader = new BufferedReader(
+                new InputStreamReader(new java.io.FileInputStream(sentinel)))) {
+            return reader.readLine();
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
     /**
      * Launch the Telegram daemon process.
      */

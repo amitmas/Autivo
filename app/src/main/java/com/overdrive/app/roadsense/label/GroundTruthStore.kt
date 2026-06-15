@@ -162,6 +162,10 @@ class GroundTruthStore private constructor() {
     /** "Delete local calibrations" also clears the ground-truth labels (R-SET-5). */
     fun deleteAll(): Int {
         synchronized(lock) {
+            // Lazy open: the controller no longer init()s this store at boot when RoadSense
+            // is disabled, but delete-local must still wipe labels left by a prior enabled
+            // session. init() is idempotent and reentrant on [lock].
+            if (!initialized) init()
             val c = connection ?: return -1
             return try {
                 c.createStatement().use { st -> st.executeUpdate("DELETE FROM roadsense_labels;") }

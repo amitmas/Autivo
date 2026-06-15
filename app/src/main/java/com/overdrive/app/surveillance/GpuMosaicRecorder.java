@@ -639,11 +639,28 @@ public class GpuMosaicRecorder {
             };
             overlayVertexBuffer = GlUtil.createFloatBuffer(overlayVertexCoords);
             overlayTexCoordBuffer = GlUtil.createFloatBuffer(overlayTexCoords);
-            
+
+            // On an encoder REINIT (init() re-run on an existing recorder, e.g.
+            // a mid-recording quality/codec change), tear down the prior renderer
+            // first — stop+join its raster worker and recycle its bitmaps — so we
+            // don't orphan a 2Hz daemon thread + ~0.8MB of bitmaps per reinit.
+            if (overlayRenderer != null) {
+                overlayRenderer.stopWorker();
+                overlayRenderer.release();
+            }
             // Create bitmap renderer
             overlayRenderer = new OverlayBitmapRenderer();
             overlayTextureInitialized = false;
         }
+
+        // Start the off-GL-thread raster worker if the overlay is already active
+        // at init time. The 3 overlay setters run at recorder-CONFIG time (before
+        // init() runs on the GL thread), when overlayRenderer is still null and
+        // reconcileOverlayWorker early-returns — so without this, the worker would
+        // only ever start if a setter fired AGAIN post-init. On the encoder-reinit
+        // path no such setter fires, and the overlay would silently freeze. Mirror
+        // OemDashcamPipeline's post-create reconcile.
+        reconcileOverlayWorker();
         
         // Set GL clear color once. GL context state, persists across
         // drawFrame calls; the encoder EGL context is exclusive to this
@@ -872,16 +889,13 @@ public class GpuMosaicRecorder {
         if (overlayEnabled && overlayRecordingModeAllowed && overlayRenderer != null) {
             overlayFrameCounter++;
             try {
-                // Re-raster the overlay bitmap at ~2 Hz (overlayRasterStride is
-                // fps-derived in init()). Faster than this just redraws pixels
-                // the telemetry layer hasn't changed. The composite draw below
-                // still runs every frame off the last uploaded texture.
-                if ((overlayFrameCounter == 1 || overlayFrameCounter % overlayRasterStride == 0)
-                        && telemetryCollector != null) {
-                    TelemetrySnapshot snapshot = telemetryCollector.getLatestSnapshot();
-                    overlayRenderer.renderFrame(snapshot, overlayFrameCounter / overlayRasterStride);
-                }
-                
+                // The software Canvas raster (renderFrame) now runs on
+                // OverlayBitmapRenderer's dedicated 2 Hz background worker
+                // (started in setOverlayEnabled), NOT here — the GL thread used
+                // to eat that per-icon Gaussian-blur raster every ~8th frame
+                // right before eglSwap. The GL thread now does ONLY the cheap
+                // half: swapAndGetFront() + texSubImage2D upload + composite.
+                //
                 // Upload new bitmap to texture ONLY when the double buffer actually swapped.
                 // swapAndGetFront() returns null when no new content is available,
                 // avoiding the expensive texImage2D/texSubImage2D call on unchanged frames.
@@ -1392,6 +1406,26 @@ public class GpuMosaicRecorder {
     
     public void setOverlayEnabled(boolean enabled) {
         this.overlayEnabled = enabled;
+        reconcileOverlayWorker();
+    }
+
+    /**
+     * Start/stop the overlay raster worker to match the active overlay state.
+     * The worker rasters the overlay bitmap off the GL thread; it should run
+     * exactly when the overlay would actually be composited (enabled + in a
+     * recording mode that shows it + a telemetry source to read). Idempotent —
+     * OverlayBitmapRenderer.start/stopWorker dedupe. Called from every input
+     * that changes those conditions (setOverlayEnabled / setOverlayRecordingModeAllowed
+     * / setTelemetryCollector), all of which may run off the GL thread.
+     */
+    private void reconcileOverlayWorker() {
+        OverlayBitmapRenderer r = overlayRenderer;
+        if (r == null) return;
+        if (overlayEnabled && overlayRecordingModeAllowed && telemetryCollector != null) {
+            r.startWorker(telemetryCollector);
+        } else {
+            r.stopWorker();
+        }
     }
 
     /**
@@ -1704,10 +1738,12 @@ public class GpuMosaicRecorder {
 
     public void setOverlayRecordingModeAllowed(boolean allowed) {
         this.overlayRecordingModeAllowed = allowed;
+        reconcileOverlayWorker();
     }
 
     public void setTelemetryCollector(TelemetryDataCollector collector) {
         this.telemetryCollector = collector;
+        reconcileOverlayWorker();
     }
 
     /**
@@ -1771,6 +1807,10 @@ public class GpuMosaicRecorder {
             overlayTextureId = 0;
         }
         if (overlayRenderer != null) {
+            // CRITICAL ordering: stop+join the raster worker BEFORE recycling
+            // the bitmaps, so the worker can never draw into a recycled bitmap
+            // (use-after-free). stopWorker() joins; release() then recycles.
+            overlayRenderer.stopWorker();
             overlayRenderer.release();
             overlayRenderer = null;
         }

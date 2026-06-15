@@ -225,7 +225,7 @@ public final class DaemonLogConfig {
      * Returns true if ANY logging is enabled (for proguard-safe fast check).
      * When this is false and proguard strips log calls, this class is a no-op.
      */
-    public static final boolean ANY_LOGGING_ENABLED = ENABLE_ALL
+    public static final boolean ANY_LOGGING_ENABLED = BuildConfig.LOG_CAPTURE || ENABLE_ALL
         || CAMERA_DAEMON || ACC_SENTRY_DAEMON || SENTRY_DAEMON
         || TELEGRAM_BOT_DAEMON || BYD_EVENT_DAEMON || GLOBAL_PROXY_DAEMON
         || GPU_PIPELINE || PANORAMIC_CAMERA || EGL_CORE || GL_UTIL
@@ -317,6 +317,11 @@ public final class DaemonLogConfig {
      * Called by DaemonLogger on every log write.
      */
     public static boolean isFileLoggingEnabled(String tag) {
+        // Braveheart (release-type build with LOG_CAPTURE=true) keeps file
+        // logging on for EVERY daemon tag so customers can send per-daemon
+        // logs. The DaemonLogger log calls survive R8 in that variant because
+        // its buildType omits proguard-rules-strip-logs.pro.
+        if (BuildConfig.LOG_CAPTURE) return true;
         if (ENABLE_ALL) return true;
         return ENABLED_TAGS.contains(tag);
     }

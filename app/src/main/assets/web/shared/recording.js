@@ -326,10 +326,15 @@ BYD.recording = {
                 this.storageInfo.usbFreeSpace = data.usbFreeSpace || 0;
                 this.storageInfo.usbTotalSpace = data.usbTotalSpace || 0;
 
-                // Dynamic per-volume ceilings (live StatFs from server)
+                // Dynamic per-volume ceilings (live StatFs from server) — now the
+                // FULL usable volume per category (no /N division).
                 this.storageInfo.maxLimitMb       = data.maxLimitMb       || 100000;
                 this.storageInfo.maxLimitMbSdCard = data.maxLimitMbSdCard || 100000;
                 this.storageInfo.maxLimitMbUsb    = data.maxLimitMbUsb    || 100000;
+                // Effective enforced limit = configured clamped to the active
+                // volume's capacity. Differs from recordingsLimitMb only during a
+                // fallback to internal; drives the honest banner copy below.
+                this.storageInfo.recordingsEffectiveLimitMb = data.recordingsEffectiveLimitMb || 0;
                 this.storageInfo.recordingsPath = data.recordingsPath || '';
 
                 this.updateStorageLimitUI();
@@ -477,6 +482,20 @@ BYD.recording = {
             var fellBack = (configured === 'SD_CARD' || configured === 'USB')
                 && active === 'INTERNAL';
             fallbackBanner.style.display = fellBack ? 'flex' : 'none';
+            // Honest enforcement copy: while on the internal fallback the configured
+            // limit is clamped to what internal can hold. When that clamp is active
+            // (effective < configured), say so, so the user understands why fewer
+            // clips are retained than their (external-sized) limit implies.
+            var textEl = document.getElementById('recStorageFallbackText');
+            if (textEl && fellBack) {
+                var eff = this.storageInfo.recordingsEffectiveLimitMb || 0;
+                var cfg = this.config.recordingsLimitMb || 0;
+                if (eff > 0 && cfg > 0 && eff < cfg) {
+                    textEl.textContent = BYD.i18n.t('recording.storage_fallback_enforcing', {mb: eff});
+                } else {
+                    textEl.textContent = BYD.i18n.t('recording.storage_fallback_internal');
+                }
+            }
         }
 
         // SD card button state

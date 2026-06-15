@@ -540,6 +540,94 @@ public class TripDatabase {
     }
 
     /**
+     * Delete the trip row(s) whose telemetry file path matches {@code absPath}.
+     * Returns the number of rows deleted.
+     *
+     * <p>Used by the StorageManager retention reaper: when ensureSpace deletes a
+     * trips-category {@code .jsonl.gz} file off disk, the corresponding DB row
+     * must also go, otherwise {@link #getTotalSizeBytes()} (the SUM the storage
+     * limit gate reads) stays permanently inflated by the deleted trip's bytes
+     * and the gate never converges. Mirrors the .mp4 → RecordingsIndex.remove()
+     * call the reaper already makes for recordings.
+     */
+    public int deleteByTelemetryPath(String absPath) {
+        if (absPath == null || !ensureConnection()) return 0;
+
+        String sql = "DELETE FROM trips WHERE telemetry_file_path=?";
+        try (PreparedStatement pstmt = connection.prepareStatement(sql)) {
+            pstmt.setString(1, absPath);
+            int rows = pstmt.executeUpdate();
+            if (rows > 0) {
+                logger.info("Deleted trip row(s) by telemetry path: " + absPath + " (" + rows + ")");
+            }
+            return rows;
+        } catch (Exception e) {
+            logger.error("Failed to delete trip by telemetry path: " + absPath, e);
+            reconnect();
+        }
+        return 0;
+    }
+
+    /**
+     * Reconcile DB rows against disk: delete any trip row whose
+     * {@code telemetry_file_path} no longer exists on disk. Returns the number
+     * of rows removed.
+     *
+     * <p>Closes a gap the disk-walking reaper can't: {@link #deleteByTelemetryPath}
+     * is only called when {@code ensureSpace} finds the matching {@code .jsonl.gz}
+     * file on disk and deletes it. If the file vanished out-of-band (file-manager
+     * delete, SD/volume swap, or a crash between TripApiHandler's file-delete and
+     * row-delete), the row survives, {@link #getTotalSizeBytes()} (the SUM the
+     * storage limit gate reads) stays inflated, and the gate fires every 30s while
+     * the disk walk frees nothing — a non-converging no-op. Dropping the orphan
+     * rows here lets the gate size reflect only bytes that are actually reapable.
+     *
+     * <p>A null/blank path is treated as missing (no file backs it). O(rows) with
+     * a {@code File.exists()} stat each; called only from the trips reap path when
+     * the gate believes trips is over-limit, not on every tick.
+     */
+    public int deleteRowsWithMissingFiles() {
+        if (!ensureConnection()) return 0;
+
+        synchronized (this) {
+            List<Long> orphanIds = new ArrayList<>();
+            String sel = "SELECT id, telemetry_file_path FROM trips";
+            try (PreparedStatement pstmt = connection.prepareStatement(sel);
+                 ResultSet rs = pstmt.executeQuery()) {
+                while (rs.next()) {
+                    String path = rs.getString("telemetry_file_path");
+                    if (path == null || path.isEmpty() || !new java.io.File(path).exists()) {
+                        orphanIds.add(rs.getLong("id"));
+                    }
+                }
+            } catch (Exception e) {
+                logger.error("Failed to scan trips for missing files", e);
+                reconnect();
+                return 0;
+            }
+
+            if (orphanIds.isEmpty()) return 0;
+
+            int deleted = 0;
+            String del = "DELETE FROM trips WHERE id=?";
+            try (PreparedStatement pstmt = connection.prepareStatement(del)) {
+                for (Long id : orphanIds) {
+                    pstmt.setLong(1, id);
+                    deleted += pstmt.executeUpdate();
+                }
+            } catch (Exception e) {
+                logger.error("Failed to delete orphan trip rows", e);
+                reconnect();
+            }
+            if (deleted > 0) {
+                logger.info("Reconciled trips DB: removed " + deleted
+                        + " row(s) whose telemetry file was gone from disk");
+            }
+            return deleted;
+        }
+    }
+
+    /**
      * Get the total number of trips in the database.
      */
     public int getTripCount() {

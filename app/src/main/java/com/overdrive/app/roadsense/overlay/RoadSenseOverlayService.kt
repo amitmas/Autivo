@@ -24,6 +24,7 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import com.overdrive.app.R
 import com.overdrive.app.config.UnifiedConfigManager
+import com.overdrive.app.roadsense.config.RoadSenseConfig
 import com.overdrive.app.roadsense.warn.OverlayState
 import com.overdrive.app.services.DaemonKeepaliveService
 
@@ -412,6 +413,19 @@ class RoadSenseOverlayService : Service() {
         // off the UI looper (audit UI #3).
         val r = object : Runnable {
             override fun run() {
+                // Visibility self-guard: the user can hide the overlay (roadSense.
+                // overlayVisible=false) while we're already running — e.g. the daemon
+                // launched us on ACC-on and the user then flips the toggle, or a remote
+                // (tunnel/browser) write lands. The app-side onResume/keepalive gate only
+                // runs when the Activity is touched, so without this a daemon-launched
+                // overlay would linger on screen after being hidden. readState() already
+                // refreshed the UCM cache this tick, so this is a cache-fresh read (no
+                // extra disk hit). Stop cleanly — startFromDaemon/startIfPermitted will
+                // bring us back if the user re-enables.
+                if (!RoadSenseConfig.snapshot().overlayVisible) {
+                    handler.post { stopSelf() }
+                    return
+                }
                 val state = readState()
                 val warnMode = currentWarnMode()
                 // Skip the main-thread render when nothing render-relevant changed —

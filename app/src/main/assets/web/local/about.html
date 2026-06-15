@@ -201,6 +201,15 @@
                         <div class="credits-card" id="supportersList"></div>
                     </section>
 
+                    <!-- Diagnostics: per-daemon log send. Hidden unless the
+                         backend reports log upload is available (braveheart
+                         build). Populated by send-logs.js. -->
+                    <section class="about-section" id="diagSection" style="display:none">
+                        <h3 class="about-subhead" data-i18n="logs.section_title">Diagnostics</h3>
+                        <p class="about-section-sub" data-i18n="logs.section_sub">Send a daemon log to the maintainer — you'll get a short code to share.</p>
+                        <div class="credits-card" id="diagDaemonList"></div>
+                    </section>
+
                     <!-- Third-party asset attributions (license obligations). The
                          RoadSense approach-warning chimes are from the Google Sound
                          Library under CC BY 4.0 — attribution is required by the
@@ -278,6 +287,7 @@
     <script src="../shared/pwa-init.js?v=index1"></script>
     <script src="../shared/core.js"></script>
     <script src="../shared/update-flow.js"></script>
+    <script src="../shared/send-logs.js"></script>
     <script>
         function toggleSidebar() {
             document.getElementById('sidebar').classList.toggle('open');

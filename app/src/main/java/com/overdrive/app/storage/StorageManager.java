@@ -167,12 +167,18 @@ public class StorageManager {
     // pulls the live filesystem total minus a safety reserve.
     private static final long MAX_LIMIT_MB_FALLBACK = 100000;  // 100GB
 
-    // Per-category share of the volume — recordings, surveillance, trips,
-    // proximity all live on the same FS, so giving each one 100% of the disk
-    // overcommits by 4x. 40% per category leaves headroom for the OS, the
-    // muxer flush queue, and the other Overdrive categories competing for
-    // the same pool.
-    private static final double PER_CATEGORY_SHARE = 0.40;
+    // NOTE (2026-06, per-category share removed): there used to be a
+    // PER_CATEGORY_SHARE = 0.40 here that capped EACH category's slider max at
+    // 40% of the volume so the four categories sharing one FS couldn't overcommit
+    // it 4x. Product decision reversed that: a category's max should reflect the
+    // REAL volume capacity, not volume/N — the artificial division confused users
+    // (a 256 GB card showing a ~100 GB ceiling). The max is now the full usable
+    // volume (getEffectiveMaxLimitMb → volumeCeilingMb). Overcommit is accepted but
+    // made SAFE rather than impossible: each category is independently reaped to its
+    // own limit, VOLUME_HEADROOM_MB stays reserved on every ceiling, and the
+    // recorder pre-flight + ENOSPC fallback guarantee a writable floor. The sum of
+    // configured limits CAN now exceed the disk; that's the user's choice and can't
+    // cause data loss because retention + physical-space reserve still hold.
 
     // Reserve a small fraction of the volume so the encoder can never hit
     // ENOSPC mid-file from the user setting "max" on a near-empty disk.
@@ -734,6 +740,7 @@ public class StorageManager {
                         waitForBounded(listProcess, 2_000, "sm list-volumes (already-mounted)");
                         if (isSd) initSdCardDirectories(); else initUsbDirectories();
                         updateActiveDirectories();
+                        reclampLimitsToMountedCeilings();
                         return true;
                     }
                     logWarn(targetClass + " volume " + parts[0] + " reports mounted but path " +
@@ -945,6 +952,16 @@ public class StorageManager {
         }
 
         // Signal 2 (MMC bus): /sys/class/mmc_host/mmcN/mmcN:* card-present entry.
+        // MUST be SD-specific: internal eMMC ALSO creates a child here (typically
+        // mmc0:0001), so a blanket "any mmcN:HEX child" match false-positives on
+        // the always-present eMMC. That false positive is dangerous now that the
+        // single-volume tiebreaker (discoverVolumes Method 4) consults this probe
+        // to PROMOTE a lone volume to SD — on a real-USB-only box it would wrongly
+        // promote the USB stick to SD and persist it via learnSdUuid(). So we
+        // read each card's `type` attribute and accept ONLY type "SD"/"SDIO"
+        // (eMMC reports "MMC"). If `type` can't be read we conservatively do NOT
+        // match — better to miss the kernel-fallback recovery (Signal 1
+        // sys.byd.isSDExist covers the BYD fleet anyway) than to misclassify.
         try {
             File mmcHostDir = new File("/sys/class/mmc_host");
             if (mmcHostDir.exists() && mmcHostDir.isDirectory()) {
@@ -954,17 +971,23 @@ public class StorageManager {
                         File[] children = host.listFiles();
                         if (children == null) continue;
                         for (File child : children) {
-                            // mmcN:NNNN entries appear when a card is attached.
-                            // Internal eMMC also creates such entries (mmc0:0001 typically),
-                            // so the presence check alone isn't SD-specific — but the
-                            // caller already gated on classifyPublicVolume not finding
-                            // an SD via sm, so any mmc_host child here that ISN'T the
-                            // eMMC indicates an inserted external card. We don't need
-                            // to disambiguate further: false-positives just trigger a
-                            // 5s vold-catchup poll that no-ops and falls through.
-                            if (child.getName().matches("mmc\\d+:[0-9a-fA-F]+")) {
-                                return true;
-                            }
+                            if (!child.getName().matches("mmc\\d+:[0-9a-fA-F]+")) continue;
+                            // Discriminate external SD from internal eMMC via the
+                            // card `type` sysfs node: "SD"/"SDIO" = removable card,
+                            // "MMC" = soldered eMMC.
+                            File typeFile = new File(child, "type");
+                            if (!typeFile.isFile() || !typeFile.canRead()) continue;
+                            try (BufferedReader tr = new BufferedReader(new FileReader(typeFile))) {
+                                String type = tr.readLine();
+                                if (type != null) {
+                                    type = type.trim().toUpperCase(java.util.Locale.US);
+                                    if (type.startsWith("SD")) {
+                                        logInfo("isSdCardPhysicallyPresent: mmc_host card type="
+                                                + type + " at " + child.getName());
+                                        return true;
+                                    }
+                                }
+                            } catch (Exception ignored) {}
                         }
                     }
                 }
@@ -1446,15 +1469,26 @@ public class StorageManager {
         // the type-discriminating rewrite. Recover for the unambiguous case:
         //   - SD still not found
         //   - exactly one mounted public volume observed by Method 1
-        //   - no physical USB device attached (per /sys/bus/usb/devices)
+        //   - EITHER no physical USB device attached (per /sys/bus/usb/devices)
+        //     OR the firmware positively reports a card in the SD slot
+        //     (isSdCardPhysicallyPresent → sys.byd.isSDExist / mmc_host).
+        // The isSdCardPhysicallyPresent() leg is the regression fix for
+        // SCSI-bridged readers: on those the SD reader ITSELF enumerates as a
+        // USB mass-storage device, so isUsbDeviceAttached() is permanently
+        // true and this tiebreaker never armed even with the SD as the lone
+        // volume. Gating the new leg on the firmware SD-present signal keeps a
+        // lone REAL USB stick (isSDExist=false, no mmc_host entry) from being
+        // mispromoted to SD — that case still falls through, exactly as today.
         // Then the lone volume is, by elimination, the SD slot.
+        boolean m4NoUsb = !isUsbDeviceAttached();
         if (!foundSdAvail && ambiguousMounts.size() == 1
-                && !isUsbDeviceAttached()) {
+                && (m4NoUsb || isSdCardPhysicallyPresent())) {
             String[] only = ambiguousMounts.get(0);
             String mountPath = only[0];
             String volumeUuid = only[1];
             // If we already classed this as USB above, demote it — we now
-            // know it's the only volume and there's no real USB to call it.
+            // know it's the only volume and (no real USB present, or the
+            // firmware says the slot is the SD card).
             if (mountPath.equals(foundUsbPath)) {
                 foundUsbPath = null;
                 foundUsbAvail = false;
@@ -1462,9 +1496,82 @@ public class StorageManager {
             foundSdPath = mountPath;
             foundSdAvail = true;
             learnSdUuid(volumeUuid);
-            logInfo("Found SD card via single-volume tiebreaker (no USB attached): "
+            logInfo("Found SD card via single-volume tiebreaker ("
+                    + (m4NoUsb ? "no USB attached" : "firmware SD-present, bridged reader") + "): "
                     + mountPath + " [" + only[3] + ":" + only[4]
                     + ", classifier=" + (only[2].isEmpty() ? "ambiguous" : only[2]) + "]");
+        }
+
+        // Method 4b: USB-OTG-prop elimination (regression fix for the
+        // two-major-8 case: a SCSI-bridged SD card (8:97) AND a real USB
+        // stick (8:113) mounted at the same time). classifyPublicVolume()
+        // buckets BOTH as "USB" when sys.byd.mSdcardUuid is momentarily empty
+        // (the ACC-cycle unmount window) AND no learned UUID exists yet, so
+        // Method 1 finds no SD; Method 4 can't help because there are two
+        // volumes, not one. Use the firmware's OWN USB-OTG identifier
+        // (sys.byd.mUsbotgUuid, symmetric to mSdcardUuid) to name the real
+        // USB, then the single remaining mounted volume is the SD by
+        // elimination. Strictly additive and positive-evidence-only:
+        //   - SD still not found
+        //   - firmware names a USB-OTG uuid AND that volume is actually
+        //     mounted right now (otgSeen → the firmware view is LIVE, not
+        //     stale), so we never act on a phantom USB identity
+        //   - exactly one OTHER mounted volume remains
+        //   - firmware confirms a card is in the SD slot
+        //     (isSdCardPhysicallyPresent) — this guard stops the exotic
+        //     "two USB sticks via a hub, no SD" layout from promoting the
+        //     second stick to SD.
+        if (!foundSdAvail && !ambiguousMounts.isEmpty()) {
+            String otgUuid = getSystemProperty("sys.byd.mUsbotgUuid");
+            // Contradictory-firmware guard: if the OTG prop names the SAME uuid
+            // the firmware (or our learned record) calls the SD card, the props
+            // are internally inconsistent. Acting would EXCLUDE the SD as "OTG"
+            // and promote the real USB stick to SD (a persisted SD/USB swap via
+            // learnSdUuid). Refuse Method 4b in that case and let the safer
+            // signals / fallback handle it.
+            String sdUuidProp = getSystemProperty("sys.byd.mSdcardUuid");
+            String learnedSd = readLearnedSdUuid();
+            boolean otgContradictsSd = otgUuid != null && !otgUuid.isEmpty()
+                    && ((sdUuidProp != null && otgUuid.equalsIgnoreCase(sdUuidProp))
+                        || (learnedSd != null && !learnedSd.isEmpty()
+                            && otgUuid.equalsIgnoreCase(learnedSd)));
+            if (otgContradictsSd) {
+                logWarn("Method 4b skipped: sys.byd.mUsbotgUuid (" + otgUuid
+                        + ") collides with the SD uuid (prop=" + sdUuidProp
+                        + ", learned=" + learnedSd + ") — contradictory firmware, not eliminating");
+            }
+            if (!otgContradictsSd && otgUuid != null && !otgUuid.isEmpty()) {
+                boolean otgSeen = false;
+                java.util.List<String[]> nonOtg = new java.util.ArrayList<>();
+                for (String[] m : ambiguousMounts) {
+                    if (otgUuid.equalsIgnoreCase(m[1])) otgSeen = true;
+                    else nonOtg.add(m);
+                }
+                if (otgSeen && nonOtg.size() == 1 && isSdCardPhysicallyPresent()) {
+                    String[] sd = nonOtg.get(0);
+                    String mountPath = sd[0];
+                    String volumeUuid = sd[1];
+                    // Pin the firmware-named volume as the USB (it may have
+                    // been the one Method 1 latched as foundUsbPath, or none).
+                    String otgPath = "/storage/" + otgUuid;
+                    if (isPathLikelyMounted(otgPath)) {
+                        foundUsbPath = otgPath;
+                        foundUsbAvail = true;
+                    }
+                    // Don't let the SD volume also masquerade as USB.
+                    if (mountPath.equals(foundUsbPath)) {
+                        foundUsbPath = null;
+                        foundUsbAvail = false;
+                    }
+                    foundSdPath = mountPath;
+                    foundSdAvail = true;
+                    learnSdUuid(volumeUuid);
+                    logInfo("Found SD card via USB-OTG elimination (firmware names "
+                            + otgUuid + " as USB-OTG, SD-present confirmed): " + mountPath
+                            + " [" + sd[3] + ":" + sd[4]
+                            + ", classifier=" + (sd[2].isEmpty() ? "ambiguous" : sd[2]) + "]");
+                }
+            }
         }
 
         // Commit results atomically. Volumes that disappeared since the last
@@ -1950,7 +2057,32 @@ public class StorageManager {
                 + " reserve) — redirecting THIS segment to internal "
                 + internalDir.getAbsolutePath() + " (" + formatSize(internalFree)
                 + " free) so recording is not lost");
+            // Rising edge of the fallback: trim internal to its effective cap NOW
+            // (off this per-segment path, on the async executor) so internal stays
+            // bounded from the first fallback segment rather than waiting up to 30s
+            // for the periodic ticker. ensureRecordingsSpace's own active-volume
+            // scoping does the internal-only bounding; it self-defers if the encoder
+            // is mid-write. Only on the false→true transition so we don't re-enqueue
+            // a reap every segment for the whole full-disk stint.
+            //
+            // ORDERING (data-loss guard): set the flag true BEFORE enqueueing so the
+            // executor task observes it via the j.u.c. submit happens-before edge.
+            // getActiveRecordingsStorageType() reads this flag to decide INTERNAL; if
+            // the task ran while it still read false, ensureSpace would NOT rescope and
+            // would reap the combined pool against the full external limit — deleting
+            // the configured SD/USB archive. Setting it first makes the scoping engage.
+            boolean risingEdge = trackState && !recordingsEnospcFallbackActive;
             if (trackState) recordingsEnospcFallbackActive = true;
+            if (risingEdge) {
+                try {
+                    asyncCleanupExecutor.execute(() -> {
+                        try { ensureRecordingsSpace(0, internalDir); }
+                        catch (Throwable t) { logWarn("Fallback-engage internal trim failed: " + t.getMessage()); }
+                    });
+                } catch (Throwable ignored) {
+                    // Executor shutting down — the 30s ticker + post-save cleanup still bound internal.
+                }
+            }
             return internalDir;
         } catch (Throwable t) {
             logWarn("resolveTargetWithEnospcFallback failed, using target as-is: " + t.getMessage());
@@ -2075,10 +2207,17 @@ public class StorageManager {
                     // Clamp to dynamic max — limit may have been persisted against
                     // a different volume (e.g., user swapped a 128GB SD for a 32GB
                     // one), so re-check against the current effective ceiling.
-                    recordingsLimitMb   = Math.max(MIN_LIMIT_MB, Math.min(getEffectiveMaxLimitMb(recordingsStorageType),   recordingsLimitMb));
-                    surveillanceLimitMb = Math.max(MIN_LIMIT_MB, Math.min(getEffectiveMaxLimitMb(surveillanceStorageType), surveillanceLimitMb));
-                    proximityLimitMb    = Math.max(MIN_LIMIT_MB, Math.min(getEffectiveMaxLimitMb(surveillanceStorageType), proximityLimitMb));
-                    tripsLimitMb        = Math.max(MIN_LIMIT_MB, Math.min(getEffectiveMaxLimitMb(tripsStorageType),        tripsLimitMb));
+                    // BUT: if the configured external volume is simply UNMOUNTED at
+                    // boot (not swapped), don't shrink the user's persisted limit down
+                    // to internal's ceiling — that would silently lose their large
+                    // external limit with no re-expansion on remount. Preserve the
+                    // persisted intent (clamp only to the absolute sentinel); runtime
+                    // enforcement is already bounded to internal capacity by
+                    // effectiveReapLimitBytes during the fallback. See loadTimeCeilingMb.
+                    recordingsLimitMb   = Math.max(MIN_LIMIT_MB, Math.min(loadTimeCeilingMb(recordingsStorageType),   recordingsLimitMb));
+                    surveillanceLimitMb = Math.max(MIN_LIMIT_MB, Math.min(loadTimeCeilingMb(surveillanceStorageType), surveillanceLimitMb));
+                    proximityLimitMb    = Math.max(MIN_LIMIT_MB, Math.min(loadTimeCeilingMb(surveillanceStorageType), proximityLimitMb));
+                    tripsLimitMb        = Math.max(MIN_LIMIT_MB, Math.min(loadTimeCeilingMb(tripsStorageType),        tripsLimitMb));
                     
                     logInfo("Loaded storage config: recordings=" + recordingsLimitMb + "MB (" + recordingsStorageType + 
                         "), surveillance=" + surveillanceLimitMb + "MB (" + surveillanceStorageType + 
@@ -2102,27 +2241,24 @@ public class StorageManager {
      */
     public synchronized void saveConfig() {
         try {
-            File configFile = new File(CONFIG_FILE);
-            JSONObject config;
-            
-            if (configFile.exists()) {
-                BufferedReader reader = new BufferedReader(new FileReader(configFile));
-                StringBuilder sb = new StringBuilder();
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    sb.append(line);
-                }
-                reader.close();
-                config = new JSONObject(sb.toString());
-            } else {
-                config = new JSONObject();
-                config.put("version", 1);
-            }
-            
-            JSONObject storage = config.optJSONObject("storage");
-            if (storage == null) {
-                storage = new JSONObject();
-            }
+            // Route the storage-section persist through UnifiedConfigManager so
+            // there is ONE lock domain + ONE atomic writer over
+            // /data/local/tmp/overdrive_config.json. The previous body did its
+            // own read-modify-write guarded only by synchronized(this) (the
+            // StorageManager monitor) and wrote with a plain truncating
+            // FileWriter — a disjoint mutex from UCM's cross-process FileLock on
+            // overdrive_config.json.lock + tmp+rename. The two schemes did not
+            // exclude each other, so a concurrent UCM updateSection (same file)
+            // could lost-update the storage limit, torn-read a half-truncated
+            // file, or — worst — a SIGKILL/ACC-cut between the FileWriter
+            // truncate and flush could wipe the ENTIRE config (the v23→v24 wipe
+            // vector UCM was hardened against). updateSection does
+            // loadConfigFresh + FileLock + atomic tmp+rename + .bak self-heal,
+            // and (in the daemon, UID 2000) writes locally. It also refreshes
+            // the UCM cache, so the old explicit forceReload() is now redundant.
+            // Stay synchronized so the in-memory fields are read consistently
+            // while assembling the JSON.
+            JSONObject storage = new JSONObject();
             storage.put("recordingsLimitMb", recordingsLimitMb);
             storage.put("surveillanceLimitMb", surveillanceLimitMb);
             storage.put("proximityLimitMb", proximityLimitMb);
@@ -2130,25 +2266,11 @@ public class StorageManager {
             storage.put("recordingsStorageType", recordingsStorageType.name());
             storage.put("surveillanceStorageType", surveillanceStorageType.name());
             storage.put("tripsStorageType", tripsStorageType.name());
-            config.put("storage", storage);
-            config.put("lastModified", System.currentTimeMillis());
-            
-            FileWriter writer = new FileWriter(configFile);
-            writer.write(config.toString(2));
-            writer.close();
 
-            configFile.setReadable(true, false);
-            configFile.setWritable(true, false);
-
-            // UnifiedConfigManager has its own in-memory cache of this same
-            // file. Without this invalidation, the next updateSection() call
-            // would merge into a stale cached config (still holding the OLD
-            // storage section) and write it back, silently reverting the
-            // SD_CARD/USB selection the user just made.
-            try {
-                com.overdrive.app.config.UnifiedConfigManager.forceReload();
-            } catch (Throwable t) {
-                logWarn("UnifiedConfigManager.forceReload() failed: " + t.getMessage());
+            boolean ok = com.overdrive.app.config.UnifiedConfigManager.updateSection("storage", storage);
+            if (!ok) {
+                logError("Could not save storage config: UnifiedConfigManager.updateSection(\"storage\") failed");
+                return;
             }
 
             logInfo("Saved storage config: recordings=" + recordingsLimitMb + "MB (" + recordingsStorageType +
@@ -2314,36 +2436,56 @@ public class StorageManager {
     public long getRecordingsLimitMb() {
         return recordingsLimitMb;
     }
-    
+
     public long getSurveillanceLimitMb() {
         return surveillanceLimitMb;
     }
-    
+
     public long getProximityLimitMb() {
         return proximityLimitMb;
     }
-    
+
     public long getTripsLimitMb() {
         return tripsLimitMb;
     }
+
+    /**
+     * The retention limit (MB) ACTUALLY being enforced for a category right now —
+     * the configured limit clamped to what the currently-active volume can hold.
+     * Equals the configured limit in normal operation; during a fallback to internal
+     * it's {@code min(configured, internal capacity)}. The UI shows this (alongside
+     * the configured value) so a user whose external volume is full/absent sees the
+     * honest "saving to internal: enforcing N MB" number rather than a limit the
+     * fallback volume can never reach. Categories: recordings/surveillance/proximity/trips.
+     */
+    public long getEffectiveLimitMb(String category) {
+        return effectiveReapLimitMb(activeTypeForCategory(category), configuredLimitMbForCategory(category));
+    }
     
+    // Runtime limit setters clamp with loadTimeCeilingMb (NOT the strict
+    // getEffectiveMaxLimitMb) so a save while the configured external volume is
+    // merely UNMOUNTED does not silently shrink the persisted limit to internal's
+    // ceiling with no upward re-clamp on remount. When the volume IS mounted,
+    // loadTimeCeilingMb returns the real ceiling so a genuine smaller-volume swap
+    // is still clamped. Runtime over-fill during a fallback stays bounded by
+    // effectiveReapLimitBytes. Mirrors loadConfig's load-time clamp (see ~line 2116).
     public void setRecordingsLimitMb(long limitMb) {
-        recordingsLimitMb = Math.max(MIN_LIMIT_MB, Math.min(getEffectiveMaxLimitMb(recordingsStorageType), limitMb));
+        recordingsLimitMb = Math.max(MIN_LIMIT_MB, Math.min(loadTimeCeilingMb(recordingsStorageType), limitMb));
         saveConfig();
     }
 
     public void setSurveillanceLimitMb(long limitMb) {
-        surveillanceLimitMb = Math.max(MIN_LIMIT_MB, Math.min(getEffectiveMaxLimitMb(surveillanceStorageType), limitMb));
+        surveillanceLimitMb = Math.max(MIN_LIMIT_MB, Math.min(loadTimeCeilingMb(surveillanceStorageType), limitMb));
         saveConfig();
     }
 
     public void setProximityLimitMb(long limitMb) {
-        proximityLimitMb = Math.max(MIN_LIMIT_MB, Math.min(getEffectiveMaxLimitMb(surveillanceStorageType), limitMb));
+        proximityLimitMb = Math.max(MIN_LIMIT_MB, Math.min(loadTimeCeilingMb(surveillanceStorageType), limitMb));
         saveConfig();
     }
 
     public void setTripsLimitMb(long limitMb) {
-        tripsLimitMb = Math.max(MIN_LIMIT_MB, Math.min(getEffectiveMaxLimitMb(tripsStorageType), limitMb));
+        tripsLimitMb = Math.max(MIN_LIMIT_MB, Math.min(loadTimeCeilingMb(tripsStorageType), limitMb));
         saveConfig();
     }
     
@@ -2415,7 +2557,21 @@ public class StorageManager {
         // Re-clamp the persisted limit against the new volume's effective max
         // (e.g., user switches from SD to USB, USB is smaller). Limit may
         // need to shrink before updateActiveDirectories runs cleanup.
-        recordingsLimitMb = Math.max(MIN_LIMIT_MB, Math.min(getEffectiveMaxLimitMb(type), recordingsLimitMb));
+        //
+        // FIX (audit, MEDIUM): only DOWN-clamp when the live StatFs read is
+        // genuinely positive. The web POST echoes the storage TYPE on every
+        // limit save, so this runs constantly — and getEffectiveMaxLimitMb()
+        // collapses to internal's ~8GB ceiling whenever the live volume read
+        // returns 0/throws (FUSE/vold hiccup) even though sdCardAvailable still
+        // reports the card mounted. Clamping on that transient zero would
+        // permanently shrink a valid persisted external limit (reclamp only
+        // GROWS back, never restores the original intent). A genuine smaller
+        // SWAP still reads live>0 and clamps correctly; runtime over-fill on a
+        // transient zero is already bounded by effectiveReapLimitBytes.
+        long liveTotal = liveVolumeTotalBytes(type);
+        if (liveTotal > 0) {
+            recordingsLimitMb = Math.max(MIN_LIMIT_MB, Math.min(getEffectiveMaxLimitMb(type), recordingsLimitMb));
+        }
         updateActiveDirectories();
         saveConfig();
         logInfo("Recordings storage type set to: " + type);
@@ -2549,8 +2705,15 @@ public class StorageManager {
         if (!ensureExternalAvailable(type, "surveillance")) return false;
 
         surveillanceStorageType = type;
-        surveillanceLimitMb = Math.max(MIN_LIMIT_MB, Math.min(getEffectiveMaxLimitMb(type), surveillanceLimitMb));
-        proximityLimitMb    = Math.max(MIN_LIMIT_MB, Math.min(getEffectiveMaxLimitMb(type), proximityLimitMb));
+        // FIX (audit, MEDIUM): only DOWN-clamp on a genuinely positive live
+        // StatFs read — see setRecordingsStorageType for the full rationale (a
+        // transient 0/exception read must not permanently shrink the persisted
+        // external limit).
+        long liveTotal = liveVolumeTotalBytes(type);
+        if (liveTotal > 0) {
+            surveillanceLimitMb = Math.max(MIN_LIMIT_MB, Math.min(getEffectiveMaxLimitMb(type), surveillanceLimitMb));
+            proximityLimitMb    = Math.max(MIN_LIMIT_MB, Math.min(getEffectiveMaxLimitMb(type), proximityLimitMb));
+        }
         updateActiveDirectories();
         saveConfig();
         logInfo("Surveillance storage type set to: " + type);
@@ -2598,7 +2761,12 @@ public class StorageManager {
         if (!ensureExternalAvailable(type, "trips")) return false;
 
         tripsStorageType = type;
-        tripsLimitMb = Math.max(MIN_LIMIT_MB, Math.min(getEffectiveMaxLimitMb(type), tripsLimitMb));
+        // FIX (audit, MEDIUM): only DOWN-clamp on a genuinely positive live
+        // StatFs read — see setRecordingsStorageType for the full rationale.
+        long liveTotal = liveVolumeTotalBytes(type);
+        if (liveTotal > 0) {
+            tripsLimitMb = Math.max(MIN_LIMIT_MB, Math.min(getEffectiveMaxLimitMb(type), tripsLimitMb));
+        }
         updateActiveDirectories();
         saveConfig();
         logInfo("Trips storage type set to: " + type);
@@ -3010,7 +3178,38 @@ public class StorageManager {
         initSdCardDirectories();
         initUsbDirectories();
         updateActiveDirectories();
+        reclampLimitsToMountedCeilings();
         logInfo("Volume refresh complete. SD=" + sdCardAvailable + ", USB=" + usbAvailable);
+    }
+
+    /**
+     * Upward re-clamp on remount: when a configured external volume returns, the
+     * persisted limit may have been shrunk by an OLDER build that used the strict
+     * getEffectiveMaxLimitMb ceiling in its setters (collapsing it to internal's
+     * ~8GB while the card was absent, with no path back). Re-clamp each category's
+     * persisted limit to the now-real mounted ceiling so that intent is restored.
+     * loadTimeCeilingMb returns the true ceiling for a mounted volume and the
+     * preserving sentinel for an unmounted one, so this never shrinks a value and
+     * only grows it back up to what the (now mounted) volume can actually hold.
+     * Persists only if something changed. Cheap; safe to call on every remount.
+     */
+    private void reclampLimitsToMountedCeilings() {
+        try {
+            long r = Math.max(MIN_LIMIT_MB, Math.min(loadTimeCeilingMb(recordingsStorageType),   recordingsLimitMb));
+            long s = Math.max(MIN_LIMIT_MB, Math.min(loadTimeCeilingMb(surveillanceStorageType), surveillanceLimitMb));
+            long p = Math.max(MIN_LIMIT_MB, Math.min(loadTimeCeilingMb(surveillanceStorageType), proximityLimitMb));
+            long t = Math.max(MIN_LIMIT_MB, Math.min(loadTimeCeilingMb(tripsStorageType),        tripsLimitMb));
+            // Only the persisted *intent* matters here; loadTimeCeilingMb already
+            // preserves a large external limit while unmounted, so the values here
+            // never decrease — they only recover toward the mounted ceiling.
+            boolean changed = (r != recordingsLimitMb) || (s != surveillanceLimitMb)
+                           || (p != proximityLimitMb) || (t != tripsLimitMb);
+            recordingsLimitMb = r;
+            surveillanceLimitMb = s;
+            proximityLimitMb = p;
+            tripsLimitMb = t;
+            if (changed) saveConfig();
+        } catch (Throwable ignored) {}
     }
 
     /**
@@ -3058,7 +3257,30 @@ public class StorageManager {
      * so capping at internal's true total stops the user from persisting
      * a 100GB limit against a missing 32GB stick. INTERNAL itself
      * returning <=0 (StatFs literally unreadable) keeps the sentinel.
+     *
+     * <p>The ceiling is the FULL usable volume (total − {@link #VOLUME_HEADROOM_MB}),
+     * NOT a per-category fraction — the per-category /N share was removed (see the
+     * note where PER_CATEGORY_SHARE used to be declared).
      */
+    /**
+     * Live total-bytes of the volume for {@code type}, straight from StatFs.
+     * Returns 0 if the read throws or the volume is currently unreadable.
+     *
+     * <p>Used by the storage-type setters to distinguish a real smaller-volume
+     * SWAP (live &gt; 0 → down-clamp the persisted limit) from a transient
+     * FUSE/vold hiccup (live == 0 → leave the limit intact). Unlike
+     * {@link #getEffectiveMaxLimitMb}, this never substitutes internal's ceiling
+     * for an unreadable external — a 0 here means "don't shrink", not "8GB".
+     */
+    private long liveVolumeTotalBytes(StorageType type) {
+        switch (type) {
+            case SD_CARD: return getSdCardTotalSpace();
+            case USB:     return getUsbTotalSpace();
+            case INTERNAL:
+            default:      return getInternalTotalSpace();
+        }
+    }
+
     public long getEffectiveMaxLimitMb(StorageType type) {
         long totalBytes;
         switch (type) {
@@ -3069,20 +3291,196 @@ public class StorageManager {
         }
         if (totalBytes <= 0) {
             if (type == StorageType.INTERNAL) return MAX_LIMIT_MB_FALLBACK;
-            // Unmounted SD/USB: clamp to internal volume's ceiling so a save
+            // Unmounted SD/USB: clamp to internal volume's FULL ceiling so a save
             // while the volume is missing can't persist a value larger than
             // the fallback target can ever hold.
             long internalBytes = getInternalTotalSpace();
             if (internalBytes <= 0) return MAX_LIMIT_MB_FALLBACK;
-            long internalUsableMb = (internalBytes / 1024L / 1024L) - VOLUME_HEADROOM_MB;
-            if (internalUsableMb <= 0) return MIN_LIMIT_MB;
-            return Math.max(MIN_LIMIT_MB, (long)(internalUsableMb * PER_CATEGORY_SHARE));
+            return volumeCeilingMb(internalBytes);
         }
+        return volumeCeilingMb(totalBytes);
+    }
 
+    /**
+     * Full usable ceiling (MB) for a volume of {@code totalBytes}: the whole
+     * volume minus {@link #VOLUME_HEADROOM_MB} of ENOSPC headroom, floored at
+     * {@link #MIN_LIMIT_MB}. No per-category division — one category may be
+     * configured up to (nearly) the whole disk.
+     */
+    private long volumeCeilingMb(long totalBytes) {
         long usableMb = (totalBytes / 1024L / 1024L) - VOLUME_HEADROOM_MB;
-        if (usableMb <= 0) return MIN_LIMIT_MB;
-        long perCategoryMb = (long)(usableMb * PER_CATEGORY_SHARE);
-        return Math.max(MIN_LIMIT_MB, perCategoryMb);
+        return usableMb <= MIN_LIMIT_MB ? MIN_LIMIT_MB : usableMb;
+    }
+
+    /**
+     * Load-time clamp ceiling (MB) for a configured storage type. Same as
+     * {@link #getEffectiveMaxLimitMb} EXCEPT that an UNMOUNTED external volume yields
+     * the absolute {@link #MAX_LIMIT_MB_FALLBACK} sentinel rather than internal's
+     * ceiling — so a persisted external limit isn't silently shrunk to internal size
+     * just because the card happens to be absent at boot (there is no upward
+     * re-clamp on remount). When the external IS mounted we use the real ceiling, so
+     * a genuine card SWAP to a smaller volume is still clamped correctly. The save
+     * setters ({@link #setRecordingsLimitMb} etc.) keep using the strict
+     * {@link #getEffectiveMaxLimitMb} so a user can't PERSIST an oversized value, and
+     * runtime enforcement during a fallback stays bounded by
+     * {@link #effectiveReapLimitBytes} regardless of this persisted number.
+     */
+    private long loadTimeCeilingMb(StorageType type) {
+        if (type == StorageType.INTERNAL) return getEffectiveMaxLimitMb(StorageType.INTERNAL);
+        boolean mounted = (type == StorageType.SD_CARD) ? sdCardAvailable
+                        : (type == StorageType.USB) ? usbAvailable : false;
+        return mounted ? getEffectiveMaxLimitMb(type) : MAX_LIMIT_MB_FALLBACK;
+    }
+
+    /**
+     * Runtime EFFECTIVE retention limit (MB) for a category whose configured
+     * limit is {@code configuredMb}, given the volume writes are ACTUALLY landing
+     * on right now ({@code activeType}). Returns {@code min(configuredMb,
+     * fullCeiling(activeType))}, floored at {@link #MIN_LIMIT_MB}.
+     *
+     * <p>This is the heart of the fallback fix. The persisted/displayed
+     * {@code *LimitMb} is the user's configured number on their chosen (usually
+     * external) volume and is NEVER rewritten. But when an external volume is
+     * full/absent and recording falls back to internal, enforcing that
+     * external-sized number (e.g. 100 GB) as the reaper target on an 8 GB internal
+     * means the reaper never fires and internal fills to physical-full — the exact
+     * "recording lost on fallback" bug. Clamping the ENFORCED target to what the
+     * active volume can physically hold bounds internal correctly while changing
+     * nothing the user sees. When the external returns, {@code activeType} flips
+     * back and the clamp evaporates — the configured number is honored again on the
+     * volume that can hold it.
+     */
+    private long effectiveReapLimitMb(StorageType activeType, long configuredMb) {
+        long ceiling = getEffectiveMaxLimitMb(activeType);
+        return Math.max(MIN_LIMIT_MB, Math.min(configuredMb, ceiling));
+    }
+
+    /** Bytes form of {@link #effectiveReapLimitMb}. */
+    private long effectiveReapLimitBytes(StorageType activeType, long configuredMb) {
+        return effectiveReapLimitMb(activeType, configuredMb) * 1024L * 1024L;
+    }
+
+    // ── Per-category resolvers for the active-volume retention scoping ──────────
+    // These let the single chokepoint in ensureSpace() resolve, for any category,
+    // (a) the volume writes are CURRENTLY landing on, (b) the user's CONFIGURED
+    // volume, and (c) the configured MB limit — without each of the ~16 reap call
+    // sites needing to know about fallback. Proximity rides SURVEILLANCE's storage
+    // type (see the proximity clamp sites) but keeps its own proximityLimitMb.
+
+    private StorageType activeTypeForCategory(String category) {
+        switch (category) {
+            case "recordings":   return getActiveRecordingsStorageType();   // ENOSPC-aware (mounted-but-full → INTERNAL)
+            case "surveillance": return getActiveSurveillanceStorageType();
+            case "proximity":    return getActiveSurveillanceStorageType();  // proximity follows surveillance volume
+            case "trips":        return getActiveTripsStorageType();
+            default:             return StorageType.INTERNAL;
+        }
+    }
+
+    private StorageType configuredTypeForCategory(String category) {
+        switch (category) {
+            case "recordings":   return recordingsStorageType;
+            case "surveillance": return surveillanceStorageType;
+            case "proximity":    return surveillanceStorageType;
+            case "trips":        return tripsStorageType;
+            default:             return StorageType.INTERNAL;
+        }
+    }
+
+    private long configuredLimitMbForCategory(String category) {
+        switch (category) {
+            case "recordings":   return recordingsLimitMb;
+            case "surveillance": return surveillanceLimitMb;
+            case "proximity":    return proximityLimitMb;
+            case "trips":        return tripsLimitMb;
+            default:             return DEFAULT_RECORDINGS_LIMIT_MB;
+        }
+    }
+
+    /** True when a category's writes have fallen back from a configured EXTERNAL
+     *  volume onto internal (external full/absent) — the condition under which the
+     *  reaper, the size accounting, and the encoder-busy defer gate must all switch
+     *  to the internal-scoped pool + effective (clamped) limit instead of the
+     *  combined cross-volume pool + raw external limit. Single source of truth so
+     *  the gate decisions can't disagree with {@link #ensureSpace}'s own rescoping. */
+    private boolean isFallbackActiveForCategory(String category) {
+        return activeTypeForCategory(category) == StorageType.INTERNAL
+            && configuredTypeForCategory(category) != StorageType.INTERNAL;
+    }
+
+    /** The byte size to compare against the limit when deciding whether a reap is
+     *  needed — the INTERNAL-scoped pool during a fallback (so the full external
+     *  archive doesn't inflate the number and make a near-full internal look fine),
+     *  else the normal combined-pool size. Matches the pool {@link #ensureSpace}
+     *  actually reaps.
+     *
+     *  <p>Normal mode delegates to each category's regular size source so we don't
+     *  regress any caching — notably {@link #getTripsSize()} prefers a sub-ms H2
+     *  {@code SUM(size_bytes)} query over a multi-minute FUSE walk. The internal-scoped
+     *  fallback branch must use the raw {@link #getDirectoriesTotalSize} walk because
+     *  the cached whole-pool sums span all volumes and wouldn't match internal-only. */
+    private long scopedSizeForCategory(String category) {
+        if (isFallbackActiveForCategory(category)) {
+            return getDirectoriesTotalSize(category,
+                internalScopedDirs(getReapableDirs(category)), namePrefixForCategory(category));
+        }
+        switch (category) {
+            case "recordings":   return getRecordingsSize();
+            case "surveillance": return getSurveillanceSize();
+            case "proximity":    return getProximitySize();
+            case "trips":        return getTripsSize();   // DB-cached — avoids the FUSE walk
+            default:             return getDirectoriesTotalSize(category,
+                getReapableDirs(category), namePrefixForCategory(category));
+        }
+    }
+
+    /** The byte limit to enforce for a category right now — the effective (configured
+     *  clamped to internal capacity) limit during a fallback, else the raw configured
+     *  limit. Matches the limit {@link #ensureSpace} actually applies. */
+    private long scopedLimitBytesForCategory(String category) {
+        long configuredMb = configuredLimitMbForCategory(category);
+        if (isFallbackActiveForCategory(category)) {
+            return effectiveReapLimitBytes(StorageType.INTERNAL, configuredMb);
+        }
+        return configuredMb * 1024L * 1024L;
+    }
+
+    /** The INTERNAL active dir for a category — the dir writes land on during a
+     *  fallback. Used as the {@code activeDir} when the reaper is scoped to internal
+     *  so its mkdir / log references the volume actually being written. */
+    private File internalDirForCategory(String category) {
+        switch (category) {
+            case "recordings":   return internalRecordingsDir;
+            case "surveillance": return internalSurveillanceDir;
+            case "proximity":    return internalProximityDir;
+            case "trips":        return internalTripsDir;
+            default:             return internalRecordingsDir;
+        }
+    }
+
+    /**
+     * Filter a reapable-dir list down to the INTERNAL volume. Used by the
+     * active-volume scoping in {@link #ensureSpace} during a fallback so the reaper
+     * bounds ONLY internal and NEVER auto-deletes the configured external volume's
+     * archive while it's merely full/absent.
+     *
+     * <p>ALLOWLIST by {@link #INTERNAL_BASE_DIR}'s volume root (/storage/emulated/0)
+     * rather than denylisting {@code sdCardPath}/{@code usbPath}: those external-path
+     * volatiles can momentarily read null/stale during a card pull/swap (they're
+     * assigned in a separate call from the {@code sdCardRecordingsDir} fields this
+     * filters), and a null external path would let an external dir slip through a
+     * denylist and into the reap set — risking deletion of the external archive.
+     * Keeping ONLY internal-volume dirs is immune to that race. Legacy/flat-base
+     * paths all live under /storage/emulated/0, so they correctly stay in the set.
+     */
+    private List<File> internalScopedDirs(List<File> all) {
+        final String internalVolumeRoot = "/storage/emulated/0";
+        List<File> out = new ArrayList<>(all.size());
+        for (File d : all) {
+            if (d == null) continue;
+            if (d.getAbsolutePath().startsWith(internalVolumeRoot)) out.add(d);
+        }
+        return out;
     }
 
     /**
@@ -3524,8 +3922,12 @@ public class StorageManager {
         // starve the recorder's pre-flight in another.
         synchronized (recordingsCleanupLock) {
             File targetDir = (activeDir != null) ? activeDir : recordingsDir;
-            if (deferIfEncoderBusy(DEFERRED_RECORDINGS, getRecordingsSize(),
-                    recordingsLimitMb * 1024 * 1024)) {
+            // Defer-gate on the EFFECTIVE scope (internal pool + clamped limit during
+            // a fallback), matching what ensureSpace will actually enforce — otherwise
+            // the combined-pool size vs raw external limit never trips and a near-full
+            // internal fallback volume is never reaped while the encoder is writing.
+            if (deferIfEncoderBusy(DEFERRED_RECORDINGS, scopedSizeForCategory("recordings"),
+                    scopedLimitBytesForCategory("recordings"))) {
                 return true;
             }
             return ensureSpace("recordings", getReapableDirs("recordings"), targetDir,
@@ -3666,8 +4068,8 @@ public class StorageManager {
      */
     public boolean ensureSurveillanceSpace(long reserveBytes) {
         synchronized (surveillanceCleanupLock) {
-            if (deferIfEncoderBusy(DEFERRED_SURVEILLANCE, getSurveillanceSize(),
-                    surveillanceLimitMb * 1024 * 1024)) {
+            if (deferIfEncoderBusy(DEFERRED_SURVEILLANCE, scopedSizeForCategory("surveillance"),
+                    scopedLimitBytesForCategory("surveillance"))) {
                 return true;
             }
             return ensureSpace("surveillance", getReapableDirs("surveillance"), surveillanceDir,
@@ -3686,8 +4088,8 @@ public class StorageManager {
      */
     public boolean ensureProximitySpace(long reserveBytes) {
         synchronized (proximityCleanupLock) {
-            if (deferIfEncoderBusy(DEFERRED_PROXIMITY, getProximitySize(),
-                    proximityLimitMb * 1024 * 1024)) {
+            if (deferIfEncoderBusy(DEFERRED_PROXIMITY, scopedSizeForCategory("proximity"),
+                    scopedLimitBytesForCategory("proximity"))) {
                 return true;
             }
             return ensureSpace("proximity", getReapableDirs("proximity"), proximityDir,
@@ -3705,8 +4107,26 @@ public class StorageManager {
      */
     public boolean ensureTripsSpace(long reserveBytes) {
         synchronized (tripsCleanupLock) {
-            if (deferIfEncoderBusy(DEFERRED_TRIPS, getTripsSize(),
-                    tripsLimitMb * 1024 * 1024)) {
+            // Reconcile orphan DB rows BEFORE reading the gate size. The trips
+            // limit gate reads the DB SUM(size_bytes+sidecar_size_bytes), but the
+            // reaper frees bytes by walking the filesystem. A row whose .jsonl.gz
+            // vanished out-of-band (file-manager delete, SD/volume swap, or a crash
+            // between TripApiHandler's file-delete and row-delete) keeps the SUM
+            // inflated forever: the gate fires every 30s while the disk walk has
+            // nothing to delete, so it never converges. Drop those rows here so the
+            // DB-backed size only reflects bytes that are actually reapable, then
+            // expire the cached SUM so the gate re-reads post-reconcile reality.
+            try {
+                com.overdrive.app.trips.TripAnalyticsManager tam =
+                        com.overdrive.app.daemon.CameraDaemon.getTripAnalyticsManager();
+                com.overdrive.app.trips.TripDatabase db = (tam != null) ? tam.getDatabase() : null;
+                if (db != null && db.deleteRowsWithMissingFiles() > 0) {
+                    invalidateTripsDbSizeCache();
+                }
+            } catch (Throwable ignored) {}
+
+            if (deferIfEncoderBusy(DEFERRED_TRIPS, scopedSizeForCategory("trips"),
+                    scopedLimitBytesForCategory("trips"))) {
                 return true;
             }
             return ensureSpace("trips", getReapableDirs("trips"), tripsDir,
@@ -3766,8 +4186,13 @@ public class StorageManager {
     private static String[] sidecarExtensionsForCategory(String category) {
         switch (category) {
             case "recordings":
-                // cam_*.mp4 has no sidecars in the current build.
-                return new String[]{};
+                // cam_*.mp4 carries a cam_*.json geo sidecar written by
+                // LocationSidecarWriter for the pano/recorder flow. Reaping the
+                // .mp4 must also reap its .json (and count it toward the limit)
+                // or the sidecars leak forever, one per recorded segment. The
+                // dvr_ aux clips get no .json, so this can't orphan-delete a
+                // needed dvr_ companion.
+                return new String[]{".json"};
             case "surveillance":
                 // event_*: timeline JSON, hero JPG, overlay SRT.
                 return new String[]{".json", ".jpg", ".srt"};
@@ -3807,6 +4232,18 @@ public class StorageManager {
      * SOTA: Uses shell fallback for listing/deleting when directory is owned
      * by a different UID than the daemon.
      *
+     * <p><b>Fallback scoping (2026-06).</b> When the category's CONFIGURED volume
+     * is external but writes are CURRENTLY landing on internal (the external is
+     * full or unmounted — {@link #activeTypeForCategory} resolves to INTERNAL while
+     * {@link #configuredTypeForCategory} is SD/USB), this method rescopes itself to
+     * the INTERNAL volume only and enforces {@link #effectiveReapLimitBytes} (the
+     * configured MB clamped to what internal can physically hold). This bounds the
+     * fallback internal volume to the SAME configured limit — capped at internal's
+     * real capacity so it can't fill to physical-full — WITHOUT auto-deleting the
+     * configured external volume's archive while it's merely full/absent (the
+     * external dirs are dropped from the reap set, never reaped here). In normal
+     * mode (active == configured) the scoping is a no-op and behavior is unchanged.
+     *
      * @param category    Category key — recordings/surveillance/proximity/trips.
      * @param dirs        Every directory whose files count toward this limit.
      *                    May contain a mix of active, inactive, and legacy
@@ -3820,6 +4257,38 @@ public class StorageManager {
     private boolean ensureSpace(String category, List<File> dirs, File activeDir,
                                 String namePrefix,
                                 long limitBytes, long reserveBytes) {
+        // Active-volume scoping: if writes have fallen back from a configured
+        // external volume onto internal, bound internal to the configured limit
+        // (clamped to internal's capacity) and DON'T touch the external archive.
+        StorageType activeType = activeTypeForCategory(category);
+        StorageType configuredType = configuredTypeForCategory(category);
+        if (activeType == StorageType.INTERNAL && configuredType != StorageType.INTERNAL) {
+            long configuredMb = configuredLimitMbForCategory(category);
+            long effLimitBytes = effectiveReapLimitBytes(StorageType.INTERNAL, configuredMb);
+            if (effLimitBytes != limitBytes || dirs.size() != internalScopedDirs(dirs).size()) {
+                logInfo(category + " retention scoped to internal fallback volume: limit "
+                    + formatSize(limitBytes) + " → effective " + formatSize(effLimitBytes)
+                    + " (configured volume " + configuredType + " unavailable/full; not reaping it)");
+            }
+            limitBytes = effLimitBytes;
+            dirs = internalScopedDirs(dirs);
+            File internalDir = internalDirForCategory(category);
+            if (internalDir != null) activeDir = internalDir;
+        } else if (activeType == StorageType.INTERNAL) {
+            // Natively-INTERNAL category (configuredType == INTERNAL, so the
+            // fallback rescope above did NOT fire). A limit persisted while
+            // internal's StatFs transiently read 0 can be up to the 100 GB
+            // sentinel; with no clamp here the reaper target would stay at that
+            // sentinel on an ~8 GB volume and internal fills to physical-full —
+            // the persisted slider value is silently un-enforced. Bound the
+            // enforced target to internal's real capacity. effectiveReapLimitBytes
+            // also returns the sentinel during the SAME transient zero, so this
+            // only bites once StatFs recovers — which is exactly when over-fill
+            // matters — giving correct convergence without shrinking on a hiccup.
+            limitBytes = Math.min(limitBytes,
+                effectiveReapLimitBytes(StorageType.INTERNAL, configuredLimitMbForCategory(category)));
+        }
+
         if (activeDir != null && (!activeDir.exists() || !activeDir.isDirectory())) {
             activeDir.mkdirs();
         }
@@ -3830,6 +4299,11 @@ public class StorageManager {
         final String primaryExt = primaryExtensionForCategory(category);
         final String[] sidecarExts = sidecarExtensionsForCategory(category);
         final String[] auxPrefixes = auxiliaryPrefixesForCategory(category);
+
+        // Set true when a trips DB row is dropped below so the DB-size cache can
+        // be expired after the loop (otherwise the next getTripsSize() returns a
+        // stale, inflated SUM and the limit gate never converges).
+        boolean tripsRowReaped = false;
 
         // Collect every reapable anchor file, deduplicated by filename so a
         // clip that exists on both internal and SD card isn't accounted twice.
@@ -3849,7 +4323,24 @@ public class StorageManager {
             for (File f : files) {
                 if (!f.isFile()) continue;
                 String name = f.getName();
-                if (namePrefix != null && !name.startsWith(namePrefix)) continue;
+                // Anchor gate. Use nameMatchesCategoryPrefix (primary OR auxiliary
+                // prefix), NOT a bare startsWith(namePrefix), so STANDALONE
+                // auxiliary clips are reaped as first-class anchors. Concretely:
+                // OEM Dashcam DRIVE clips (dvr_<ts>.mp4) live in the recordings
+                // dir and are COUNTED toward the limit by getDirectoriesTotalSize
+                // (which already uses nameMatchesCategoryPrefix), but they have
+                // their own timestamps — never a matching cam_ stem — so the old
+                // startsWith("cam") gate excluded them from allFiles entirely.
+                // They were counted-but-unreapable: once the cam_ files were under
+                // the limit the reaper deleted nothing while dvr_ kept the dir over
+                // limit forever (SD filled silently). The aux-sidecar branch below
+                // only catches `<aux><anchorStem>_…` siblings (e.g. surveillance
+                // thumb_<event>_…), which dvr_ standalone clips never match — hence
+                // they were invisible here. Matching them as anchors makes the
+                // recordings limit enforceable regardless of cam_/dvr_ mix, and
+                // keeps the reaper consistent with the size measurement.
+                if (namePrefix != null
+                        && !nameMatchesCategoryPrefix(name, namePrefix, auxPrefixes)) continue;
                 if (!seenNames.add(name)) continue;
                 allFiles.add(f);
                 currentSize += f.length();
@@ -3931,6 +4422,24 @@ public class StorageManager {
                     try {
                         com.overdrive.app.server.RecordingsIndex
                                 .getInstance().remove(file.getName());
+                    } catch (Throwable ignored) {}
+                }
+
+                // Trips anchors live in TripDatabase, not RecordingsIndex. The
+                // limit gate reads the DB SUM(size_bytes+sidecar_size_bytes), so
+                // a reaped .jsonl.gz whose row survives keeps that SUM (and the
+                // gate) permanently inflated — the gate fires every 30s but finds
+                // nothing to delete. Drop the row here, mirroring the .mp4 branch
+                // above, and flag the DB-size cache for invalidation after the
+                // loop so the next getTripsSize() reflects post-reap reality.
+                if (file.getName().endsWith(".jsonl.gz")) {
+                    try {
+                        com.overdrive.app.trips.TripAnalyticsManager tam =
+                                com.overdrive.app.daemon.CameraDaemon.getTripAnalyticsManager();
+                        com.overdrive.app.trips.TripDatabase db = (tam != null) ? tam.getDatabase() : null;
+                        if (db != null && db.deleteByTelemetryPath(file.getAbsolutePath()) > 0) {
+                            tripsRowReaped = true;
+                        }
                     } catch (Throwable ignored) {}
                 }
 
@@ -4083,7 +4592,21 @@ public class StorageManager {
             }
         }
 
+        // If we dropped any trips DB rows above, expire the DB-size cache so the
+        // next getTripsSize()/getTripsCount() re-queries the post-reap SUM rather
+        // than returning the stale (inflated) value that keeps the limit gate
+        // from ever converging.
+        if (tripsRowReaped) {
+            invalidateTripsDbSizeCache();
+        }
+
         return currentSize <= targetSize;
+    }
+
+    /** Force the next {@link #getTripsSizeFromDbCached} read to re-query the DB. */
+    private synchronized void invalidateTripsDbSizeCache() {
+        cachedTripsDbSize = -1;
+        cachedTripsDbSizeAt = 0;
     }
     
     /**
@@ -4251,8 +4774,11 @@ public class StorageManager {
                     // Make all files in directory readable
                     makeFilesReadable(recordingsDir);
 
-                    long currentSize = getRecordingsSize();
-                    long limitBytes = recordingsLimitMb * 1024 * 1024;
+                    // Scoped to the active volume so a fallback to internal triggers
+                    // (and bounds) on internal's pool + effective limit, not the
+                    // combined cross-volume pool vs the raw external limit.
+                    long currentSize = scopedSizeForCategory("recordings");
+                    long limitBytes = scopedLimitBytesForCategory("recordings");
 
                     if (currentSize > limitBytes) {
                         logInfo("Recording file saved - triggering cleanup (current=" +
@@ -4309,8 +4835,8 @@ public class StorageManager {
                     // Make all files in directory readable
                     makeFilesReadable(surveillanceDir);
 
-                    long currentSize = getSurveillanceSize();
-                    long limitBytes = surveillanceLimitMb * 1024 * 1024;
+                    long currentSize = scopedSizeForCategory("surveillance");
+                    long limitBytes = scopedLimitBytesForCategory("surveillance");
 
                     if (currentSize > limitBytes) {
                         logInfo("Surveillance file saved - triggering cleanup (current=" +
@@ -4354,8 +4880,8 @@ public class StorageManager {
                     // Make all files in directory readable
                     makeFilesReadable(proximityDir);
 
-                    long currentSize = getProximitySize();
-                    long limitBytes = proximityLimitMb * 1024 * 1024;
+                    long currentSize = scopedSizeForCategory("proximity");
+                    long limitBytes = scopedLimitBytesForCategory("proximity");
 
                     if (currentSize > limitBytes) {
                         logInfo("Proximity file saved - triggering cleanup (current=" +
@@ -4397,15 +4923,19 @@ public class StorageManager {
                     // Make all files in directory readable
                     makeFilesReadable(tripsDir);
 
-                    long currentSize = getTripsSize();
-                    long limitBytes = tripsLimitMb * 1024 * 1024;
+                    // Scoped (parity with the other onXxxFileSaved handlers) so a
+                    // trips fallback to internal triggers on internal's pool + cap.
+                    // scopedSizeForCategory("trips") still uses the DB-cached size in
+                    // normal mode (no FUSE walk).
+                    long currentSize = scopedSizeForCategory("trips");
+                    long limitBytes = scopedLimitBytesForCategory("trips");
 
                     if (currentSize > limitBytes) {
                         logInfo("Trip file saved - triggering cleanup (current=" +
                             formatSize(currentSize) + ", limit=" + formatSize(limitBytes) + ")");
                         ensureSpace("trips", getReapableDirs("trips"), tripsDir,
                             namePrefixForCategory("trips"),
-                            limitBytes, 0);
+                            tripsLimitMb * 1024 * 1024, 0);
                     } else {
                         logDebug("Trip file saved - within limits (" +
                             formatSize(currentSize) + "/" + formatSize(limitBytes) + ")");
@@ -4615,15 +5145,28 @@ public class StorageManager {
                     // recordings) grow many tens of MB over its OWN limit
                     // before triggering. Per-dir ratio gives every dir an
                     // independent, fair escape (audit Finding "storage drift").
-                    long recBytes = getRecordingsSize();
-                    long survBytes = getSurveillanceSize();
-                    long tripsBytes = getTripsSize();
-                    long recLim = recordingsLimitMb * 1024 * 1024;
-                    long survLim = surveillanceLimitMb * 1024 * 1024;
-                    long tripsLim = tripsLimitMb * 1024 * 1024;
+                    // Scoped to each category's ACTIVE volume + effective limit so a
+                    // fallback to internal is measured on internal's pool vs internal's
+                    // cap (combined-pool-vs-raw-external would never trip during a
+                    // fallback and internal could fill to physical-full mid-recording).
+                    long recBytes = scopedSizeForCategory("recordings");
+                    long survBytes = scopedSizeForCategory("surveillance");
+                    long tripsBytes = scopedSizeForCategory("trips");
+                    long proxBytes = scopedSizeForCategory("proximity");
+                    long recLim = scopedLimitBytesForCategory("recordings");
+                    long survLim = scopedLimitBytesForCategory("surveillance");
+                    long tripsLim = scopedLimitBytesForCategory("trips");
+                    long proxLim = scopedLimitBytesForCategory("proximity");
                     boolean recHard  = recLim   > 0 && recBytes   > recLim   * 21 / 20;  // >5% over OWN limit
                     boolean survHard = survLim  > 0 && survBytes  > survLim  * 21 / 20;
                     boolean tripsHard= tripsLim > 0 && tripsBytes > tripsLim * 21 / 20;
+                    // Proximity keeps its OWN logical cap (proximityLimitMb) even
+                    // though it shares surveillance's volume, so a proximity-only
+                    // overflow must be able to force a pass during continuous
+                    // recording — otherwise the periodic proximity reap below is
+                    // unreachable for the whole drive (encoder writing the whole
+                    // time) and proximity parks above its limit until an idle tick.
+                    boolean proxHard = proxLim  > 0 && proxBytes  > proxLim  * 21 / 20;
 
                     // Free-disk emergency: if ANY active volume is critically
                     // low, continuing to write is going to fail anyway. Force
@@ -4631,9 +5174,23 @@ public class StorageManager {
                     // categories' active volumes covers the case where
                     // surveillance is on USB while recordings are on internal —
                     // a starved surveillance volume must still trigger.
+                    //
+                    // Probe each category's ACTIVE volume (activeTypeForCategory),
+                    // NOT the raw configured volatiles — mirroring scopedSizeForCategory.
+                    // During an external→internal fallback activeTypeForCategory
+                    // returns INTERNAL, so this measures the volume actually being
+                    // written; the old configured-type loop measured the unmounted/
+                    // full external (free=0, filtered out) and missed the internal
+                    // pool entirely, so the escape silently no-op'd in the exact
+                    // fallback scenario it exists to guard.
                     long minFree = Long.MAX_VALUE;
-                    for (StorageType t : new StorageType[]{
-                            recordingsStorageType, surveillanceStorageType, tripsStorageType}) {
+                    boolean activeExternalDown = false;
+                    Set<StorageType> activeTypes = new HashSet<>();
+                    activeTypes.add(activeTypeForCategory("recordings"));
+                    activeTypes.add(activeTypeForCategory("surveillance"));
+                    activeTypes.add(activeTypeForCategory("trips"));
+                    activeTypes.add(activeTypeForCategory("proximity"));
+                    for (StorageType t : activeTypes) {
                         long f;
                         switch (t) {
                             case SD_CARD: f = getSdCardFreeSpace(); break;
@@ -4641,23 +5198,38 @@ public class StorageManager {
                             case INTERNAL:
                             default:      f = getInternalFreeSpace(); break;
                         }
-                        if (f > 0 && f < minFree) minFree = f;
+                        if (f <= 0) {
+                            // A 0 reading on an ACTIVE external volume means it is
+                            // unmounted/inaccessible (or genuinely 0-free) — treat
+                            // that as critical rather than discarding it, so the
+                            // escape stays live when the active external is down.
+                            // Internal returning 0 is a transient StatFs hiccup, not
+                            // a definitive critical signal, so don't latch on it.
+                            if (t == StorageType.SD_CARD || t == StorageType.USB) {
+                                activeExternalDown = true;
+                            }
+                            continue;
+                        }
+                        if (f < minFree) minFree = f;
                     }
                     long sdFree = (minFree == Long.MAX_VALUE) ? 0 : minFree;
-                    boolean diskCritical = sdFree > 0 && sdFree < 200L * 1024 * 1024;  // <200MB free
+                    boolean diskCritical = activeExternalDown
+                        || (sdFree > 0 && sdFree < 200L * 1024 * 1024);  // <200MB free
 
-                    boolean hardOverlimit = recHard || survHard || tripsHard || diskCritical;
+                    boolean hardOverlimit = recHard || survHard || tripsHard || proxHard || diskCritical;
                     if (hardOverlimit) {
                         logWarn("Periodic cleanup forced during recording: "
                             + "rec=" + formatSize(recBytes) + "/" + formatSize(recLim) + (recHard ? " HARD" : "")
                             + " surv=" + formatSize(survBytes) + "/" + formatSize(survLim) + (survHard ? " HARD" : "")
                             + " trips=" + formatSize(tripsBytes) + "/" + formatSize(tripsLim) + (tripsHard ? " HARD" : "")
+                            + " prox=" + formatSize(proxBytes) + "/" + formatSize(proxLim) + (proxHard ? " HARD" : "")
                             + " sdFree=" + formatSize(sdFree) + (diskCritical ? " CRITICAL" : ""));
                     } else {
                         // Mark all dirs that are at risk so we drain them later.
                         if (recBytes > recLim * 0.9) deferredCleanupDirs.add(DEFERRED_RECORDINGS);
                         if (survBytes > survLim * 0.9) deferredCleanupDirs.add(DEFERRED_SURVEILLANCE);
                         if (tripsBytes > tripsLim * 0.9) deferredCleanupDirs.add(DEFERRED_TRIPS);
+                        if (proxLim > 0 && proxBytes > proxLim * 0.9) deferredCleanupDirs.add(DEFERRED_PROXIMITY);
                         return;
                     }
                 }
@@ -4681,10 +5253,19 @@ public class StorageManager {
                 // Each ensureXxxSpace self-acquires its category lock; the
                 // size readouts under the same monitor stay consistent with
                 // what ensureXxxSpace will operate on.
+                // Scope size+limit to each category's ACTIVE volume + effective
+                // (clamped) cap, exactly like the HARD branch above and ensureSpace
+                // itself. The old combined-pool-size-vs-raw-external-limit gate
+                // never tripped during an external→internal fallback (the large
+                // under-limit external archive dominated the combined size while
+                // the raw external limit stayed far away), so a near-full internal
+                // pool looked fine and grew toward physical-full. The scoped
+                // helpers are no-ops in normal (active==configured) mode, so
+                // non-fallback behavior is unchanged.
                 synchronized (recordingsCleanupLock) {
-                    long currentSize = getRecordingsSize();
-                    long limitBytes = recordingsLimitMb * 1024 * 1024;
-                    if (currentSize > limitBytes * 0.9) {  // 90% threshold
+                    long currentSize = scopedSizeForCategory("recordings");
+                    long limitBytes = scopedLimitBytesForCategory("recordings");
+                    if (limitBytes > 0 && currentSize > limitBytes * 0.9) {  // 90% threshold
                         logInfo("Periodic cleanup: recordings at " +
                             formatSize(currentSize) + "/" + formatSize(limitBytes));
                         ensureRecordingsSpace(50 * 1024 * 1024);  // Reserve 50MB
@@ -4692,9 +5273,9 @@ public class StorageManager {
                 }
 
                 synchronized (surveillanceCleanupLock) {
-                    long currentSize = getSurveillanceSize();
-                    long limitBytes = surveillanceLimitMb * 1024 * 1024;
-                    if (currentSize > limitBytes * 0.9) {  // 90% threshold
+                    long currentSize = scopedSizeForCategory("surveillance");
+                    long limitBytes = scopedLimitBytesForCategory("surveillance");
+                    if (limitBytes > 0 && currentSize > limitBytes * 0.9) {  // 90% threshold
                         logInfo("Periodic cleanup: surveillance at " +
                             formatSize(currentSize) + "/" + formatSize(limitBytes));
                         ensureSurveillanceSpace(50 * 1024 * 1024);  // Reserve 50MB
@@ -4702,12 +5283,30 @@ public class StorageManager {
                 }
 
                 synchronized (tripsCleanupLock) {
-                    long currentSize = getTripsSize();
-                    long limitBytes = tripsLimitMb * 1024 * 1024;
-                    if (currentSize > limitBytes * 0.9) {  // 90% threshold
+                    long currentSize = scopedSizeForCategory("trips");
+                    long limitBytes = scopedLimitBytesForCategory("trips");
+                    if (limitBytes > 0 && currentSize > limitBytes * 0.9) {  // 90% threshold
                         logInfo("Periodic cleanup: trips at " +
                             formatSize(currentSize) + "/" + formatSize(limitBytes));
                         ensureTripsSpace(50 * 1024 * 1024);  // Reserve 50MB
+                    }
+                }
+
+                // Proximity must be swept here too. It was historically reaped
+                // ONLY reactively — on the next proximity recording start
+                // (ProximityRecordingHandler) or an explicit limit change
+                // (runCleanup). Once proximity events stop, the dir parks above
+                // its limit forever (field: 476/500 MB = 95%, well over the 90%
+                // threshold) because nothing periodic ever revisits it. Mirror
+                // the other three categories so the limit converges regardless
+                // of whether new proximity clips are still being written.
+                synchronized (proximityCleanupLock) {
+                    long currentSize = scopedSizeForCategory("proximity");
+                    long limitBytes = scopedLimitBytesForCategory("proximity");
+                    if (limitBytes > 0 && currentSize > limitBytes * 0.9) {  // 90% threshold
+                        logInfo("Periodic cleanup: proximity at " +
+                            formatSize(currentSize) + "/" + formatSize(limitBytes));
+                        ensureProximitySpace(50 * 1024 * 1024);  // Reserve 50MB
                     }
                 }
             } catch (Exception e) {
@@ -4745,10 +5344,11 @@ public class StorageManager {
         if (toRun.contains(DEFERRED_RECORDINGS)) {
             try {
                 synchronized (recordingsCleanupLock) {
-                    long limitBytes = recordingsLimitMb * 1024 * 1024;
-                    if (getRecordingsSize() > limitBytes) {
+                    // Scoped to the active volume (internal during a fallback) so the
+                    // drain actually fires when internal is over its effective cap.
+                    if (scopedSizeForCategory("recordings") > scopedLimitBytesForCategory("recordings")) {
                         ensureSpace("recordings", getReapableDirs("recordings"), recordingsDir,
-                            namePrefixForCategory("recordings"), limitBytes, 0);
+                            namePrefixForCategory("recordings"), recordingsLimitMb * 1024 * 1024, 0);
                     }
                 }
             } catch (Exception e) {
@@ -4759,10 +5359,9 @@ public class StorageManager {
         if (toRun.contains(DEFERRED_SURVEILLANCE)) {
             try {
                 synchronized (surveillanceCleanupLock) {
-                    long limitBytes = surveillanceLimitMb * 1024 * 1024;
-                    if (getSurveillanceSize() > limitBytes) {
+                    if (scopedSizeForCategory("surveillance") > scopedLimitBytesForCategory("surveillance")) {
                         ensureSpace("surveillance", getReapableDirs("surveillance"), surveillanceDir,
-                            namePrefixForCategory("surveillance"), limitBytes, 0);
+                            namePrefixForCategory("surveillance"), surveillanceLimitMb * 1024 * 1024, 0);
                     }
                 }
             } catch (Exception e) {
@@ -4773,10 +5372,9 @@ public class StorageManager {
         if (toRun.contains(DEFERRED_PROXIMITY)) {
             try {
                 synchronized (proximityCleanupLock) {
-                    long limitBytes = proximityLimitMb * 1024 * 1024;
-                    if (getProximitySize() > limitBytes) {
+                    if (scopedSizeForCategory("proximity") > scopedLimitBytesForCategory("proximity")) {
                         ensureSpace("proximity", getReapableDirs("proximity"), proximityDir,
-                            namePrefixForCategory("proximity"), limitBytes, 0);
+                            namePrefixForCategory("proximity"), proximityLimitMb * 1024 * 1024, 0);
                     }
                 }
             } catch (Exception e) {
@@ -4787,10 +5385,9 @@ public class StorageManager {
         if (toRun.contains(DEFERRED_TRIPS)) {
             try {
                 synchronized (tripsCleanupLock) {
-                    long limitBytes = tripsLimitMb * 1024 * 1024;
-                    if (getTripsSize() > limitBytes) {
+                    if (scopedSizeForCategory("trips") > scopedLimitBytesForCategory("trips")) {
                         ensureSpace("trips", getReapableDirs("trips"), tripsDir,
-                            namePrefixForCategory("trips"), limitBytes, 0);
+                            namePrefixForCategory("trips"), tripsLimitMb * 1024 * 1024, 0);
                     }
                 }
             } catch (Exception e) {

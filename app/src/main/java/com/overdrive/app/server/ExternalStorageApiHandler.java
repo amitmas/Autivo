@@ -160,18 +160,32 @@ public class ExternalStorageApiHandler {
         
         try {
             JSONObject config = new JSONObject(body);
-            
+
+            // Batch the up-to-four field updates into ONE persist: apply each
+            // field without saving (the *NoSave setters clamp + mutate only),
+            // then saveConfig() once. Avoids four sequential UCM file-lock
+            // round-trips per POST. The monitoring side-effect of `enabled`
+            // (start/stopMonitoring) is decoupled from the persist and applied
+            // after the single save.
+            boolean enabledChanged = false;
+            boolean enabledValue = cleaner.isEnabled();
             if (config.has("enabled")) {
-                cleaner.setEnabled(config.getBoolean("enabled"));
+                enabledValue = config.getBoolean("enabled");
+                cleaner.setEnabledNoSave(enabledValue);
+                enabledChanged = true;
             }
             if (config.has("reservedSpaceMb")) {
-                cleaner.setReservedSpaceMb(config.getLong("reservedSpaceMb"));
+                cleaner.setReservedSpaceMbNoSave(config.getLong("reservedSpaceMb"));
             }
             if (config.has("protectedHours")) {
-                cleaner.setProtectedHours(config.getInt("protectedHours"));
+                cleaner.setProtectedHoursNoSave(config.getInt("protectedHours"));
             }
             if (config.has("minFilesKeep")) {
-                cleaner.setMinFilesKeep(config.getInt("minFilesKeep"));
+                cleaner.setMinFilesKeepNoSave(config.getInt("minFilesKeep"));
+            }
+            cleaner.saveConfig();
+            if (enabledChanged) {
+                cleaner.applyMonitoringState();
             }
             
             JSONObject response = new JSONObject();

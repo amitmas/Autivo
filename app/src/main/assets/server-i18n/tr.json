@@ -101,7 +101,12 @@
     "mqtt_not_initialized": "MQTT başlatılmamış",
     "max_connections_reached": "Maksimum bağlantılar ({0})",
     "missing_connection_id": "Kayıp bağlantı kimliği",
-    "connection_not_found": "Bağlantı bulunamadı: {0}"
+    "connection_not_found": "Bağlantı bulunamadı: {0}",
+    "update_invalid_channel": "Geçersiz güncelleme kanalı",
+    "update_channel_write_failed": "Güncelleme kanalı kaydedilemedi",
+    "update_channel_tag_mismatch": "Bu sürüm farklı bir kanalda. Önce kanalları değiştirin.",
+    "logs_upload_unavailable": "Bu yapıda günlük yükleme mevcut değil",
+    "logs_unknown_daemon": "Bilinmeyen arka plan programı. Deneyin: {0}"
   },
   "notifications": {
     "charging_started": "Şarj başladı .",

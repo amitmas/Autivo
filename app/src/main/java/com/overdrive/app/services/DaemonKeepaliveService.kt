@@ -134,7 +134,10 @@ class DaemonKeepaliveService : Service() {
         // disabled feature stays silent. The overlay itself only renders daemon-
         // published state, so showing it early just yields the idle/scanning pill.
         try {
-            if (com.overdrive.app.roadsense.config.RoadSenseConfig.snapshot(forceReload = true).enabled) {
+            // overlayShouldShow() also honours the user's overlayVisible opt-out (default
+            // ON) — a hidden overlay must stay hidden across a process respawn, not pop
+            // back just because the feature is enabled.
+            if (com.overdrive.app.roadsense.config.RoadSenseConfig.snapshot(forceReload = true).overlayShouldShow()) {
                 com.overdrive.app.roadsense.overlay.RoadSenseOverlayService.startIfPermitted(applicationContext)
             }
         } catch (e: Exception) {

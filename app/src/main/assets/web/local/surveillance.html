@@ -130,6 +130,22 @@
                         </div>
                         <div class="setting-hint" id="accOffModeHint" data-i18n="surveillance.accoff_hint_smart">Motion + AI gating. Recordings begin only when something moves and AI confirms a person, vehicle, or other relevant object.</div>
 
+                        <!-- Keep USB ports powered while parked. Default ON. Off lets
+                             ONLY the USB rail sleep on the next ACC-OFF cycle to save
+                             battery. Cameras / parked surveillance are unaffected. -->
+                        <div class="setting-row">
+                            <div class="setting-info">
+                                <div class="setting-name" data-i18n="surveillance.keep_usb_power">Keep USB powered while parked</div>
+                                <div class="setting-desc" data-i18n="surveillance.keep_usb_power_desc">Keeps the USB ports powered after the car is switched off (for example to charge a phone or power an accessory). Turn off to let the USB ports sleep and save the 12V battery. This does not affect the cameras — parked surveillance keeps running either way. Takes effect the next time the car is switched off.</div>
+                            </div>
+                            <div class="setting-control">
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="survKeepUsbPower" onchange="SurvSettings.toggleKeepUsbPower()">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                        </div>
+
                         <div class="info-box">
                             <div class="info-row"><span class="label" data-i18n="surveillance.status_label">Status</span><span class="value" id="survState" data-i18n="common.idle">Idle</span></div>
                             <div class="info-row">

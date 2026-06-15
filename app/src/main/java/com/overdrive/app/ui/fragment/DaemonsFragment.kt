@@ -66,7 +66,12 @@ class DaemonsFragment : Fragment() {
         daemonAdapter = DaemonAdapter(
             onToggle = { type, enabled -> onDaemonToggled(type, enabled) },
             onConfigureClick = { type -> onDaemonConfigureClicked(type) },
-            onDownloadLog = if (com.overdrive.app.BuildConfig.DEBUG) {
+            // Per-daemon log action is available in debug AND in the braveheart
+            // build (LOG_CAPTURE) — braveheart keeps DaemonLogger file output so
+            // customers can send logs. Plain release/alpha builds strip the
+            // calls, so the action stays hidden there.
+            onDownloadLog = if (com.overdrive.app.BuildConfig.DEBUG
+                    || com.overdrive.app.BuildConfig.LOG_CAPTURE) {
                 { type -> onDownloadLogClicked(type) }
             } else null
         )
@@ -425,6 +430,115 @@ class DaemonsFragment : Fragment() {
      * Uses tail to limit output size and avoid OOM on large log files.
      */
     private fun onDownloadLogClicked(type: DaemonType) {
+        val logPath = DaemonAdapter.getLogFilePath(type) ?: return
+        val ctx = context ?: return
+        val daemonName = type.displayName.replace(" ", "_").lowercase()
+        val localizedName = type.localizedName(ctx)
+
+        // In braveheart (LOG_CAPTURE) with a Worker URL configured, offer two
+        // ways to send: upload-and-get-a-code (zero-friction for support) or
+        // the existing Android share-sheet. Debug builds keep share-only.
+        if (com.overdrive.app.logging.LogUploader.isUploadConfigured()) {
+            val dialogView = LayoutInflater.from(ctx).inflate(R.layout.dialog_send_log, null)
+            dialogView.findViewById<TextView>(R.id.sendLogSubtitle)?.text =
+                getString(R.string.logs_send_subtitle, localizedName)
+
+            val dialog = com.google.android.material.dialog.MaterialAlertDialogBuilder(
+                ctx, R.style.Theme_Overdrive_M3_Dialog)
+                .setView(dialogView)
+                .setNegativeButton(android.R.string.cancel, null)
+                .create()
+
+            dialogView.findViewById<View>(R.id.optionUpload)?.setOnClickListener {
+                dialog.dismiss()
+                uploadDaemonLog(type, localizedName)
+            }
+            dialogView.findViewById<View>(R.id.optionShare)?.setOnClickListener {
+                dialog.dismiss()
+                shareDaemonLog(type)
+            }
+            dialog.show()
+            return
+        }
+        shareDaemonLog(type)
+    }
+
+    /**
+     * Upload a daemon log via the daemon-side IPC (UPLOAD_LOG → LogUploader →
+     * Cloudflare Worker) so the proxy-aware, redaction path runs in the daemon
+     * process that owns /data/local/tmp. Shows the returned short code.
+     */
+    private fun uploadDaemonLog(type: DaemonType, localizedName: String) {
+        val ctx = context ?: return
+        val daemonKey = DaemonAdapter.daemonLogKey(type) ?: run {
+            Toast.makeText(ctx, getString(R.string.toast_log_not_found), Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        // Indeterminate progress for the duration of the IPC (proxy + retry, up
+        // to ~35s). LogUploader reports no byte progress, so this is a spinner,
+        // not a percentage. Non-cancelable: the daemon-side upload runs to
+        // completion regardless, and a half-dismissed dialog would just drop the
+        // returned code on the floor.
+        val progressView = LayoutInflater.from(ctx).inflate(R.layout.dialog_log_uploading, null)
+        val progressDialog = com.google.android.material.dialog.MaterialAlertDialogBuilder(
+            ctx, R.style.Theme_Overdrive_M3_Dialog)
+            .setView(progressView)
+            .setCancelable(false)
+            .show()
+
+        Thread {
+            val req = org.json.JSONObject().apply {
+                put("command", "UPLOAD_LOG")
+                put("daemon", daemonKey)
+            }
+            // 35s > LogUploader worst case (proxy 12s + direct-retry 12s = 24s)
+            // so the IPC read never races a still-running upload.
+            val resp = com.overdrive.app.server.DaemonIpcClient.send(req, 35_000)
+            activity?.runOnUiThread {
+                progressDialog.dismiss()
+                if (!isAdded) return@runOnUiThread
+                val ctx2 = context ?: return@runOnUiThread
+                if (resp == null || !resp.optBoolean("success", false)) {
+                    val err = resp?.optString("error") ?: getString(R.string.errors_network)
+                    Toast.makeText(ctx2, getString(R.string.toast_log_save_failed, err), Toast.LENGTH_LONG).show()
+                    return@runOnUiThread
+                }
+                val code = resp.optString("code", "")
+                showLogUploadedDialog(ctx2, code)
+            }
+        }.start()
+    }
+
+    /**
+     * Result dialog for a successful log upload. The retrieval code is the
+     * payload, so it gets a prominent monospace card (tap the card OR the
+     * "Copy code" button to copy) instead of being buried in a prose message.
+     */
+    private fun showLogUploadedDialog(ctx: android.content.Context, code: String) {
+        val view = LayoutInflater.from(ctx).inflate(R.layout.dialog_log_uploaded, null)
+        view.findViewById<TextView>(R.id.uploadedCode)?.text = code
+
+        fun copyCode() {
+            val clip = ctx.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
+                as? android.content.ClipboardManager
+            clip?.setPrimaryClip(android.content.ClipData.newPlainText("log code", code))
+            Toast.makeText(ctx, R.string.toast_url_copied_short, Toast.LENGTH_SHORT).show()
+        }
+
+        val dialog = com.google.android.material.dialog.MaterialAlertDialogBuilder(
+            ctx, R.style.Theme_Overdrive_M3_Dialog)
+            .setView(view)
+            .setPositiveButton(R.string.logs_copy_code) { _, _ -> copyCode() }
+            .setNegativeButton(R.string.logs_done, null)
+            .show()
+
+        // Tapping the code card copies too (and keeps the dialog open so the
+        // user can still read the instructions / re-copy).
+        view.findViewById<View>(R.id.codeCard)?.setOnClickListener { copyCode() }
+    }
+
+    private fun shareDaemonLog(type: DaemonType) {
         val logPath = DaemonAdapter.getLogFilePath(type) ?: return
         val ctx = context ?: return
         val daemonName = type.displayName.replace(" ", "_").lowercase()

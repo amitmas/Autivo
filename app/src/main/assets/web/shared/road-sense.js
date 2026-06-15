@@ -38,6 +38,9 @@ BYD.roadSense = {
         crowdUpload: false,
         crowdDownload: false,
         syncWorkerUrl: '',
+        // Show the app-side floating pill/card on screen (default ON). Hiding it is
+        // display-only — detection/audio/crowdsource keep running daemon-side.
+        overlayVisible: true,
         // Blind Spot (separate UCM 'blindspot' section). enabled gates the
         // native indicator overlay; the 6 numerics are the stitch calibration.
         bsEnabled: false,
@@ -133,6 +136,9 @@ BYD.roadSense = {
                 if (typeof rs.crowdUpload === 'boolean') c.crowdUpload = rs.crowdUpload;
                 if (typeof rs.crowdDownload === 'boolean') c.crowdDownload = rs.crowdDownload;
                 if (typeof rs.syncWorkerUrl === 'string') c.syncWorkerUrl = rs.syncWorkerUrl;
+                // Default ON when the key is absent (existing installs) — only flip to
+                // hidden on an explicit stored false.
+                if (typeof rs.overlayVisible === 'boolean') c.overlayVisible = rs.overlayVisible;
             }
             // Blind Spot lives in its own top-level section.
             if (data && data.success && data.config && data.config.blindspot) {
@@ -209,6 +215,7 @@ BYD.roadSense = {
         this._setBadge('rsStatusBadge', c.enabled);
 
         this._setChecked('rsCalibrationMode', c.calibrationMode);
+        this._setChecked('rsOverlayVisible', c.overlayVisible);
 
         var inAppMap = (typeof window.AndroidBridge !== 'undefined'
             && typeof AndroidBridge.openHazardMap === 'function');
@@ -413,6 +420,30 @@ BYD.roadSense = {
         const ok = await this._save({ calibrationMode: on });
         if (ok) { this.config.calibrationMode = on; this._toastSaved(); }
         else { el.checked = !on; this._toastFailed(); }
+    },
+
+    /**
+     * Show/hide the app-side floating RoadSense overlay. Persists roadSense.
+     * overlayVisible (the daemon launch gate + the app onResume/keepalive gate both
+     * read it). Display-only: detection, audio warnings, and crowdsource keep running
+     * — so this never touches the master `enabled`. After persisting, nudge the native
+     * side (AndroidBridge.syncRoadSenseOverlay) so the pill/card appears or disappears
+     * immediately instead of on the next Activity onResume; no-op on a tunnel/browser
+     * where there's no native overlay to drive.
+     */
+    async toggleOverlayVisible() {
+        const el = document.getElementById('rsOverlayVisible');
+        if (!el) return;
+        const on = el.checked;
+        const ok = await this._save({ overlayVisible: on });
+        if (ok) {
+            this.config.overlayVisible = on;
+            if (typeof window.AndroidBridge !== 'undefined'
+                    && typeof AndroidBridge.syncRoadSenseOverlay === 'function') {
+                try { AndroidBridge.syncRoadSenseOverlay(); } catch (e) { /* best-effort */ }
+            }
+            this._toastSaved();
+        } else { el.checked = !on; this._toastFailed(); }
     },
 
     // Launch the native MapLibre hazard map via the AndroidBridge. In-app only

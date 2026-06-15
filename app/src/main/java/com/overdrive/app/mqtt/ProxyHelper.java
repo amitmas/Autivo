@@ -39,8 +39,23 @@ public class ProxyHelper {
     private static final String PROXY_HOST = "127.0.0.1";
     private static final int PROXY_PORT = 8119;
     private static final int TAILSCALE_PROXY_PORT = 8539;
-    private static final int PROBE_TIMEOUT_MS = 200;
-    private static final long CACHE_DURATION_MS = 60_000; // 60 seconds
+    // Loopback TCP connect budget. 200ms was too tight: a cold/loaded sing-box (or a
+    // probe issued while the proxy is still binding) could miss, and a SINGLE miss
+    // poisoned a whole minute (see the asymmetric cache below) → every map search /
+    // routing / tile fetch went DIRECT and timed out on in-car mobile data even though
+    // the proxy was actually up. 500ms is still trivial against a localhost listener
+    // (a refused connection returns immediately; only a genuinely slow accept waits).
+    private static final int PROBE_TIMEOUT_MS = 500;
+    // ASYMMETRIC cache (root-cause fix for "couldn't search routes while sing-box on"):
+    //   • a POSITIVE probe caches for CACHE_DURATION_MS — the proxy rarely vanishes
+    //     mid-drive, so we don't re-probe on every request.
+    //   • a NEGATIVE probe caches for only NEG_CACHE_DURATION_MS, so a TRANSIENT miss
+    //     self-heals within seconds instead of forcing NO_PROXY (→ direct → timeout)
+    //     for a full minute. connectFailed()/invalidateCache() still force an immediate
+    //     re-probe on a real failure; this just bounds the blast radius of a probe that
+    //     missed while the proxy was fine.
+    private static final long CACHE_DURATION_MS = 60_000;     // positive result: 60s
+    private static final long NEG_CACHE_DURATION_MS = 2_000;  // negative result: 2s
 
     private static volatile boolean proxyChecked = false;
     private static volatile boolean proxyAvailable = false;
@@ -50,13 +65,18 @@ public class ProxyHelper {
     private ProxyHelper() {} // Utility class
 
     /**
-     * Check if the sing-box proxy is available.
-     * Result is cached for 60 seconds.
+     * Check if the sing-box proxy is available. Result is cached — a POSITIVE result
+     * for {@link #CACHE_DURATION_MS}, a NEGATIVE result for only
+     * {@link #NEG_CACHE_DURATION_MS} so a transient probe miss doesn't strand traffic
+     * on the (timing-out) direct path for a full minute.
      */
     public static boolean isProxyAvailable() {
         long now = System.currentTimeMillis();
-        if (proxyChecked && (now - lastProbeTime) < CACHE_DURATION_MS) {
-            return proxyAvailable;
+        if (proxyChecked) {
+            long ttl = proxyAvailable ? CACHE_DURATION_MS : NEG_CACHE_DURATION_MS;
+            if ((now - lastProbeTime) < ttl) {
+                return proxyAvailable;
+            }
         }
 
         proxyChecked = true;

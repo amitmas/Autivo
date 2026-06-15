@@ -32,11 +32,16 @@ object ValhallaRouteClient {
     // Lazy so the OkHttpClient isn't built until the first route request.
     // Proxy-aware via MapNetworking (the BYOK endpoint is on the public internet,
     // so it must follow sing-box / Tailscale when present).
+    // connectTimeout widened 4s→8s for the PROXIED path (the sing-box CONNECT handshake
+    // on in-car mobile data needs more than 4s; the old budget tipped route requests
+    // into a connect timeout while the proxy was actually fine — part of the "can't
+    // search routes while sing-box on" report). readTimeout stays 10s (Valhalla compute
+    // round-trip); bounded so a hung endpoint still fails gracefully to an empty route.
     private val http: OkHttpClient by lazy {
         MapNetworking.builder()
-            .connectTimeout(4, TimeUnit.SECONDS)
+            .connectTimeout(8, TimeUnit.SECONDS)
             .readTimeout(10, TimeUnit.SECONDS)
-            .writeTimeout(5, TimeUnit.SECONDS)
+            .writeTimeout(8, TimeUnit.SECONDS)
             .retryOnConnectionFailure(false)
             .build()
     }
@@ -108,7 +113,8 @@ object ValhallaRouteClient {
      * @return ordered routes (primary first), or empty list on failure
      */
     fun routesWithAlternates(
-        startLat: Double, startLng: Double, endLat: Double, endLng: Double, alternates: Int
+        startLat: Double, startLng: Double, endLat: Double, endLng: Double, alternates: Int,
+        startHeading: Double? = null
     ): List<NavRoute> {
         return try {
             val cfg = NavMapConfig.fromUnifiedConfig()
@@ -119,7 +125,7 @@ object ValhallaRouteClient {
             }
 
             val url = buildRouteUrl(cfg.routingEndpoint, key)
-            val body = buildRequestBody(startLat, startLng, endLat, endLng, alternates)
+            val body = buildRequestBody(startLat, startLng, endLat, endLng, alternates, startHeading)
 
             val req = Request.Builder()
                 .url(url)
@@ -164,10 +170,19 @@ object ValhallaRouteClient {
      * @param endLng destination longitude (decimal degrees)
      */
     internal fun buildRequestBody(
-        startLat: Double, startLng: Double, endLat: Double, endLng: Double, alternates: Int = 0
+        startLat: Double, startLng: Double, endLat: Double, endLng: Double, alternates: Int = 0,
+        startHeading: Double? = null
     ): String {
         val locations = JSONArray()
-        locations.put(JSONObject().put("lat", startLat).put("lon", startLng))
+        val start = JSONObject().put("lat", startLat).put("lon", startLng)
+        // Origin heading: on a reroute the car is already moving in a direction —
+        // pass it (+tolerance) so Valhalla starts the new route IN that direction
+        // instead of demanding an immediate U-turn back onto the old path.
+        if (startHeading != null && !startHeading.isNaN()) {
+            start.put("heading", ((startHeading % 360.0) + 360.0) % 360.0)
+            start.put("heading_tolerance", 45)
+        }
+        locations.put(start)
         locations.put(JSONObject().put("lat", endLat).put("lon", endLng))
         val body = JSONObject()
             .put("locations", locations)
@@ -275,7 +290,13 @@ object ValhallaRouteClient {
                         lengthMeters = m.optDouble("length", 0.0) * 1000.0,
                         timeSeconds = m.optDouble("time", 0.0),
                         lat = mp.lat,
-                        lng = mp.lng
+                        lng = mp.lng,
+                        // Enrichment (all optional in Valhalla output):
+                        roundaboutExitCount = m.optInt("roundabout_exit_count", 0),
+                        bearingBefore = m.optInt("bearing_before", -1),
+                        bearingAfter = m.optInt("bearing_after", -1),
+                        verbalPre = m.optString("verbal_pre_transition_instruction", ""),
+                        verbalPost = m.optString("verbal_post_transition_instruction", "")
                     )
                 )
             }

@@ -163,13 +163,24 @@ public class TelegramApiHandler {
                 return;
             }
 
-            JSONObject botInfo = telegramGetMe(token);
-            if (botInfo == null) {
+            GetMeResult gm = telegramGetMe(token);
+            if (gm.result == null) {
                 response.put("success", false);
-                response.put("error", "Telegram getMe failed — check token + network");
+                // Distinguish "Telegram rejected the token" (the user's token is
+                // wrong/revoked) from "couldn't reach Telegram" (network/proxy)
+                // so the user knows what to fix instead of a vague combined msg.
+                if (gm.rejectedByTelegram) {
+                    response.put("error", gm.description != null && !gm.description.isEmpty()
+                            ? ("Telegram rejected this token: " + gm.description)
+                            : "Telegram rejected this token — check it's correct and not revoked");
+                } else {
+                    response.put("error", "Couldn't reach Telegram. Check the head unit's "
+                            + "internet/proxy connection and try again.");
+                }
                 HttpResponse.sendJson(out, response.toString());
                 return;
             }
+            JSONObject botInfo = gm.result;
 
             UnifiedTelegramConfig.setBotToken(
                     token,
@@ -299,34 +310,85 @@ public class TelegramApiHandler {
      * {@code result} object on success, or null on any failure. 5-second
      * connect / read timeout so a flaky network doesn't hang the HTTP worker.
      */
-    private static JSONObject telegramGetMe(String token) {
+    /**
+     * Outcome of a getMe validation. {@code result} non-null = success.
+     * {@code rejectedByTelegram} true = Telegram answered but said the token is
+     * bad (HTTP 401 / ok:false) — the user's token is wrong, NOT the network.
+     * false = we never got a verdict from Telegram (transport/proxy failure).
+     */
+    private static final class GetMeResult {
+        JSONObject result;          // non-null on success
+        boolean rejectedByTelegram; // true => token is bad (not a network issue)
+        String description;         // Telegram's "description" on rejection
+    }
+
+    private static GetMeResult telegramGetMe(String token) {
+        // Proxy-aware, mirroring AppUpdater + the Telegram DAEMON's own client:
+        // the head unit's egress to api.telegram.org usually REQUIRES the
+        // sing-box/Tailscale proxy (CN firmware / captive SIM). The previous
+        // bare url.openConnection() went DIRECT, so token validation failed
+        // even on a perfectly valid token whenever direct egress was blocked —
+        // while the daemon (which DOES proxy) worked fine once saved. Try the
+        // proxy first, then fall back to a direct attempt.
+        java.net.Proxy proxy = com.overdrive.app.mqtt.ProxyHelper.getHttpProxy();
+        boolean haveProxy = proxy != null && proxy.type() != java.net.Proxy.Type.DIRECT;
+
+        GetMeResult r = haveProxy ? getMeOnce(token, proxy) : null;
+        if (r != null && (r.result != null || r.rejectedByTelegram)) return r;
+        // Proxy attempt didn't reach a verdict (or no proxy): invalidate the
+        // shared probe cache (proxy may be down) and retry DIRECT.
+        if (haveProxy) com.overdrive.app.mqtt.ProxyHelper.invalidateCache();
+        GetMeResult direct = getMeOnce(token, java.net.Proxy.NO_PROXY);
+        return direct != null ? direct : new GetMeResult();
+    }
+
+    /**
+     * Single getMe attempt over an explicit proxy (or NO_PROXY). 10s
+     * connect/read (raised from 5s) since a proxied hop to Telegram can be
+     * slower than a direct one. Sets rejectedByTelegram when Telegram answers
+     * with a non-2xx or ok:false (definitive bad-token verdict).
+     */
+    private static GetMeResult getMeOnce(String token, java.net.Proxy proxy) {
+        GetMeResult out = new GetMeResult();
         HttpURLConnection conn = null;
         try {
             URL url = new URL("https://api.telegram.org/bot" + token + "/getMe");
-            conn = (HttpURLConnection) url.openConnection();
+            conn = (HttpURLConnection) (proxy != null
+                    ? url.openConnection(proxy)
+                    : url.openConnection());
             conn.setRequestMethod("GET");
-            conn.setConnectTimeout(5000);
-            conn.setReadTimeout(5000);
+            conn.setConnectTimeout(10000);
+            conn.setReadTimeout(10000);
             int code = conn.getResponseCode();
-            if (code != 200) {
-                logger.warn("getMe HTTP " + code);
-                return null;
+            String pl = (proxy != null ? proxy.type().toString() : "DIRECT");
+            // We GOT an HTTP response from Telegram — read the body either way
+            // so a 401/400 carries its "description".
+            java.io.InputStream in = (code >= 200 && code < 300)
+                    ? conn.getInputStream() : conn.getErrorStream();
+            String bodyStr = "";
+            if (in != null) {
+                java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+                byte[] buf = new byte[2048];
+                int n;
+                while ((n = in.read(buf)) >= 0) baos.write(buf, 0, n);
+                in.close();
+                bodyStr = baos.toString("UTF-8");
             }
-            java.io.InputStream in = conn.getInputStream();
-            java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
-            byte[] buf = new byte[2048];
-            int n;
-            while ((n = in.read(buf)) >= 0) baos.write(buf, 0, n);
-            in.close();
-            JSONObject json = new JSONObject(baos.toString("UTF-8"));
-            if (!json.optBoolean("ok", false)) {
-                logger.warn("getMe ok=false: " + json.optString("description", ""));
-                return null;
+            JSONObject json = bodyStr.isEmpty() ? new JSONObject() : new JSONObject(bodyStr);
+            if (code == 200 && json.optBoolean("ok", false)) {
+                out.result = json.getJSONObject("result");
+                return out;
             }
-            return json.getJSONObject("result");
+            // Telegram answered but rejected — definitive bad-token verdict.
+            out.rejectedByTelegram = true;
+            out.description = json.optString("description", "");
+            logger.warn("getMe rejected HTTP " + code + " (proxy=" + pl + "): " + out.description);
+            return out;
         } catch (Exception e) {
-            logger.warn("getMe exception: " + e.getMessage());
-            return null;
+            // Never reached a verdict — transport/proxy failure.
+            logger.warn("getMe exception (proxy="
+                    + (proxy != null ? proxy.type() : "DIRECT") + "): " + e.getMessage());
+            return out; // rejectedByTelegram stays false
         } finally {
             if (conn != null) try { conn.disconnect(); } catch (Exception ignored) {}
         }

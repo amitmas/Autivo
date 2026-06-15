@@ -245,6 +245,16 @@ public class GpsMonitor {
     public String getProvider() { return "sidecar"; }
     public boolean isMoving() { return speed > 1.0f; }
 
+    /**
+     * True while the current fix originated from the persisted cache file (loaded at
+     * daemon init) and has NOT yet been overwritten by a live IPC update. Such a fix
+     * may be from a previous drive/boot, so geo-tagging consumers must treat it as
+     * stale and decline to tag (a parked sentry clip should not inherit yesterday's
+     * address). Cleared the moment a real IPC update lands (see {@link #updateFromIpc}).
+     * Cheaper than {@link #getLocationJson()} for the recorder hot path.
+     */
+    public boolean isLoadedFromCache() { return loadedFromCache; }
+
     public boolean hasLocation() {
         return latitude != 0.0 || longitude != 0.0;
     }

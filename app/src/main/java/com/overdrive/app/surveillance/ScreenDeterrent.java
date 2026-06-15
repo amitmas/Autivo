@@ -210,6 +210,26 @@ public final class ScreenDeterrent {
     public void onMotionDetected() {
         if (!hotCacheEnabled) return;
 
+        // SAFETY (deterrent-while-driving): the deterrent renders a full-screen
+        // SurfaceControl layer at z=Integer.MAX_VALUE that occludes the ENTIRE
+        // head-unit (nav, reversing camera, controls). It must NEVER appear
+        // while ACC is on / the vehicle is in use. This is the load-bearing
+        // gate: it covers EVERY caller — the motion pipeline
+        // (SurveillanceEngineGpu), the /api/surveillance/screen-deterrent/test
+        // endpoint, and any future caller — instead of relying on the
+        // edge-driven screenDeterrentForceStop flag, which is only asserted on
+        // the ACC OFF→ON transition and is false during steady-state driving
+        // (so a deterrent triggered WHILE already driving had nothing stopping
+        // it). isAccOn() is a free volatile read. It can be stale-false in
+        // narrow windows (dead AccSentry, stalled IPC), but those self-heal via
+        // the ACC-on disarm watchdog's HAL probe which also refreshes this
+        // flag; this guard closes the common + steady-state cases that had NO
+        // guard at all. Fail-safe: if ACC is on, do not arm or render.
+        if (com.overdrive.app.monitor.AccMonitor.isAccOn()) {
+            logger.warn("Screen deterrent suppressed — ACC is ON (must never cover the screen while driving)");
+            return;
+        }
+
         long durationMs = hotCacheDurationSec * 1000L;
         long newDeadline = System.currentTimeMillis() + durationMs;
 
@@ -292,6 +312,17 @@ public final class ScreenDeterrent {
     // ── fire() — the executor-thread render loop ───────────────────────────
 
     private void fire() {
+        // SAFETY (deterrent-while-driving), defense-in-depth: onMotionDetected()
+        // enqueues fire() on the executor, so ACC could turn on in the gap
+        // between that check and this render. Re-check at the actual render
+        // moment — this is the last line before the z=MAX SurfaceControl layer
+        // is created. Zero the deadline so cleanup()'s sustained-motion
+        // re-enqueue loop can't keep re-firing into a driving window.
+        if (com.overdrive.app.monitor.AccMonitor.isAccOn()) {
+            logger.warn("Screen deterrent fire() aborted — ACC turned ON before render");
+            extendDeadlineMs.set(0);
+            return;
+        }
         Context ctx = resolveContext();
         if (ctx == null) {
             // Throttle: cleanup() re-enqueues onMotionDetected on sustained
@@ -429,6 +460,14 @@ public final class ScreenDeterrent {
      */
     private boolean shouldStop() {
         if (cancelled.get()) return true;
+        // SAFETY (deterrent-while-driving): tear down the in-flight layer the
+        // instant ACC reads ON, independent of the cross-process
+        // screenDeterrentForceStop flag. forceStop is only written on the ACC
+        // OFF→ON edge by AccSentryDaemon; if that daemon is dead/stalled at the
+        // transition, forceStop never flips and the loop would otherwise run to
+        // its deadline (up to 30s) over the live driving screen. A direct
+        // isAccOn() read here bounds that to one render tick (≤200ms).
+        if (com.overdrive.app.monitor.AccMonitor.isAccOn()) return true;
         long now = System.currentTimeMillis();
         long localDeadline = extendDeadlineMs.get();
         if (now >= localDeadline) return true;

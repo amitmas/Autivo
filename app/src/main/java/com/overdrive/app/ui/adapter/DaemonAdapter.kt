@@ -239,6 +239,23 @@ class DaemonAdapter(
                 DaemonType.TELEGRAM_DAEMON -> "/data/local/tmp/telegrambotdaemon.log"
             }
         }
+
+        /**
+         * Stable daemon KEY matching DaemonLogPaths (used by the braveheart log
+         * upload IPC). Kept in lockstep with getLogFilePath above.
+         */
+        fun daemonLogKey(type: DaemonType): String? {
+            return when (type) {
+                DaemonType.CAMERA_DAEMON -> "camera"
+                DaemonType.ACC_SENTRY_DAEMON -> "accsentry"
+                DaemonType.SENTRY_DAEMON -> "sentry"
+                DaemonType.TELEGRAM_DAEMON -> "telegram"
+                DaemonType.CLOUDFLARED_TUNNEL -> "cloudflared"
+                DaemonType.ZROK_TUNNEL -> "zrok"
+                DaemonType.TAILSCALE_TUNNEL -> "tailscale"
+                DaemonType.SINGBOX_PROXY -> "singbox"
+            }
+        }
     }
     
     private class DaemonDiffCallback : DiffUtil.ItemCallback<DaemonState>() {
