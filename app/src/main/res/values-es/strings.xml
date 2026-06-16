@@ -608,7 +608,7 @@
          notifications into one shade entry. The summary text is intentionally
          generic so it stays accurate whether all three services are running
          or only the keepalive survived an OOM respawn. -->
-    <string name="daemon_keepalive_notif_title">Sobredrive activo</string>
+    <string name="daemon_keepalive_notif_title">Overdrive activo</string>
     <string name="daemon_keepalive_notif_text">Monitoreo de sistemas de vehículos</string>
     <string name="overdrive_status_summary_title">Sobreunidad</string>
     <string name="overdrive_status_summary_text">Servicios en segundo plano ejecutándose</string>
