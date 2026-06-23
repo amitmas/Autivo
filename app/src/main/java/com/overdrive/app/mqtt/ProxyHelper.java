@@ -124,7 +124,7 @@ public class ProxyHelper {
      */
     public static Proxy getHttpProxy() {
         if (isProxyAvailable()) {
-            return new Proxy(Proxy.Type.HTTP, new InetSocketAddress(PROXY_HOST, proxyPort));
+            return new Proxy(Proxy.Type.SOCKS, new InetSocketAddress(PROXY_HOST, proxyPort));
         }
         return Proxy.NO_PROXY;
     }
