@@ -519,6 +519,10 @@ public class HttpServer {
                 if (!serveStaticFile(out, "local/charging.html")) {
                     HttpResponse.sendError(out, 404, "charging.html not found");
                 }
+            } else if (path.equals("/automations.html") || path.equals("/automations")) {
+                if (!serveStaticFile(out, "local/automations.html")) {
+                    HttpResponse.sendError(out, 404, "automations.html not found");
+                }
             } else if (path.equals("/vehicle-control.html") || path.equals("/vehicle-control")) {
                 if (!serveStaticFile(out, "local/vehicle-control.html")) {
                     HttpResponse.sendError(out, 404, "vehicle-control.html not found");
@@ -700,6 +704,11 @@ public class HttpServer {
         // MQTT API
         if (path.startsWith("/api/mqtt/")) {
             return MqttApiHandler.handle(method, path, body, out);
+        }
+
+        // Automations API
+        if (path.startsWith("/api/automations")) {
+            return AutomationApiHandler.handle(method, path, body, out);
         }
 
         // RoadSense API (delete-local / delete-cloud data actions)

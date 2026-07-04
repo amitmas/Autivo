@@ -217,6 +217,9 @@ public final class DaemonLogConfig {
     /** PerformanceApiHandler - performance API handler */
     public static final boolean PERFORMANCE_API_HANDLER = false;
 
+    /** Automations - Covers all automation logs */
+    public static final boolean AUTOMATIONS = false;
+
     // ==================== TAG LOOKUP ====================
     
     private static final Set<String> ENABLED_TAGS = new HashSet<>();
@@ -242,7 +245,7 @@ public final class DaemonLogConfig {
         || OVERLAY_RENDERER || TRIP_ANALYTICS || STORAGE_MANAGER
         || MQTT_CONNECTION_MANAGER || MQTT_PUBLISHER || MQTT_CONNECTION_STORE
         || EXTERNAL_STORAGE_CLEANER || HTTP_SERVER || SURVEILLANCE_IPC
-        || ABRP_API_HANDLER || PERFORMANCE_API_HANDLER;
+        || ABRP_API_HANDLER || PERFORMANCE_API_HANDLER || AUTOMATIONS;
     
     static {
         if (!ENABLE_ALL) {
@@ -309,6 +312,10 @@ public final class DaemonLogConfig {
             if (SURVEILLANCE_IPC)           ENABLED_TAGS.add("SurveillanceIPC");
             if (ABRP_API_HANDLER)           ENABLED_TAGS.add("AbrpApiHandler");
             if (PERFORMANCE_API_HANDLER)    ENABLED_TAGS.add("PerformanceApiHandler");
+            if (AUTOMATIONS) {
+                ENABLED_TAGS.add("Automations");
+                ENABLED_TAGS.add("AutomationAction");
+            }
         }
     }
 

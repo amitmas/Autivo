@@ -1,5 +1,7 @@
 package com.overdrive.app.byd;
 
+import com.overdrive.app.automation.condition.BydEvent;
+
 import org.json.JSONArray;
 import org.json.JSONObject;
 
@@ -885,7 +887,9 @@ public class BydVehicleData {
 
         public BydVehicleData build() {
             timestamp = System.currentTimeMillis();
-            return new BydVehicleData(this);
+            BydVehicleData data = new BydVehicleData(this);
+            BydEvent.bydEvent(data);
+            return data;
         }
     }
 }

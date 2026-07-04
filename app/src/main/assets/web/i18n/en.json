@@ -17,6 +17,7 @@
     "mqtt_title": "MQTT - OverDrive",
     "trips_title": "Trips - OverDrive",
     "charging_title": "Charging - OverDrive",
+    "automations_title": "Automations - OverDrive",
     "notifications_title": "Notifications - OverDrive",
     "vehicle_control_title": "Vehicle Control - OverDrive",
     "login_title": "Login - OverDrive",
@@ -38,6 +39,7 @@
     "charging": "Charging",
     "notifications": "Notifications",
     "vehicle_control": "Vehicle Control",
+    "automations": "Automations",
     "about": "About",
     "byd_cloud": "BYD Cloud",
     "integrations_group": "Integrations",
@@ -786,6 +788,21 @@
       "climb": "🏔️ Climb",
       "descent": "⬇️ Descent"
     }
+  },
+  "automation": {
+    "tab_automations": "Automations",
+    "tab_add": "Add",
+    "page_title": "Automations",
+    "empty_p": "No Automations configured. Add an automation.",
+    "add_automation": "Add Automation",
+    "edit_automation": "Edit Automation",
+    "save_automation": "Save Automation",
+    "failed_to_load_schema": "Failed to load Automation schema. Check connection to Overdrive.",
+    "invalid_form": "Please check the form has been correctly filled.",
+    "parse_error": "Failed to parse Automation.",
+    "add_row": "Add Row",
+    "extra_row": "And",
+    "toast_triggered": "Triggered Automation."
   },
   "recording": {
     "tab_status": "Status",

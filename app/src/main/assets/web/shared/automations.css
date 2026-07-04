@@ -1,0 +1,149 @@
+/*
+ * Overdrive — Automation visuals.
+ */
+
+.empty-state { text-align: center; padding: 48px 24px; color: var(--text-muted); }
+.empty-state svg { width: 48px; height: 48px; margin-bottom: 16px; opacity: 0.4; }
+.empty-state p { font-size: 14px; margin-bottom: 16px; }
+.icon-btn {
+    background: none; border: 1px solid var(--border-color); border-radius: 6px; padding: 6px;
+    color: var(--text-secondary); cursor: pointer; font-size: 12px;
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 32px; height: 32px; flex-shrink: 0;
+}
+.icon-btn svg { width: 16px; height: 16px; display: block; }
+.icon-btn:hover { background: var(--bg-elevated); color: var(--text-primary); }
+.icon-btn.danger { color: var(--danger); }
+.icon-btn.danger:hover { border-color: var(--danger); background: rgba(239,68,68,0.08); color: var(--danger); }
+
+.form-grid input, .form-grid select, .form-grid textarea {
+    padding: 10px 12px; background: var(--bg-elevated); border: 1px solid var(--border-color);
+    border-radius: 8px; color: var(--text-primary); font-size: 14px; font-family: 'Inter', sans-serif;
+}
+.form-grid .label {
+    font-size: 14px;
+    font-weight: 500;
+    display: flex;
+    align-items: center;
+    line-height: 1;
+}
+.form-grid .description {
+    font-size: 12px;
+    color: var(--text-muted);
+    line-height: 1;
+}
+.form-grid .section {
+    margin-bottom: 15px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--border-subtle);
+}
+.form-grid .invalid {
+    border: 1px solid var(--danger);
+}
+#formCard:has(.invalid) #saveBtn {
+    background: #374151;
+    cursor: not-allowed;
+}
+.form-grid .row {
+    display: flex;
+    flex-wrap: wrap;
+    margin: 5px 0px;
+}
+.form-grid .row .inputs {
+    display: flex;
+    flex-wrap: wrap;
+    margin-bottom: 5px;
+    flex: 1;
+}
+.form-grid .row .inputs > *, .form-grid .row > .input {
+    flex: 0 0 25%;
+    margin: 5px 0px;
+}
+.form-grid .row .inputs > textarea {
+    flex: 0 0 100%;
+    margin: 10px 0px;
+    min-height: 6em;
+    resize: vertical;
+}
+@media (max-width: 1279px) {
+    .form-grid .row .inputs > *, .form-grid .row > .input {
+        flex: 0 0 50%;
+    }
+}
+@media (max-width: 768px) {
+    .form-grid .row .inputs > *, .form-grid .row > .input {
+        flex: 0 0 100%;
+    }
+}
+.form-grid .row .inputs > .type-selector {
+    display: flex;
+    align-items: center;
+}
+.form-grid .row .inputs > .type-selector > .description-icon {
+    width: 20px;
+    height: 20px;
+    cursor: pointer;
+}
+.description-tooltip {
+    position: absolute;
+    background: var(--panel-overlay-bg-strong);
+    border: 1px solid var(--brand-primary);
+    border-radius: 12px;
+    padding: 12px 16px;
+    pointer-events: none;
+    opacity: 0;
+    z-index: 9999;
+    transition: opacity 0.15s;
+    min-width: 200px;
+    max-width: 260px;
+    backdrop-filter: blur(12px);
+    color: var(--text-primary);
+}
+.description-tooltip.visible {
+    opacity: 1;
+}
+.form-grid .row .inputs > .type-selector > .input {
+    flex: 1;
+}
+.form-grid .delete-container {
+    margin-left: auto;
+    align-items: center;
+    display: flex;
+    margin-bottom: 5px;
+}
+.form-grid .add-button {
+    margin-top: 10px;
+}
+#automationList .card.disabled {
+    opacity: 0.6;
+}
+#automationList .header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 14px 16px;
+    word-break: break-word;
+}
+#automationList .info {
+    flex: 1;
+    min-width: 0;
+}
+#automationList .actions {
+    display: flex;
+    gap: 6px;
+    flex-shrink: 0;
+}
+#automationList .body {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 16px 12px;
+    gap: 8px;
+}
+#automationList .status-text {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text-secondary);
+}

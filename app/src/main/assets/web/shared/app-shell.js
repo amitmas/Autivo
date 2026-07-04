@@ -50,6 +50,7 @@
         { href: 'vehicle-control.html', i18n: 'nav.vehicle_control', label: 'Vehicle Control', svg: '<rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>' },
         { href: 'trips.html',           i18n: 'nav.trips',           label: 'Trips',           svg: '<path d="M3 17h2v-7l4 4 4-4 4 4 4-4v7h2"/><path d="M4 5h16"/>' },
         { href: 'charging.html',        i18n: 'nav.charging',        label: 'Charging',        svg: '<path d="M13 2 L4 14 h7 l-1 8 9-12 h-7 z"/>', svgExtra: 'stroke-linecap="round" stroke-linejoin="round"' },
+        { href: 'automations.html',     i18n: 'nav.automations',     label: 'Automations',     svg: '<rect width="8" height="8" x="3" y="3" rx="2"/><path d="M7 11v4a2 2 0 0 0 2 2h4"/><rect width="8" height="8" x="13" y="13" rx="2"/>' },
 
         // ===== Integrations group ===== — mirrors the native Integrations
         // sub-page (Telegram, ABRP, MQTT, BYD Cloud).

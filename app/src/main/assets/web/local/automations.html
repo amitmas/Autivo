@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title data-i18n="app.automations_title">Automations - OverDrive</title>
+    <link rel="icon" type="image/webp" href="../shared/app-icon-dark.webp">
+    <script src="../shared/theme.js?v=5"></script>
+    <script src="../shared/app-shell.js"></script>
+    <!--
+      Bottom-tab manifest for Automations — three task-based tabs:
+        Automations — automation list (or empty-state with a CTA that switches to Add)
+        Add         — automation form, always visible; "Save" returns to Automations
+      No tab-bar action button: the form lives on its own tab so the Apply
+      pill stays clean. List item Edit switches to Add tab with the form
+      prefilled (handled in shared/automations.js).
+    -->
+    <script>
+        window.OT_TABS = [
+            { id: 'automations', label: 'Automations', i18n: 'automation.tab_automations', svg: '<rect width="8" height="8" x="3" y="3" rx="2"/><path d="M7 11v4a2 2 0 0 0 2 2h4"/><rect width="8" height="8" x="13" y="13" rx="2"/>', readOnly: true },
+            { id: 'add',         label: 'Add',         i18n: 'automation.tab_add',         svg: '<line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>', readOnly: true }
+        ];
+
+        // Helper used by automation.js to switch tabs after save / from list item Edit.
+        // Mirrors the click flow inside app-tabs.js so the localStorage active-tab
+        // record stays correct.
+        window.OT_setActiveTab = function (id) {
+            var btn = document.querySelector('.bottom-tabs .bottom-tab[data-tab-target="' + id + '"]');
+            if (btn) { btn.click(); return true; }
+            return false;
+        };
+    </script>
+    <script src="../shared/app-tabs.js"></script>
+    <link rel="stylesheet" href="../shared/styles.css?v=16">
+    <link rel="stylesheet" href="../shared/automations.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="app-layout">
+        <!-- Sidebar -->
+        <!-- App shell sidebar (rendered by ../shared/app-shell.js) -->
+        <div id="app-shell-mount"></div>
+        <!-- Main Content -->
+        <main class="main-content">
+            <div class="mobile-header">
+                <button class="menu-toggle" onclick="toggleSidebar()">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="4" x2="20" y1="12" y2="12"/><line x1="4" x2="20" y1="6" y2="6"/><line x1="4" x2="20" y1="18" y2="18"/></svg>
+                </button>
+                <span style="font-weight:600;" data-i18n="automation.page_title">Automations</span>
+                <div style="width:40px;"></div>
+            </div>
+
+            <header class="page-header">
+                <h1 class="page-title" data-i18n="automation.page_title">Automations</h1>
+                <!-- The form lives on the Add tab (see window.OT_TABS above);
+                     the empty-state below has a CTA that switches to it. -->
+            </header>
+
+            <div class="page-body">
+                <!-- Automation List -->
+                <div id="automationList" data-tab="automations"></div>
+
+                <!-- Empty State (Automations tab) — switches to Add tab on CTA click. -->
+                <div id="emptyState" class="card" data-tab="automations" style="display:none;">
+                    <div class="empty-state">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><rect width="8" height="8" x="3" y="3" rx="2"/><path d="M7 11v4a2 2 0 0 0 2 2h4"/><rect width="8" height="8" x="13" y="13" rx="2"/></svg>
+                        <p data-i18n="automation.empty_p">No Automations configured. Add an automation.</p>
+                        <button class="btn btn-primary" onclick="AutomationSettings.showForm(null, {})" data-i18n="automation.add_automation">Add Automation</button>
+                    </div>
+                </div>
+
+                <!-- Add / Edit Form (Add tab) — always rendered; the .footer-bar
+                     #btnApply isn't used here, the form has its own Save button. -->
+                <div id="formCard" class="card" data-tab="add">
+                    <div class="card-header">
+                        <div class="card-title">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+                            <span id="formTitle" data-i18n="automation.add_automation">Add Automation</span>
+                        </div>
+                    </div>
+                    <div class="card-body">
+                        <div class="form-grid" id="formGrid">
+
+                        </div>
+
+                        <div class="form-actions">
+                            <button class="btn btn-secondary" onclick="AutomationSettings.hideForm()" data-i18n="common.cancel">Cancel</button>
+                            <button id="saveBtn" class="btn btn-primary" onclick="AutomationSettings.saveForm()" data-i18n="automation.save_automation">Save Automation</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <div class="sidebar-overlay" id="sidebarOverlay" onclick="toggleSidebar()"></div>
+    <div id="toastContainer" class="toast-container"></div>
+
+    <script src="../shared/auth.js"></script>
+    <script src="../shared/core.js"></script>
+    <script src="../shared/update-flow.js"></script>
+    <script src="../shared/automations.js"></script>
+    <script>
+        function toggleSidebar() {
+            document.getElementById('sidebar').classList.toggle('open');
+            document.getElementById('sidebarOverlay').classList.toggle('show');
+        }
+        BYD.i18n.init().then(function () {
+            BYD.core.init();
+            AutomationSettings.init();
+        });
+    </script>
+</body>
+</html>
