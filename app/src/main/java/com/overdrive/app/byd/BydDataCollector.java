@@ -1756,7 +1756,18 @@ public class BydDataCollector {
             Object elecPct = BydDeviceHelper.callGetter(statisticDevice, "getElecPercentageValue");
             if (elecPct instanceof Number) {
                 double soc = ((Number) elecPct).doubleValue();
-                if (soc >= 0 && soc <= 100) b.socPercent(soc);
+                if (soc >= 0 && soc <= 100) {
+                    // The on-demand getter returns a COARSE (integer on this trim) SoC,
+                    // while the typed onElecPercentageChanged event carries the true
+                    // decimal. Don't let an integer poll clobber a fresher decimal that
+                    // rounds to the same whole number — otherwise SoC flickers
+                    // integer<->decimal every poll cycle. Take the poll only when it
+                    // actually moves the rounded value (or nothing has been set yet).
+                    double prevSoc = b.socPercent;
+                    if (Double.isNaN(prevSoc) || Math.round(prevSoc) != Math.round(soc)) {
+                        b.socPercent(soc);
+                    }
+                }
             }
             if (Double.isNaN(b.socPercent)) {
                 try {
@@ -3824,8 +3835,18 @@ public class BydDataCollector {
             logger.info("  Instrument listener registered (generic fallback)");
             count++;
         }
-        if (BydDeviceHelper.registerListener(statisticDevice, this::onGenericCallback)) {
-            logger.info("  Statistic listener registered");
+        // Statistic listener MUST be typed to receive onElecPercentageChanged(double)
+        // — the DECIMAL display SoC. It's a concrete method on
+        // AbsBYDAutoStatisticListener, not on the bare IBYDAutoListener marker
+        // interface, so the generic Proxy path can never deliver it (same class of
+        // bug as onExternalChargingPowerChanged above): SoC then only advanced on the
+        // slow getElecPercentageValue() poll (integer on this trim). Typed first;
+        // generic fallback kept for firmware exposing only the bare registerListener.
+        if (BydDeviceHelper.registerStatisticListener(statisticDevice, this::onGenericCallback)) {
+            logger.info("  Statistic listener registered (typed — decimal SoC)");
+            count++;
+        } else if (BydDeviceHelper.registerListener(statisticDevice, this::onGenericCallback)) {
+            logger.info("  Statistic listener registered (generic fallback)");
             count++;
         }
         if (BydDeviceHelper.registerListener(lightDevice, this::onLightsCallback)) {

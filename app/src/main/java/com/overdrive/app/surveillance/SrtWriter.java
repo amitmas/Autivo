@@ -282,6 +282,8 @@ public final class SrtWriter {
     public static final String K_PERSON_DETECTED   = "srt.person_detected";
     public static final String K_PERSON_CLOSE      = "srt.person_close";
     public static final String K_VEHICLE_DETECTED  = "srt.vehicle_detected";
+    public static final String K_BIKE_DETECTED     = "srt.bike_detected";
+    public static final String K_ANIMAL_DETECTED   = "srt.animal_detected";
     public static final String K_MOTION_STARTED    = "srt.motion_started";
     public static final String K_MOTION_ENDED      = "srt.motion_ended";
     public static final String K_PROXIMITY_RED     = "srt.proximity_red";

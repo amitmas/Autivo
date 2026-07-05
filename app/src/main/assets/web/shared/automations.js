@@ -1,14 +1,40 @@
+/*
+ * Overdrive — Automations UI controller.
+ *
+ * ES5 / Chrome 58 floor (BYD DiLink head-unit WebView, Android 7.1). Assets
+ * ship raw — there is NO transpile/build step — so this file must parse and
+ * run on Chrome 58. In particular:
+ *   - No optional chaining (?.) / nullish coalescing (??) — both are Chrome 80+.
+ *     A single one anywhere aborts the ENTIRE script at parse time, which is
+ *     what left the tab blank and every onclick handler dead.
+ *   - No Array.flat / Object.fromEntries / String.replaceAll (Chrome 90+),
+ *     no class fields / private #fields, no numeric separators, no
+ *     optional-catch-binding (`catch {}` — needs `catch (e) {}`).
+ *   - const/let, arrow functions, template literals, for...of, Array.from,
+ *     Promise and fetch ARE fine on Chrome 58.
+ * Mutating network calls (POST/PUT/DELETE) MUST use fetch() — XHR request
+ * bodies are silently dropped on this WebView.
+ */
 
 window.BYD = window.BYD || {};
 
 const triggerIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 5a2 2 0 0 1 3.008-1.728l11.997 6.998a2 2 0 0 1 .003 3.458l-12 7A2 2 0 0 1 5 19z"/></svg>';
 const editIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>';
 const deleteIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>';
-const infoIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg>'
+const infoIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg>';
+
+// Automation ids and the schema section ids are user / server supplied. They
+// are safe to interpolate into text, but NOT into class names (a leading
+// digit, space, or punctuation throws a DOMException from classList.add) and
+// NOT into URLs without percent-encoding. Sanitize to a token for class use;
+// encodeURIComponent for URL path segments.
+function sanitizeToken(value) {
+    return String(value == null ? '' : value).replace(/[^a-zA-Z0-9_-]/g, '_');
+}
 
 BYD.automations = {
     automations: {},
-    schema: {},
+    schema: [],
     formData: {},
     editingId: null,
 
@@ -50,18 +76,29 @@ BYD.automations = {
         this.renderForm();
     },
 
+    // The schema is an ordered list of sections. Normalize whatever the
+    // server returns (array, or an empty/failed object) to an array so the
+    // rest of the code can iterate it consistently.
+    schemaSections() {
+        if (Array.isArray(this.schema)) return this.schema;
+        return [];
+    },
+
     render() {
         const list = document.getElementById('automationList');
         const empty = document.getElementById('emptyState');
+        const head = document.getElementById('listHead');
         if (!list || !empty) return;
 
         if (Object.keys(this.automations).length === 0) {
             list.innerHTML = '';
             empty.style.display = 'block';
+            if (head) head.style.display = 'none';
             return;
         }
 
         empty.style.display = 'none';
+        if (head) head.style.display = '';
         list.innerHTML = '';
         for (let [key, automation] of Object.entries(this.automations)) {
             list.append(this.createAutomationElement(key, automation));
@@ -69,59 +106,68 @@ BYD.automations = {
     },
 
     createAutomationElement(key, automation) {
+        // Never interpolate the raw id into a class name — a key with a
+        // leading digit / space / punctuation throws a DOMException from
+        // classList.add. Sanitize to a token, and stash the real id on a
+        // data-attribute for anything that needs it back.
+        const token = sanitizeToken(key);
         const automationDiv = document.createElement('div');
-        automationDiv.classList.add(`${key}-card`, 'card', automation.disabled ? 'disabled': 'enabled');
+        automationDiv.classList.add(token + '-card', 'card', automation.disabled ? 'disabled' : 'enabled');
+        automationDiv.setAttribute('data-automation-id', key);
 
         const automationHeader = document.createElement('div');
-        automationHeader.classList.add(`${key}-header`, 'header');
+        automationHeader.classList.add(token + '-header', 'header');
         automationDiv.append(automationHeader);
 
         const automationInfo = document.createElement('div');
-        automationInfo.classList.add(`${key}-info`, 'info');
+        automationInfo.classList.add(token + '-info', 'info');
         automationInfo.innerHTML = this.buildAutomationText(automation);
         automationHeader.append(automationInfo);
 
         const automationActions = document.createElement('div');
-        automationActions.classList.add(`${key}-actions`, 'actions');
+        automationActions.classList.add(token + '-actions', 'actions');
         automationHeader.append(automationActions);
 
         const triggerBtn = document.createElement('button');
-        triggerBtn.classList.add(`${key}-action`, 'action', 'icon-btn');
+        triggerBtn.classList.add(token + '-action', 'action', 'icon-btn');
+        triggerBtn.title = BYD.i18n.t('automation.trigger');
         triggerBtn.innerHTML = triggerIcon;
         triggerBtn.addEventListener('click', () => this.triggerAutomation(key));
         automationActions.append(triggerBtn);
 
         const editBtn = document.createElement('button');
-        editBtn.classList.add(`${key}-action`, 'action', 'icon-btn');
+        editBtn.classList.add(token + '-action', 'action', 'icon-btn');
+        editBtn.title = BYD.i18n.t('automation.edit_automation');
         editBtn.innerHTML = editIcon;
         editBtn.addEventListener('click', () => this.showForm(key, automation));
         automationActions.append(editBtn);
 
         const deleteBtn = document.createElement('button');
-        deleteBtn.classList.add(`${key}-action`, 'action', 'icon-btn', 'danger');
+        deleteBtn.classList.add(token + '-action', 'action', 'icon-btn', 'danger');
+        deleteBtn.title = BYD.i18n.t('common.delete');
         deleteBtn.innerHTML = deleteIcon;
         deleteBtn.addEventListener('click', () => this.deleteAutomation(key));
         automationActions.append(deleteBtn);
 
         const automationBody = document.createElement('div');
-        automationBody.classList.add(`${key}-body`, 'body');
+        automationBody.classList.add(token + '-body', 'body');
         automationDiv.append(automationBody);
 
         const statusText = document.createElement('div');
-        statusText.classList.add(`${key}-status-text`, 'status-text');
+        statusText.classList.add(token + '-status-text', 'status-text');
         automationBody.append(statusText);
 
         const statusDot = document.createElement('span');
-        statusDot.classList.add(`${key}-status-dot`, 'status-dot', automation.disabled ? 'off' : 'connected');
+        statusDot.classList.add(token + '-status-dot', 'status-dot', automation.disabled ? 'off' : 'connected');
         statusText.append(statusDot);
 
         const statusMessage = document.createElement('span');
-        statusText.classList.add(`${key}-status-message`, 'status-message');
-        statusMessage.innerHTML = BYD.i18n.t(`common.${automation.disabled ? 'disabled' : 'enabled'}`);
+        statusMessage.classList.add(token + '-status-message', 'status-message');
+        statusMessage.textContent = BYD.i18n.t('common.' + (automation.disabled ? 'disabled' : 'enabled'));
         statusText.append(statusMessage);
 
         const statusToggle = document.createElement('label');
-        statusToggle.classList.add(`${key}-toggle-switch`, 'toggle-switch');
+        statusToggle.classList.add(token + '-toggle-switch', 'toggle-switch');
         automationBody.append(statusToggle);
 
         const statusCheckbox = document.createElement('input');
@@ -131,46 +177,59 @@ BYD.automations = {
         statusToggle.append(statusCheckbox);
 
         const statusSlider = document.createElement('span');
-        statusSlider.classList.add(`${key}-toggle-slider`, 'toggle-slider');
+        statusSlider.classList.add(token + '-toggle-slider', 'toggle-slider');
         statusToggle.append(statusSlider);
 
         return automationDiv;
     },
 
     buildAutomationText(automation) {
-        if (!this.schema) return BYD.i18n.t('automation.failed_to_load_schema');
+        const sections = this.schemaSections();
+        if (!sections.length) return BYD.i18n.t('automation.failed_to_load_schema');
 
         let result = '';
         try {
-            for (const section of this.schema) {
-                if (section.options?.length) {
-                    const sectionData = automation[section.id] ?? [];
+            for (const section of sections) {
+                if (section.options && section.options.length) {
+                    const sectionData = (automation[section.id] != null) ? automation[section.id] : [];
                     for (let i = 0; i < sectionData.length; i++) {
+                        const entry = sectionData[i] || {};
                         result += i === 0 ? section.label : BYD.i18n.t('automation.extra_row');
                         result += ' ';
-                        const data = section.options.find(option => option.id === sectionData[i].type);
+                        const data = section.options.find(option => option.id === entry.type);
+                        if (!data) continue;
                         result += data.label + ' ';
-                        if (data.variables?.length) result += '(';
-                        for (const variable of data.variables ?? []) {
-                            const option = variable.options && variable.options.find(option => option.id === sectionData[i].variables[variable.id]);
-                            result += variable.label + '=' + (option?.label ?? sectionData[i].variables[variable.id]) + ',';
+                        const dataVars = (data.variables && data.variables.length) ? data.variables : [];
+                        const entryVars = entry.variables || {};
+                        if (dataVars.length) result += '(';
+                        for (const variable of dataVars) {
+                            const rawVal = entryVars[variable.id];
+                            const option = variable.options && variable.options.find(o => o.id === rawVal);
+                            result += variable.label + '=' + ((option && option.label != null) ? option.label : rawVal) + ',';
                         }
-                        if (data.variables?.length) result = result.slice(0, result.length - 1) + ') ';
+                        if (dataVars.length) result = result.slice(0, result.length - 1) + ') ';
 
                         if (data.comparator && data.value) {
+                            // `variable` is a STRING here ('comparator' | 'value'),
+                            // NOT an object with an .id — the option/value both
+                            // live directly at entry[variable] (e.g. entry.comparator),
+                            // not under entry.variables. Reading entry.variables[variable.id]
+                            // (the old bug) yielded `undefined` for every comparator/value.
                             for (const variable of ['comparator', 'value']) {
-                                const option = data[variable].options && data[variable].options.find(option => option.id === sectionData[i][variable]);
-                                result += (option?.label ?? sectionData[i].variables[variable.id]) + ' ';
+                                const rawVal = entry[variable];
+                                const spec = data[variable];
+                                const option = spec && spec.options && spec.options.find(o => o.id === rawVal);
+                                result += ((option && option.label != null) ? option.label : rawVal) + ' ';
                             }
                         }
                     }
                 } else {
                     result += section.label + '=' + automation[section.id];
                 }
-                result += '<br>'
+                result += '<br>';
             }
-        } catch(e) {
-            return BYD.i18n.t('automation.parse_error')
+        } catch (e) {
+            return BYD.i18n.t('automation.parse_error');
         }
         return result;
     },
@@ -179,24 +238,31 @@ BYD.automations = {
         const grid = document.getElementById('formGrid');
         if (!grid) return;
 
-        if (Object.keys(this.schema).length === 0) {
-            grid.innerHTML = BYD.i18n.t('automation.failed_to_load_schema');
+        const sections = this.schemaSections();
+        if (!sections.length) {
+            grid.innerHTML = '';
+            const msg = document.createElement('div');
+            msg.classList.add('form-empty');
+            msg.textContent = BYD.i18n.t('automation.failed_to_load_schema');
+            grid.append(msg);
             return;
         }
 
         grid.innerHTML = '';
-        for (let section of this.schema) {
+        for (let section of sections) {
             grid.append(this.createSection(section));
         }
     },
 
     createSection(section) {
+        const token = sanitizeToken(section.id);
         const sectionDiv = document.createElement('div');
-        sectionDiv.classList.add(`${section.id}-section`, 'section');
+        sectionDiv.classList.add(token + '-section', 'section');
 
-        if (section.options?.length) {
+        if (section.options && section.options.length) {
+            const required = (section.required != null) ? section.required : 0;
             if (!this.formData[section.id]) this.formData[section.id] = [];
-            while (this.formData[section.id].length < (section.required ?? 0)) this.formData[section.id].push({});
+            while (this.formData[section.id].length < required) this.formData[section.id].push({});
             sectionDiv.append(this.createRowLabel(section));
             if (section.description) {
                 sectionDiv.append(this.createRowDescription(section));
@@ -206,12 +272,13 @@ BYD.automations = {
                     sectionDiv.append(this.createRowLabel({ id: section.id, label: BYD.i18n.t('automation.extra_row') }));
                 }
                 const row = this.createRow(section, i);
-                if (this.formData[section.id].length > (section.required ?? 0)) {
+                if (this.formData[section.id].length > required) {
                     const deleteContainer = document.createElement('div');
-                    deleteContainer.classList.add(`${section.id}-delete-container`, 'delete-container');
+                    deleteContainer.classList.add(token + '-delete-container', 'delete-container');
 
                     const deleteBtn = document.createElement('button');
-                    deleteBtn.classList.add(`${section.id}-delete`, 'delete', 'icon-btn', 'danger');
+                    deleteBtn.classList.add(token + '-delete', 'delete', 'icon-btn', 'danger');
+                    deleteBtn.title = BYD.i18n.t('automation.delete_row');
                     deleteBtn.innerHTML = deleteIcon;
                     deleteBtn.addEventListener('click', () => {
                         this.formData[section.id].splice(i, 1);
@@ -226,8 +293,8 @@ BYD.automations = {
                 sectionDiv.append(this.createRowElement(section));
             }
             const addBtn = document.createElement('button');
-            addBtn.classList.add('btn', 'btn-secondary', `${section.id}-add-button`, 'add-button');
-            addBtn.innerHTML = `${BYD.i18n.t('automation.add_row')} +`;
+            addBtn.classList.add('btn', 'btn-secondary', token + '-add-button', 'add-button');
+            addBtn.innerHTML = BYD.i18n.t('automation.add_row') + ' +';
             addBtn.addEventListener('click', () => {
                 this.formData[section.id].push({});
                 this.renderForm();
@@ -239,7 +306,8 @@ BYD.automations = {
                 sectionDiv.append(this.createRowDescription(section));
             }
             const row = this.createRowElement(section);
-            row.append(this.createInput(section, this.formData[section.id] ?? section.min, (element, value) => {
+            const initial = (this.formData[section.id] != null) ? this.formData[section.id] : section.min;
+            row.append(this.createInput(section, initial, (element, value) => {
                 this.formData[section.id] = value;
             }));
             sectionDiv.append(row);
@@ -248,12 +316,13 @@ BYD.automations = {
     },
 
     createRow({ id, label, options }, index) {
+        const token = sanitizeToken(id);
         const row = this.createRowElement({ id });
         const inputs = document.createElement('div');
-        inputs.classList.add(`${id}-inputs`, 'inputs');
+        inputs.classList.add(token + '-inputs', 'inputs');
 
         const typeSelectorContainer = document.createElement('div');
-        typeSelectorContainer.classList.add(`${id}-type-selector`, 'type-selector');
+        typeSelectorContainer.classList.add(token + '-type-selector', 'type-selector');
 
         const eventListener = (element, value, selected) => {
             inputs.querySelectorAll('.variable-input').forEach(input => input.remove());
@@ -262,7 +331,7 @@ BYD.automations = {
             if (!this.formData[id][index].variables) this.formData[id][index].variables = {};
             if (selected.description) {
                 const icon = document.createElement('div');
-                icon.classList.add(`${id}-description-tooltip`, 'description-icon');
+                icon.classList.add(token + '-description-tooltip', 'description-icon');
                 icon.innerHTML = infoIcon;
                 icon.addEventListener('mouseover', () => {
                     const currentPosition = icon.getBoundingClientRect();
@@ -271,11 +340,12 @@ BYD.automations = {
                 icon.addEventListener('mouseout', () => this.hideDescriptionTooltip());
                 typeSelectorContainer.append(icon);
             }
-            for (const variable of selected.variables ?? []) {
+            const selectedVars = (selected.variables && selected.variables.length) ? selected.variables : [];
+            for (const variable of selectedVars) {
                 const variableSelector = this.createInput(variable, this.formData[id][index].variables[variable.id], (element, value) => {
                     this.formData[id][index].variables[variable.id] = value;
                 });
-                variableSelector.classList.add(`${id}-input`, 'variable-input');
+                variableSelector.classList.add(token + '-input', 'variable-input');
                 inputs.append(variableSelector);
             }
             if (selected.comparator && selected.value) {
@@ -283,11 +353,11 @@ BYD.automations = {
                     const selector = this.createInput(selected[variable], this.formData[id][index][variable], (element, value) => {
                         this.formData[id][index][variable] = value;
                     });
-                    selector.classList.add(`${id}-input`, 'variable-input', variable);
+                    selector.classList.add(token + '-input', 'variable-input', variable);
                     inputs.append(selector);
                 }
             }
-        }
+        };
 
         const typeSelector = this.createEnumInput(this.getTypeEnum(id, options), this.formData[id][index].type, eventListener);
         typeSelectorContainer.prepend(typeSelector);
@@ -301,13 +371,13 @@ BYD.automations = {
 
     createRowElement({ id }) {
         const row = document.createElement('div');
-        row.classList.add(`${id}-row`, 'row');
+        row.classList.add(sanitizeToken(id) + '-row', 'row');
         return row;
     },
 
     createRowLabel({ id, label }) {
         const rowLabel = document.createElement('span');
-        rowLabel.classList.add(`${id}-label`, 'label');
+        rowLabel.classList.add(sanitizeToken(id) + '-label', 'label');
         rowLabel.textContent = label;
 
         return rowLabel;
@@ -315,7 +385,7 @@ BYD.automations = {
 
     createRowDescription({ id, description }) {
         const rowDescription = document.createElement('span');
-        rowDescription.classList.add(`${id}-description`, 'description');
+        rowDescription.classList.add(sanitizeToken(id) + '-description', 'description');
         rowDescription.textContent = description;
 
         return rowDescription;
@@ -328,7 +398,7 @@ BYD.automations = {
             tooltip.classList.add('description-tooltip');
             document.body.append(tooltip);
         }
-        tooltip.innerHTML = description;
+        tooltip.textContent = description;
         tooltip.style.left = x + 'px';
         tooltip.style.top = y + 'px';
         const position = tooltip.getBoundingClientRect();
@@ -351,10 +421,10 @@ BYD.automations = {
     getTypeEnum(id, options) {
         return {
             type: 'enum',
-            label: 'Select',
+            label: BYD.i18n.t('automation.select'),
             id,
             options,
-        }
+        };
     },
 
     createInput(data, defaultValue, eventListener) {
@@ -362,7 +432,21 @@ BYD.automations = {
             case 'enum': return this.createEnumInput(data, defaultValue, eventListener);
             case 'string': return this.createStringInput(data, defaultValue, eventListener);
             case 'int': return this.createIntInput(data, defaultValue, eventListener);
+            default: return this.createFallbackInput(data);
         }
+    },
+
+    // An unknown input type used to return `undefined`, and the caller then
+    // did row.append(undefined) → TypeError, which aborted the whole form
+    // render. Return a disabled, clearly-inert field instead so one unknown
+    // type can't blank the entire form.
+    createFallbackInput(data) {
+        const input = document.createElement('input');
+        input.classList.add('input', 'unknown');
+        input.type = 'text';
+        input.disabled = true;
+        input.placeholder = (data && data.label != null) ? data.label : BYD.i18n.t('automation.unsupported_input');
+        return input;
     },
 
     createEnumInput(data, defaultValue, eventListener) {
@@ -375,7 +459,8 @@ BYD.automations = {
         placeholder.selected = true;
         placeholder.hidden = true;
         selector.append(placeholder);
-        for (const option of data.options) {
+        const options = data.options || [];
+        for (const option of options) {
             const optionElement = document.createElement('option');
             optionElement.value = option.id;
             optionElement.textContent = option.label;
@@ -384,21 +469,21 @@ BYD.automations = {
         if (defaultValue) selector.value = defaultValue;
         // Add invalid class if the selected option is not within the options list
         const changeEvent = () => {
-            const selected = data.options.find(option => option.id === selector.value);
+            const selected = options.find(option => option.id === selector.value);
             if (selected) {
                 selector.classList.toggle('invalid', false);
                 if (eventListener) eventListener(selector, selector.value, selected);
             } else {
                 selector.classList.toggle('invalid', true);
             }
-        }
+        };
         selector.addEventListener('change', changeEvent);
         changeEvent();
         return selector;
     },
 
     createStringInput(data, defaultValue, eventListener) {
-        const maxLength = data.maxLength ?? 2147483647;
+        const maxLength = (data.maxLength != null) ? data.maxLength : 2147483647;
         const input = document.createElement(maxLength <= 30 ? 'input' : 'textarea');
         input.classList.add('input', 'string');
         input.placeholder = data.label;
@@ -412,7 +497,7 @@ BYD.automations = {
             } else {
                 input.classList.toggle('invalid', true);
             }
-        }
+        };
         input.addEventListener('change', changeEvent);
         changeEvent();
         return input;
@@ -423,19 +508,21 @@ BYD.automations = {
         input.classList.add('input', 'int');
         input.type = 'number';
         input.placeholder = data.label;
-        input.min = data.min ?? 0;
-        input.max = data.max ?? 2147483647;
-        if (!isNaN(defaultValue)) input.value = defaultValue;
+        const min = (data.min != null) ? data.min : 0;
+        const max = (data.max != null) ? data.max : 2147483647;
+        input.min = min;
+        input.max = max;
+        if (defaultValue != null && !isNaN(defaultValue)) input.value = defaultValue;
         // Add invalid class if the selected value is not within the min and max
         const changeEvent = () => {
-            const value = parseInt(input.value);
-            if (!isNaN(value) && value >= data.min && value <= data.max) {
+            const value = parseInt(input.value, 10);
+            if (!isNaN(value) && value >= min && value <= max) {
                 input.classList.toggle('invalid', false);
                 if (eventListener) eventListener(input, value);
             } else {
                 input.classList.toggle('invalid', true);
             }
-        }
+        };
         input.addEventListener('change', changeEvent);
         changeEvent();
         return input;
@@ -445,9 +532,23 @@ BYD.automations = {
         if (typeof window.OT_setActiveTab === 'function') window.OT_setActiveTab(id);
     },
 
-    showForm(id, formData) {
+    _syncSaveDisabled() {
+        // :has() is Chrome 105+ (the head-unit WebView is Chrome 58), so the
+        // "disable Save while the form has an invalid field" affordance can't
+        // live in CSS. Reflect it onto the button here instead — called after
+        // every render and whenever a field's validity may have changed.
+        const saveBtn = document.getElementById('saveBtn');
+        if (!saveBtn) return;
+        const hasInvalid = document.querySelectorAll('.form-grid .invalid').length > 0;
+        saveBtn.classList.toggle('is-disabled', hasInvalid);
+    },
+
+    showForm(id, automation) {
         this.editingId = id;
-        this.formData = formData;
+        // Deep-clone the source automation so editing the form does NOT mutate
+        // the cached list item in place (which would survive until reload and
+        // make Cancel a no-op). A fresh add starts from an empty object.
+        this.formData = automation ? JSON.parse(JSON.stringify(automation)) : {};
         var titleEl = document.getElementById('formTitle');
         if (titleEl) {
             if (id) {
@@ -457,6 +558,7 @@ BYD.automations = {
             }
         }
         this.renderForm();
+        this._syncSaveDisabled();
         this._switchTab('add');
     },
 
@@ -472,7 +574,10 @@ BYD.automations = {
             this.toast(BYD.i18n.t('automation.invalid_form'), 'error');
         } else {
             try {
-                const resp = await fetch(`/api/automations/automation${this.editingId ? '/' + this.editingId : ''}`, {
+                const path = this.editingId
+                    ? '/api/automations/automation/' + encodeURIComponent(this.editingId)
+                    : '/api/automations/automation';
+                const resp = await fetch(path, {
                     method: this.editingId ? 'PUT' : 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(this.formData)
@@ -483,38 +588,38 @@ BYD.automations = {
                     this.hideForm();
                     return this.toast(BYD.i18n.t('toast.saved'), 'success');
                 }
-            } catch(e) {}
+            } catch (e) {}
             this.toast(BYD.i18n.t('errors.save_failed'), 'error');
         }
     },
 
     async triggerAutomation(key) {
         try {
-            const resp = await fetch(`/api/automations/test/${key}`, { method: 'POST' });
+            const resp = await fetch('/api/automations/test/' + encodeURIComponent(key), { method: 'POST' });
             const result = await resp.json();
             if (result.success) {
                 return this.toast(BYD.i18n.t('automation.toast_triggered'), 'success');
             }
-        } catch(e) {}
+        } catch (e) {}
         this.toast(BYD.i18n.t('errors.generic'), 'error');
     },
 
     async deleteAutomation(key) {
         if (!confirm(BYD.i18n.t('confirm.delete'))) return;
         try {
-            const resp = await fetch(`/api/automations/automation/${key}`, { method: 'DELETE' });
+            const resp = await fetch('/api/automations/automation/' + encodeURIComponent(key), { method: 'DELETE' });
             const result = await resp.json();
             if (result.success) {
                 await this.loadAutomations();
                 return this.toast(BYD.i18n.t('toast.deleted'), 'success');
             }
-        } catch(e) {}
+        } catch (e) {}
         this.toast(BYD.i18n.t('errors.delete_failed'), 'error');
     },
 
     async disableAutomation(key, disabled) {
         try {
-            const resp = await fetch(`/api/automations/disable/${key}`, {
+            const resp = await fetch('/api/automations/disable/' + encodeURIComponent(key), {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ disabled })
@@ -522,10 +627,12 @@ BYD.automations = {
             const result = await resp.json();
             if (result.success) {
                 await this.loadAutomations();
-                this.hideForm();
                 return this.toast(BYD.i18n.t('toast.saved'), 'success');
             }
-        } catch(e) {}
+        } catch (e) {}
+        // The backend did not accept the toggle — re-render from cached state so the switch reverts to
+        // the real backend value instead of staying stuck in the flipped position the user just clicked.
+        this.render();
         this.toast(BYD.i18n.t('errors.save_failed'), 'error');
     },
 
@@ -536,6 +643,14 @@ BYD.automations = {
             console.log('[Automations] ' + type + ': ' + message);
         }
     }
-}
+};
 
 window.AutomationSettings = BYD.automations;
+
+// Keep the Save-disabled affordance in sync as the user edits fields. Field
+// validity is toggled on 'change'; re-check after it bubbles to the grid.
+document.addEventListener('change', function (e) {
+    if (e.target && e.target.closest && e.target.closest('.form-grid')) {
+        BYD.automations._syncSaveDisabled();
+    }
+});

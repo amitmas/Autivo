@@ -55,11 +55,16 @@ public class AutomationCondition {
     /**
      * Compare this value using the stored comparator
      * Checks for null response from the compare method to ensure the comparator and values are valid
+     * A null value means the referenced event has never fired since boot, so its state is unknown.
+     * In that case the condition is treated as not met (returns false) rather than dereferencing null,
+     * which would throw an NPE on the telemetry/queue threads that call conditionsMet.
      *
      * @param value The value to compare with this condition
      * @return true if the comparison was successful, false otherwise
      */
     public boolean compare(Value value) {
+        // An absent (never-fired) event value can never satisfy a condition
+        if (value == null) return false;
         // Compare to true as it will be null when not a valid comparison
         return Boolean.TRUE.equals(value.compare(this.value, comparator));
     }

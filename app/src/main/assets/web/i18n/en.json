@@ -793,7 +793,10 @@
     "tab_automations": "Automations",
     "tab_add": "Add",
     "page_title": "Automations",
+    "page_sub": "Run an action automatically when a vehicle event matches your conditions.",
+    "list_title": "Your automations",
     "empty_p": "No Automations configured. Add an automation.",
+    "empty_hint": "Create one to trigger an action when a vehicle event matches your conditions.",
     "add_automation": "Add Automation",
     "edit_automation": "Edit Automation",
     "save_automation": "Save Automation",
@@ -802,7 +805,11 @@
     "parse_error": "Failed to parse Automation.",
     "add_row": "Add Row",
     "extra_row": "And",
-    "toast_triggered": "Triggered Automation."
+    "toast_triggered": "Triggered Automation.",
+    "trigger": "Run now",
+    "delete_row": "Remove row",
+    "select": "Select",
+    "unsupported_input": "Unsupported field"
   },
   "recording": {
     "tab_status": "Status",

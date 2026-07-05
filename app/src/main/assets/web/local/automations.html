@@ -55,17 +55,39 @@
                 <h1 class="page-title" data-i18n="automation.page_title">Automations</h1>
                 <!-- The form lives on the Add tab (see window.OT_TABS above);
                      the empty-state below has a CTA that switches to it. -->
+                <!-- Clock badge — matches the other local pages. Hidden inside the
+                     head-unit WebView (which has its own system clock) and shown
+                     only in the browser / standalone PWA; gated in the init script
+                     below via window.AndroidBridge. Starts hidden so it never
+                     flashes on the head unit before the script runs. -->
+                <div class="header-actions" id="headerActions" style="display:none;">
+                    <div class="header-badge">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+                        <span id="currentTime">--:--</span>
+                    </div>
+                </div>
             </header>
 
             <div class="page-body">
+                <!-- Section header for the list (Automations tab). Mirrors the
+                     uppercase section-title used across the other local pages. -->
+                <div class="automations-section-head" data-tab="automations" id="listHead" style="display:none;">
+                    <h2 class="automations-section-title" data-i18n="automation.list_title">Your automations</h2>
+                    <button class="btn btn-secondary" onclick="AutomationSettings.showForm(null, {})">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                        <span data-i18n="automation.add_automation">Add Automation</span>
+                    </button>
+                </div>
+
                 <!-- Automation List -->
                 <div id="automationList" data-tab="automations"></div>
 
                 <!-- Empty State (Automations tab) — switches to Add tab on CTA click. -->
                 <div id="emptyState" class="card" data-tab="automations" style="display:none;">
                     <div class="empty-state">
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><rect width="8" height="8" x="3" y="3" rx="2"/><path d="M7 11v4a2 2 0 0 0 2 2h4"/><rect width="8" height="8" x="13" y="13" rx="2"/></svg>
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect width="8" height="8" x="3" y="3" rx="2"/><path d="M7 11v4a2 2 0 0 0 2 2h4"/><rect width="8" height="8" x="13" y="13" rx="2"/></svg>
                         <p data-i18n="automation.empty_p">No Automations configured. Add an automation.</p>
+                        <p class="empty-state-hint" data-i18n="automation.empty_hint">Create one to trigger an action when a vehicle event matches your conditions.</p>
                         <button class="btn btn-primary" onclick="AutomationSettings.showForm(null, {})" data-i18n="automation.add_automation">Add Automation</button>
                     </div>
                 </div>
@@ -105,6 +127,15 @@
         function toggleSidebar() {
             document.getElementById('sidebar').classList.toggle('open');
             document.getElementById('sidebarOverlay').classList.toggle('show');
+        }
+        // Show the clock badge only outside the head-unit WebView. The native
+        // shell injects window.AndroidBridge, so its absence means we're in a
+        // browser or standalone PWA — where the page-level clock is useful.
+        // BYD.core.init() runs startClock(), which populates #currentTime when
+        // the element is present regardless of visibility.
+        if (typeof window.AndroidBridge === 'undefined') {
+            var headerActions = document.getElementById('headerActions');
+            if (headerActions) headerActions.style.display = '';
         }
         BYD.i18n.init().then(function () {
             BYD.core.init();

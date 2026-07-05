@@ -1275,6 +1275,7 @@
     <string name="onboarding_expert_done_body">คุณได้เห็นการตั้งค่าเชิงลึกแล้ว เปิดคู่มือนี้อีกครั้งได้ทุกเมื่อจากปุ่มช่วยเหลือ</string>
     <string name="onboarding_expert_chapter_label">บทที่ %1$d จาก %2$d</string>
     <string name="rail_charging">การชาร์จ</string>
+    <string name="rail_automations">ระบบอัตโนมัติ</string>
     <string name="onboarding_skip">ข้าม</string>
     <string name="onboarding_expert_traffic_body">ตัวตรวจสอบการจราจรในตัวของ BYD บล็อกแอปอื่นๆ ไม่ให้ใช้ซิมในตัวของรถ หากคุณต้องการเข้าถึงรถของคุณจากระยะไกลผ่านซิม BYD คุณต้องปิดมันที่นี่ หัวเครื่องจะรีบูตเพื่อใช้การเปลี่ยนแปลง</string>
     <string name="onboarding_expert_surveillance_body">ปรับแต่งการตรวจจับ คุณภาพ และที่จัดเก็บที่นี่ สิ่งเหล่านี้เปิดเป็นหน้าตั้งค่าในแอปที่ส่งมาจากรถของคุณ — หน้าจอว่างเปล่าหมายความว่าตัวช่วยยังเริ่มทำงานอยู่</string>

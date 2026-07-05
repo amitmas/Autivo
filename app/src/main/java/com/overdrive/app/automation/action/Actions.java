@@ -49,11 +49,14 @@ public class Actions {
                         new Label("area", "automation.area"),
                         new Label("driver", "automation.driver"),
                         new Label("passenger", "automation.passenger")),
+                // Seat climate is 3-level hardware (off/low/high); the SDK write path collapses any
+                // "medium" onto high, so exposing only these three keeps the action honest and
+                // symmetric with the seatClimate condition enum.
                 new EnumType(
                         new Label("payload", "automation.state"),
                         new Label("off", "automation.off"),
                         new Label("low", "automation.low"),
-                        new Label("medium", "automation.high"))));
+                        new Label("high", "automation.high"))));
     }
 
     /**

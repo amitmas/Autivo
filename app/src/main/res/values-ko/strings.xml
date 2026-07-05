@@ -1275,6 +1275,7 @@
     <string name="onboarding_expert_done_body">더 깊은 설정을 둘러보셨습니다. 도움말 버튼에서 언제든 이 가이드를 다시 열 수 있습니다.</string>
     <string name="onboarding_expert_chapter_label">%2$d장 중 %1$d장</string>
     <string name="rail_charging">충전</string>
+    <string name="rail_automations">자동화</string>
     <string name="onboarding_skip">건너뛰기</string>
     <string name="onboarding_expert_traffic_body">BYD의 내장 트래픽 모니터는 다른 앱이 차량 내장 SIM을 사용하지 못하도록 차단합니다. BYD SIM을 통해 차량에 원격으로 접속하려면 여기서 이를 비활성화해야 합니다. 변경 사항을 적용하기 위해 헤드 유닛이 재부팅됩니다.</string>
     <string name="onboarding_expert_surveillance_body">여기서 감지, 화질, 저장소를 세부 조정하세요. 이 항목들은 차량에서 제공되는 앱 내 설정 페이지로 열립니다 — 빈 화면은 헬퍼가 아직 시작 중이라는 의미입니다.</string>

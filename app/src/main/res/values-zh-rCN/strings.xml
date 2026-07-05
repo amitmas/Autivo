@@ -731,6 +731,7 @@
     <string name="rail_vehicle">汽車</string>
     <string name="rail_trips">行程</string>
     <string name="rail_charging">Charging</string>
+    <string name="rail_automations">自动化</string>
     <string name="rail_integrations">集成</string>
     <string name="rail_diagnostics">診斷結果</string>
     <string name="rail_settings">設定</string>

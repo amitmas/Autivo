@@ -1275,6 +1275,7 @@
     <string name="onboarding_expert_done_body">Bạn đã xem qua các cài đặt sâu hơn. Mở lại hướng dẫn này bất cứ lúc nào từ nút trợ giúp.</string>
     <string name="onboarding_expert_chapter_label">Chương %1$d trên %2$d</string>
     <string name="rail_charging">Sạc</string>
+    <string name="rail_automations">Tự động hóa</string>
     <string name="onboarding_skip">Bỏ qua</string>
     <string name="onboarding_expert_traffic_body">Trình giám sát giao thông tích hợp sẵn của BYD chặn các ứng dụng khác sử dụng SIM tích hợp sẵn của xe. Nếu bạn muốn truy cập xe từ xa qua SIM BYD, bạn phải tắt nó tại đây. Head-unit sẽ khởi động lại để áp dụng thay đổi.</string>
     <string name="onboarding_expert_surveillance_body">Tinh chỉnh phát hiện, chất lượng và bộ nhớ tại đây. Những mục này mở dưới dạng trang cấu hình trong ứng dụng được phục vụ từ xe của bạn — màn hình trống chỉ có nghĩa là trợ lý vẫn đang khởi động.</string>

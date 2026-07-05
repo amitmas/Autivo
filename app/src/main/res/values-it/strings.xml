@@ -736,6 +736,7 @@ Questa azione non puo essere annullata.</string>
     <string name="rail_vehicle">Veicolo</string>
     <string name="rail_trips">Viaggi</string>
     <string name="rail_charging">Ricarica</string>
+    <string name="rail_automations">Automazioni</string>
     <string name="rail_integrations">Integrazioni</string>
     <string name="rail_diagnostics">Diagnostica</string>
     <string name="rail_settings">Impostazioni</string>

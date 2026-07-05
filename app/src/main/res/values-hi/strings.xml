@@ -1285,6 +1285,7 @@
     <string name="onboarding_expert_done_body">आपने गहरी सेटिंग्स देख लीं। इस गाइड को हेल्प बटन से कभी भी दोबारा खोलें।</string>
     <string name="onboarding_expert_chapter_label">अध्याय %1$d / %2$d</string>
     <string name="rail_charging">चार्जिंग</string>
+    <string name="rail_automations">ऑटोमेशन</string>
     <string name="onboarding_skip">छोड़ें</string>
     <string name="onboarding_expert_traffic_body">BYD का बिल्ट-इन Traffic Monitor दूसरे ऐप्स को गाड़ी के बिल्ट-इन SIM का उपयोग करने से रोकता है। अगर आप BYD SIM पर अपनी गाड़ी तक रिमोट से पहुँचना चाहते हैं, तो आपको इसे यहाँ बंद करना होगा। बदलाव लागू करने के लिए हेड यूनिट रीबूट होती है।</string>
     <string name="onboarding_expert_surveillance_body">यहाँ डिटेक्शन, क्वालिटी और स्टोरेज को बारीकी से ट्यून करें। ये आपकी गाड़ी से सर्व होने वाले इन-ऐप कॉन्फ़िग पेज के रूप में खुलते हैं — खाली स्क्रीन का मतलब बस इतना है कि हेल्पर अभी शुरू हो रहा है।</string>

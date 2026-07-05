@@ -20,7 +20,10 @@ public class Automation {
     private final int delay;
     private final List<AutomationAction> actions;
 
-    private boolean disabled;
+    // volatile: written from HTTP request threads (setDisabled) and read from the telemetry thread
+    // (stateChanged) and the queue worker thread (triggerActions) with no shared lock, so a plain field
+    // could let those threads observe a stale enabled/disabled state and fire a just-disabled automation.
+    private volatile boolean disabled;
 
     /**
      * A representation of a single automation

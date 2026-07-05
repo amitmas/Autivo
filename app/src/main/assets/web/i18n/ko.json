@@ -23,7 +23,8 @@
     "telegram_title": "Telegram - OverDrive",
     "dashboard_title": "대시보드 - OverDrive",
     "road_sense_title": "RoadSense - OverDrive",
-    "charging_title": "충전 - OverDrive"
+    "charging_title": "충전 - OverDrive",
+    "automations_title": "자동화 - OverDrive"
   },
   "nav": {
     "dashboard": "대시보드",
@@ -50,7 +51,8 @@
     "brand_home": "OverDrive — 대시보드 열기",
     "telegram": "Telegram",
     "road_sense": "RoadSense",
-    "charging": "충전"
+    "charging": "충전",
+    "automations": "자동화"
   },
   "road_sense": {
     "page_title": "RoadSense Settings",
@@ -368,7 +370,8 @@
     "drive_rhd_sub": "운전자가 오른쪽에 앉습니다(영국, 호주, 인도, 일본).",
     "drive_save_failed": "차량 레이아웃을 저장하지 못했습니다",
     "drive_saved": "차량 레이아웃을 저장했습니다",
-    "drive_load_failed": "차량 레이아웃을 불러오지 못했습니다"
+    "drive_load_failed": "차량 레이아웃을 불러오지 못했습니다",
+    "tab_log": "기록"
   },
   "trip": {
     "tab_trips": "주행 기록",
@@ -677,6 +680,28 @@
       "badge_title": "텔레메트리에서 복구됨 — 주행 점수 없음",
       "detail_note": "텔레메트리에서 복구되었습니다. 거리, 속도, 고도는 GPS로 재구성됩니다. 이 주행에 대해 배터리, 에너지, 비용, 주행 점수는 기록되지 않았습니다."
     }
+  },
+  "automation": {
+    "tab_automations": "자동화",
+    "tab_add": "추가",
+    "page_title": "자동화",
+    "page_sub": "차량 이벤트가 조건과 일치할 때 작업을 자동으로 실행합니다.",
+    "list_title": "내 자동화",
+    "empty_p": "구성된 자동화가 없습니다. 자동화를 추가하세요.",
+    "empty_hint": "차량 이벤트가 조건과 일치할 때 작업을 실행하도록 자동화를 만드세요.",
+    "add_automation": "자동화 추가",
+    "edit_automation": "자동화 편집",
+    "save_automation": "자동화 저장",
+    "failed_to_load_schema": "자동화 스키마를 불러오지 못했습니다. Overdrive 연결을 확인하세요.",
+    "invalid_form": "양식이 올바르게 입력되었는지 확인하세요.",
+    "parse_error": "자동화를 구문 분석하지 못했습니다.",
+    "add_row": "행 추가",
+    "extra_row": "그리고",
+    "toast_triggered": "자동화를 실행했습니다.",
+    "trigger": "지금 실행",
+    "delete_row": "행 제거",
+    "select": "선택",
+    "unsupported_input": "지원되지 않는 필드"
   },
   "recording": {
     "tab_status": "상태",
@@ -1322,7 +1347,11 @@
     "storage_blocked_usb_off": "주차 중 SD/USB를 사용하려면 \"USB 전원 유지\"를 켜세요",
     "usb_off_confirm_body": "SD 카드는 USB 전원 레일을 공유하므로 주차 중에는 전원이 공급되지 않습니다. 녹화가 계속 작동하도록 감시 저장소가 내부 저장소로 전환됩니다. USB 전원을 다시 켠 후 SD 카드로 다시 전환할 수 있습니다.",
     "approach_trigger_hint": "모든 이벤트에 대해 전체 배회 시간을 요구하려면 끄기로 설정하세요. 값이 낮을수록 다가오는 대상을 더 빨리 녹화합니다(AI가 실제 사람/차량을 인식할 때만 작동).",
-    "approach_trigger_desc": "카메라 AI가 실제 사람이나 차량의 접근을 확인하면 전체 배회 시간을 기다리지 않고 더 빨리 녹화합니다"
+    "approach_trigger_desc": "카메라 AI가 실제 사람이나 차량의 접근을 확인하면 전체 배회 시간을 기다리지 않고 더 빨리 녹화합니다",
+    "low_soc_cutoff": "배터리 부족 차단",
+    "low_soc_cutoff_desc": "메인 배터리가 이 수준으로 떨어지면 감시를 중지하고 차량을 절전 모드로 전환하여 과방전으로부터 보호합니다. 배터리 수준으로 중지하지 않으려면 끄기로 설정하세요.",
+    "low_soc_cutoff_hint": "값이 높을수록 배터리를 더 보호하지만 감시가 더 일찍 종료됩니다. 끄기로 두면 배터리가 위험 수준에 이를 때까지 계속 감시합니다.",
+    "low_soc_cutoff_off": "끄기"
   },
   "mqtt": {
     "tab_connections": "연결",
@@ -1389,7 +1418,11 @@
     "ha_short": "Home Assistant",
     "allow_control": "Allow vehicle control",
     "allow_control_desc": "Expose controllable entities (climate, windows, seats, settings…) and act on commands from Home Assistant. Local SDK only — never the BYD cloud. Off by default.",
-    "control_short": "control"
+    "control_short": "control",
+    "heartbeat_send_all": "하트비트 시 전체 동기화",
+    "heartbeat_send_all_desc": "변경 사항이 없어도 하트비트 간격마다 모든 값을 다시 전송합니다. 연결 끊김으로 손실된 상태를 복구합니다.",
+    "flush_on_state_change": "모드 변경 시 플러시",
+    "flush_on_state_change_desc": "차량 모드가 바뀔 때(시동 켜짐/꺼짐, 충전 시작/중지) 모든 값을 다시 전송하여, 네트워크 전환 중 단일 업데이트가 손실되더라도 새 상태가 항상 HA에 도달하도록 합니다. 가볍게 — 전환 시에만 실행됩니다."
   },
   "abrp": {
     "connected": "연결",
@@ -2300,5 +2333,61 @@
     "restored_msg": "설정이 복원되었습니다. 다시 로드하는 중…",
     "preview_failed": "백업을 검증할 수 없습니다.",
     "export_title": "설정 내보내기"
+  },
+  "notiflog": {
+    "load_failed": "알림을 불러오지 못했습니다",
+    "count_one": "알림 {n}개",
+    "count_other": "알림 {n}개",
+    "snapshot_alt": "이벤트 스냅샷",
+    "delete": "삭제",
+    "range_pick": "시작일 또는 종료일을 선택하세요",
+    "range_apply": "적용",
+    "page_of": "{total}페이지 중 {page}페이지",
+    "delete_title": "알림을 삭제할까요?",
+    "delete_body": "기록에서 삭제됩니다. 되돌릴 수 없습니다.",
+    "deleted": "알림을 삭제했습니다",
+    "delete_failed": "삭제하지 못했습니다",
+    "bulk_confirm_title": "선택 항목을 삭제할까요?",
+    "bulk_confirm_body": "선택한 알림 {n}개를 삭제할까요? 되돌릴 수 없습니다.",
+    "bulk_deleted": "{n}개 삭제됨",
+    "clear_title": "모든 알림을 지울까요?",
+    "clear_body": "전체 알림 기록을 영구적으로 삭제합니다.",
+    "clear_all": "모두 지우기",
+    "cleared": "알림 기록을 지웠습니다",
+    "done": "완료",
+    "select": "선택",
+    "select_all": "모두 선택",
+    "clear_selection": "선택 해제",
+    "n_selected": "{n}개 선택됨",
+    "none_selected": "0개 선택됨",
+    "group_other": "기타",
+    "filter_date": "날짜",
+    "filter_all": "전체 기간",
+    "filter_7d": "7일",
+    "filter_30d": "30일",
+    "filter_custom": "사용자 지정 기간",
+    "filter_category": "카테고리",
+    "filter_severity": "심각도",
+    "cat_all": "전체",
+    "cat_surveillance": "감시",
+    "cat_charging": "충전",
+    "cat_security": "보안",
+    "cat_vehicle": "차량",
+    "sev_all": "전체",
+    "sev_critical": "심각",
+    "sev_warn": "경고",
+    "sev_info": "정보",
+    "person": "사람",
+    "vehicle": "차량",
+    "bike": "오토바이",
+    "animal": "동물",
+    "prox_very_close": "매우 가까움",
+    "prox_close": "가까움",
+    "prox_mid": "중간",
+    "prox_far": "멀리",
+    "empty": "아직 알림이 없습니다",
+    "empty_hint": "수신한 알림이 여기에 표시되어 언제든지 확인할 수 있습니다.",
+    "prev": "이전",
+    "next": "다음"
   }
 }

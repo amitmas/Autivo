@@ -446,6 +446,7 @@
     <string name="rail_recordings">Opptak</string>
     <string name="rail_vehicle">Køretøy</string>
     <string name="rail_trips">Turer</string>
+    <string name="rail_automations">Automatiseringer</string>
     <string name="rail_integrations">Integrasjoner</string>
     <string name="rail_diagnostics">Diagnostikk</string>
     <string name="rail_settings">Innstillinger</string>

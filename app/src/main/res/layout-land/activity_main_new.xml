@@ -95,6 +95,11 @@
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content" />
                 <include
+                    android:id="@+id/railDestAutomations"
+                    layout="@layout/item_rail_destination"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content" />
+                <include
                     android:id="@+id/railDestIntegrations"
                     layout="@layout/item_rail_destination"
                     android:layout_width="match_parent"

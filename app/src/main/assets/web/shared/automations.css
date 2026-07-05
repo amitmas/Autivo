@@ -1,53 +1,101 @@
 /*
  * Overdrive — Automation visuals.
+ *
+ * Chrome 58 / Android 7.1 floor (BYD DiLink head-unit WebView), assets ship
+ * raw with no build step. Two hard constraints drive the choices here:
+ *   - flex `gap:` is Chrome 84+ and is SILENTLY IGNORED on-car, so every
+ *     intra-row spacing uses sibling margins (`> * + *`), the same idiom the
+ *     charging / notifications pages use.
+ *   - `:has()` is Chrome 105+, so the "dim Save while the form is invalid"
+ *     affordance is driven by a JS-toggled `.is-disabled` class (see
+ *     automations.js `_syncSaveDisabled`), NOT a `:has(.invalid)` selector.
+ * All colours / radii come from the shared design tokens (design-tokens.css)
+ * — no raw hex, no ad-hoc pixel radii.
  */
 
+/* ===== LIST SECTION HEADER ===== */
+.automations-section-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 16px;
+}
+.automations-section-head > * + * { margin-left: 12px; }   /* flex gap ignored on Chrome-58 */
+.automations-section-title {
+    font-size: 12px; font-weight: 600;
+    letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--text-secondary);
+    margin: 0;
+}
+
+/* ===== EMPTY STATE ===== */
 .empty-state { text-align: center; padding: 48px 24px; color: var(--text-muted); }
 .empty-state svg { width: 48px; height: 48px; margin-bottom: 16px; opacity: 0.4; }
-.empty-state p { font-size: 14px; margin-bottom: 16px; }
+.empty-state p { font-size: 14px; margin-bottom: 6px; color: var(--text-secondary); }
+.empty-state .empty-state-hint { font-size: 13px; margin-bottom: 20px; color: var(--text-muted); }
+
+/* ===== ICON BUTTONS (automation-specific — no shared equivalent) ===== */
 .icon-btn {
-    background: none; border: 1px solid var(--border-color); border-radius: 6px; padding: 6px;
+    background: none; border: 1px solid var(--border-default); border-radius: var(--radius-sm); padding: 6px;
     color: var(--text-secondary); cursor: pointer; font-size: 12px;
     display: inline-flex; align-items: center; justify-content: center;
-    width: 32px; height: 32px; flex-shrink: 0;
+    width: 36px; height: 36px; flex-shrink: 0;
+    transition: background 0.2s, color 0.2s, border-color 0.2s;
 }
 .icon-btn svg { width: 16px; height: 16px; display: block; }
-.icon-btn:hover { background: var(--bg-elevated); color: var(--text-primary); }
+.icon-btn:hover { background: var(--bg-elevated); color: var(--text-primary); border-color: var(--border-default); }
 .icon-btn.danger { color: var(--danger); }
 .icon-btn.danger:hover { border-color: var(--danger); background: rgba(239,68,68,0.08); color: var(--danger); }
 
+/* ===== FORM ===== */
 .form-grid input, .form-grid select, .form-grid textarea {
-    padding: 10px 12px; background: var(--bg-elevated); border: 1px solid var(--border-color);
-    border-radius: 8px; color: var(--text-primary); font-size: 14px; font-family: 'Inter', sans-serif;
+    padding: 10px 12px; background: var(--bg-elevated); border: 1px solid var(--border-default);
+    border-radius: var(--radius-sm); color: var(--text-primary); font-size: 14px; font-family: inherit;
 }
 .form-grid .label {
     font-size: 14px;
     font-weight: 500;
+    color: var(--text-primary);
     display: flex;
     align-items: center;
-    line-height: 1;
+    line-height: 1.2;
 }
 .form-grid .description {
-    font-size: 12px;
+    font-size: 13px;
     color: var(--text-muted);
-    line-height: 1;
+    line-height: 1.4;
+    margin-top: 2px;
+}
+.form-grid .form-empty {
+    font-size: 14px;
+    color: var(--text-muted);
+    line-height: 1.5;
 }
 .form-grid .section {
-    margin-bottom: 15px;
-    padding-bottom: 10px;
+    margin-bottom: 18px;
+    padding-bottom: 14px;
     border-bottom: 1px solid var(--border-subtle);
 }
-.form-grid .invalid {
-    border: 1px solid var(--danger);
+.form-grid .section:last-of-type {
+    border-bottom: none;
+    margin-bottom: 0;
+    padding-bottom: 0;
 }
-#formCard:has(.invalid) #saveBtn {
-    background: #374151;
+.form-grid .invalid {
+    border-color: var(--danger);
+}
+/* `:has()` is Chrome 105+ (head unit is Chrome 58); the disabled-Save look is
+   driven by the .is-disabled class automations.js toggles when a field is
+   invalid. Mirrors .btn-primary:disabled. */
+#formCard #saveBtn.is-disabled {
+    opacity: 0.5;
     cursor: not-allowed;
+    pointer-events: none;
 }
 .form-grid .row {
     display: flex;
     flex-wrap: wrap;
-    margin: 5px 0px;
+    margin: 8px 0;
 }
 .form-grid .row .inputs {
     display: flex;
@@ -55,13 +103,19 @@
     margin-bottom: 5px;
     flex: 1;
 }
+/* Each input claims a quarter-row on wide viewports; sibling margins give the
+   inter-input spacing (flex gap is ignored on Chrome-58). The negative row
+   margin cancels the outer inputs' side margins so the grid stays flush. */
+.form-grid .row .inputs { margin-left: -5px; margin-right: -5px; }
 .form-grid .row .inputs > *, .form-grid .row > .input {
     flex: 0 0 25%;
-    margin: 5px 0px;
+    padding: 0 5px;
+    margin: 5px 0;
+    box-sizing: border-box;
 }
 .form-grid .row .inputs > textarea {
     flex: 0 0 100%;
-    margin: 10px 0px;
+    margin: 10px 0;
     min-height: 6em;
     resize: vertical;
 }
@@ -82,13 +136,17 @@
 .form-grid .row .inputs > .type-selector > .description-icon {
     width: 20px;
     height: 20px;
+    margin-left: 6px;   /* selector → info icon (flex gap ignored on Chrome-58) */
+    color: var(--text-muted);
     cursor: pointer;
+    flex: 0 0 auto;
 }
+.form-grid .row .inputs > .type-selector > .description-icon:hover { color: var(--text-primary); }
 .description-tooltip {
     position: absolute;
     background: var(--panel-overlay-bg-strong);
     border: 1px solid var(--brand-primary);
-    border-radius: 12px;
+    border-radius: var(--radius-md);
     padding: 12px 16px;
     pointer-events: none;
     opacity: 0;
@@ -96,8 +154,11 @@
     transition: opacity 0.15s;
     min-width: 200px;
     max-width: 260px;
+    -webkit-backdrop-filter: blur(12px);
     backdrop-filter: blur(12px);
     color: var(--text-primary);
+    font-size: 13px;
+    line-height: 1.4;
 }
 .description-tooltip.visible {
     opacity: 1;
@@ -112,38 +173,60 @@
     margin-bottom: 5px;
 }
 .form-grid .add-button {
-    margin-top: 10px;
+    margin-top: 12px;
 }
+.form-grid .unknown {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
+
+/* Form action row (Cancel / Save). Sibling-margin gap for Chrome-58. */
+.form-actions {
+    display: flex;
+    justify-content: flex-end;
+    margin-top: 24px;
+    padding-top: 20px;
+    border-top: 1px solid var(--border-subtle);
+}
+.form-actions > * + * { margin-left: 12px; }
+
+/* ===== AUTOMATION LIST CARDS ===== */
+/* Space stacked list cards like the shared `.card + .card` rhythm. */
+#automationList > * + * { margin-top: 16px; }
 #automationList .card.disabled {
     opacity: 0.6;
 }
 #automationList .header {
     display: flex;
     align-items: center;
-    gap: 12px;
-    padding: 14px 16px;
+    padding: 16px 20px;
     word-break: break-word;
 }
+/* icon actions / info spacing via sibling margins (flex gap ignored on Chrome-58). */
+#automationList .header > * + * { margin-left: 12px; }
 #automationList .info {
     flex: 1;
     min-width: 0;
+    font-size: 14px;
+    line-height: 1.5;
+    color: var(--text-primary);
 }
 #automationList .actions {
     display: flex;
-    gap: 6px;
     flex-shrink: 0;
 }
+#automationList .actions > * + * { margin-left: 6px; }
 #automationList .body {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 0 16px 12px;
-    gap: 8px;
+    padding: 0 20px 16px;
 }
+#automationList .body > * + * { margin-left: 8px; }
 #automationList .status-text {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 13px;
-  color: var(--text-secondary);
+    display: inline-flex;
+    align-items: center;
+    font-size: 13px;
+    color: var(--text-secondary);
 }
+#automationList .status-text > * + * { margin-left: 8px; }

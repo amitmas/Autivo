@@ -23,7 +23,8 @@
     "telegram_title": "Telegram - OverDrive",
     "dashboard_title": "bảng điều khiển - OverDrive",
     "road_sense_title": "RoadSense - OverDrive",
-    "charging_title": "Sạc - OverDrive"
+    "charging_title": "Sạc - OverDrive",
+    "automations_title": "Tự động hóa - OverDrive"
   },
   "nav": {
     "dashboard": "Bảng điều khiển",
@@ -50,7 +51,8 @@
     "brand_home": "OverDrive — mở Bảng điều khiển",
     "telegram": "Telegram",
     "road_sense": "RoadSense",
-    "charging": "Sạc"
+    "charging": "Sạc",
+    "automations": "Tự động hóa"
   },
   "road_sense": {
     "page_title": "RoadSense Settings",
@@ -368,7 +370,8 @@
     "drive_rhd_sub": "Người lái ngồi bên phải (Anh, Úc, Ấn Độ, Nhật Bản).",
     "drive_save_failed": "Không thể lưu bố trí xe",
     "drive_saved": "Đã lưu bố trí xe",
-    "drive_load_failed": "Không thể tải bố trí xe"
+    "drive_load_failed": "Không thể tải bố trí xe",
+    "tab_log": "Nhật ký"
   },
   "trip": {
     "tab_trips": "Chuyến đi",
@@ -677,6 +680,28 @@
       "badge_title": "Được khôi phục từ telemetry — không có điểm lái xe",
       "detail_note": "Được khôi phục từ telemetry. Quãng đường, tốc độ và độ cao được dựng lại từ GPS; pin, năng lượng, chi phí và điểm lái xe không được ghi lại cho hành trình này."
     }
+  },
+  "automation": {
+    "tab_automations": "Tự động hóa",
+    "tab_add": "Thêm",
+    "page_title": "Tự động hóa",
+    "page_sub": "Tự động chạy một hành động khi một sự kiện của xe khớp với các điều kiện của bạn.",
+    "list_title": "Tự động hóa của bạn",
+    "empty_p": "Chưa cấu hình tự động hóa nào. Hãy thêm một tự động hóa.",
+    "empty_hint": "Tạo một tự động hóa để kích hoạt một hành động khi một sự kiện của xe khớp với các điều kiện của bạn.",
+    "add_automation": "Thêm tự động hóa",
+    "edit_automation": "Chỉnh sửa tự động hóa",
+    "save_automation": "Lưu tự động hóa",
+    "failed_to_load_schema": "Không tải được lược đồ tự động hóa. Hãy kiểm tra kết nối tới Overdrive.",
+    "invalid_form": "Vui lòng kiểm tra biểu mẫu đã được điền đúng.",
+    "parse_error": "Không phân tích được tự động hóa.",
+    "add_row": "Thêm hàng",
+    "extra_row": "Và",
+    "toast_triggered": "Đã kích hoạt tự động hóa.",
+    "trigger": "Chạy ngay",
+    "delete_row": "Xóa hàng",
+    "select": "Chọn",
+    "unsupported_input": "Trường không được hỗ trợ"
   },
   "recording": {
     "tab_status": "Trạng thái",
@@ -1322,7 +1347,11 @@
     "storage_blocked_usb_off": "Bật \"Giữ nguồn USB\" để dùng SD/USB khi đỗ",
     "usb_off_confirm_body": "Thẻ SD dùng chung đường nguồn USB, nên nó sẽ không được cấp nguồn khi đỗ. Giám sát sẽ chuyển sang bộ nhớ trong để việc ghi hình tiếp tục hoạt động. Bạn có thể chuyển lại sang thẻ SD sau khi bật lại nguồn USB.",
     "approach_trigger_hint": "Đặt Tắt để yêu cầu đủ thời gian lảng vảng cho mọi sự kiện. Giá trị thấp hơn ghi lại người tiến đến nhanh hơn (chỉ kích hoạt khi AI thấy người/phương tiện thực sự).",
-    "approach_trigger_desc": "Ghi hình sớm hơn khi AI camera xác nhận có người hoặc phương tiện thực sự đang tiến đến — mà không phải chờ hết toàn bộ thời gian lảng vảng"
+    "approach_trigger_desc": "Ghi hình sớm hơn khi AI camera xác nhận có người hoặc phương tiện thực sự đang tiến đến — mà không phải chờ hết toàn bộ thời gian lảng vảng",
+    "low_soc_cutoff": "Ngưỡng pin thấp",
+    "low_soc_cutoff_desc": "Dừng giám sát và để xe ngủ khi pin chính tụt xuống mức này, bảo vệ pin khỏi xả quá mức. Đặt thành Tắt để không bao giờ dừng theo mức pin.",
+    "low_soc_cutoff_hint": "Giá trị cao hơn bảo vệ pin tốt hơn nhưng kết thúc giám sát sớm hơn. Tắt sẽ tiếp tục theo dõi cho đến khi pin cạn tới mức nguy hiểm.",
+    "low_soc_cutoff_off": "Tắt"
   },
   "mqtt": {
     "tab_connections": "Mối nối",
@@ -1389,7 +1418,11 @@
     "ha_short": "Home Assistant",
     "allow_control": "Allow vehicle control",
     "allow_control_desc": "Expose controllable entities (climate, windows, seats, settings…) and act on commands from Home Assistant. Local SDK only — never the BYD cloud. Off by default.",
-    "control_short": "control"
+    "control_short": "control",
+    "heartbeat_send_all": "Đồng bộ đầy đủ theo heartbeat",
+    "heartbeat_send_all_desc": "Gửi lại mọi giá trị theo chu kỳ heartbeat ngay cả khi không có gì thay đổi. Khôi phục trạng thái bị mất khi rớt kết nối.",
+    "flush_on_state_change": "Gửi khi đổi chế độ",
+    "flush_on_state_change_desc": "Gửi lại mọi giá trị khi xe đổi chế độ (bật/tắt động cơ, bắt đầu/dừng sạc), để trạng thái mới luôn đến được HA ngay cả khi một bản cập nhật bị mất lúc chuyển mạng. Nhẹ — chỉ kích hoạt khi có chuyển trạng thái."
   },
   "abrp": {
     "connected": "Kết nối",
@@ -2300,5 +2333,61 @@
     "restored_msg": "Đã khôi phục cài đặt. Đang tải lại…",
     "preview_failed": "Không thể xác thực bản sao lưu.",
     "export_title": "Xuất cài đặt"
+  },
+  "notiflog": {
+    "load_failed": "Không thể tải thông báo",
+    "count_one": "{n} thông báo",
+    "count_other": "{n} thông báo",
+    "snapshot_alt": "Ảnh chụp sự kiện",
+    "delete": "Xóa",
+    "range_pick": "Chọn ngày bắt đầu hoặc kết thúc",
+    "range_apply": "Áp dụng",
+    "page_of": "Trang {page}/{total}",
+    "delete_title": "Xóa thông báo?",
+    "delete_body": "Thao tác này xóa thông báo khỏi nhật ký và không thể hoàn tác.",
+    "deleted": "Đã xóa thông báo",
+    "delete_failed": "Không thể xóa",
+    "bulk_confirm_title": "Xóa mục đã chọn?",
+    "bulk_confirm_body": "Xóa {n} thông báo đã chọn? Không thể hoàn tác.",
+    "bulk_deleted": "Đã xóa {n}",
+    "clear_title": "Xóa tất cả thông báo?",
+    "clear_body": "Thao tác này xóa vĩnh viễn toàn bộ nhật ký thông báo.",
+    "clear_all": "Xóa tất cả",
+    "cleared": "Đã xóa nhật ký thông báo",
+    "done": "Xong",
+    "select": "Chọn",
+    "select_all": "Chọn tất cả",
+    "clear_selection": "Bỏ chọn",
+    "n_selected": "Đã chọn {n}",
+    "none_selected": "Đã chọn 0",
+    "group_other": "Khác",
+    "filter_date": "Ngày",
+    "filter_all": "Mọi lúc",
+    "filter_7d": "7 ngày",
+    "filter_30d": "30 ngày",
+    "filter_custom": "Khoảng tùy chỉnh",
+    "filter_category": "Danh mục",
+    "filter_severity": "Mức độ",
+    "cat_all": "Tất cả",
+    "cat_surveillance": "Giám sát",
+    "cat_charging": "Sạc",
+    "cat_security": "An ninh",
+    "cat_vehicle": "Xe",
+    "sev_all": "Tất cả",
+    "sev_critical": "Nghiêm trọng",
+    "sev_warn": "Cảnh báo",
+    "sev_info": "Thông tin",
+    "person": "người",
+    "vehicle": "xe",
+    "bike": "xe máy",
+    "animal": "động vật",
+    "prox_very_close": "Rất gần",
+    "prox_close": "Gần",
+    "prox_mid": "Trung bình",
+    "prox_far": "Xa",
+    "empty": "Chưa có thông báo",
+    "empty_hint": "Các cảnh báo bạn nhận được sẽ hiển thị ở đây để xem lại bất cứ lúc nào.",
+    "prev": "Trước",
+    "next": "Sau"
   }
 }

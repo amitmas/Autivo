@@ -45,12 +45,20 @@ public class EventTimelineCollector {
 
     private static final long COALESCE_MS = 2000;
 
-    // Type constants (byte values for compact storage)
+    // Type constants (byte values for compact storage). Ordered by span
+    // priority: when several classes coalesce into one span the HIGHEST value
+    // wins the marker/type (see onAiDetection's `type > bestType`). ANIMAL sits
+    // just above MOTION — the lowest-priority *recognized* class — so a
+    // person/car/bike sharing the window still names the span (a dog next to a
+    // person reads "person", not "animal"), while an animal-only window reads
+    // "animal" instead of a bare "motion". Values are private and never
+    // persisted as raw bytes, so this renumbering is internal-only.
     private static final byte TYPE_MOTION = 0;
-    private static final byte TYPE_BIKE   = 1;
-    private static final byte TYPE_CAR    = 2;
-    private static final byte TYPE_PERSON = 3;
-    private static final String[] TYPE_NAMES = {"motion", "bike", "car", "person"};
+    private static final byte TYPE_ANIMAL = 1;
+    private static final byte TYPE_BIKE   = 2;
+    private static final byte TYPE_CAR    = 3;
+    private static final byte TYPE_PERSON = 4;
+    private static final String[] TYPE_NAMES = {"motion", "animal", "bike", "car", "person"};
 
     // ========================================================================
     // PRE-TRIGGER SEMANTIC RING BUFFER (always active)
@@ -427,9 +435,9 @@ public class EventTimelineCollector {
      * spam every motion blip into a subtitle line):
      * <ul>
      *   <li>Each non-static actor produces ONE entry at its first-seen
-     *       offset, keyed by class group (PERSON / VEHICLE) and tightened
-     *       to {@code srt.person_close} when peakProximity is VERY_CLOSE
-     *       or CLOSE.</li>
+     *       offset, keyed by class group (PERSON / VEHICLE / BIKE / ANIMAL)
+     *       and tightened to {@code srt.person_close} when peakProximity is
+     *       VERY_CLOSE or CLOSE.</li>
      *   <li>Spans of type {@code motion} that don't overlap any actor
      *       produce a single {@code srt.motion_started} entry at the
      *       span's start. Avoids duplicating actor-driven entries.</li>
@@ -495,9 +503,15 @@ public class EventTimelineCollector {
                     case VEHICLE:
                         key = SrtWriter.K_VEHICLE_DETECTED;
                         break;
+                    case BIKE:
+                        key = SrtWriter.K_BIKE_DETECTED;
+                        break;
+                    case ANIMAL:
+                        key = SrtWriter.K_ANIMAL_DETECTED;
+                        break;
                     default:
-                        // BIKE / ANIMAL / UNKNOWN: no key in the catalog yet;
-                        // fall through to motion if applicable.
+                        // UNKNOWN: no class-specific key; fall through to the
+                        // generic-motion span fallback below if applicable.
                         break;
                 }
                 if (key != null) {
@@ -676,6 +690,7 @@ public class EventTimelineCollector {
             if (classId == 0)                                      type = TYPE_PERSON;
             else if (classId == 2 || classId == 5 || classId == 7) type = TYPE_CAR;
             else if (classId == 1 || classId == 3)                 type = TYPE_BIKE;
+            else if (classId >= 14 && classId <= 23)               type = TYPE_ANIMAL;  // COCO animals
             else continue;
 
             totalCount++;
@@ -891,7 +906,7 @@ public class EventTimelineCollector {
             } catch (Throwable ignored) { /* default standard */ }
 
             JSONArray eventsArray = new JSONArray();
-            int motionN = 0, personN = 0, carN = 0, bikeN = 0;
+            int motionN = 0, personN = 0, carN = 0, bikeN = 0, animalN = 0;
 
             for (int si = 0; si < count; si++) {
                 int i = sortIdx[si];
@@ -908,7 +923,14 @@ public class EventTimelineCollector {
                 // count reached >=2 may be hiding a real coexisting mover merged
                 // with the parked car — keep it (fail-open). Only a lone-object
                 // span (count<=1) that is a parked car's own marker is dropped.
-                if ((types[i] == TYPE_CAR || types[i] == TYPE_BIKE)
+                // ANIMAL spans are included: a static/background animal
+                // misread (or a coalesced parked-object chain) is dropped on
+                // the same containment test, keeping the marker consistent with
+                // the pill/chip (both of which already exclude static
+                // non-person actors). overlapsStaticActor considers non-person
+                // static actors only, so a real moving animal — a non-static
+                // ANIMAL actor — is never dropped (fail-open).
+                if ((types[i] == TYPE_CAR || types[i] == TYPE_BIKE || types[i] == TYPE_ANIMAL)
                         && (counts[i] & 0xFF) <= 1
                         && overlapsStaticActor(starts[i], ends[i], (cameras[i] & 0x0F), actors)) {
                     continue;
@@ -946,6 +968,7 @@ public class EventTimelineCollector {
                     case "person": personN++; break;
                     case "car":    carN++;    break;
                     case "bike":   bikeN++;   break;
+                    case "animal": animalN++; break;
                     default:       motionN++; break;
                 }
             }
@@ -1064,6 +1087,11 @@ public class EventTimelineCollector {
             stats.put("person", personN);
             stats.put("car", carN);
             stats.put("bike", bikeN);
+            // Additive span-count field (mirrors the v2 set). Older readers
+            // ignore it; the actor-based animalCount below remains the primary
+            // headline source. Kept in lockstep so animal spans don't silently
+            // fold into the "motion" count.
+            stats.put("animal", animalN);
             // v3 additions
             stats.put("personCount", personCount);
             stats.put("vehicleCount", vehicleCount);

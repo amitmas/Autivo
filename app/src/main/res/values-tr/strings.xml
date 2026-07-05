@@ -1285,6 +1285,7 @@
     <string name="onboarding_expert_done_body">Daha derin ayarları gördünüz. Bu rehberi yardım düğmesinden istediğiniz zaman tekrar açın.</string>
     <string name="onboarding_expert_chapter_label">Bölüm %1$d / %2$d</string>
     <string name="rail_charging">Şarj</string>
+    <string name="rail_automations">Otomasyonlar</string>
     <string name="onboarding_skip">Atla</string>
     <string name="onboarding_expert_traffic_body">BYD\'nin yerleşik Trafik Monitörü, diğer uygulamaların aracın yerleşik SIM\'ini kullanmasını engeller. Aracınıza BYD SIM üzerinden uzaktan erişmek istiyorsanız, bunu buradan devre dışı bırakmanız gerekir. Değişikliğin uygulanması için kafa ünitesi yeniden başlatılır.</string>
     <string name="onboarding_expert_surveillance_body">Algılama, kalite ve depolamayı buradan ince ayarlayın. Bunlar aracınızdan sunulan uygulama içi yapılandırma sayfaları olarak açılır — boş bir ekran yalnızca yardımcının hâlâ başlamakta olduğu anlamına gelir.</string>

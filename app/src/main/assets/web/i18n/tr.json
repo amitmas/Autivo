@@ -23,7 +23,8 @@
     "telegram_title": "Telegram - OverDrive",
     "dashboard_title": "Kontrol tablosu - OverDrive",
     "road_sense_title": "RoadSense - OverDrive",
-    "charging_title": "Şarj - OverDrive"
+    "charging_title": "Şarj - OverDrive",
+    "automations_title": "Otomasyonlar - OverDrive"
   },
   "nav": {
     "dashboard": "Kontrol paneli",
@@ -50,7 +51,8 @@
     "brand_home": "OverDrive — Kontrol panelini aç",
     "telegram": "Telegram",
     "road_sense": "RoadSense",
-    "charging": "Şarj"
+    "charging": "Şarj",
+    "automations": "Otomasyonlar"
   },
   "road_sense": {
     "page_title": "RoadSense Settings",
@@ -368,7 +370,8 @@
     "drive_rhd_sub": "Sürücü sağda oturur (Birleşik Krallık, Avustralya, Hindistan, Japonya).",
     "drive_save_failed": "Araç düzeni kaydedilemedi",
     "drive_saved": "Araç düzeni kaydedildi",
-    "drive_load_failed": "Araç düzeni yüklenemedi"
+    "drive_load_failed": "Araç düzeni yüklenemedi",
+    "tab_log": "Günlük"
   },
   "trip": {
     "tab_trips": "Seyahatler",
@@ -677,6 +680,28 @@
       "badge_title": "Telemetriden kurtarıldı — sürüş puanı yok",
       "detail_note": "Telemetriden kurtarıldı. Mesafe, hız ve rakım GPS'ten yeniden oluşturuldu; bu yolculuk için batarya, enerji, maliyet ve sürüş puanları kaydedilmedi."
     }
+  },
+  "automation": {
+    "tab_automations": "Otomasyonlar",
+    "tab_add": "Ekle",
+    "page_title": "Otomasyonlar",
+    "page_sub": "Bir araç olayı koşullarınızla eşleştiğinde bir eylemi otomatik olarak çalıştırın.",
+    "list_title": "Otomasyonlarınız",
+    "empty_p": "Yapılandırılmış otomasyon yok. Bir otomasyon ekleyin.",
+    "empty_hint": "Bir araç olayı koşullarınızla eşleştiğinde bir eylemi tetiklemek için bir tane oluşturun.",
+    "add_automation": "Otomasyon Ekle",
+    "edit_automation": "Otomasyonu Düzenle",
+    "save_automation": "Otomasyonu Kaydet",
+    "failed_to_load_schema": "Otomasyon şeması yüklenemedi. Overdrive bağlantısını kontrol edin.",
+    "invalid_form": "Lütfen formun doğru doldurulduğunu kontrol edin.",
+    "parse_error": "Otomasyon ayrıştırılamadı.",
+    "add_row": "Satır Ekle",
+    "extra_row": "Ve",
+    "toast_triggered": "Otomasyon tetiklendi.",
+    "trigger": "Şimdi çalıştır",
+    "delete_row": "Satırı kaldır",
+    "select": "Seç",
+    "unsupported_input": "Desteklenmeyen alan"
   },
   "recording": {
     "tab_status": "Durum",
@@ -1322,7 +1347,11 @@
     "storage_blocked_usb_off": "Park halindeyken SD/USB kullanmak için \"USB'yi açık tut\" seçeneğini etkinleştirin",
     "usb_off_confirm_body": "SD kart, USB güç hattını paylaşır, bu yüzden park halindeyken beslemesiz kalır. Kaydın çalışmaya devam etmesi için Gözetim Dahili depolamaya geçirilecek. USB gücünü tekrar açtıktan sonra SD karta geri dönebilirsiniz.",
     "approach_trigger_hint": "Her olay için tam oyalanma süresini zorunlu kılmak üzere Kapalı olarak ayarlayın. Daha düşük değerler yaklaşan kişileri daha hızlı kaydeder (yalnızca yapay zekâ gerçek bir kişi/araç gördüğünde tetiklenir).",
-    "approach_trigger_desc": "Kamera yapay zekâsı gerçekten yaklaşan bir kişiyi veya aracı doğruladığında — tam oyalanma süresini beklemeden daha erken kayda başla"
+    "approach_trigger_desc": "Kamera yapay zekâsı gerçekten yaklaşan bir kişiyi veya aracı doğruladığında — tam oyalanma süresini beklemeden daha erken kayda başla",
+    "low_soc_cutoff": "Düşük batarya kesme",
+    "low_soc_cutoff_desc": "Ana batarya bu seviyeye düştüğünde gözetimi durdurarak aracın uykuya geçmesine izin verir ve aşırı deşarja karşı korur. Batarya seviyesinde hiç durmamak için Kapalı olarak ayarlayın.",
+    "low_soc_cutoff_hint": "Yüksek değerler bataryayı daha çok korur ama gözetimi daha erken sonlandırır. Kapalı, batarya kritik seviyeye inene kadar izlemeyi sürdürür.",
+    "low_soc_cutoff_off": "Kapalı"
   },
   "mqtt": {
     "tab_connections": "Bağlantılar",
@@ -1389,7 +1418,11 @@
     "ha_short": "Home Assistant",
     "allow_control": "Allow vehicle control",
     "allow_control_desc": "Expose controllable entities (climate, windows, seats, settings…) and act on commands from Home Assistant. Local SDK only — never the BYD cloud. Off by default.",
-    "control_short": "control"
+    "control_short": "control",
+    "heartbeat_send_all": "Heartbeat'te tam eşitleme",
+    "heartbeat_send_all_desc": "Hiçbir şey değişmese bile her değeri heartbeat aralığında yeniden gönderir. Bağlantı kesintisinde kaybolan durumu geri kazanır.",
+    "flush_on_state_change": "Mod değişiminde gönder",
+    "flush_on_state_change_desc": "Araç mod değiştirdiğinde (motor açık/kapalı, şarj başladı/durdu) her değeri yeniden gönderir; böylece bir güncelleme ağ geçişinde kaybolsa bile yeni durum her zaman HA'ya ulaşır. Hafif — yalnızca geçişlerde tetiklenir."
   },
   "abrp": {
     "connected": "Bağlı",
@@ -2300,5 +2333,61 @@
     "restored_msg": "Ayarlar geri yüklendi. Yeniden yükleniyor…",
     "preview_failed": "Yedek doğrulanamadı.",
     "export_title": "Ayarları dışa aktar"
+  },
+  "notiflog": {
+    "load_failed": "Bildirimler yüklenemedi",
+    "count_one": "{n} bildirim",
+    "count_other": "{n} bildirim",
+    "snapshot_alt": "Olay anlık görüntüsü",
+    "delete": "Sil",
+    "range_pick": "Başlangıç veya bitiş tarihi seçin",
+    "range_apply": "Uygula",
+    "page_of": "Sayfa {page} / {total}",
+    "delete_title": "Bildirim silinsin mi?",
+    "delete_body": "Bu, bildirimi günlükten kaldırır. Geri alınamaz.",
+    "deleted": "Bildirim silindi",
+    "delete_failed": "Silinemedi",
+    "bulk_confirm_title": "Seçilenler silinsin mi?",
+    "bulk_confirm_body": "Seçili {n} bildirim silinsin mi? Bu işlem geri alınamaz.",
+    "bulk_deleted": "{n} silindi",
+    "clear_title": "Tüm bildirimler temizlensin mi?",
+    "clear_body": "Bu, tüm bildirim günlüğünü kalıcı olarak siler.",
+    "clear_all": "Tümünü temizle",
+    "cleared": "Bildirim günlüğü temizlendi",
+    "done": "Bitti",
+    "select": "Seç",
+    "select_all": "Tümünü seç",
+    "clear_selection": "Temizle",
+    "n_selected": "{n} seçildi",
+    "none_selected": "0 seçildi",
+    "group_other": "Diğer",
+    "filter_date": "Tarih",
+    "filter_all": "Tüm zamanlar",
+    "filter_7d": "7 gün",
+    "filter_30d": "30 gün",
+    "filter_custom": "Özel aralık",
+    "filter_category": "Kategori",
+    "filter_severity": "Önem",
+    "cat_all": "Tümü",
+    "cat_surveillance": "Gözetim",
+    "cat_charging": "Şarj",
+    "cat_security": "Güvenlik",
+    "cat_vehicle": "Araç",
+    "sev_all": "Tümü",
+    "sev_critical": "Kritik",
+    "sev_warn": "Uyarı",
+    "sev_info": "Bilgi",
+    "person": "kişi",
+    "vehicle": "araç",
+    "bike": "motosiklet",
+    "animal": "hayvan",
+    "prox_very_close": "Çok yakın",
+    "prox_close": "Yakın",
+    "prox_mid": "Orta",
+    "prox_far": "Uzak",
+    "empty": "Henüz bildirim yok",
+    "empty_hint": "Aldığınız uyarılar burada görünür; istediğiniz zaman inceleyebilirsiniz.",
+    "prev": "Önceki",
+    "next": "Sonraki"
   }
 }

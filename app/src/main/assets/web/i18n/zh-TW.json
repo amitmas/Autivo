@@ -23,7 +23,8 @@
     "telegram_title": "Telegram - OverDrive",
     "dashboard_title": "控制板 - OverDrive",
     "road_sense_title": "RoadSense - OverDrive",
-    "charging_title": "充電 - OverDrive"
+    "charging_title": "充電 - OverDrive",
+    "automations_title": "自動化 - OverDrive"
   },
   "nav": {
     "dashboard": "儀表板",
@@ -50,7 +51,8 @@
     "brand_home": "OverDrive — 開啟儀表板",
     "telegram": "Telegram",
     "road_sense": "RoadSense",
-    "charging": "充電"
+    "charging": "充電",
+    "automations": "自動化"
   },
   "road_sense": {
     "page_title": "RoadSense 設定",
@@ -368,7 +370,8 @@
     "drive_rhd_sub": "駕駛位於右側(英國、澳洲、印度、日本)。",
     "drive_save_failed": "無法儲存車輛配置",
     "drive_saved": "已儲存車輛配置",
-    "drive_load_failed": "無法載入車輛配置"
+    "drive_load_failed": "無法載入車輛配置",
+    "tab_log": "紀錄"
   },
   "trip": {
     "tab_trips": "行程",
@@ -677,6 +680,28 @@
       "badge_title": "從遙測資料復原 — 無駕駛評分",
       "detail_note": "從遙測資料復原。距離、速度與海拔是由 GPS 重建；此行程未記錄電池、能耗、費用與駕駛評分。"
     }
+  },
+  "automation": {
+    "tab_automations": "自動化",
+    "tab_add": "新增",
+    "page_title": "自動化",
+    "page_sub": "當車輛事件符合您的條件時自動執行動作。",
+    "list_title": "您的自動化",
+    "empty_p": "尚未設定自動化。請新增一個自動化。",
+    "empty_hint": "建立一個自動化，在車輛事件符合您的條件時觸發動作。",
+    "add_automation": "新增自動化",
+    "edit_automation": "編輯自動化",
+    "save_automation": "儲存自動化",
+    "failed_to_load_schema": "無法載入自動化結構描述。請檢查與 Overdrive 的連線。",
+    "invalid_form": "請檢查表單是否已正確填寫。",
+    "parse_error": "無法解析自動化。",
+    "add_row": "新增列",
+    "extra_row": "並且",
+    "toast_triggered": "已觸發自動化。",
+    "trigger": "立即執行",
+    "delete_row": "移除列",
+    "select": "選擇",
+    "unsupported_input": "不支援的欄位"
   },
   "recording": {
     "tab_status": "Status",
@@ -1322,7 +1347,11 @@
     "storage_blocked_usb_off": "開啟「保持 USB 供電」以在停車時使用 SD/USB",
     "usb_off_confirm_body": "SD 卡與 USB 共用同一電源，因此停車時將無法供電。監控會切換為內部儲存空間，以確保錄影持續運作。重新開啟 USB 電源後，您可以再切換回 SD 卡。",
     "approach_trigger_hint": "設為關閉則每個事件都須等候完整的徘徊時間。數值越低，越快錄下走近的情況（僅在 AI 偵測到真實的人/車輛時觸發）。",
-    "approach_trigger_desc": "當鏡頭 AI 確認有真實的人或車輛接近時提早錄影 — 無需等候完整的徘徊時間"
+    "approach_trigger_desc": "當鏡頭 AI 確認有真實的人或車輛接近時提早錄影 — 無需等候完整的徘徊時間",
+    "low_soc_cutoff": "低電量停止",
+    "low_soc_cutoff_desc": "當主電池電量降至此水準時停止監控並讓車輛休眠，防止其過度放電。設為關閉則不依電量停止。",
+    "low_soc_cutoff_hint": "數值越高對電池保護越好，但監控結束得越早。關閉後將持續監控，直到電池電量降至極低。",
+    "low_soc_cutoff_off": "關閉"
   },
   "mqtt": {
     "tab_connections": "連接方式",
@@ -1389,7 +1418,11 @@
     "ha_short": "Home Assistant",
     "allow_control": "允許車輛控制",
     "allow_control_desc": "公開可控制的實體（空調、車窗、座椅、設定…）並執行來自 Home Assistant 的指令。僅限本機 SDK — 絕不透過 BYD 雲端。預設為關閉。",
-    "control_short": "控制"
+    "control_short": "控制",
+    "heartbeat_send_all": "心跳時全量同步",
+    "heartbeat_send_all_desc": "即使沒有任何變化，也在每個心跳間隔重新傳送所有數值。可復原因連線中斷而遺失的狀態。",
+    "flush_on_state_change": "模式切換時清送",
+    "flush_on_state_change_desc": "當車輛模式發生變化時（引擎開/關、充電開始/停止）重新傳送所有數值，即使在網路切換時遺失了某次更新，新狀態也始終能送達HA。輕量——僅在狀態轉換時觸發。"
   },
   "abrp": {
     "connected": "聯繫",
@@ -2300,5 +2333,61 @@
     "restored_msg": "已還原設定。重新載入中…",
     "preview_failed": "無法驗證備份。",
     "export_title": "匯出設定"
+  },
+  "notiflog": {
+    "load_failed": "無法載入通知",
+    "count_one": "{n} 則通知",
+    "count_other": "{n} 則通知",
+    "snapshot_alt": "事件快照",
+    "delete": "刪除",
+    "range_pick": "請選擇開始或結束日期",
+    "range_apply": "套用",
+    "page_of": "第 {page} 頁，共 {total} 頁",
+    "delete_title": "刪除通知？",
+    "delete_body": "將從紀錄中移除，此操作無法復原。",
+    "deleted": "已刪除通知",
+    "delete_failed": "刪除失敗",
+    "bulk_confirm_title": "刪除所選項目？",
+    "bulk_confirm_body": "刪除所選的 {n} 則通知？此操作無法復原。",
+    "bulk_deleted": "已刪除 {n} 則",
+    "clear_title": "清除所有通知？",
+    "clear_body": "這將永久刪除整個通知紀錄。",
+    "clear_all": "全部清除",
+    "cleared": "通知紀錄已清除",
+    "done": "完成",
+    "select": "選取",
+    "select_all": "全選",
+    "clear_selection": "清除",
+    "n_selected": "已選 {n} 項",
+    "none_selected": "已選 0 項",
+    "group_other": "其他",
+    "filter_date": "日期",
+    "filter_all": "全部時間",
+    "filter_7d": "7 天",
+    "filter_30d": "30 天",
+    "filter_custom": "自訂範圍",
+    "filter_category": "類別",
+    "filter_severity": "嚴重程度",
+    "cat_all": "全部",
+    "cat_surveillance": "監控",
+    "cat_charging": "充電",
+    "cat_security": "安全",
+    "cat_vehicle": "車輛",
+    "sev_all": "全部",
+    "sev_critical": "嚴重",
+    "sev_warn": "警報",
+    "sev_info": "資訊",
+    "person": "人",
+    "vehicle": "車輛",
+    "bike": "機車",
+    "animal": "動物",
+    "prox_very_close": "極近",
+    "prox_close": "近",
+    "prox_mid": "中等",
+    "prox_far": "遠",
+    "empty": "尚無通知",
+    "empty_hint": "您收到的提醒會顯示在這裡，可隨時查看。",
+    "prev": "上一頁",
+    "next": "下一頁"
   }
 }

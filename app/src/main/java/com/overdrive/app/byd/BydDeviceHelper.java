@@ -794,6 +794,66 @@ public final class BydDeviceHelper {
         return false;
     }
 
+    /**
+     * Register a typed statistic listener. onElecPercentageChanged(double) — the
+     * DECIMAL display SoC — is a concrete method on AbsBYDAutoStatisticListener, NOT
+     * on the bare IBYDAutoListener marker interface, so the generic Proxy path can
+     * never receive it (the HAL dispatches it only to typed subscribers) — exactly
+     * like onExternalChargingPowerChanged on the instrument device. Via the generic
+     * path SoC only ever came from the slow getElecPercentageValue() poll (integer on
+     * this trim); the typed path delivers sub-integer SoC the moment it changes.
+     * Forwards the same methods the generic hub (onGenericCallback) already handles so
+     * there is zero behavioural regression, only added granularity. Typed first with a
+     * generic fallback kept at the call site for firmware exposing only the bare
+     * registerListener.
+     */
+    public static boolean registerStatisticListener(Object device, ListenerCallback callback) {
+        if (device == null) return false;
+        try {
+            android.hardware.bydauto.statistic.AbsBYDAutoStatisticListener listener =
+                new android.hardware.bydauto.statistic.AbsBYDAutoStatisticListener() {
+                    @Override
+                    public void onElecPercentageChanged(double percentage) {
+                        invokeCallback(callback, "onElecPercentageChanged", new Object[]{percentage});
+                    }
+                    @Override
+                    public void onFuelPercentageChanged(int percentage) {
+                        invokeCallback(callback, "onFuelPercentageChanged", new Object[]{percentage});
+                    }
+                };
+
+            // Strategy 1: 2-arg with empty int[] (subscribe-all) — some firmware
+            // only delivers through the filtered overload.
+            Method registerWithIds = findRegisterMethodWithIds(device.getClass(),
+                android.hardware.bydauto.statistic.AbsBYDAutoStatisticListener.class);
+            boolean twoArgRegistered = false;
+            if (registerWithIds != null) {
+                try {
+                    registerWithIds.invoke(device, listener, new int[0]);
+                    twoArgRegistered = true;
+                } catch (Exception e) {
+                    logger.debug("Statistic 2-arg registration failed: " + e.getMessage());
+                }
+            }
+
+            // Strategy 2: 1-arg typed.
+            Method register = findRegisterMethod(device.getClass(),
+                android.hardware.bydauto.statistic.AbsBYDAutoStatisticListener.class);
+            if (register != null) {
+                register.invoke(device, listener);
+                return true;
+            }
+            if (twoArgRegistered) return true;
+            logger.debug("registerStatisticListener: no registerListener method on "
+                + device.getClass().getName());
+        } catch (NoClassDefFoundError e) {
+            logger.debug("registerStatisticListener: class not available on this firmware");
+        } catch (Exception e) {
+            logger.debug("registerStatisticListener failed: " + e.getMessage());
+        }
+        return false;
+    }
+
     private static void invokeCallback(ListenerCallback callback, String method, Object[] args) {
         try {
             callback.onCallback(method, args);

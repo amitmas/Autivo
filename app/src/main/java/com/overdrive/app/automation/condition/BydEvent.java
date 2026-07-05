@@ -5,7 +5,6 @@ import com.overdrive.app.byd.BydVehicleData;
 import com.overdrive.app.byd.bodywork.BodyworkConstants;
 import com.overdrive.app.monitor.GearMonitor;
 
-import java.util.Arrays;
 import java.util.Map;
 
 public class BydEvent {
@@ -55,24 +54,30 @@ public class BydEvent {
 
         Automations.update(POWER, BodyworkConstants.powerLevelToString(data.powerLevel).toLowerCase());
         Automations.update(GEAR, GearMonitor.gearToString(data.gearMode).toLowerCase());
-        Automations.update(WINDOW_LF_PERCENT, data.windowOpenPercent[0]);
-        Automations.update(WINDOW_LF, data.windowOpenPercent[0] == 0 ? "closed" : "open");
-        Automations.update(WINDOW_RF_PERCENT, data.windowOpenPercent[1]);
-        Automations.update(WINDOW_RF, data.windowOpenPercent[1] == 0 ? "closed" : "open");
-        Automations.update(WINDOW_LR_PERCENT, data.windowOpenPercent[2]);
-        Automations.update(WINDOW_LR, data.windowOpenPercent[2] == 0 ? "closed" : "open");
-        Automations.update(WINDOW_RR_PERCENT, data.windowOpenPercent[3]);
-        Automations.update(WINDOW_RR, data.windowOpenPercent[3] == 0 ? "closed" : "open");
-        if (data.windowOpenPercent.length > 4) Automations.update(WINDOW_SUNROOF_PERCENT, data.windowOpenPercent[4]);
-        if (data.windowOpenPercent.length > 4) Automations.update(WINDOW_SUNROOF, data.windowOpenPercent[4] == 0 ? "closed" : "open");
-        if (data.windowOpenPercent.length > 5) Automations.update(WINDOW_SUNSHADE_PERCENT, data.windowOpenPercent[5]);
-        if (data.windowOpenPercent.length > 5) Automations.update(WINDOW_SUNSHADE, data.windowOpenPercent[5] == 0 ? "closed" : "open");
+        // windowOpenPercent is nullable (defaults null; only populated when the bodywork HAL device is
+        // present, and may be left null if the HAL reflection threw), and the HAL fills unavailable /
+        // unreadable slots with a negative sentinel (-1). Guard the whole block so the telemetry poll
+        // loop (build sites are not wrapped in try/catch) never NPEs, index every slot defensively by
+        // length, and skip sentinel slots — otherwise a -1 would map to "open" (since -1 != 0) and
+        // false-fire a "window open" automation, and would keep WINDOW_ALL from ever reporting "closed".
+        int[] win = data.windowOpenPercent;
+        if (win != null) {
+            if (win.length > 0) updateWindow(WINDOW_LF_PERCENT, WINDOW_LF, win[0]);
+            if (win.length > 1) updateWindow(WINDOW_RF_PERCENT, WINDOW_RF, win[1]);
+            if (win.length > 2) updateWindow(WINDOW_LR_PERCENT, WINDOW_LR, win[2]);
+            if (win.length > 3) updateWindow(WINDOW_RR_PERCENT, WINDOW_RR, win[3]);
+            if (win.length > 4) updateWindow(WINDOW_SUNROOF_PERCENT, WINDOW_SUNROOF, win[4]);
+            if (win.length > 5) updateWindow(WINDOW_SUNSHADE_PERCENT, WINDOW_SUNSHADE, win[5]);
 
-        if (Arrays.stream(data.windowOpenPercent).allMatch(percent -> percent == 0)) {
-            Automations.update(WINDOW_ALL, "closed");
-        } else {
-            // Set the state to open when any window is open so it can be used as a shortcut to see that all are closed
-            Automations.update(WINDOW_ALL, "open");
+            // WINDOW_ALL is a convenience shortcut ("are all windows shut?"). Only meaningful once we
+            // have at least one real reading: "closed" iff every available (non-negative) slot is 0.
+            boolean anyKnown = false, anyOpen = false;
+            for (int percent : win) {
+                if (percent < 0) continue; // unavailable slot — ignore
+                anyKnown = true;
+                if (percent != 0) anyOpen = true;
+            }
+            if (anyKnown) Automations.update(WINDOW_ALL, anyOpen ? "open" : "closed");
         }
         if (!Double.isNaN(data.socPercent)) Automations.update(BATTERY_LEVEL, (int) data.socPercent);
         if (data.elecRangeKm != BydVehicleData.UNAVAILABLE) {
@@ -96,6 +101,19 @@ public class BydEvent {
         boolean poweredOn = data.powerLevel >= 2;
         Automations.update(AC, (poweredOn && data.acStartState == 1) ? "on" : "off");
         if (!Double.isNaN(data.insideTempC)) Automations.update(TEMPERATURE, (int) data.insideTempC);
+    }
+
+    /**
+     * Seed the percent and open/closed state events for one window slot, skipping unavailable slots.
+     *
+     * @param percentKey The event key for the raw open percentage
+     * @param stateKey   The event key for the derived open/closed state
+     * @param percent    The slot's open percentage, or a negative sentinel if unavailable
+     */
+    private static void updateWindow(EventData percentKey, EventData stateKey, int percent) {
+        if (percent < 0) return; // unavailable/unreadable slot — leave the state unseeded
+        Automations.update(percentKey, percent);
+        Automations.update(stateKey, percent == 0 ? "closed" : "open");
     }
 
     private static String seatClimateToString(int level) {

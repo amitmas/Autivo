@@ -3,6 +3,8 @@
     "person_detected": "Person detected",
     "person_close": "Person detected close range",
     "vehicle_detected": "Vehicle detected",
+    "bike_detected": "Bike detected",
+    "animal_detected": "Animal detected",
     "motion_started": "Motion started",
     "motion_ended": "Motion ended",
     "proximity_red": "Proximity alert · close (0–0.5m)",

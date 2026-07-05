@@ -1275,6 +1275,7 @@
     <string name="onboarding_expert_done_body">您已看過更深入的設定。隨時可從說明按鈕再次開啟此導覽。</string>
     <string name="onboarding_expert_chapter_label">第 %1$d 章，共 %2$d 章</string>
     <string name="rail_charging">充電</string>
+    <string name="rail_automations">自動化</string>
     <string name="onboarding_skip">略過</string>
     <string name="onboarding_expert_traffic_body">BYD 內建的流量監控會阻止其他應用程式使用車輛內建的 SIM 卡。若您想透過 BYD SIM 遠端連線您的車輛，必須在此將其停用。主機會重新開機以套用變更。</string>
     <string name="onboarding_expert_surveillance_body">在此微調偵測、畫質與儲存空間。這些會以由車輛提供的應用程式內設定頁開啟 — 空白畫面只是表示協助程式仍在啟動中。</string>

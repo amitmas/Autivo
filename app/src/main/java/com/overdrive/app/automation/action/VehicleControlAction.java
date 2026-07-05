@@ -3,6 +3,8 @@ package com.overdrive.app.automation.action;
 import com.overdrive.app.automation.AutomationAction;
 import com.overdrive.app.automation.type.Type;
 import com.overdrive.app.automation.value.Label;
+import com.overdrive.app.byd.BydDataCollector;
+import com.overdrive.app.byd.BydVehicleData;
 import com.overdrive.app.byd.routing.VehicleCommandRouter;
 import com.overdrive.app.mqtt.VehicleControlCatalog;
 import com.overdrive.app.server.Messages;
@@ -99,7 +101,12 @@ public class VehicleControlAction extends BaseAction {
         // Vehicle control currently only uses a single variable for an action
         String payload = Objects.requireNonNullElse(automationAction.getVariables().get("payload"), "").toString();
         // TODO: Add other variables in to sub for actions like climate control
-        VehicleControlCatalog.ControlAction action = entity.toAction(null, payload, null);
+        // Pass the latest vehicle snapshot so composite commands can preserve sibling state (e.g. a
+        // seat_heat_driver command reads the other zones' current levels from the snapshot; a null
+        // snapshot would reset them all to 0). getData() may still be null before the first collect,
+        // which the catalog handlers already tolerate.
+        BydVehicleData snapshot = BydDataCollector.getInstance().getData();
+        VehicleControlCatalog.ControlAction action = entity.toAction(null, payload, snapshot);
         if (action == null || action.command == null) {
             logger.error("Action for vehicle control automation entity missing: " + getLabel().getId());
             return;

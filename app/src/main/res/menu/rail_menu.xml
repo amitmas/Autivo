@@ -30,6 +30,10 @@
         android:icon="@drawable/ic_charging"
         android:title="@string/rail_charging" />
     <item
+        android:id="@+id/automationsFragment"
+        android:icon="@drawable/ic_automations"
+        android:title="@string/rail_automations" />
+    <item
         android:id="@+id/integrationsFragment"
         android:icon="@drawable/ic_integrations"
         android:title="@string/rail_integrations" />
