@@ -444,6 +444,34 @@ public class MqttConnectionManager {
     // ==================== TELEMETRY COLLECTION ====================
 
     /**
+     * Return a shallow copy of {@code base} with the position fields refreshed to the current GPS
+     * fix. Used on a telemetry-cache hit so the GPS track publishes at the publish-cycle rate
+     * (e.g. 1Hz) instead of being frozen to the 2s telemetry cache, while the expensive BYD SDK
+     * fields stay cached. Mirrors the lat/lon/elevation/heading block in {@link #collectTelemetry()}.
+     * Copies rather than mutating {@code base} because the cached object is shared across connections.
+     */
+    private JSONObject withLiveGps(JSONObject base) {
+        try {
+            JSONObject copy = new JSONObject();
+            for (java.util.Iterator<String> it = base.keys(); it.hasNext(); ) {
+                String k = it.next();
+                copy.put(k, base.opt(k));
+            }
+            if (gpsMonitor != null && gpsMonitor.hasLocation()) {
+                copy.put("lat", gpsMonitor.getLatitude());
+                copy.put("lon", gpsMonitor.getLongitude());
+                double alt = gpsMonitor.getAltitude();
+                if (alt != 0) copy.put("elevation", alt);
+                float heading = gpsMonitor.getHeading();
+                if (heading > 0) copy.put("heading", heading);
+            }
+            return copy;
+        } catch (Exception e) {
+            return base; // on any failure, fall back to the cached snapshot unchanged
+        }
+    }
+
+    /**
      * Collect telemetry from all data sources.
      * Same fields as ABRP Gold Standard payload for consistency.
      */
@@ -452,8 +480,15 @@ public class MqttConnectionManager {
 
         // If we collected data less than 2 seconds ago, return the cached copy immediately.
         // This protects the BYD hardware from being spammed by multiple MQTT threads.
+        //
+        // BUT position must not be frozen to that 2s cache: GPS comes from the in-memory GpsMonitor
+        // (~1Hz, cheap to read — no BYD SDK hit), and serving the cached snapshot capped the
+        // published track at ~0.5Hz and lagged the position (visible as corner-cutting + start/stop
+        // gaps in HA). Refresh just the position fields onto a COPY of the cached snapshot so the
+        // track publishes at the full publish-cycle rate. Copy, not mutate: the cached object is
+        // shared with other connections that read it concurrently.
         if (lastCachedTelemetry != null && (now - lastCollectionTimeMs) < TELEMETRY_CACHE_TTL_MS) {
-            return lastCachedTelemetry;
+            return withLiveGps(lastCachedTelemetry);
         }
 
         JSONObject payload = new JSONObject();

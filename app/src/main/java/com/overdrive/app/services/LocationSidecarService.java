@@ -191,9 +191,13 @@ public class LocationSidecarService extends Service implements LocationListener 
             @Override
             public void run() {
                 sendGpsViaTcp();
-                
-                // If no fresh GPS fix in 30 seconds, request one explicitly
-                // This handles cases where the provider stopped sending updates
+
+                // Poll the provider's last-known fix and process it. Our own 1s
+                // GPS request (requestLocationUpdates GPS_PROVIDER, 1000ms) keeps
+                // the provider PRODUCING fixes at ~1Hz, so its last-known cache is
+                // fresh at ~1Hz even if the onLocationChanged callback isn't
+                // delivering on this background looper — this poll then picks up a
+                // fresh distinct fix each tick.
                 if (permissionGranted && locationManager != null) {
                     try {
                         Location lastGps = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER);
@@ -201,7 +205,7 @@ public class LocationSidecarService extends Service implements LocationListener 
                             long fixAge = System.currentTimeMillis() - lastGps.getTime();
                             if (fixAge < 10000) {
                                 // Fresh fix available that we might have missed
-                                onLocationChanged(lastGps);
+                                processFix(lastGps);
                             }
                         }
                     } catch (SecurityException e) {
@@ -210,13 +214,15 @@ public class LocationSidecarService extends Service implements LocationListener 
                         // Ignore
                     }
                 }
-                
-                // Periodic keep-alive / daemon-restart recovery. Kept at 4s
-                // (down from the original 2s for CPU/IPC savings, but well
-                // under RoadSense's 5s fix-staleness cutoff) so that when the
-                // car is truly stationary and the provider emits no callbacks,
-                // GpsMonitor.lastUpdate never ages past the consumer threshold.
-                handler.postDelayed(this, 4000);
+
+                // Periodic keep-alive / poll / daemon-restart recovery. Dropped
+                // from 4000ms -> 1000ms: at 4s this poll was the ONLY thing
+                // advancing GpsMonitor (the provider callback wasn't delivering),
+                // capping GPS at ~0.25Hz across both the MQTT feed AND the internal
+                // trip track. 1s makes GpsMonitor ~1Hz. Still well under RoadSense's
+                // 5s fix-staleness cutoff; CPU/IPC cost of a localhost write + one
+                // file cache per second is negligible (was 2s originally).
+                handler.postDelayed(this, 1000);
             }
         };
         handler.postDelayed(periodicSender, 5000);
@@ -282,7 +288,18 @@ public class LocationSidecarService extends Service implements LocationListener 
             // IPC/disk spam happens downstream in onLocationChanged (the
             // distance/time gate), NOT at the provider — coarsening the
             // provider here would starve hazard approach detection.
-            if (locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
+            //
+            // Register UNCONDITIONALLY — never gate on isProviderEnabled().
+            // The head unit disables location (location_mode=0) whenever the
+            // car is off, and app (re)starts almost always happen parked, so
+            // an isProviderEnabled gate here meant the listener was NEVER
+            // registered for that app instance and the callback path never
+            // delivered — fixes then only arrived via the periodic
+            // getLastKnownLocation poll, riding on the factory nav's own GPS
+            // request while driving. Android accepts registration while a
+            // provider is disabled and starts delivering the moment it comes
+            // on (ACC-on) — exactly the behavior we want.
+            try {
                 locationManager.requestLocationUpdates(
                     LocationManager.GPS_PROVIDER,
                     1000,  // 1 second
@@ -290,12 +307,15 @@ public class LocationSidecarService extends Service implements LocationListener 
                     this,
                     workerThread.getLooper()  // deliver off the UI thread
                 );
-                Log.i(TAG, "GPS provider started (1s/0m)");
+                Log.i(TAG, "GPS provider registered (1s/0m), enabled="
+                        + locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER));
+            } catch (Exception e) {
+                Log.e(TAG, "GPS provider registration failed: " + e.getMessage());
             }
 
             // Also use network provider as fallback. 5s cadence is fine; keep
             // min-distance 0 so it doesn't pre-filter fixes the gate wants.
-            if (locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) {
+            try {
                 locationManager.requestLocationUpdates(
                     LocationManager.NETWORK_PROVIDER,
                     5000,  // 5 seconds
@@ -303,7 +323,10 @@ public class LocationSidecarService extends Service implements LocationListener 
                     this,
                     workerThread.getLooper()  // deliver off the UI thread
                 );
-                Log.i(TAG, "Network provider started (5s/0m)");
+                Log.i(TAG, "Network provider registered (5s/0m), enabled="
+                        + locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER));
+            } catch (Exception e) {
+                Log.e(TAG, "Network provider registration failed: " + e.getMessage());
             }
             
             // Get last known location immediately
@@ -331,6 +354,11 @@ public class LocationSidecarService extends Service implements LocationListener 
 
     @Override
     public void onLocationChanged(Location location) {
+        processFix(location);
+    }
+
+    /** Process a fix from either the provider callback or the periodic poll. */
+    private void processFix(Location location) {
         if (location == null) return;
 
         long now = System.currentTimeMillis();
