@@ -1587,6 +1587,10 @@ public class CameraDaemon {
     public static boolean isRunning() {
         return running.get();
     }
+
+    public static HttpServer getHttpServer() {
+        return httpServer;
+    }
     
     /**
      * Periodic memory monitor. Daemon-process equivalent of

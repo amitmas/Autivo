@@ -14,6 +14,7 @@ import org.json.JSONObject;
 
 import java.io.BufferedOutputStream;
 import java.io.BufferedReader;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
@@ -648,6 +649,21 @@ public class HttpServer {
         } finally {
             try { client.close(); } catch (Exception e) {}
         }
+    }
+
+    /**
+     * Used for automations to have an API action without going through authentication
+     *
+     * @return The HTTP response as a String
+     */
+    public String automationApiRequest(String method, String path, String body) {
+        OutputStream out = new ByteArrayOutputStream();
+        try {
+            if (!routeToHandlers(method, path, body, null, null, out)) return null;
+        } catch (Exception e) {
+            return null;
+        }
+        return out.toString();
     }
 
     /**
