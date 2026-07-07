@@ -2412,6 +2412,10 @@ public class BydDataCollector {
                 }
             }
             b.seatHeat(seatHeat).seatCool(seatCool);
+            int childPresenceDetection = BydDeviceHelper.callGetSingle(settingDevice, BydFeatureIds.SETTING_CPD_SWITCH_STATUS);
+            if (childPresenceDetection >= 0) {
+                b.childPresenceDetection(childPresenceDetection);
+            }
         } catch (Exception e) {
             logger.debug("collectSettings error: " + e.getMessage());
         }
@@ -4305,7 +4309,16 @@ public class BydDataCollector {
         try {
             int eventId = ((Number) args[0]).intValue();
             int iVal = BydDeviceHelper.getIntValue(args[1]);
-            // SDK reports 1=off, 2=low, 3=high. Anything else is unknown — ignore.
+            // SDK reports 1=on, 2=off, 3=delay for CPD
+            if (eventId == BydFeatureIds.SETTING_CPD_SWITCH_STATUS && iVal > 0 && iVal < 4) {
+                BydVehicleData current = snapshot.get();
+                if (current != null) {
+                    snapshot.set(current.toBuilder().childPresenceDetection(iVal).build());
+                }
+                return;
+            }
+
+            // SDK reports 1=off, 2=low, 3=high for seats. Anything else is unknown — ignore.
             if (iVal < 1 || iVal > 3) return;
 
             int normalized = iVal - 1;
@@ -5397,6 +5410,18 @@ public class BydDataCollector {
             return result == 0;
         } catch (Exception e) {
             logger.debug("setSeatMemoryPosition failed: " + e.getMessage());
+        }
+        return false;
+    }
+
+    public boolean setChildPresenceDetection(int value) {
+        try {
+            if (value < 1 || value > 3) return false;
+            // 1 is for on, 2 is for off and 3 is for delay
+            int result = BydDeviceHelper.callSetSingle(settingDevice, BydFeatureIds.SETTING_CPD_SWITCH_STATUS_SET, value);
+            return result == 0;
+        } catch (Exception e) {
+            logger.debug("setChildPresenceDetection failed: " + e.getMessage());
         }
         return false;
     }

@@ -548,6 +548,15 @@ public final class VehicleCommandRouter {
         public boolean executeViaSdk(BydDataCollector c) { return c.setSpeedLimitWarning(enabled); }
     }
 
+    public static final class SettingChildPresenceDetectionCommand extends VehicleCommand {
+        public final int value;
+        public SettingChildPresenceDetectionCommand(int value) { this.value = value; }
+        public String name() { return "setting-cpd"; }
+        public Capability sdkCapability() { return Capability.REQUIRED; }
+        public RoutePreference defaultPreference() { return RoutePreference.SDK_ONLY; }
+        public boolean executeViaSdk(BydDataCollector c) { return c.setChildPresenceDetection(value); }
+    }
+
     /**
      * Smart-charging schedule — BYD cloud /control/smartCharge/saveOrUpdate.
      * Wire-compatible with pyBYD's trigger_save_charging_schedule.

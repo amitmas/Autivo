@@ -28,6 +28,7 @@ var VC = {
         windows: { lf: 0, rf: 0, lr: 0, rr: 0, sunroof: 0, sunshade: 0 },
         lights: { dayTimeLight: false },
         adas: { speedLimitWarning: false },
+        setting: { childPresenceDetection: false },
         soc: 0,
         rangeKm: 0,
         cloudConfigured: false,
@@ -1514,6 +1515,18 @@ var VC = {
                     BYD.i18n.t('vehicle.slw_failed'));
             });
         });
+        this.bindBtn('btnCPD', function() {
+            var enable = !(self.vehicleState.setting && self.vehicleState.setting.childPresenceDetection);
+            self.apiPost('/api/vehicle/setting', { target: 'childPresenceDetection', value: enable ? 1 : 2 }).then(function(result) {
+                if (result.success) {
+                    self.vehicleState.setting.childPresenceDetection = enable;
+                    self.updateAdasUI();
+                }
+                self.toastFromResult(result,
+                    BYD.i18n.t(enable ? 'vehicle.cpd_enabled' : 'vehicle.cpd_disabled'),
+                    BYD.i18n.t('vehicle.cpd_failed'));
+            });
+        });
 
         // === CHARGING SCHEDULE ===
         // pyBYD-shaped: { startChargeTime, endChargeTime, chargeWay, enabled }.
@@ -1967,6 +1980,7 @@ var VC = {
 
             if (data.lights) self.vehicleState.lights = data.lights;
             if (data.adas) self.vehicleState.adas = data.adas;
+            if (data.setting) self.vehicleState.setting = data.setting;
 
             if (data.seats && data.seats.heat) self.vehicleState.seatHeat = data.seats.heat;
             if (data.seats && data.seats.cool) self.vehicleState.seatCool = data.seats.cool;
@@ -2379,6 +2393,9 @@ var VC = {
         var btnSLW = document.getElementById('btnSLW');
         var on = !!(this.vehicleState.adas && this.vehicleState.adas.speedLimitWarning);
         if (btnSLW) { if (on) btnSLW.classList.add('on'); else btnSLW.classList.remove('on'); }
+        var btnCPD = document.getElementById('btnCPD');
+        var on = !!(this.vehicleState.setting && this.vehicleState.setting.childPresenceDetection);
+        if (btnCPD) { if (on) btnCPD.classList.add('on'); else btnCPD.classList.remove('on'); }
     },
 
     /** Custom-mode chargeWay: always emit CSV so server doesn't fall back to "e". */

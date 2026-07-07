@@ -108,6 +108,9 @@ public class BydVehicleData {
     // ==================== ADAS ====================
     public final boolean speedLimitWarning;
 
+    // ==================== Setting ====================
+    public final int childPresenceDetection;
+
     // ==================== SEATBELTS ====================
     public final int[] seatbeltStatus;    // [1-5]
 
@@ -261,6 +264,7 @@ public class BydVehicleData {
         this.hazard = b.hazard;
         this.dayTimeLight = b.dayTimeLight;
         this.speedLimitWarning = b.speedLimitWarning;
+        this.childPresenceDetection = b.childPresenceDetection;
         this.seatbeltStatus = b.seatbeltStatus;
         this.seatHeat = b.seatHeat;
         this.seatCool = b.seatCool;
@@ -664,6 +668,7 @@ public class BydVehicleData {
         b.dayTimeLight = dayTimeLight; b.seatbeltStatus = seatbeltStatus;
         b.seatHeat = seatHeat; b.seatCool = seatCool;
         b.speedLimitWarning = speedLimitWarning;
+        b.childPresenceDetection = childPresenceDetection;
         b.acStartState = acStartState; b.acCycleMode = acCycleMode; b.acWindMode = acWindMode; b.acFanLevel = acFanLevel;
         b.tempUnit = tempUnit; b.slopeDegrees = slopeDegrees; b.powerLevel = powerLevel;
         b.mcuStatus = mcuStatus; b.emergencyAlarmState = emergencyAlarmState;
@@ -724,6 +729,7 @@ public class BydVehicleData {
         int leftTurnState = UNAVAILABLE, rightTurnState = UNAVAILABLE;
         boolean lowBeam, highBeam, rearFog, frontFog, hazard, dayTimeLight;
         boolean speedLimitWarning;
+        int childPresenceDetection;
         int acStartState = UNAVAILABLE, acCycleMode = UNAVAILABLE, acWindMode = UNAVAILABLE, acFanLevel = UNAVAILABLE, tempUnit = UNAVAILABLE;
         double slopeDegrees = NaN;
         int powerLevel = UNAVAILABLE, mcuStatus = UNAVAILABLE, emergencyAlarmState = UNAVAILABLE;
@@ -830,6 +836,7 @@ public class BydVehicleData {
         public Builder hazard(boolean v) { hazard = v; return this; }
         public Builder dayTimeLight(boolean v) { dayTimeLight = v; return this; }
         public Builder speedLimitWarning(boolean v) { speedLimitWarning = v; return this; }
+        public Builder childPresenceDetection(int v) { childPresenceDetection = v; return this; }
         public Builder seatbeltStatus(int[] v) { seatbeltStatus = v; return this; }
         public Builder seatHeat(int[] v) { seatHeat = v; return this; }
         public Builder seatCool(int[] v) { seatCool = v; return this; }

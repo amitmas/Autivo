@@ -32,6 +32,7 @@ import java.io.OutputStream;
  *   POST /api/vehicle/seat          — SDK_ONLY
  *   POST /api/vehicle/lights        — SDK_ONLY
  *   POST /api/vehicle/adas          — SDK_ONLY
+ *   POST /api/vehicle/setting       — SDK_ONLY
  *   POST /api/vehicle/battery-heat  — CLOUD_ONLY
  *   GET  /api/vehicle/charging-schedule  — local mirror { enabled, startChargeTime, endChargeTime, chargeWay }
  *   POST /api/vehicle/charging-schedule  — { startChargeTime, endChargeTime, chargeWay, enabled } CLOUD_ONLY
@@ -114,6 +115,12 @@ public class VehicleControlApiHandler {
         // POST /api/vehicle/adas
         if (cleanPath.equals("/api/vehicle/adas") && method.equals("POST")) {
             handleAdas(out, body);
+            return true;
+        }
+
+        // POST /api/vehicle/setting
+        if (cleanPath.equals("/api/vehicle/setting") && method.equals("POST")) {
+            handleSetting(out, body);
             return true;
         }
 
@@ -343,6 +350,12 @@ public class VehicleControlApiHandler {
         JSONObject adas = new JSONObject();
         adas.put("speedLimitWarning", data.speedLimitWarning);
         response.put("adas", adas);
+
+        // Setting
+        JSONObject setting = new JSONObject();
+        // Conside the delay setting to be on
+        setting.put("childPresenceDetection", data.childPresenceDetection != 2);
+        response.put("setting", setting);
 
         // Seats — heating/cooling levels for driver/passenger ([0-2], 0=off)
         JSONObject seats = new JSONObject();
@@ -760,6 +773,38 @@ public class VehicleControlApiHandler {
             HttpResponse.sendJson(out, resp.toString());
         } catch (Exception e) {
             logger.warn("Adas command failed: " + e.getMessage());
+            response.put("success", false);
+            response.put("error", e.getMessage());
+            HttpResponse.sendJson(out, response.toString());
+        }
+    }
+
+    /**
+     * Setting controls — SDK_ONLY routed.
+     * Body: { "target": "childPresenceDetection", "value": 1|2|3 }
+     * The value 1 is for on, 2 is for off and 3 is for delay
+     */
+    private static void handleSetting(OutputStream out, String body) throws Exception {
+        JSONObject response = new JSONObject();
+        try {
+            JSONObject req = new JSONObject(body);
+            String target = req.optString("target", null);
+            int value = req.optInt("value", 1);
+            if (!"childPresenceDetection".equals(target)) {
+                response.put("success", false);
+                response.put("error", Messages.get("errors.vehicle_unsupported_target_with_target", target));
+                HttpResponse.sendJson(out, response.toString());
+                return;
+            }
+            CommandResult r = VehicleCommandRouter.getInstance()
+                    .execute(new VehicleCommandRouter.SettingChildPresenceDetectionCommand(value));
+            logger.info("Adas: target=childPresenceDetection value=" + value + " " + r.outcome);
+            JSONObject resp = routedResponse(r, "setting");
+            resp.put("target", target);
+            resp.put("value", value);
+            HttpResponse.sendJson(out, resp.toString());
+        } catch (Exception e) {
+            logger.warn("Setting command failed: " + e.getMessage());
             response.put("success", false);
             response.put("error", e.getMessage());
             HttpResponse.sendJson(out, response.toString());

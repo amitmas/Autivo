@@ -597,45 +597,6 @@ public class HttpServer {
                 if (!serveStaticFile(out, filePath)) {
                     HttpResponse.sendError(out, 404, "Not Found: " + path);
                 }
-            }
-            // Core camera APIs (kept inline for simplicity)
-            else if (path.startsWith("/snapshot/")) {
-                int camId = Integer.parseInt(path.substring(10));
-                sendSnapshot(out, camId);
-            } else if (path.equals("/status")) {
-                sendStatus(out);
-            } else if (path.startsWith("/api/start/")) {
-                int camId = Integer.parseInt(path.substring(11));
-                CameraDaemon.startCamera(camId, true, false);
-                HttpResponse.sendJson(out, "{\"status\":\"ok\",\"action\":\"start\",\"camera\":" + camId + "}");
-            } else if (path.startsWith("/api/view/")) {
-                int camId = Integer.parseInt(path.substring(10));
-                CameraDaemon.startCamera(camId, true, true);
-                HttpResponse.sendJson(out, "{\"status\":\"ok\",\"action\":\"view\",\"camera\":" + camId + "}");
-            } else if (path.startsWith("/api/stop/")) {
-                int camId = Integer.parseInt(path.substring(10));
-                CameraDaemon.stopCamera(camId);
-                HttpResponse.sendJson(out, "{\"status\":\"ok\",\"action\":\"stop\",\"camera\":" + camId + "}");
-            } else if (path.equals("/api/stopall")) {
-                CameraDaemon.stopAllCameras();
-                HttpResponse.sendJson(out, "{\"status\":\"ok\",\"action\":\"stopall\"}");
-            } else if (path.equals("/api/recording/mode")) {
-                // Get/Set recording mode
-                if (method.equals("GET")) {
-                    String currentMode = CameraDaemon.getRecordingMode();
-                    HttpResponse.sendJson(out, "{\"status\":\"ok\",\"mode\":\"" + currentMode + "\"}");
-                } else if (method.equals("POST")) {
-                    JSONObject json = new JSONObject(body);
-                    String mode = json.optString("mode", "");
-                    if (!mode.isEmpty()) {
-                        CameraDaemon.setRecordingMode(mode);
-                        HttpResponse.sendJson(out, "{\"status\":\"ok\",\"mode\":\"" + mode + "\"}");
-                    } else {
-                        HttpResponse.sendJson(out, "{\"status\":\"error\",\"message\":\"No mode specified\"}");
-                    }
-                } else {
-                    HttpResponse.sendError(out, 405, "Method Not Allowed");
-                }
             } else if (path.startsWith("/h264/")) {
                 // Deprecated HTTP streaming
                 JSONObject response = new JSONObject();
@@ -676,6 +637,53 @@ public class HttpServer {
      */
     private boolean routeToHandlers(String method, String path, String body, String rangeHeader,
                                      String ifNoneMatchHeader, OutputStream out) throws Exception {
+        // Core camera APIs (kept inline for simplicity)
+        if (path.startsWith("/snapshot/")) {
+            int camId = Integer.parseInt(path.substring(10));
+            sendSnapshot(out, camId);
+            return true;
+        } else if (path.equals("/status")) {
+            sendStatus(out);
+            return true;
+        } else if (path.startsWith("/api/start/")) {
+            int camId = Integer.parseInt(path.substring(11));
+            CameraDaemon.startCamera(camId, true, false);
+            HttpResponse.sendJson(out, "{\"status\":\"ok\",\"action\":\"start\",\"camera\":" + camId + "}");
+            return true;
+        } else if (path.startsWith("/api/view/")) {
+            int camId = Integer.parseInt(path.substring(10));
+            CameraDaemon.startCamera(camId, true, true);
+            HttpResponse.sendJson(out, "{\"status\":\"ok\",\"action\":\"view\",\"camera\":" + camId + "}");
+            return true;
+        } else if (path.startsWith("/api/stop/")) {
+            int camId = Integer.parseInt(path.substring(10));
+            CameraDaemon.stopCamera(camId);
+            HttpResponse.sendJson(out, "{\"status\":\"ok\",\"action\":\"stop\",\"camera\":" + camId + "}");
+            return true;
+        } else if (path.equals("/api/stopall")) {
+            CameraDaemon.stopAllCameras();
+            HttpResponse.sendJson(out, "{\"status\":\"ok\",\"action\":\"stopall\"}");
+            return true;
+        } else if (path.equals("/api/recording/mode")) {
+            // Get/Set recording mode
+            if (method.equals("GET")) {
+                String currentMode = CameraDaemon.getRecordingMode();
+                HttpResponse.sendJson(out, "{\"status\":\"ok\",\"mode\":\"" + currentMode + "\"}");
+            } else if (method.equals("POST")) {
+                JSONObject json = new JSONObject(body);
+                String mode = json.optString("mode", "");
+                if (!mode.isEmpty()) {
+                    CameraDaemon.setRecordingMode(mode);
+                    HttpResponse.sendJson(out, "{\"status\":\"ok\",\"mode\":\"" + mode + "\"}");
+                } else {
+                    HttpResponse.sendJson(out, "{\"status\":\"error\",\"message\":\"No mode specified\"}");
+                }
+            } else {
+                HttpResponse.sendError(out, 405, "Method Not Allowed");
+            }
+            return true;
+        }
+
         // Recordings API (with Range header support for video seeking) + thumbnails + event timelines
         if (path.startsWith("/api/recordings") || path.startsWith("/video/") ||
             path.startsWith("/thumb/") || path.startsWith("/api/events/")) {

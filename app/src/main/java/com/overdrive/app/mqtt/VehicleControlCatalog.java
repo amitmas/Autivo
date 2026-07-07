@@ -360,6 +360,12 @@ public final class VehicleControlCatalog {
                 "1", "0", (sub, payload, snap) ->
                         ControlAction.of(new VehicleCommandRouter.AdasSpeedLimitWarningCommand(truthy(payload)))));
 
+        // ── ADAS child presence detection — switch (real state) ──────────────
+        // TODO: stateKey is not a boolean. Is that an issue?
+        register(sw("adas_cpd", "Child Presence Detection", "mdi:car-child-seat", "config", "child_presence_detection",
+                "1", "0", (sub, payload, snap) ->
+                        ControlAction.of(new VehicleCommandRouter.SettingChildPresenceDetectionCommand(truthy(payload) ? 1 : 2))));
+
         // ── Charge cap (BEV) — switch + number, optimistic state ────────
         register(sw("charge_cap_enabled", "Charge Limit", "mdi:battery-charging-100", "config", null, "1", "0",
                 (sub, payload, snap) -> ControlAction.echo(

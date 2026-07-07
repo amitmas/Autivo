@@ -23,6 +23,17 @@ public class Actions {
         addAction(new VehicleControlAction(
                 new Label("adas_slw", "automation.set_slw"), "automation.set_slw_description",
                 new EnumType(new Label("payload", "automation.action"), new Label("off", "automation.off"), new Label("on", "automation.on"))));
+        addAction(new ApiAction(
+                new Label("cpd", "automation.set_cpd"),
+                "automation.set_cpd_description",
+                "POST",
+                "/api/vehicle/setting",
+                "{\"target\":\"childPresenceDetection\",\"value\":${action}",
+                new EnumType(
+                        new Label("action", "automation.action"),
+                        new Label("2", "automation.off"),
+                        new Label("1", "automation.on"),
+                        new Label("3", "automation.cpd_delay"))));
         addAction(new VehicleControlAction(
                 new Label("drl", "automation.set_drl"), "automation.set_drl_description",
                 new EnumType(new Label("payload", "automation.action"), new Label("off", "automation.off"), new Label("on", "automation.on"))));
@@ -142,19 +153,18 @@ public class Actions {
                         new Label("action", "automation.action"),
                         new Label("disable", "automation.off"),
                         new Label("enable", "automation.on"))));
-        // Recording settings are inline in the handleClient method so can't be accessed. Only doing surveillance for now.
-        // addAction(new ApiAction(
-        //         new Label("recording", "automation.set_recording"),
-        //         "automation.set_recording_description",
-        //         "POST",
-        //         "/api/recording/mode",
-        //         "{\"mode\":\"${mode}\"}",
-        //         new EnumType(
-        //                 new Label("mode", "automation.mode"),
-        //                 new Label("NONE", "automation.none"),
-        //                 new Label("CONTINUOUS", "automation.continuous"),
-        //                 new Label("DRIVE_MODE", "automation.drive_mode"),
-        //                 new Label("PROXIMITY_GUARD", "automation.proximity_guard"))));
+        addAction(new ApiAction(
+                new Label("recording", "automation.set_recording"),
+                "automation.set_recording_description",
+                "POST",
+                "/api/recording/mode",
+                "{\"mode\":\"${mode}\"}",
+                new EnumType(
+                        new Label("mode", "automation.mode"),
+                        new Label("NONE", "automation.none"),
+                        new Label("CONTINUOUS", "automation.continuous"),
+                        new Label("DRIVE_MODE", "automation.drive_mode"),
+                        new Label("PROXIMITY_GUARD", "automation.proximity_guard"))));
         // Shell command — the free-text StringType variable is defined inside
         // ShellAction. Autonomous exec, so it self-gates on the dedicated
         // automation.allowShell flag (toggle on the Automations page) at fire
