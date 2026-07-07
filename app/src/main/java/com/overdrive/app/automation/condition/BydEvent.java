@@ -133,11 +133,11 @@ public class BydEvent {
 
     private static String cpdToString(int value) {
         switch (value) {
-            case 0:
-                return "on";
             case 1:
-                return "off";
+                return "on";
             case 2:
+                return "off";
+            case 3:
                 return "delay";
             default:
                 return "unknown";

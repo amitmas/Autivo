@@ -28,7 +28,7 @@ public class Actions {
                 "automation.set_cpd_description",
                 "POST",
                 "/api/vehicle/setting",
-                "{\"target\":\"childPresenceDetection\",\"value\":${action}",
+                "{\"target\":\"childPresenceDetection\",\"value\":${action}}",
                 new EnumType(
                         new Label("action", "automation.action"),
                         new Label("2", "automation.off"),
