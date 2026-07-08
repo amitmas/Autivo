@@ -86,6 +86,8 @@ public final class BydFeatureIds {
     public static final int SET_DRIVER_SEAT_VENTILATING_STATE = resolveOrFallback("Setting.SET_DRIVER_SEAT_VENTILATING_STATE", 1335885832);
     public static final int SET_PASSENGER_SEAT_HEATING_STATE = resolveOrFallback("Setting.SET_PASSENGER_SEAT_HEATING_STATE", 1335885843);
     public static final int SET_PASSENGER_SEAT_VENTILATING_STATE = resolveOrFallback("Setting.SET_PASSENGER_SEAT_VENTILATING_STATE", 1335885840);
+    public static final int SETTING_CPD_SWITCH_STATUS  = resolveOrFallback("Setting.SETTING_CPD_SWITCH_STATUS", 376438818);
+    public static final int SETTING_CPD_SWITCH_STATUS_SET  = resolveOrFallback("Setting.SETTING_CPD_SWITCH_STATUS_SET", 1324617778);
 
     // ==================== BODY ====================
     public static final int BODY_ATMOSPHERE_LIGHT_SWITCH = resolveOrFallback("Body.ATMOSPHERE_LIGHT_SWITCH_EXECUTE", 489701406);

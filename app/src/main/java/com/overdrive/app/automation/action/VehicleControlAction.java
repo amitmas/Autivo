@@ -24,10 +24,14 @@ public class VehicleControlAction extends BaseAction {
      * An action to send a vehicle control event
      * The variables passed in to this will be concatenated for the payload
      *
+     * This is deprecated in favour of the ApiAction
+     * Some actions will still use this for backward compatibility
+     *
      * @param label       The label for this notification with an id and display name
      * @param description The description for this action
      * @param variables   The variables to concatenate for the payload
      */
+    @Deprecated
     public VehicleControlAction(Label label, String description, Type... variables) {
         this.label = label;
         this.description = description;

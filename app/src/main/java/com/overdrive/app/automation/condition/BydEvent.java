@@ -31,6 +31,7 @@ public class BydEvent {
     public static final EventData LIGHTS_HAZARD = new EventData("lights", Map.of("area", "hazard"));
     public static final EventData LIGHTS_DRL = new EventData("lights", Map.of("area", "drl"));
     public static final EventData SLW = new EventData("slw");
+    public static final EventData CPD = new EventData("cpd");
     public static final EventData SEAT_HEAT_DRIVER = new EventData("seatClimate", Map.of("type", "heat", "area", "driver"));
     public static final EventData SEAT_HEAT_PASSENGER = new EventData("seatClimate", Map.of("type", "heat", "area", "passenger"));
     public static final EventData SEAT_COOL_DRIVER = new EventData("seatClimate", Map.of("type", "cool", "area", "driver"));
@@ -90,6 +91,7 @@ public class BydEvent {
         Automations.update(LIGHTS_HAZARD, data.hazard ? "on" : "off");
         Automations.update(LIGHTS_DRL, data.dayTimeLight ? "on" : "off");
         Automations.update(SLW, data.speedLimitWarning ? "on" : "off");
+        Automations.update(CPD, cpdToString(data.childPresenceDetection));
         if (data.seatHeat != null) {
             if (data.seatHeat.length > 0) Automations.update(SEAT_HEAT_DRIVER, seatClimateToString(data.seatHeat[0]));
             if (data.seatHeat.length > 1) Automations.update(SEAT_HEAT_PASSENGER, seatClimateToString(data.seatHeat[1]));
@@ -124,6 +126,19 @@ public class BydEvent {
                 return "low";
             case 2:
                 return "high";
+            default:
+                return "unknown";
+        }
+    }
+
+    private static String cpdToString(int value) {
+        switch (value) {
+            case 1:
+                return "on";
+            case 2:
+                return "off";
+            case 3:
+                return "delay";
             default:
                 return "unknown";
         }

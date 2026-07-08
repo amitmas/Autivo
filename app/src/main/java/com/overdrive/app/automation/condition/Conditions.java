@@ -82,6 +82,14 @@ public class Conditions {
                 "automation.slw_description",
                 new EnumType(new Label("state", "automation.state"), new Label("on", "automation.on"), new Label("off", "automation.off"))));
         addCondition(new EventCondition(
+                new Label("cpd", "automation.cpd"),
+                "automation.cpd_description",
+                new EnumType(
+                        new Label("state", "automation.state"),
+                        new Label("on", "automation.on"),
+                        new Label("off", "automation.off"),
+                        new Label("delay", "automation.cpd_delay"))));
+        addCondition(new EventCondition(
                 new Label("seatClimate", "automation.seat_climate"),
                 "automation.seat_climate_description",
                 new EnumType(
