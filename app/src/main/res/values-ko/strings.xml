@@ -23,7 +23,7 @@
     <string name="action_select_all">모든 것을 선택</string>
     <string name="action_select_all_short">모두들</string>
     <string name="action_delete">삭제</string>
-    <string name="action_share">Share</string>
+    <string name="action_share">공유</string>
     <string name="action_done">완료</string>
     <string name="action_remind_me_later">나중에 기억해</string>
     <string name="action_retry">다시 시도</string>
@@ -57,7 +57,7 @@
     <string name="cd_player_quadrant_rear">후방 카메라 표시</string>
     <string name="cd_player_quadrant_left">좌측 카메라 표시</string>
     <string name="cd_delete">삭제</string>
-    <string name="cd_share">Share</string>
+    <string name="cd_share">공유</string>
     <string name="cd_expand">확장</string>
     <string name="cd_configure">구성</string>
     <string name="cd_download_log">다운로드 로그</string>
@@ -75,10 +75,10 @@
          translatable=false to avoid bloating the i18n catalog. The
          _cd content-descriptions are real prose and ARE translatable —
          they go through the NLLB pipeline like every other a11y string. -->
-    <string name="overlay_mode_off_cd">Stop recording</string>
-    <string name="overlay_mode_continuous_cd">Continuous recording</string>
-    <string name="overlay_mode_drive_cd">Drive-mode recording</string>
-    <string name="overlay_mode_proximity_cd">Proximity-guard recording</string>
+    <string name="overlay_mode_off_cd">녹화 중지</string>
+    <string name="overlay_mode_continuous_cd">연속 녹화</string>
+    <string name="overlay_mode_drive_cd">주행 모드 녹화</string>
+    <string name="overlay_mode_proximity_cd">근접 가드 녹화</string>
     <!-- item_log_entry placeholders (timestamp/tag/message are runtime, but these are
          placeholder/preview text used at design time and visible in some empty states) -->
     <string name="log_entry_default_timestamp">12시 34분56분</string>
@@ -133,11 +133,11 @@
     <string name="camera_option_5">카메라 5</string>
     <string name="camera_selection_hint">자동으로 각 부트에서 트리밍에 적합한 카메라를 선택합니다. 카메라 1 = BYD Seal, 카메라 0 = Atto 트리밍. 설정이 효력을 발휘하기 위해 카메라 ID를 변경한 후 다이몬을 다시 시작하십시오.</string>
     <!-- OEM Dashcam camera ID picker (Phase 5: separate forward-sensor pipeline) -->
-    <string name="camera_oem_dashcam_title">OEM Dashcam Camera ID</string>
-    <string name="camera_oem_dashcam_hint">Pick the AVMCamera id that points at the forward dashcam sensor. Dashcam is the OPPOSITE of pano: Seal/Han pano = 1 → dashcam = 0; Atto / Tang pano = 0 → dashcam = 1. Leave on Auto to let OverDrive pick.</string>
-    <string name="camera_oem_dashcam_auto_resolved">Auto — using id %1$d (pano is id %2$d)</string>
-    <string name="camera_oem_dashcam_auto_unavailable">Auto — pano id is %1$d, can\'t infer dashcam</string>
-    <string name="camera_oem_dashcam_save">Save</string>
+    <string name="camera_oem_dashcam_title">OEM 대시캠 카메라 ID</string>
+    <string name="camera_oem_dashcam_hint">전방 대시캠 센서를 가리키는 AVMCamera id를 선택하세요. 대시캠은 pano의 반대입니다: Seal/Han pano = 1 → dashcam = 0; Atto / Tang pano = 0 → dashcam = 1. OverDrive가 선택하도록 Auto로 두세요.</string>
+    <string name="camera_oem_dashcam_auto_resolved">자동 — id %1$d 사용 중 (파노는 id %2$d)</string>
+    <string name="camera_oem_dashcam_auto_unavailable">자동 — 파노 id가 %1$d여서 대시캠을 추론할 수 없음</string>
+    <string name="camera_oem_dashcam_save">저장</string>
     <string name="camera_concurrent_probe_label">다음 부팅 시 듀얼 카메라 지원 테스트</string>
     <string name="camera_concurrent_probe_subtitle">두 카메라를 동시에 열어 이 차량이 파노라마 + 대시캠을 동시에 실행할 수 있는지 확인하는 1회성 점검입니다. 주차 중 다음 재시작 시 한 번 실행됩니다. 녹화가 잘못된 경우가 아니면 끄세요 — 필수는 아니며, 실행 시 녹화가 진행 중이면 잠시 중단될 수 있습니다.</string>
     <!-- Dashcam-side camera labels — REVERSE of the pano labels above. The
@@ -146,8 +146,8 @@
          dialogs. Without these strings the dashcam picker re-used the pano
          labels and told Seal owners to pick "Camera 1 — Seal" for their
          dashcam, which is the pano camera, not the dashcam. -->
-    <string name="camera_oem_option_0">Camera 0 — Seal / Han (default)</string>
-    <string name="camera_oem_option_1">Camera 1 — Atto / Tang</string>
+    <string name="camera_oem_option_0">카메라 0 — Seal / Han (기본값)</string>
+    <string name="camera_oem_option_1">카메라 1 — Atto / Tang</string>
     <!-- Camera mapping dialog (multi-vehicle role-to-slice routing) -->
     <string name="camera_mapping_title">카메라 지도</string>
     <string name="camera_role_label">역할 지도</string>
@@ -262,7 +262,7 @@
     <string name="recording_lib_filter_section_severity">심각성</string>
     <string name="recording_lib_filter_section_type">유형</string>
     <string name="recording_lib_filter_section_place">장소</string>
-    <string name="recording_lib_place_search_hint">Search places…</string>
+    <string name="recording_lib_place_search_hint">장소 검색…</string>
     <string name="recording_lib_chip_type_normal">보통</string>
     <string name="recording_lib_chip_type_proximity">거리</string>
     <string name="recording_lib_date_today">오늘날</string>
@@ -281,29 +281,29 @@
     <string name="cd_open_filters">열 필터</string>
     <string name="cd_clear_filter">맑은 필터</string>
     <!-- v5 redesign: SOTA empty state with CTA + tile type badges -->
-    <string name="recording_lib_empty_title">No recordings match</string>
-    <string name="recording_lib_empty_body">Try adjusting your date range or chip filters.</string>
-    <string name="recording_lib_empty_clear_filters">Clear filters</string>
+    <string name="recording_lib_empty_title">일치하는 녹화가 없음</string>
+    <string name="recording_lib_empty_body">날짜 범위나 칩 필터를 조정해 보세요.</string>
+    <string name="recording_lib_empty_clear_filters">필터 지우기</string>
     <!-- Shown on the empty-state body when there are zero clips on disk
          (no filter is active). Sets a friendlier tone than "No recordings match". -->
-    <string name="recording_lib_empty_disk_title">Nothing recorded yet</string>
-    <string name="recording_lib_empty_disk_body">Captures will appear here as soon as the dashcam or surveillance pipeline writes a clip.</string>
+    <string name="recording_lib_empty_disk_title">아직 녹화된 것이 없음</string>
+    <string name="recording_lib_empty_disk_body">대시캠 또는 감시 파이프라인이 클립을 기록하는 즉시 캡처가 여기에 표시됩니다.</string>
     <!-- Shown while the daemon is warming the H2 recording index on cold
          start. Includes a progress counter when the daemon reports done/total,
          otherwise a static body. The library re-polls every 1.5s and
          transitions out automatically once results land. -->
-    <string name="recording_lib_building_index_title">Building library index</string>
-    <string name="recording_lib_building_index_body">One moment while the daemon scans your recordings.</string>
-    <string name="recording_lib_building_index_progress">Indexed %1$d of %2$d clips…</string>
+    <string name="recording_lib_building_index_title">라이브러리 색인 생성 중</string>
+    <string name="recording_lib_building_index_body">데몬이 녹화를 스캔하는 동안 잠시 기다려 주세요.</string>
+    <string name="recording_lib_building_index_progress">%2$d개 중 %1$d개 클립 색인 완료…</string>
     <!-- Tile type badge labels — short, glanceable, mirrors the on-disk
          filename prefix (cam_/event_/dvr_/proximity_) so power users can
          map a tile back to its file group at a glance. -->
     <string name="recording_lib_type_normal">CAM</string>
-    <string name="recording_lib_type_event">EVENT</string>
+    <string name="recording_lib_type_event">이벤트</string>
     <string name="recording_lib_type_proximity">PROX</string>
     <string name="recording_lib_type_oem">OEM</string>
     <!-- Toast shown when a multi-select share is dispatched. -->
-    <string name="toast_share_recordings">Sharing %1$d recordings</string>
+    <string name="toast_share_recordings">녹화 %1$d개 공유 중</string>
     <!-- fragment_sentry_config -->
     <!-- fragment_video_player -->
     <string name="player_title_recording">녹음</string>
@@ -407,7 +407,7 @@
     <string name="update_hide">숨기기</string>
     <!-- Update channel selector (Settings → About) -->
     <string name="settings_update_channel_title">업데이트 채널</string>
-    <string name="settings_update_channel_alpha">Alpha</string>
+    <string name="settings_update_channel_alpha">알파</string>
     <string name="settings_update_channel_braveheart">Braveheart</string>
     <string name="settings_update_channel_alpha_desc">안정적인 릴리스입니다. 게시된 모든 버전이 유지되며, 원하는 버전을 선택하여 설치할 수 있습니다 (다운그레이드 허용). 일상적인 사용에 권장됩니다.</string>
     <string name="settings_update_channel_braveheart_desc">게시되는 즉시 제공되는 최신 빌드입니다. 새로운 기능을 가장 먼저 사용할 수 있지만, 불안정하거나 버그가 있을 수 있습니다. 문제가 발생하면 데몬 화면을 열고 데몬 로그를 탭한 다음 \"업로드 및 코드 받기\"를 선택하고 커뮤니티 채널에서 코드를 공유해 주세요.</string>
@@ -446,7 +446,7 @@
     <string name="dialog_reset_soh_title">SOH 추정값을 재설정하세요?</string>
     <string name="dialog_reset_soh_message">이 방법은 모든 SOH 데이터를 삭제하고 처음부터 재평가를 강요합니다. 이 경우:\n\n• 배터리가 교체되었습니다.\n• SOH 판독은 잘못된 것 같습니다.\n• 당신은 재계열을 원하고 있습니다.\n\n시스템은 다음 사용할 수 있는 데이터 소스에서 재계열됩니다. (OEM, 충전 캘리브레이션, 또는 즉각적인 판독).</string>
     <string name="dialog_reset_following_title">다음을 다시 설정하세요?</string>
-    <string name="dialog_reset_following_message">This cannot be undone.\n\n%1$s</string>
+    <string name="dialog_reset_following_message">되돌릴 수 없습니다.\n\n%1$s</string>
     <string name="dialog_reset_complete_title">다시 설정 완료</string>
     <string name="dialog_traffic_cannot_check_title">상태 확인 불가능</string>
     <string name="dialog_traffic_cannot_check_message">ADB 연결은 아직 준비되지 않았습니다. 앱은 시스템 패키지를 관리하기 위해 ADB 액세스가 필요합니다. 개발자 옵션에서 USB 디버깅이 활성화되어 있는지 확인하십시오.</string>
@@ -545,7 +545,7 @@
     <!-- Braveheart log send (upload to Cloudflare or share-sheet) -->
     <string name="logs_send_title">%1$s 로그 보내기</string>
     <string name="logs_send_title_plain">데몬 로그 보내기</string>
-    <string name="logs_send_subtitle">%1$s · choose how to send it to us</string>
+    <string name="logs_send_subtitle">%1$s · 보낼 방법을 선택하세요</string>
     <string name="logs_send_upload">업로드 및 코드 받기</string>
     <string name="logs_send_upload_desc">로그를 저희에게 보내고 짧은 코드를 제공합니다. 지원에 가장 편리합니다.</string>
     <string name="logs_send_share">파일 공유…</string>
@@ -554,7 +554,7 @@
     <string name="logs_uploading_subtitle">비밀 정보 삭제 및 보안 전송 중</string>
     <string name="logs_uploaded_title">로그 업로드 완료</string>
     <string name="logs_uploaded_instructions">이 코드를 문제가 발생했을 때 무엇을 하고 있었는지에 대한 메모와 함께 저희에게 공유해 주세요. Discord, GitHub Issues 또는 WhatsApp에 게시해 주세요. 링크는 정보 화면에 있습니다.</string>
-    <string name="logs_uploaded_privacy">Secrets redacted · the log auto-expires</string>
+    <string name="logs_uploaded_privacy">비밀 정보 삭제됨 · 로그는 자동 만료됩니다</string>
     <string name="logs_copy_code">코드 복사</string>
     <string name="logs_done">완료</string>
     <string name="placeholder_dash">—</string>
@@ -596,7 +596,7 @@
     <string name="nav_page_telegram">Telegram</string>
     <string name="nav_page_abrp">ABRP</string>
     <string name="nav_page_mqtt">MQTT</string>
-    <string name="nav_page_byd_cloud">BYD Cloud</string>
+    <string name="nav_page_byd_cloud">BYD 클라우드</string>
     <!-- StatusOverlayService persistent notification (foreground service) -->
     <string name="status_overlay_notif_title">OverDrive 상태</string>
     <string name="status_overlay_notif_text">상태 덮개 활성</string>
@@ -605,10 +605,10 @@
          notifications into one shade entry. The summary text is intentionally
          generic so it stays accurate whether all three services are running
          or only the keepalive survived an OOM respawn. -->
-    <string name="daemon_keepalive_notif_title">Overdrive Active</string>
-    <string name="daemon_keepalive_notif_text">Monitoring vehicle systems</string>
+    <string name="daemon_keepalive_notif_title">Overdrive 활성</string>
+    <string name="daemon_keepalive_notif_text">차량 시스템 모니터링 중</string>
     <string name="overdrive_status_summary_title">Overdrive</string>
-    <string name="overdrive_status_summary_text">Background services running</string>
+    <string name="overdrive_status_summary_text">백그라운드 서비스 실행 중</string>
     <!-- ============================================================== -->
     <!-- M3 Revamp: navigation rail + settings sub-rail + theme picker  -->
     <!-- ============================================================== -->
@@ -628,7 +628,7 @@
     <string name="settings_section_daemons">대몬</string>
     <string name="settings_section_privacy">개인 정보 보호 &amp; 데이터</string>
     <string name="settings_section_overlay">상태 덮개</string>
-    <string name="settings_section_security">Security</string>
+    <string name="settings_section_security">보안</string>
     <string name="settings_overlay_subtitle">유동 상태 알약의 어떤 세그먼트가 눈에 띄는지를 선택하십시오.</string>
     <string name="settings_overlay_camera_title">카메라 표시</string>
     <string name="settings_overlay_camera_subtitle">녹화가 활발한 상태에서 REC/ PROX 배지를 표시하십시오.</string>
@@ -850,56 +850,56 @@
          The lock guards the OverDrive UI only. Cam daemon, AccSentry,
          surveillance, recording, Telegram alerts, status overlay, and the
          deterrent screen all run independently regardless of this state. -->
-    <string name="settings_security_title">Security</string>
-    <string name="settings_security_subtitle">Lock the OverDrive app so passengers and valets can\'t open it without your PIN.</string>
-    <string name="settings_security_stance_title">UI lock only</string>
-    <string name="settings_security_stance_body">Surveillance, recording, deterrent, alerts, and background services keep running while the app is locked. The PIN gates the OverDrive interface, nothing else.</string>
-    <string name="settings_security_overline_lock">App lock</string>
-    <string name="settings_security_overline_recovery">If you forget your PIN</string>
-    <string name="settings_security_toggle_title">Require PIN</string>
-    <string name="settings_security_toggle_subtitle_off">Off — anyone can open OverDrive.</string>
-    <string name="settings_security_toggle_subtitle_on">On — PIN required to open OverDrive.</string>
-    <string name="settings_security_change_title">Change PIN</string>
-    <string name="settings_security_change_subtitle">Confirm current PIN, then set a new one.</string>
-    <string name="settings_security_autolock_title">Auto-lock</string>
-    <string name="settings_security_autolock_immediate">Lock immediately</string>
-    <string name="settings_security_autolock_1min">After 1 minute</string>
-    <string name="settings_security_autolock_5min">After 5 minutes</string>
-    <string name="settings_security_autolock_15min">After 15 minutes</string>
-    <string name="settings_security_autolock_never">Never auto-lock by time</string>
-    <string name="settings_security_recovery_title">ADB recovery</string>
-    <string name="settings_security_recovery_body">Forgotten PIN can be cleared from a host machine over USB debugging without a factory reset. Run this command, then reopen the app.</string>
+    <string name="settings_security_title">보안</string>
+    <string name="settings_security_subtitle">승객이나 발렛이 PIN 없이 열 수 없도록 OverDrive 앱을 잠급니다.</string>
+    <string name="settings_security_stance_title">UI 잠금만</string>
+    <string name="settings_security_stance_body">앱이 잠긴 동안에도 감시, 녹화, 억제, 알림 및 백그라운드 서비스는 계속 실행됩니다. PIN은 OverDrive 인터페이스만 잠그며, 그 외에는 아무것도 잠그지 않습니다.</string>
+    <string name="settings_security_overline_lock">앱 잠금</string>
+    <string name="settings_security_overline_recovery">PIN을 잊어버린 경우</string>
+    <string name="settings_security_toggle_title">PIN 요구</string>
+    <string name="settings_security_toggle_subtitle_off">끔 — 누구나 OverDrive를 열 수 있습니다.</string>
+    <string name="settings_security_toggle_subtitle_on">켬 — OverDrive를 열려면 PIN이 필요합니다.</string>
+    <string name="settings_security_change_title">PIN 변경</string>
+    <string name="settings_security_change_subtitle">현재 PIN을 확인한 후 새 PIN을 설정하세요.</string>
+    <string name="settings_security_autolock_title">자동 잠금</string>
+    <string name="settings_security_autolock_immediate">즉시 잠금</string>
+    <string name="settings_security_autolock_1min">1분 후</string>
+    <string name="settings_security_autolock_5min">5분 후</string>
+    <string name="settings_security_autolock_15min">15분 후</string>
+    <string name="settings_security_autolock_never">시간 기준 자동 잠금 안 함</string>
+    <string name="settings_security_recovery_title">ADB 복구</string>
+    <string name="settings_security_recovery_body">잊어버린 PIN은 공장 초기화 없이 USB 디버깅을 통해 호스트 컴퓨터에서 지울 수 있습니다. 이 명령을 실행한 후 앱을 다시 여세요.</string>
     <!-- Verbatim ADB command. translatable=false so the i18n pipeline
          doesn't localize the literal path/command — translators following
          Crowdin would otherwise risk breaking the only recovery path. -->
-    <string name="settings_security_dialog_set_title">Set PIN</string>
-    <string name="settings_security_dialog_set_body">Pick a 4–8 digit PIN. You\'ll need this every time you open the app.</string>
-    <string name="settings_security_dialog_disable_title">Turn off PIN lock?</string>
-    <string name="settings_security_dialog_disable_body">Confirm your current PIN to turn off the app lock.</string>
-    <string name="settings_security_dialog_change_step1_title">Confirm current PIN</string>
-    <string name="settings_security_dialog_change_step1_body">Enter your current PIN, then you\'ll set a new one.</string>
-    <string name="settings_security_action_set">Set PIN</string>
-    <string name="settings_security_action_disable">Turn off lock</string>
-    <string name="settings_security_action_continue">Continue</string>
+    <string name="settings_security_dialog_set_title">PIN 설정</string>
+    <string name="settings_security_dialog_set_body">4~8자리 PIN을 선택하세요. 앱을 열 때마다 필요합니다.</string>
+    <string name="settings_security_dialog_disable_title">PIN 잠금을 해제하시겠습니까?</string>
+    <string name="settings_security_dialog_disable_body">앱 잠금을 해제하려면 현재 PIN을 확인하세요.</string>
+    <string name="settings_security_dialog_change_step1_title">현재 PIN 확인</string>
+    <string name="settings_security_dialog_change_step1_body">현재 PIN을 입력하면 새 PIN을 설정합니다.</string>
+    <string name="settings_security_action_set">PIN 설정</string>
+    <string name="settings_security_action_disable">잠금 해제</string>
+    <string name="settings_security_action_continue">계속</string>
     <string name="settings_security_pin_hint">PIN</string>
-    <string name="settings_security_pin_confirm_hint">Confirm PIN</string>
-    <string name="settings_security_error_length">PIN must be 4 to 8 digits</string>
-    <string name="settings_security_error_numeric">Digits only</string>
-    <string name="settings_security_error_mismatch">PINs don\'t match</string>
-    <string name="settings_security_error_wrong">Wrong PIN</string>
-    <string name="settings_security_error_locked_out">Too many attempts. Try again in a moment.</string>
-    <string name="settings_security_error_persist">Couldn\'t save the PIN. Try again.</string>
-    <string name="settings_security_toast_set_ok">PIN set. App lock is on.</string>
-    <string name="settings_security_toast_disable_ok">App lock turned off.</string>
+    <string name="settings_security_pin_confirm_hint">PIN 확인</string>
+    <string name="settings_security_error_length">PIN은 4~8자리여야 합니다</string>
+    <string name="settings_security_error_numeric">숫자만</string>
+    <string name="settings_security_error_mismatch">PIN이 일치하지 않습니다</string>
+    <string name="settings_security_error_wrong">잘못된 PIN</string>
+    <string name="settings_security_error_locked_out">시도가 너무 많습니다. 잠시 후 다시 시도하세요.</string>
+    <string name="settings_security_error_persist">PIN을 저장할 수 없습니다. 다시 시도하세요.</string>
+    <string name="settings_security_toast_set_ok">PIN이 설정되었습니다. 앱 잠금이 켜졌습니다.</string>
+    <string name="settings_security_toast_disable_ok">앱 잠금이 해제되었습니다.</string>
     <!-- PIN unlock screen (PinLockActivity). Shown over MainActivity when
          the app lock is enabled and the session isn\'t fresh. -->
-    <string name="pin_lock_title">Enter PIN</string>
-    <string name="pin_lock_title_unlocked">Unlocked</string>
-    <string name="pin_lock_subtitle_default">Unlock OverDrive to continue.</string>
-    <string name="pin_lock_subtitle_wrong">Wrong PIN. Try again.</string>
-    <string name="pin_lock_subtitle_locked_out">Too many attempts. Try again shortly.</string>
+    <string name="pin_lock_title">PIN 입력</string>
+    <string name="pin_lock_title_unlocked">잠금 해제됨</string>
+    <string name="pin_lock_subtitle_default">계속하려면 OverDrive의 잠금을 해제하세요.</string>
+    <string name="pin_lock_subtitle_wrong">잘못된 PIN입니다. 다시 시도하세요.</string>
+    <string name="pin_lock_subtitle_locked_out">시도가 너무 많습니다. 잠시 후 다시 시도하세요.</string>
     <!-- %1$s is a formatted countdown like "30s" or "2:45". -->
-    <string name="pin_lock_subtitle_locked_out_countdown">Locked. Try again in %1$s.</string>
+    <string name="pin_lock_subtitle_locked_out_countdown">잠겼습니다. %1$s 후 다시 시도하세요.</string>
     <string name="pin_lock_lockout_seconds">%1$ds</string>
     <string name="pin_lock_lockout_minutes">%1$d:%2$02d</string>
     <!-- Lock-screen recovery hint. Two-part: a translatable prose prefix
@@ -907,8 +907,8 @@
          settings_security_recovery_command resource so a future edit to
          the command stays in sync across both surfaces). The lock screen
          concatenates them at runtime via String.format. -->
-    <string name="pin_lock_recovery_hint_prefix">Forgot your PIN? Run from a connected computer:\n%1$s</string>
-    <string name="pin_lock_backspace_cd">Backspace</string>
+    <string name="pin_lock_recovery_hint_prefix">PIN을 잊으셨나요? 연결된 컴퓨터에서 실행하세요:\n%1$s</string>
+    <string name="pin_lock_backspace_cd">백스페이스</string>
     <plurals name="pin_lock_dot_a11y">
         <item quantity="other">%1$d digits entered</item>
     </plurals>
@@ -955,7 +955,7 @@
          placeholder shape so the bold-ifier still finds the digits. -->
     <string name="dashboard_insight_kwh_format">%1$.1f kWh</string>
     <string name="dashboard_insight_percent_format">%1$.1f%%</string>
-    <string name="dashboard_insight_hours_minutes">%1$d hr %2$d min</string>
+    <string name="dashboard_insight_hours_minutes">%1$d시간 %2$d분</string>
     <!-- Today's clips. -->
     <plurals name="dashboard_insight_today_clips">
         <item quantity="other">오늘 녹음된 %1$d 클립</item>
@@ -980,47 +980,47 @@
     <string name="rail_roadsense">RoadSense</string>
     <string name="rail_hazard_map">지도</string>
     <string name="roadsense_title">RoadSense</string>
-    <string name="roadsense_pill_scanning">Scanning</string>
+    <string name="roadsense_pill_scanning">스캔 중</string>
     <string name="roadsense_pill_idle">RoadSense</string>
-    <string name="roadsense_status_idle">Idle</string>
+    <string name="roadsense_status_idle">대기</string>
     <!-- VEHICLE calibration (suspension-learning) — the green/orange/red dot. Worded
          about the car, not the route, since that's what maturity actually measures. -->
-    <string name="roadsense_cal_learning">Learning your vehicle</string>
-    <string name="roadsense_cal_ready">Vehicle calibrated</string>
-    <string name="roadsense_cal_partial">Calibration improving</string>
+    <string name="roadsense_cal_learning">차량 학습 중</string>
+    <string name="roadsense_cal_ready">차량 보정 완료</string>
+    <string name="roadsense_cal_partial">보정 개선 중</string>
     <!-- Idle caption — ROUTE coverage (distinct from vehicle calibration). "Clear
          ahead" only when we've actually mapped this stretch; "New road" when we
          haven't, so an unsurveyed road isn't mistaken for confirmed-safe. -->
-    <string name="roadsense_clear_ahead">Clear ahead</string>
-    <string name="roadsense_road_mapped">Road mapped · clear</string>
-    <string name="roadsense_road_new">New road · learning</string>
+    <string name="roadsense_clear_ahead">전방 안전</string>
+    <string name="roadsense_road_mapped">도로 매핑됨 · 이상 없음</string>
+    <string name="roadsense_road_new">새 도로 · 학습 중</string>
     <string name="roadsense_unit_meters">m</string>
     <string name="roadsense_dash_distance">—</string>
-    <string name="roadsense_warn_label">Warn</string>
-    <string name="roadsense_toggle_audio">Audio</string>
-    <string name="roadsense_toggle_visual">Visual</string>
+    <string name="roadsense_warn_label">경고</string>
+    <string name="roadsense_toggle_audio">오디오</string>
+    <string name="roadsense_toggle_visual">시각</string>
     <!-- severity / type readouts (formatted at runtime) -->
-    <string name="roadsense_sev_minor">Minor</string>
-    <string name="roadsense_sev_moderate">Moderate</string>
-    <string name="roadsense_sev_severe">Severe</string>
-    <string name="roadsense_type_breaker">Speed breaker</string>
-    <string name="roadsense_type_pothole">Pothole</string>
-    <string name="roadsense_type_hazard">Hazard</string>
-    <string name="roadsense_type_rough">Rough section</string>
+    <string name="roadsense_sev_minor">경미</string>
+    <string name="roadsense_sev_moderate">보통</string>
+    <string name="roadsense_sev_severe">심각</string>
+    <string name="roadsense_type_breaker">과속방지턱</string>
+    <string name="roadsense_type_pothole">포트홀</string>
+    <string name="roadsense_type_hazard">위험</string>
+    <string name="roadsense_type_rough">거친 구간</string>
     <!-- "Moderate · Pothole" style line -->
     <string name="roadsense_hazard_format">%1$s · %2$s</string>
     <!-- Zone readouts (D-032): cluster of hazards announced as one. -->
     <!-- "3 bumps ahead" — %1$d = count -->
-    <string name="roadsense_zone_count">%1$d bumps ahead</string>
+    <string name="roadsense_zone_count">전방 요철 %1$d개</string>
     <!-- "Rough section · 40 m" — %1$d = length in metres -->
-    <string name="roadsense_zone_rough">Rough section · %1$d m</string>
+    <string name="roadsense_zone_rough">거친 구간 · %1$d m</string>
     <!-- Calibration-Mode confirm card (R-OVL-6) -->
-    <string name="roadsense_confirm_prompt">Was this a hazard?</string>
-    <string name="roadsense_confirm_reject">Not a hazard</string>
-    <string name="roadsense_confirm_accept">Confirm</string>
+    <string name="roadsense_confirm_prompt">위험 요소였나요?</string>
+    <string name="roadsense_confirm_reject">위험 아님</string>
+    <string name="roadsense_confirm_accept">확인</string>
     <!-- content descriptions -->
-    <string name="roadsense_cd_cal_level">Vehicle calibration level</string>
-    <string name="roadsense_cd_direction">Direction to next hazard</string>
+    <string name="roadsense_cd_cal_level">차량 보정 수준</string>
+    <string name="roadsense_cd_direction">다음 위험 방향</string>
     <!-- Blind Spot overlay labels (native overlay window). -->
     <string name="blindspot_overlay_left">좌측</string>
     <string name="blindspot_overlay_right">우측</string>
@@ -1043,7 +1043,7 @@
     <string name="roadsense_map_status_local">기기 내</string>
     <string name="roadsense_map_status_cloud">공유됨</string>
     <!-- Meta line: "Moderate · 82% confidence · 3 reports" -->
-    <string name="roadsense_map_meta_format">%1$s · %2$d%% confidence · %3$s</string>
+    <string name="roadsense_map_meta_format">%1$s · 신뢰도 %2$d%% · %3$s</string>
     <!-- "3 reports" / "1 report" -->
     <plurals name="roadsense_map_reports">
         <item quantity="other">%1$d reports</item>

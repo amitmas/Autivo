@@ -10,9 +10,9 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * WBSK white-box AES lookup tables (China BYD app transport layer).
+ * WBSK white-box AES lookup tables (China BYD cloud transport layer).
  *
- * 16 tables extracted from the CN DiLink app's {@code libwbsk_crypto_tool.so}:
+ * 16 tables from the CN cloud transport's {@code libwbsk_crypto_tool.so}:
  *   - 8 byte tables  (256 bytes each): enc/dec InitXor, RoundXor, Sbox/InvSbox, FinalXor
  *   - 8 u32  tables (1024 bytes each, little-endian): enc Te0..Te3, dec Td0..Td3
  *

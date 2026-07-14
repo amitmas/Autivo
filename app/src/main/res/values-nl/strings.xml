@@ -735,6 +735,7 @@
     <string name="rail_trips">Ritten</string>
     <string name="rail_charging">Opladen</string>
     <string name="rail_automations">Automatiseringen</string>
+    <string name="rail_key_mapping">Sleutel toewijzen</string>
     <string name="rail_integrations">Integratie</string>
     <string name="rail_diagnostics">Diagnostiek</string>
     <string name="rail_settings">Instellingen</string>

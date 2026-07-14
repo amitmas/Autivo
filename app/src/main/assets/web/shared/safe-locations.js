@@ -4,7 +4,7 @@
  * UX Flow:
  * 1. Toggle ON → map appears centered on current GPS
  * 2. A live draggable circle shows the zone being configured
- * 3. Slider below map controls radius (50-500m), circle updates in real-time
+ * 3. Slider below map controls radius (15-500m), circle updates in real-time
  * 4. "Add This Zone" saves it with a name prompt
  * 5. Saved zones appear as circles on map + list cards below
  */

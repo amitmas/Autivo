@@ -585,6 +585,35 @@ public final class VehicleCommandRouter {
         public boolean executeViaSdk(BydDataCollector c) { return c.setEspState(enabled); }
     }
 
+    /**
+     * iTAC (Intelligent Torque Adaption Control) on/off. SDK-only — the iTAC feature
+     * id lives on the setting HAL and has no BYD cloud remote-control equivalent.
+     * Performance/traction feature, distinct from the ESP stability interlock.
+     */
+    public static final class AdasItacCommand extends VehicleCommand {
+        public final boolean enabled;
+        public AdasItacCommand(boolean on) { this.enabled = on; }
+        public String name() { return "adas-itac"; }
+        public Capability sdkCapability() { return Capability.REQUIRED; }
+        public RoutePreference defaultPreference() { return RoutePreference.SDK_ONLY; }
+        public boolean executeViaSdk(BydDataCollector c) { return c.setItacState(enabled); }
+    }
+
+    /**
+     * Lane-assist mode (Lane Departure Warning / Prevention) via
+     * BYDAutoADASDevice.setLKSMode. SDK-only — a dedicated ADAS-device method, no BYD
+     * cloud equivalent. This is a MULTI-mode control (not on/off): app-level mode
+     * 0=Off, 1=LDW, 2=LDP, 3=LDW+LDP (BydDataCollector maps to the MCU values).
+     */
+    public static final class AdasLaneAssistCommand extends VehicleCommand {
+        public final int mode;
+        public AdasLaneAssistCommand(int mode) { this.mode = mode; }
+        public String name() { return "adas-lane-assist"; }
+        public Capability sdkCapability() { return Capability.REQUIRED; }
+        public RoutePreference defaultPreference() { return RoutePreference.SDK_ONLY; }
+        public boolean executeViaSdk(BydDataCollector c) { return c.setLaneAssistMode(mode); }
+    }
+
     public static final class SettingChildPresenceDetectionCommand extends VehicleCommand {
         public final int value;
         public SettingChildPresenceDetectionCommand(int value) { this.value = value; }
@@ -673,15 +702,17 @@ public final class VehicleCommandRouter {
         }
     }
 
-    /** Drive/operation mode: SDK OperationMode enum — 1=ECONOMY(eco), 2=SPORT.
-     *  Those are the only two operation modes (no NORMAL/SNOW). SDK-only. */
+    /** Drive mode on the setting-device "drive config" axis — 1=NORMAL, 2=ECO,
+     *  3=SPORT, 4=SNOW. Routed via {@link BydDataCollector#setDriveConfigMode(int)},
+     *  which falls back through setDriveConfig → target-driving-mode feature ids →
+     *  (for eco/sport only) the energy-device operation mode. SDK-only. */
     public static final class OperationModeCommand extends VehicleCommand {
         public final int mode;
         public OperationModeCommand(int mode) { this.mode = mode; }
-        public String name() { return "operation-mode"; }
+        public String name() { return "drive-config-mode"; }
         public Capability sdkCapability() { return Capability.REQUIRED; }
         public RoutePreference defaultPreference() { return RoutePreference.SDK_ONLY; }
-        public boolean executeViaSdk(BydDataCollector c) { return c.setOperationMode(mode); }
+        public boolean executeViaSdk(BydDataCollector c) { return c.setDriveConfigMode(mode); }
     }
 
     /** Powertrain mode: EV vs HEV (DM/PHEV only). SDK-only. */
@@ -712,6 +743,20 @@ public final class VehicleCommandRouter {
         public Capability sdkCapability() { return Capability.REQUIRED; }
         public RoutePreference defaultPreference() { return RoutePreference.SDK_ONLY; }
         public boolean executeViaSdk(BydDataCollector c) { return c.setSteerAssist(mode); }
+    }
+
+    /**
+     * Brake-pedal feel: comfort vs sport/strong. SDK-only (BYDAutoADASDevice
+     * setBrakeFootSenseState). {@code level} is the app-level convention
+     * 0=comfort/1=sport; the collector maps it to the HAL value.
+     */
+    public static final class BrakeFeelCommand extends VehicleCommand {
+        public final int level;
+        public BrakeFeelCommand(int level) { this.level = level; }
+        public String name() { return "brake-feel"; }
+        public Capability sdkCapability() { return Capability.REQUIRED; }
+        public RoutePreference defaultPreference() { return RoutePreference.SDK_ONLY; }
+        public boolean executeViaSdk(BydDataCollector c) { return c.setBrakeFootSense(level); }
     }
 
     // ── Routing ─────────────────────────────────────────────────────────

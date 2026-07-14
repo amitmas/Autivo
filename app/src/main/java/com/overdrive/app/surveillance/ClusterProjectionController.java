@@ -207,7 +207,17 @@ public final class ClusterProjectionController {
     //     on SIGKILL) is UNCHANGED and still fires regardless of holders. The sustained
     //     flag is cleared by releaseSustained() (which then closes if no transient
     //     consumer wants it) and unconditionally by forceClose/shutdown.
-    private volatile boolean sustainedHeld = false;
+    //
+    // OWNERSHIP: there can be MORE THAN ONE sustained consumer (the nav map AND the
+    // camera-view feature). A single boolean would let one consumer's release close
+    // the other's projection, and a stuck flag would disarm the transient auto-close.
+    // So hold a TOKEN SET: sustainedHeld() is true iff ANY holder remains. acquire adds
+    // a token, release removes ITS token and only closes when the set is empty. All
+    // internal gates read sustainedHeld() (derived). Concurrent (foreign threads call
+    // acquire/release) → synchronized set.
+    private final java.util.Set<String> sustainedHolders =
+        java.util.Collections.synchronizedSet(new java.util.HashSet<>());
+    private boolean sustainedHeld() { return !sustainedHolders.isEmpty(); }
 
     private ClusterProjectionController() {
         projThread = new android.os.HandlerThread("ClusterProjection");
@@ -347,9 +357,18 @@ public final class ClusterProjectionController {
      * duration. Idempotent. Safety restores (forceClose/shutdown/boot) are unaffected
      * and will still tear it down + restore the gauges. No-op while shutting down.
      */
-    public void acquireSustained() {
+    /** Back-compat: the nav map's sustained hold (token "map"). */
+    public void acquireSustained() { acquireSustained("map"); }
+
+    /**
+     * Acquire the projection as a SUSTAINED holder identified by {@code token} (e.g.
+     * "map" for the nav map, "camview" for the camera-view feature). Multiple distinct
+     * tokens can hold concurrently; the auto-close paths are suppressed while ANY token
+     * is held. Re-acquiring the same token is idempotent. See {@link #releaseSustained(String)}.
+     */
+    public void acquireSustained(String token) {
         if (shuttingDown) return;
-        sustainedHeld = true;
+        sustainedHolders.add(token != null ? token : "default");
         // Cancel any pending auto-close left over from a prior transient session.
         watchdogHandler.removeCallbacks(lingerTask);
         watchdogHandler.removeCallbacks(maxCapTask);
@@ -368,7 +387,7 @@ public final class ClusterProjectionController {
         // when no cap is pending. (commitReady additionally re-checks sustainedHeld
         // after its post — belt and braces — but the in-order removal is the real fix.)
         projHandler.post(() -> {
-            if (sustainedHeld) {
+            if (sustainedHeld()) {
                 watchdogHandler.removeCallbacks(maxCapTask);
                 watchdogHandler.removeCallbacks(lingerTask);
             }
@@ -376,15 +395,26 @@ public final class ClusterProjectionController {
         requestOpen();   // opens if closed; no-op if already up
     }
 
+    /** Back-compat: release the nav map's sustained hold (token "map"). */
+    public void releaseSustained() { releaseSustained("map"); }
+
     /**
-     * Release the sustained hold (map projection ended). If a transient consumer
-     * (blind-spot) still wants the projection right now it stays up and reverts to
-     * the normal linger lifecycle; otherwise it force-closes + restores the gauges.
+     * Release the sustained hold for {@code token}. If OTHER sustained holders remain
+     * (e.g. releasing camera-view while the map still holds), the projection stays
+     * open and nothing else changes. Only when the LAST sustained holder releases do
+     * we decide: if a transient consumer (blind-spot turn signal) still wants it
+     * (fresh within the linger window) it stays up and reverts to the normal linger
+     * lifecycle; otherwise it force-closes + restores the gauges.
      */
-    public void releaseSustained() {
-        sustainedHeld = false;
-        // If a turn signal is currently active (fresh within the linger window) keep
-        // it up and hand back to the transient lifecycle; else close now.
+    public void releaseSustained(String token) {
+        sustainedHolders.remove(token != null ? token : "default");
+        if (sustainedHeld()) {
+            // Another sustained consumer still needs the projection — leave it open.
+            return;
+        }
+        // Last sustained holder gone. If a turn signal is currently active (fresh
+        // within the linger window) keep it up and hand back to the transient
+        // lifecycle; else close now.
         long sinceSignal = System.currentTimeMillis() - lastSignalMs;
         if (sinceSignal < lingerCloseMs) {
             requestCloseLingered();   // transient takes over; closes after linger
@@ -393,8 +423,8 @@ public final class ClusterProjectionController {
         }
     }
 
-    /** True while the map holds the projection (used to gate BS coexistence). */
-    public boolean isSustainedHeld() { return sustainedHeld; }
+    /** True while ANY consumer holds the projection sustained (gates BS coexistence). */
+    public boolean isSustainedHeld() { return sustainedHeld(); }
 
     /** Null-safe static read of {@link #isSustainedHeld()} that does NOT construct the
      *  singleton (mirrors {@link #forceCloseIfActive}/{@link #shutdownIfActive}). If
@@ -405,7 +435,7 @@ public final class ClusterProjectionController {
      *  retarget / ACC-off) is never repainted over the restored gauges. */
     public static boolean isSustainedHeldStatic() {
         ClusterProjectionController i = instance;
-        return i != null && i.sustainedHeld;
+        return i != null && i.sustainedHeld();
     }
 
     /** Bump the signal timestamp (called every tick while a turn signal is active). */
@@ -425,8 +455,8 @@ public final class ClusterProjectionController {
     }
 
     private void maybeLingerClose() {
-        // Sustained holder (map) keeps the projection open — never linger-close.
-        if (sustainedHeld) return;
+        // Any sustained holder (map / camera-view) keeps the projection open — never linger-close.
+        if (sustainedHeld()) return;
         long since = System.currentTimeMillis() - lastSignalMs;
         if (since >= lingerCloseMs - 50) {
             forceClose("linger");
@@ -443,9 +473,9 @@ public final class ClusterProjectionController {
      * target-flip / errors can all force the gauges back.
      */
     public void forceClose(String reason) {
-        // An explicit/safety close always drops the sustained hold — the map's
-        // projection is being torn down; the holder must not linger and re-suppress.
-        sustainedHeld = false;
+        // An explicit/safety close always drops ALL sustained holds — the projection
+        // is being torn down; no holder must linger and re-suppress the restore.
+        sustainedHolders.clear();
         try { clearGateFlags(); } catch (Throwable ignored) {}
         watchdogHandler.removeCallbacks(maxCapTask);
         watchdogHandler.removeCallbacks(lingerTask);
@@ -554,17 +584,16 @@ public final class ClusterProjectionController {
         // carries activeUntil for SIGKILL recovery, and every EXPLICIT restore
         // (ACC-off/disable/release/SIGTERM) still fires — only the timed auto-tear
         // is suppressed. Transient (blind-spot) sessions keep the cap.
-        if (!sustainedHeld) {
+        if (!sustainedHeld()) {
             watchdogHandler.postDelayed(maxCapTask, maxProjectionMs);
-            // Re-check after the post: acquireSustained may have set sustainedHeld
-            // true on a foreign thread between the read above and this post (the
-            // narrow max-cap-on-sustained-map race). If so, pull the cap back off —
-            // a sustained map must never auto-close at 90s. acquireSustained ALSO
-            // posts a removal onto this same (projThread) looper, so the two cannot
-            // both miss; this is the cheaper in-line guard.
-            if (sustainedHeld) watchdogHandler.removeCallbacks(maxCapTask);
+            // Re-check after the post: acquireSustained may have added a holder on a
+            // foreign thread between the read above and this post (the narrow
+            // max-cap-on-sustained race). If so, pull the cap back off — a sustained
+            // hold must never auto-close at 90s. acquireSustained ALSO posts a removal
+            // onto this same (projThread) looper, so the two cannot both miss.
+            if (sustainedHeld()) watchdogHandler.removeCallbacks(maxCapTask);
         }
-        logger.info("projection OPEN + ready (" + why + (sustainedHeld ? ", sustained" : "") + ")");
+        logger.info("projection OPEN + ready (" + why + (sustainedHeld() ? ", sustained" : "") + ")");
         notifyPipelineReady();
         // Show the current-speed glass badge over whatever is projected (map / BS /
         // future content). Independent of the consumer; gated + drawn entirely inside
@@ -790,7 +819,7 @@ public final class ClusterProjectionController {
     public void shutdown() {
         watchdogHandler.removeCallbacks(maxCapTask);
         watchdogHandler.removeCallbacks(lingerTask);
-        sustainedHeld = false;   // teardown drops the hold; restore proceeds normally
+        sustainedHolders.clear();   // teardown drops ALL holds; restore proceeds normally
         synchronized (this) {
             shuttingDown = true;   // terminal — blocks any future requestOpen re-entry
             if (projState == ST_CLOSED) {

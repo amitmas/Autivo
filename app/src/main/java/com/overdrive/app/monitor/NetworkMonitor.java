@@ -284,6 +284,19 @@ public class NetworkMonitor {
         return net;
     }
 
+    /**
+     * Current network type ("wifi", "cellular", "ethernet", "none"). Reads the last
+     * cached value without forcing a refresh — callers that need freshness (e.g. the
+     * automation WiFi poll) call {@link #refresh()} themselves on their own cadence.
+     */
+    public static String getNetworkType() { return networkType; }
+
+    /** True when the last known network type is WiFi. */
+    public static boolean isWifiConnected() { return "wifi".equals(networkType); }
+
+    /** Current WiFi SSID, or "" when not on WiFi / unknown. */
+    public static String getWifiSsid() { return wifiSsid; }
+
     // ==================== SHELL UTIL ====================
 
     private static String execShell(String cmd) {

@@ -24,6 +24,7 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -63,6 +64,26 @@ public class Automations {
         // Start publishing the current time-of-day / day-of-week into the state so
         // time and day conditions can be evaluated.
         TimeEvent.scheduleTimeEvent();
+
+        // Start the low-cadence WiFi/system-boot poll (self-gating: does nothing while
+        // no automation is enabled). Feeds wifiState / wifiSsid / boot events.
+        com.overdrive.app.automation.condition.NetworkEvent.scheduleNetworkEvent();
+
+        // Start the low-cadence Bluetooth poll (self-gating, same as WiFi). Feeds
+        // btState / btDeviceName events. Costs only a parked scheduler thread until an
+        // automation is enabled.
+        com.overdrive.app.automation.condition.BluetoothEvent.scheduleBluetoothEvent();
+
+        // Start the FAST turn-indicator poll. Self-gates one level tighter than the
+        // others (isEventReferenced): it reads the lamps at 500ms ONLY while an enabled
+        // automation actually triggers on a turn signal, otherwise it's a parked thread
+        // ticking a cheap map check. Publishes turnSignal on/off far more promptly than
+        // the ~5s stationary snapshot cadence used to.
+        com.overdrive.app.automation.condition.TurnSignalEvent.scheduleTurnSignalEvent();
+
+        // Subscribe to raw door open/close edges (event-driven, no poll) so door-state
+        // triggers fire the instant a door/lid opens. Self-gates on isDisabled().
+        com.overdrive.app.automation.condition.DoorEvent.start();
     }
 
     /**
@@ -115,9 +136,110 @@ public class Automations {
         int n = 0;
         for (Automation a : automations.values()) if (!a.isDisabled()) n++;
         enabledCount = n;
+        seedReferencedVariables();
+    }
+
+    /**
+     * Seed every user VARIABLE referenced by any automation to "" (empty) if it has no
+     * value yet, so a first-run comparison behaves intuitively:
+     * {@code Parking_Mode != true} is TRUE before the flag is ever set (empty ≠ "true"),
+     * and {@code Parking_Mode == true} is FALSE. Without this, an unseen variable reads
+     * as null and {@link AutomationCondition#compare} returns false for BOTH — so a
+     * {@code != true} guard would never pass on the first run and the automation could
+     * never start. Idempotent: only seeds a variable that isn't already in the state
+     * (a real set via SetVariableAction always wins), and empty-string is a distinct,
+     * stable value so it never re-fires. Called under {@link #SAVE_LOCK} after any load
+     * or mutation, so newly-referenced variables get seeded as automations change.
+     */
+    private static void seedReferencedVariables() {
+        for (Automation a : automations.values()) {
+            // Triggers + conditions that reference a variable event.
+            for (EventData key : a.getTriggers()) seedIfVariable(key);
+            for (AutomationCondition c : a.getConditions()) seedIfVariable(c.getEventData());
+            // Also seed variables a "Set Variable" action DEFINES, so a condition on a
+            // variable only ever set (never triggered/conditioned) elsewhere still reads
+            // empty rather than null before its first set.
+            seedVariablesDefinedByActions(a.getActions());
+            seedVariablesDefinedByActions(a.getElseActions());
+        }
+    }
+
+    private static void seedIfVariable(EventData key) {
+        if (key == null) return;
+        if (!com.overdrive.app.automation.condition.BydEvent.VARIABLE_TYPE.equals(key.getType())) return;
+        // putIfAbsent semantics: never clobber a real value already set.
+        state.putIfAbsent(key, new StringValue(""));
+    }
+
+    private static void seedVariablesDefinedByActions(java.util.List<AutomationAction> actions) {
+        if (actions == null) return;
+        for (AutomationAction action : actions) {
+            if (action == null || !"setVariable".equals(action.getType())) continue;
+            Object name = action.getVariables() == null ? null : action.getVariables().get("name");
+            if (name == null) continue;
+            String n = name.toString().trim();
+            if (n.isEmpty()) continue;
+            seedIfVariable(com.overdrive.app.automation.action.SetVariableAction.variableEvent(n));
+        }
     }
 
     private Automations() {}
+
+    /**
+     * Largest manual-replay total window (beforeSeconds + afterSeconds) across
+     * every ENABLED automation's actions and else-actions. Consumed by
+     * {@link com.overdrive.app.recording.ManualClipService#getConfiguredRetentionSeconds()}
+     * so the pre-record ring is sized for automation-triggered replays too — a
+     * clip bound only in an automation (never in Key Mapping) must still fit.
+     *
+     * <p>Cheap and side-effect-free: iterates the in-memory automation map (a
+     * disabled automation contributes 0). Bounded to the manual-clip max so a
+     * hand-edited config can never request an oversized ring.
+     */
+    public static int getMaxManualClipRetentionSeconds() {
+        int max = 0;
+        for (Automation automation : automations.values()) {
+            if (automation.isDisabled()) continue;
+            max = Math.max(max, maxManualClipRetention(automation.getActions()));
+            max = Math.max(max, maxManualClipRetention(automation.getElseActions()));
+        }
+        return Math.min(com.overdrive.app.recording.ManualClipWindow.MAX_SECONDS, max);
+    }
+
+    private static int maxManualClipRetention(List<AutomationAction> actions) {
+        if (actions == null) return 0;
+        int max = 0;
+        for (AutomationAction action : actions) {
+            if (action == null || !"manualClip".equals(action.getType())) continue;
+            Map<String, Object> variables = action.getVariables();
+            if (variables == null) continue;
+            max = Math.max(max,
+                    intVar(variables, "beforeSeconds") + intVar(variables, "afterSeconds"));
+        }
+        return max;
+    }
+
+    private static int intVar(Map<String, Object> variables, String key) {
+        Object value = variables.get(key);
+        int seconds = value instanceof Number ? ((Number) value).intValue() : 0;
+        return Math.max(0, seconds);
+    }
+
+    /**
+     * Push the current manual-replay retention to the live encoder after an
+     * automation mutation, so a newly-saved (or removed) replay action changes
+     * the pre-record window without waiting for the next camera cold start —
+     * mirroring the Key Mapping save path. Best-effort and never throws: sizing
+     * also happens on encoder init, so a transient failure here self-heals.
+     */
+    private static void applyManualClipRetention() {
+        try {
+            com.overdrive.app.recording.ManualClipService.getInstance()
+                    .reapplyLiveRetention();
+        } catch (Throwable ignored) {
+            // Retention is re-derived on the next encoder init regardless.
+        }
+    }
 
     /**
      * Get a condition schema with a specific key
@@ -171,6 +293,33 @@ public class Automations {
     }
 
     /**
+     * Whether any ENABLED automation references the given event — as a TRIGGER or as a
+     * CONDITION. Lets a high-cadence event source (e.g. the turn-signal fast poll) gate
+     * its expensive per-tick work on "is anyone actually listening for this?", so it
+     * stays a true no-op until a relevant automation exists — the same
+     * cost-when-disabled bar the rest of the subsystem holds, but per-event rather than
+     * global. Conditions are included because a turn signal can gate a DIFFERENT
+     * trigger (e.g. "when speed &gt; 60 AND left indicator on"); if we polled only for
+     * triggers, that condition would evaluate against a stale/unseeded turn state.
+     * Cheap: a short walk of the (typically tiny) automation map, only called from a
+     * low/aperiodic scheduler, never the telemetry hot path.
+     *
+     * @param key the event to test
+     * @return true if at least one enabled automation references it (trigger or condition)
+     */
+    public static boolean isEventReferenced(EventData key) {
+        if (key == null || enabledCount == 0) return false;
+        for (Automation a : automations.values()) {
+            if (a.isDisabled()) continue;
+            if (a.isTriggered(key)) return true;
+            for (AutomationCondition c : a.getConditions()) {
+                if (key.equals(c.getEventData())) return true;
+            }
+        }
+        return false;
+    }
+
+    /**
      * Create or update an automation
      * Will use a UUID for new automations
      *
@@ -183,6 +332,7 @@ public class Automations {
         synchronized (SAVE_LOCK) { refreshEnabledCount(); }
         saveToFile();
         AutomationQueue.checkWorkerState();
+        applyManualClipRetention();
         logger.info("Updated automation: " + id);
     }
 
@@ -214,6 +364,7 @@ public class Automations {
         synchronized (SAVE_LOCK) { refreshEnabledCount(); }
         saveToFile();
         AutomationQueue.checkWorkerState();
+        applyManualClipRetention();
         logger.info("Removed automation: " + id);
         return true;
     }
@@ -232,6 +383,7 @@ public class Automations {
         synchronized (SAVE_LOCK) { refreshEnabledCount(); }
         saveToFile();
         AutomationQueue.checkWorkerState();
+        applyManualClipRetention();
         logger.info((disabled ? "Disabled" : "Enabled") + " automation: " + id);
         return true;
     }
@@ -250,6 +402,10 @@ public class Automations {
                     "description", Messages.get("automation.delay_description"));
             json.put(delayJson);
             json.put(actions().toJson());
+            // Optional "else" branch — same action catalog, required 0. Emitted as its
+            // own schema section so the existing schema-driven form renders it with no
+            // bespoke UI. Automations without an else branch simply leave it empty.
+            json.put(actions().elseToJson());
         } catch (Exception e) {
             // JSONObject.put only throws on null key
         }
@@ -394,10 +550,17 @@ public class Automations {
         // Don't trigger events when we don't know the previous value
         if (oldValue != null) {
             for (Map.Entry<String, Automation> automation : automations.entrySet()) {
-                if (!automation.getValue().isDisabled() && automation.getValue().isTriggered(key)) {
-                    if (automation.getValue().conditionsMet(state)) {
+                Automation a = automation.getValue();
+                if (!a.isDisabled() && a.isTriggered(key)) {
+                    // Enqueue when the conditions are met, OR when they aren't but an
+                    // else branch exists — the else branch must fire after the same
+                    // delay. The final decision (primary vs else) is re-made at fire
+                    // time in triggerActions, so a condition that flips during the
+                    // delay window is honoured. Only when conditions currently fail
+                    // AND there is no else branch do we remove any pending item.
+                    if (a.conditionsMet(state) || a.hasElseActions()) {
                         logger.info("Adding automation to queue: " + automation.getKey());
-                        AutomationQueue.addToQueue(automation.getKey(), automation.getValue().getDelay());
+                        AutomationQueue.addToQueue(automation.getKey(), a.getDelay());
                     } else {
                         logger.info("Removing automation from queue: " + automation.getKey());
                         AutomationQueue.removeFromQueue(automation.getKey());
@@ -405,6 +568,20 @@ public class Automations {
                 }
             }
         }
+    }
+
+    /**
+     * Read the current value of an event from the live automation state, or null if
+     * the event has never fired since boot. Exposed for the {@code waitUntil} action,
+     * which polls a signal's current value while running (on the single automation
+     * worker thread) — it must see the SAME committed state the trigger/condition
+     * evaluation sees, so it reads this shared map rather than a private copy.
+     *
+     * @param key the event to read
+     * @return the current {@link Value}, or null if unseen
+     */
+    public static Value getStateValue(EventData key) {
+        return key == null ? null : state.get(key);
     }
 
     /**
@@ -485,8 +662,15 @@ public class Automations {
             return true;
         }
 
-        if (!checkConditions || automation.conditionsMet(state)) {
-            logger.info("Triggering automation actions: " + id);
+        // Decide which branch to run. The /test path (checkConditions=false) always
+        // runs the PRIMARY actions so "test" exercises the happy path. The queue
+        // worker (checkConditions=true) runs the primary branch when conditions are
+        // met, otherwise the else branch (if any). Conditions are re-checked HERE, at
+        // fire time, so a value that changed during the delay window is honoured.
+        boolean met = !checkConditions || automation.conditionsMet(state);
+        boolean runElse = checkConditions && !met && automation.hasElseActions();
+        if (met || runElse) {
+            logger.info("Triggering automation " + (runElse ? "else-" : "") + "actions: " + id);
             // Guard the action run at the shared choke point that BOTH callers flow through: the
             // autonomous queue worker (AutomationQueue.java:135-139) already wraps its call in
             // catch(Throwable), but the /test endpoint (AutomationApiHandler.testAutomation) does not.
@@ -498,7 +682,8 @@ public class Automations {
             // gets a proper response and the daemon stays up. We return true (the automation EXISTS) so
             // the failure is never misreported as a 404 by callers that map false -> 404.
             try {
-                automation.triggerActions();
+                if (runElse) automation.triggerElseActions();
+                else automation.triggerActions();
             } catch (Throwable t) {
                 logger.error("Automation action threw while triggering: " + id);
             }

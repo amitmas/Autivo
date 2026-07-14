@@ -8,7 +8,7 @@ import java.util.List;
 public class BYDAutoChargingDevice extends AbsBYDAutoDevice {
 
     // Charging gun state constants
-    // NOTE: Per decompiled BYDCarController (ground truth from actual BYD APK):
+    // NOTE: Per the OEM firmware convention (ground truth from the vehicle HAL):
     //   1=NONE (no gun), 2=AC, 3=DC, 4=AC_DC, 5=VTOL
     // The HAL returns these values directly from getChargingGunState().
     public static final int CHARGING_GUN_STATE_NONE = 1;

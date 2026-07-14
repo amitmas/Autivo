@@ -741,6 +741,7 @@
     <string name="rail_trips">Поездки</string>
     <string name="rail_charging">Зарядка</string>
     <string name="rail_automations">Автоматизации</string>
+    <string name="rail_key_mapping">Сопоставление клавиш</string>
     <string name="rail_integrations">Интеграции</string>
     <string name="rail_diagnostics">Диагностика</string>
     <string name="rail_settings">Настройки</string>

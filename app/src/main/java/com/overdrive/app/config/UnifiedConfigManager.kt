@@ -433,6 +433,18 @@ object UnifiedConfigManager {
         val blindspot = config.optJSONObject("blindspot") ?: JSONObject().also {
             config.put("blindspot", it)
         }
+        // Camera-view section: an on-demand camera view (front/rear/left/right/all-4)
+        // shown on the SAME native SurfaceControl lane the blind-spot feature uses,
+        // arbitrated at render time with blind-spot priority. No default keys force
+        // behavior (enabled defaults false, so a config without this section is
+        // byte-identical to the shipping path); just guarantee the section exists so
+        // per-key merges never miss the whole object. Keys (all optional):
+        //   enabled(bool), mode(int 0=all/1=front/2=right/3=rear/4=left),
+        //   target("head_unit"|"cluster"), geometry{sizePct,corner | x,y,w,h},
+        //   geometryCluster{...}, autoHideSec(int; 0=until explicitly hidden).
+        config.optJSONObject("camview") ?: JSONObject().also {
+            config.put("camview", it)
+        }
         // Power / battery-safety section. Holds the HV-SoC surveillance cutoff
         // read by SocCutoffMonitor.cutoffPercent() (key power.lowSocCutoffPercent).
         val power = config.optJSONObject("power") ?: JSONObject().also {
@@ -1449,6 +1461,38 @@ object UnifiedConfigManager {
     fun setBlindSpotTarget(target: String): Boolean =
         updateValues("blindspot", mapOf(
             "target" to (if (target == "cluster") "cluster" else "head_unit")))
+
+    // ── Camera-view (on-demand native camera view, shares the BS lane) ──────────
+    /** The camview section {enabled, mode, target, geometry, geometryCluster, autoHideSec}. */
+    @JvmStatic
+    fun getCamView(): JSONObject {
+        return loadConfig().optJSONObject("camview") ?: JSONObject()
+    }
+
+    /** True when an on-demand camera view is currently requested/shown. */
+    @JvmStatic
+    fun isCamViewEnabled(): Boolean = getCamView().optBoolean("enabled", false)
+
+    /** Requested camera view mode: 0=all-4 mosaic, 1=front, 2=right, 3=rear, 4=left.
+     *  Clamped to that range; anything else falls back to 0 (mosaic). */
+    @JvmStatic
+    fun getCamViewMode(): Int = getCamView().optInt("mode", 0).let { if (it in 0..4) it else 0 }
+
+    /** Camera-view display target: "head_unit" (default) or "cluster". */
+    @JvmStatic
+    fun getCamViewTarget(): String = getCamView().optString("target", "head_unit")
+
+    @JvmStatic
+    fun isCamViewCluster(): Boolean = "cluster" == getCamViewTarget()
+
+    /** Auto-hide timeout in seconds (0 = stay until explicitly hidden). */
+    @JvmStatic
+    fun getCamViewAutoHideSec(): Int = getCamView().optInt("autoHideSec", 0).coerceIn(0, 600)
+
+    /** Persist camview keys with a shallow single-key merge (never clobbers the
+     *  per-target geometry/geometryCluster siblings). */
+    @JvmStatic
+    fun setCamViewValues(values: Map<String, Any>): Boolean = updateValues("camview", values)
 
     /** Physical-key mapping section: {enabled, allowAdvanced, bindings:[
      *  {keycode:int, pressType:"single|double|long", action:{kind, variables}}]}.

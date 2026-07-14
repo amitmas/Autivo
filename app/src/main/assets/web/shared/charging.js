@@ -298,9 +298,10 @@ var CHARGING = {
         // information. Show the running COST OF THIS SESSION while charging
         // (sessionKwh × rate), else this period's total cost, else the rate.
         var measured = (s.avgCostPerKwh !== undefined && s.avgCostPerKwh !== null) ? s.avgCostPerKwh : 0;
-        if (isCharging && liveKwh > 0 && this.electricityRate > 0) {
+        var liveRate = this._liveRate();  // DC tariff when the open session is DC fast, else base
+        if (isCharging && liveKwh > 0 && liveRate > 0) {
             this._setText('costHeroLabel', this._t('charge.hero_cost_session', 'Cost this session'));
-            this._setText('costHeroValue', this._money(liveKwh * this.electricityRate));
+            this._setText('costHeroValue', this._money(liveKwh * liveRate));
             this._setText('costHeroSub', this._t('charge.cost_estimated', 'estimated'));
         } else if (s.periodCost && s.periodCost > 0) {
             this._setText('costHeroLabel', this._t('charge.hero_cost_period', 'Cost this period'));
@@ -321,7 +322,7 @@ var CHARGING = {
         // open in-progress session isn't in that rollup yet, so add it live so
         // the tiles aren't "0 / -- / --" during your very first charge. No
         // double-count risk: it only lands in the rollup once it closes.
-        var liveCost = (isCharging && liveKwh > 0 && this.electricityRate > 0) ? liveKwh * this.electricityRate : 0;
+        var liveCost = (isCharging && liveKwh > 0 && liveRate > 0) ? liveKwh * liveRate : 0;
         var pSessions = (s.periodSessions || 0) + (isCharging ? 1 : 0);
         var pEnergy = energy + (isCharging ? liveKwh : 0);
         var pCost = (s.periodCost || 0) + liveCost;
@@ -1929,6 +1930,23 @@ var CHARGING = {
         if (peak >= this.AC_FAST_KW) return 'fast';
         if (peak > 0) return 'slow';
         return 'unk';
+    },
+
+    // Effective per-kWh rate for the LIVE in-progress session: the separate DC
+    // tariff when the open session is CONFIDENTLY DC and a dcRate is set, else
+    // the base rate. Mirrors the backend deriveIsDc()+effectiveRate() pricing
+    // path EXACTLY (gun==3 AND peak ≥ DC_MIN_PEAK_KW) — NOT the lenient, peak-only
+    // _typeKind() DISPLAY classifier — so this live "Cost this session" estimate
+    // agrees with the session-card cost (backend-computed) shown alongside it and
+    // with the value persisted at session end. Pricing is intentionally stricter
+    // than the label: we only apply the DC premium when the gun confirms DC.
+    _liveRate: function () {
+        var s = this._liveSession;
+        if (this.dcRate > 0 && s && s.gunState === 3
+                && s.peakPower != null && s.peakPower >= this.DC_MIN_PEAK_KW) {
+            return this.dcRate;
+        }
+        return this.electricityRate;
     },
 
     _typeLabel: function (s) {

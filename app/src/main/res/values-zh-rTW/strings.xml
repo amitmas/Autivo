@@ -23,7 +23,7 @@
     <string name="action_select_all">選擇所有</string>
     <string name="action_select_all_short">所有的</string>
     <string name="action_delete">刪除</string>
-    <string name="action_share">Share</string>
+    <string name="action_share">分享</string>
     <string name="action_done">已完成</string>
     <string name="action_remind_me_later">記得我後來</string>
     <string name="action_retry">重試</string>
@@ -57,7 +57,7 @@
     <string name="cd_player_quadrant_rear">顯示後方鏡頭</string>
     <string name="cd_player_quadrant_left">顯示左側鏡頭</string>
     <string name="cd_delete">刪除</string>
-    <string name="cd_share">Share</string>
+    <string name="cd_share">分享</string>
     <string name="cd_expand">擴展</string>
     <string name="cd_configure">設定方式</string>
     <string name="cd_download_log">下載日志</string>
@@ -75,10 +75,10 @@
          translatable=false to avoid bloating the i18n catalog. The
          _cd content-descriptions are real prose and ARE translatable —
          they go through the NLLB pipeline like every other a11y string. -->
-    <string name="overlay_mode_off_cd">Stop recording</string>
-    <string name="overlay_mode_continuous_cd">Continuous recording</string>
-    <string name="overlay_mode_drive_cd">Drive-mode recording</string>
-    <string name="overlay_mode_proximity_cd">Proximity-guard recording</string>
+    <string name="overlay_mode_off_cd">停止錄製</string>
+    <string name="overlay_mode_continuous_cd">連續錄製</string>
+    <string name="overlay_mode_drive_cd">駕駛模式錄製</string>
+    <string name="overlay_mode_proximity_cd">接近防護錄製</string>
     <!-- item_log_entry placeholders (timestamp/tag/message are runtime, but these are
          placeholder/preview text used at design time and visible in some empty states) -->
     <string name="log_entry_default_timestamp">這是一場非常棒的遊戲.</string>
@@ -96,7 +96,7 @@
     <string name="url_connecting">聯繫我們.</string>
     <!-- Shown when an external link can't open (no browser on the head unit):
          the URL is copied to the clipboard instead. %1$s = the URL. -->
-    <string name="url_copied_no_browser">No browser found. Link copied: %1$s</string>
+    <string name="url_copied_no_browser">找不到瀏覽器。已複製連結：%1$s</string>
     <!-- dialog_tailscale_settings -->
     <string name="tailscale_generate_login_url">生成登入 URL</string>
     <string name="tailscale_scan_to_login">掃描到登入</string>
@@ -133,11 +133,11 @@
     <string name="camera_option_5">攝影機 5</string>
     <string name="camera_selection_hint">自動選取對照相機的裝置.相機 1 = BYD Seal,相機 0 = Atto 裝置.</string>
     <!-- OEM Dashcam camera ID picker (Phase 5: separate forward-sensor pipeline) -->
-    <string name="camera_oem_dashcam_title">OEM Dashcam Camera ID</string>
-    <string name="camera_oem_dashcam_hint">Pick the AVMCamera id that points at the forward dashcam sensor. Dashcam is the OPPOSITE of pano: Seal/Han pano = 1 → dashcam = 0; Atto / Tang pano = 0 → dashcam = 1. Leave on Auto to let OverDrive pick.</string>
-    <string name="camera_oem_dashcam_auto_resolved">Auto — using id %1$d (pano is id %2$d)</string>
-    <string name="camera_oem_dashcam_auto_unavailable">Auto — pano id is %1$d, can\'t infer dashcam</string>
-    <string name="camera_oem_dashcam_save">Save</string>
+    <string name="camera_oem_dashcam_title">OEM 行車記錄器相機 ID</string>
+    <string name="camera_oem_dashcam_hint">選擇指向前方行車記錄器感測器的 AVMCamera id。行車記錄器與 pano 相反：Seal/Han pano = 1 → dashcam = 0；Atto／Tang pano = 0 → dashcam = 1。保持 Auto 讓 OverDrive 自行選擇。</string>
+    <string name="camera_oem_dashcam_auto_resolved">自動 — 使用 id %1$d（全景為 id %2$d）</string>
+    <string name="camera_oem_dashcam_auto_unavailable">自動 — 全景 id 為 %1$d，無法推斷行車記錄器</string>
+    <string name="camera_oem_dashcam_save">儲存</string>
     <string name="camera_concurrent_probe_label">下次開機時測試雙相機支援</string>
     <string name="camera_concurrent_probe_subtitle">一次性檢查，會同時開啟兩個相機，以確認本車可同時執行環景＋行車記錄。停車時在下次重新啟動時執行一次。除非錄影看起來有誤，否則請保持關閉 — 此功能並非必要，且若執行時正在錄影，可能會短暫中斷錄影。</string>
     <!-- Dashcam-side camera labels — REVERSE of the pano labels above. The
@@ -146,8 +146,8 @@
          dialogs. Without these strings the dashcam picker re-used the pano
          labels and told Seal owners to pick "Camera 1 — Seal" for their
          dashcam, which is the pano camera, not the dashcam. -->
-    <string name="camera_oem_option_0">Camera 0 — Seal / Han (default)</string>
-    <string name="camera_oem_option_1">Camera 1 — Atto / Tang</string>
+    <string name="camera_oem_option_0">相機 0 — Seal / Han（預設）</string>
+    <string name="camera_oem_option_1">相機 1 — Atto / Tang</string>
     <!-- Camera mapping dialog (multi-vehicle role-to-slice routing) -->
     <string name="camera_mapping_title">攝影機映射</string>
     <string name="camera_role_label">角色映射</string>
@@ -200,7 +200,7 @@
          resolves to, e.g. "Auto · English". -->
     <string name="language_auto_subtitle">追蹤系統 · %1$s</string>
     <!-- Drawer footer subtitle when on Auto, e.g. "English · Auto". -->
-    <string name="language_label_auto_fmt">%1$s · Auto</string>
+    <string name="language_label_auto_fmt">%1$s · 自動</string>
     <!-- fragment_adb_console -->
     <string name="adb_prompt">其他國家</string>
     <string name="adb_command_hint">進入指令...</string>
@@ -262,7 +262,7 @@
     <string name="recording_lib_filter_section_severity">嚴重性</string>
     <string name="recording_lib_filter_section_type">類別</string>
     <string name="recording_lib_filter_section_place">地方</string>
-    <string name="recording_lib_place_search_hint">Search places…</string>
+    <string name="recording_lib_place_search_hint">搜尋地點…</string>
     <string name="recording_lib_chip_type_normal">普通</string>
     <string name="recording_lib_chip_type_proximity">接近</string>
     <string name="recording_lib_date_today">今天</string>
@@ -281,29 +281,29 @@
     <string name="cd_open_filters">打開過濾器</string>
     <string name="cd_clear_filter">清晰的濾鏡</string>
     <!-- v5 redesign: SOTA empty state with CTA + tile type badges -->
-    <string name="recording_lib_empty_title">No recordings match</string>
-    <string name="recording_lib_empty_body">Try adjusting your date range or chip filters.</string>
-    <string name="recording_lib_empty_clear_filters">Clear filters</string>
+    <string name="recording_lib_empty_title">沒有符合的錄影</string>
+    <string name="recording_lib_empty_body">請嘗試調整日期範圍或標籤篩選。</string>
+    <string name="recording_lib_empty_clear_filters">清除篩選</string>
     <!-- Shown on the empty-state body when there are zero clips on disk
          (no filter is active). Sets a friendlier tone than "No recordings match". -->
-    <string name="recording_lib_empty_disk_title">Nothing recorded yet</string>
-    <string name="recording_lib_empty_disk_body">Captures will appear here as soon as the dashcam or surveillance pipeline writes a clip.</string>
+    <string name="recording_lib_empty_disk_title">尚未錄製任何內容</string>
+    <string name="recording_lib_empty_disk_body">一旦行車記錄器或監控管線寫入影片，擷取內容就會顯示在此。</string>
     <!-- Shown while the daemon is warming the H2 recording index on cold
          start. Includes a progress counter when the daemon reports done/total,
          otherwise a static body. The library re-polls every 1.5s and
          transitions out automatically once results land. -->
-    <string name="recording_lib_building_index_title">Building library index</string>
-    <string name="recording_lib_building_index_body">One moment while the daemon scans your recordings.</string>
-    <string name="recording_lib_building_index_progress">Indexed %1$d of %2$d clips…</string>
+    <string name="recording_lib_building_index_title">正在建立媒體庫索引</string>
+    <string name="recording_lib_building_index_body">請稍候，daemon 正在掃描你的錄影。</string>
+    <string name="recording_lib_building_index_progress">已索引 %2$d 個影片中的 %1$d 個…</string>
     <!-- Tile type badge labels — short, glanceable, mirrors the on-disk
          filename prefix (cam_/event_/dvr_/proximity_) so power users can
          map a tile back to its file group at a glance. -->
     <string name="recording_lib_type_normal">CAM</string>
-    <string name="recording_lib_type_event">EVENT</string>
+    <string name="recording_lib_type_event">事件</string>
     <string name="recording_lib_type_proximity">PROX</string>
     <string name="recording_lib_type_oem">OEM</string>
     <!-- Toast shown when a multi-select share is dispatched. -->
-    <string name="toast_share_recordings">Sharing %1$d recordings</string>
+    <string name="toast_share_recordings">正在分享 %1$d 個錄影</string>
     <!-- fragment_sentry_config -->
     <!-- fragment_video_player -->
     <string name="player_title_recording">錄音</string>
@@ -339,7 +339,7 @@
     <string name="soh_dialog_source_auto">自動檢測</string>
     <string name="soh_dialog_model_not_selected">沒有選擇</string>
     <string name="soh_dialog_capacity_not_detected">沒有發現</string>
-    <string name="soh_dialog_calibration_format">%1$.1f%% on %2$s</string>
+    <string name="soh_dialog_calibration_format">%2$s 為 %1$.1f%%</string>
     <string name="soh_dialog_frame_anchor_label">檢測完整收費</string>
     <string name="soh_dialog_frame_anchor_format">%1$.2f kWh完全檢測 (%2$d/%3$d樣本)</string>
     <string name="soh_dialog_frame_anchor_pending_format">%1$.2f kWh全體檢測 (采集%2$d/%3$d樣本)</string>
@@ -446,7 +446,7 @@
     <string name="dialog_reset_soh_title">預算的 SOH 預算?</string>
     <string name="dialog_reset_soh_message">這樣會清除所有SOH數據,並從零開始強制重新估算.\n\n如果:\n• 電池被更換\n• SOH閱讀似乎不正確\n•您想要重新校准\n\n</string>
     <string name="dialog_reset_following_title">請重置下列?</string>
-    <string name="dialog_reset_following_message">This cannot be undone.\n\n%1$s</string>
+    <string name="dialog_reset_following_message">此操作無法復原。\n\n%1$s</string>
     <string name="dialog_reset_complete_title">完成重置</string>
     <string name="dialog_traffic_cannot_check_title">無法檢查狀況</string>
     <string name="dialog_traffic_cannot_check_message">應用程式需要ADB接入來管理系統包. 請確認:\n\n• 在開發者選項中已啟用USB Debugging\n• ADB授權提示已被接受\n\n狀態會自动更新,一旦連接.</string>
@@ -538,14 +538,14 @@
     <string name="toast_log_not_found">沒有找到或無法閱讀的日志檔案</string>
     <string name="log_share_title">%1$s 記錄 - %2$s</string>
     <string name="log_share_chooser">分享%1$s日志</string>
-    <string name="log_header_title">=== %1$s Log ===</string>
+    <string name="log_header_title">=== %1$s 記錄 ===</string>
     <string name="log_header_source">源:%1$s</string>
     <string name="log_header_exported">輸出:%1$s</string>
     <string name="log_header_truncated">註: 截圖截圖為10000行 (總數:%1$d行)</string>
     <!-- Braveheart log send (upload to Cloudflare or share-sheet) -->
     <string name="logs_send_title">傳送 %1$s 日誌</string>
     <string name="logs_send_title_plain">傳送守護程式日誌</string>
-    <string name="logs_send_subtitle">%1$s · choose how to send it to us</string>
+    <string name="logs_send_subtitle">%1$s · 選擇傳送給我們的方式</string>
     <string name="logs_send_upload">上傳並取得代碼</string>
     <string name="logs_send_upload_desc">將日誌傳送給我們並提供您一個簡短代碼。最方便取得支援。</string>
     <string name="logs_send_share">分享檔案…</string>
@@ -554,7 +554,7 @@
     <string name="logs_uploading_subtitle">正在隱藏機密資訊並安全傳送</string>
     <string name="logs_uploaded_title">日誌已上傳</string>
     <string name="logs_uploaded_instructions">請與我們分享此代碼，並附註發生問題時您正在進行的操作。將其發佈到 Discord、GitHub Issues 或 WhatsApp — 連結位於「關於」畫面。</string>
-    <string name="logs_uploaded_privacy">Secrets redacted · the log auto-expires</string>
+    <string name="logs_uploaded_privacy">已遮蔽機密 · 記錄會自動過期</string>
     <string name="logs_copy_code">複製代碼</string>
     <string name="logs_done">完成</string>
     <string name="placeholder_dash">—</string>
@@ -563,7 +563,7 @@
     <!-- Recording library -->
     <string name="toast_cannot_play_video">不能播放影片: %1$s</string>
     <string name="dialog_delete_recording_title">删除錄音</string>
-    <string name="dialog_delete_recording_message">Delete %1$s?\nThis cannot be undone.</string>
+    <string name="dialog_delete_recording_message">刪除 %1$s？\n此操作無法復原。</string>
     <string name="toast_recording_deleted">已取消錄音</string>
     <string name="toast_recording_delete_failed">沒有删除錄音</string>
     <string name="toast_batch_delete_partial">%1$d 已被删除, %2$d 失败</string>
@@ -596,7 +596,7 @@
     <string name="nav_page_telegram">Telegram</string>
     <string name="nav_page_abrp">ABRP</string>
     <string name="nav_page_mqtt">MQTT</string>
-    <string name="nav_page_byd_cloud">BYD Cloud</string>
+    <string name="nav_page_byd_cloud">BYD 雲端</string>
     <!-- StatusOverlayService persistent notification (foreground service) -->
     <string name="status_overlay_notif_title">OverDrive 狀態</string>
     <string name="status_overlay_notif_text">狀態覆蓋活動</string>
@@ -605,10 +605,10 @@
          notifications into one shade entry. The summary text is intentionally
          generic so it stays accurate whether all three services are running
          or only the keepalive survived an OOM respawn. -->
-    <string name="daemon_keepalive_notif_title">Overdrive Active</string>
-    <string name="daemon_keepalive_notif_text">Monitoring vehicle systems</string>
+    <string name="daemon_keepalive_notif_title">Overdrive 執行中</string>
+    <string name="daemon_keepalive_notif_text">正在監控車輛系統</string>
     <string name="overdrive_status_summary_title">Overdrive</string>
-    <string name="overdrive_status_summary_text">Background services running</string>
+    <string name="overdrive_status_summary_text">背景服務執行中</string>
     <!-- ============================================================== -->
     <!-- M3 Revamp: navigation rail + settings sub-rail + theme picker  -->
     <!-- ============================================================== -->
@@ -628,7 +628,7 @@
     <string name="settings_section_daemons">子</string>
     <string name="settings_section_privacy">隱私與資料</string>
     <string name="settings_section_overlay">狀態覆蓋</string>
-    <string name="settings_section_security">Security</string>
+    <string name="settings_section_security">安全性</string>
     <string name="settings_overlay_subtitle">選擇浮動狀態平板的哪些部分保持可見.</string>
     <string name="settings_overlay_camera_title">攝影機表示</string>
     <string name="settings_overlay_camera_subtitle">在錄音活動中顯示REC/ PROX標志.</string>
@@ -850,56 +850,56 @@
          The lock guards the OverDrive UI only. Cam daemon, AccSentry,
          surveillance, recording, Telegram alerts, status overlay, and the
          deterrent screen all run independently regardless of this state. -->
-    <string name="settings_security_title">Security</string>
-    <string name="settings_security_subtitle">Lock the OverDrive app so passengers and valets can\'t open it without your PIN.</string>
-    <string name="settings_security_stance_title">UI lock only</string>
-    <string name="settings_security_stance_body">Surveillance, recording, deterrent, alerts, and background services keep running while the app is locked. The PIN gates the OverDrive interface, nothing else.</string>
-    <string name="settings_security_overline_lock">App lock</string>
-    <string name="settings_security_overline_recovery">If you forget your PIN</string>
-    <string name="settings_security_toggle_title">Require PIN</string>
-    <string name="settings_security_toggle_subtitle_off">Off — anyone can open OverDrive.</string>
-    <string name="settings_security_toggle_subtitle_on">On — PIN required to open OverDrive.</string>
-    <string name="settings_security_change_title">Change PIN</string>
-    <string name="settings_security_change_subtitle">Confirm current PIN, then set a new one.</string>
-    <string name="settings_security_autolock_title">Auto-lock</string>
-    <string name="settings_security_autolock_immediate">Lock immediately</string>
-    <string name="settings_security_autolock_1min">After 1 minute</string>
-    <string name="settings_security_autolock_5min">After 5 minutes</string>
-    <string name="settings_security_autolock_15min">After 15 minutes</string>
-    <string name="settings_security_autolock_never">Never auto-lock by time</string>
-    <string name="settings_security_recovery_title">ADB recovery</string>
-    <string name="settings_security_recovery_body">Forgotten PIN can be cleared from a host machine over USB debugging without a factory reset. Run this command, then reopen the app.</string>
+    <string name="settings_security_title">安全性</string>
+    <string name="settings_security_subtitle">鎖定 OverDrive 應用程式，讓乘客與代客泊車人員在沒有你的 PIN 時無法開啟。</string>
+    <string name="settings_security_stance_title">僅鎖定介面</string>
+    <string name="settings_security_stance_body">應用程式鎖定期間，監控、錄製、威懾、警示與背景服務仍持續運作。PIN 只把關 OverDrive 介面，其他一律不受影響。</string>
+    <string name="settings_security_overline_lock">應用程式鎖</string>
+    <string name="settings_security_overline_recovery">若你忘記 PIN</string>
+    <string name="settings_security_toggle_title">需要 PIN</string>
+    <string name="settings_security_toggle_subtitle_off">關閉 — 任何人都能開啟 OverDrive。</string>
+    <string name="settings_security_toggle_subtitle_on">開啟 — 開啟 OverDrive 需要 PIN。</string>
+    <string name="settings_security_change_title">變更 PIN</string>
+    <string name="settings_security_change_subtitle">確認目前的 PIN，然後設定新的 PIN。</string>
+    <string name="settings_security_autolock_title">自動上鎖</string>
+    <string name="settings_security_autolock_immediate">立即上鎖</string>
+    <string name="settings_security_autolock_1min">1 分鐘後</string>
+    <string name="settings_security_autolock_5min">5 分鐘後</string>
+    <string name="settings_security_autolock_15min">15 分鐘後</string>
+    <string name="settings_security_autolock_never">永不依時間自動上鎖</string>
+    <string name="settings_security_recovery_title">ADB 復原</string>
+    <string name="settings_security_recovery_body">忘記的 PIN 可透過 USB 偵錯從主機清除，無需回復原廠設定。執行此指令後，再重新開啟應用程式。</string>
     <!-- Verbatim ADB command. translatable=false so the i18n pipeline
          doesn't localize the literal path/command — translators following
          Crowdin would otherwise risk breaking the only recovery path. -->
-    <string name="settings_security_dialog_set_title">Set PIN</string>
-    <string name="settings_security_dialog_set_body">Pick a 4–8 digit PIN. You\'ll need this every time you open the app.</string>
-    <string name="settings_security_dialog_disable_title">Turn off PIN lock?</string>
-    <string name="settings_security_dialog_disable_body">Confirm your current PIN to turn off the app lock.</string>
-    <string name="settings_security_dialog_change_step1_title">Confirm current PIN</string>
-    <string name="settings_security_dialog_change_step1_body">Enter your current PIN, then you\'ll set a new one.</string>
-    <string name="settings_security_action_set">Set PIN</string>
-    <string name="settings_security_action_disable">Turn off lock</string>
-    <string name="settings_security_action_continue">Continue</string>
+    <string name="settings_security_dialog_set_title">設定 PIN</string>
+    <string name="settings_security_dialog_set_body">選擇 4–8 位數的 PIN。每次開啟應用程式時都會用到。</string>
+    <string name="settings_security_dialog_disable_title">關閉 PIN 鎖？</string>
+    <string name="settings_security_dialog_disable_body">確認目前的 PIN 以關閉應用程式鎖。</string>
+    <string name="settings_security_dialog_change_step1_title">確認目前的 PIN</string>
+    <string name="settings_security_dialog_change_step1_body">輸入目前的 PIN，然後設定新的 PIN。</string>
+    <string name="settings_security_action_set">設定 PIN</string>
+    <string name="settings_security_action_disable">關閉鎖定</string>
+    <string name="settings_security_action_continue">繼續</string>
     <string name="settings_security_pin_hint">PIN</string>
-    <string name="settings_security_pin_confirm_hint">Confirm PIN</string>
-    <string name="settings_security_error_length">PIN must be 4 to 8 digits</string>
-    <string name="settings_security_error_numeric">Digits only</string>
-    <string name="settings_security_error_mismatch">PINs don\'t match</string>
-    <string name="settings_security_error_wrong">Wrong PIN</string>
-    <string name="settings_security_error_locked_out">Too many attempts. Try again in a moment.</string>
-    <string name="settings_security_error_persist">Couldn\'t save the PIN. Try again.</string>
-    <string name="settings_security_toast_set_ok">PIN set. App lock is on.</string>
-    <string name="settings_security_toast_disable_ok">App lock turned off.</string>
+    <string name="settings_security_pin_confirm_hint">確認 PIN</string>
+    <string name="settings_security_error_length">PIN 必須為 4 到 8 位數字</string>
+    <string name="settings_security_error_numeric">僅限數字</string>
+    <string name="settings_security_error_mismatch">PIN 不相符</string>
+    <string name="settings_security_error_wrong">PIN 錯誤</string>
+    <string name="settings_security_error_locked_out">嘗試次數過多。請稍後再試。</string>
+    <string name="settings_security_error_persist">無法儲存 PIN。請再試一次。</string>
+    <string name="settings_security_toast_set_ok">已設定 PIN。應用程式鎖已開啟。</string>
+    <string name="settings_security_toast_disable_ok">已關閉應用程式鎖。</string>
     <!-- PIN unlock screen (PinLockActivity). Shown over MainActivity when
          the app lock is enabled and the session isn\'t fresh. -->
-    <string name="pin_lock_title">Enter PIN</string>
-    <string name="pin_lock_title_unlocked">Unlocked</string>
-    <string name="pin_lock_subtitle_default">Unlock OverDrive to continue.</string>
-    <string name="pin_lock_subtitle_wrong">Wrong PIN. Try again.</string>
-    <string name="pin_lock_subtitle_locked_out">Too many attempts. Try again shortly.</string>
+    <string name="pin_lock_title">輸入 PIN</string>
+    <string name="pin_lock_title_unlocked">已解鎖</string>
+    <string name="pin_lock_subtitle_default">解鎖 OverDrive 以繼續。</string>
+    <string name="pin_lock_subtitle_wrong">PIN 錯誤，請重試。</string>
+    <string name="pin_lock_subtitle_locked_out">嘗試次數過多。請稍後再試。</string>
     <!-- %1$s is a formatted countdown like "30s" or "2:45". -->
-    <string name="pin_lock_subtitle_locked_out_countdown">Locked. Try again in %1$s.</string>
+    <string name="pin_lock_subtitle_locked_out_countdown">已鎖定。請於 %1$s 後再試。</string>
     <string name="pin_lock_lockout_seconds">%1$ds</string>
     <string name="pin_lock_lockout_minutes">%1$d:%2$02d</string>
     <!-- Lock-screen recovery hint. Two-part: a translatable prose prefix
@@ -907,8 +907,8 @@
          settings_security_recovery_command resource so a future edit to
          the command stays in sync across both surfaces). The lock screen
          concatenates them at runtime via String.format. -->
-    <string name="pin_lock_recovery_hint_prefix">Forgot your PIN? Run from a connected computer:\n%1$s</string>
-    <string name="pin_lock_backspace_cd">Backspace</string>
+    <string name="pin_lock_recovery_hint_prefix">忘記 PIN？從已連接的電腦執行：\n%1$s</string>
+    <string name="pin_lock_backspace_cd">退格</string>
     <plurals name="pin_lock_dot_a11y">
         <item quantity="other">%1$d digits entered</item>
     </plurals>
@@ -955,7 +955,7 @@
          placeholder shape so the bold-ifier still finds the digits. -->
     <string name="dashboard_insight_kwh_format">%1$.1f kWh</string>
     <string name="dashboard_insight_percent_format">%1$.1f%%</string>
-    <string name="dashboard_insight_hours_minutes">%1$d hr %2$d min</string>
+    <string name="dashboard_insight_hours_minutes">%1$d 小時 %2$d 分</string>
     <!-- Today's clips. -->
     <plurals name="dashboard_insight_today_clips">
         <item quantity="other">今天拍攝的%1$d片段</item>
@@ -978,152 +978,152 @@
          RoadSense — road-hazard detection feature
          ============================================================ -->
     <string name="rail_roadsense">RoadSense</string>
-    <string name="rail_hazard_map">Map</string>
+    <string name="rail_hazard_map">地圖</string>
     <string name="roadsense_title">RoadSense</string>
-    <string name="roadsense_pill_scanning">Scanning</string>
+    <string name="roadsense_pill_scanning">掃描中</string>
     <string name="roadsense_pill_idle">RoadSense</string>
-    <string name="roadsense_status_idle">Idle</string>
+    <string name="roadsense_status_idle">閒置</string>
     <!-- VEHICLE calibration (suspension-learning) — the green/orange/red dot. Worded
          about the car, not the route, since that's what maturity actually measures. -->
-    <string name="roadsense_cal_learning">Learning your vehicle</string>
-    <string name="roadsense_cal_ready">Vehicle calibrated</string>
-    <string name="roadsense_cal_partial">Calibration improving</string>
+    <string name="roadsense_cal_learning">正在學習你的車輛</string>
+    <string name="roadsense_cal_ready">車輛已校準</string>
+    <string name="roadsense_cal_partial">校準改善中</string>
     <!-- Idle caption — ROUTE coverage (distinct from vehicle calibration). "Clear
          ahead" only when we've actually mapped this stretch; "New road" when we
          haven't, so an unsurveyed road isn't mistaken for confirmed-safe. -->
-    <string name="roadsense_clear_ahead">Clear ahead</string>
-    <string name="roadsense_road_mapped">Road mapped · clear</string>
-    <string name="roadsense_road_new">New road · learning</string>
+    <string name="roadsense_clear_ahead">前方暢通</string>
+    <string name="roadsense_road_mapped">道路已標記 · 暢通</string>
+    <string name="roadsense_road_new">新道路 · 學習中</string>
     <string name="roadsense_unit_meters">m</string>
     <string name="roadsense_dash_distance">—</string>
-    <string name="roadsense_warn_label">Warn</string>
-    <string name="roadsense_toggle_audio">Audio</string>
-    <string name="roadsense_toggle_visual">Visual</string>
+    <string name="roadsense_warn_label">警告</string>
+    <string name="roadsense_toggle_audio">音訊</string>
+    <string name="roadsense_toggle_visual">視覺</string>
     <!-- severity / type readouts (formatted at runtime) -->
-    <string name="roadsense_sev_minor">Minor</string>
-    <string name="roadsense_sev_moderate">Moderate</string>
-    <string name="roadsense_sev_severe">Severe</string>
-    <string name="roadsense_type_breaker">Speed breaker</string>
-    <string name="roadsense_type_pothole">Pothole</string>
-    <string name="roadsense_type_hazard">Hazard</string>
-    <string name="roadsense_type_rough">Rough section</string>
+    <string name="roadsense_sev_minor">輕微</string>
+    <string name="roadsense_sev_moderate">中等</string>
+    <string name="roadsense_sev_severe">嚴重</string>
+    <string name="roadsense_type_breaker">減速丘</string>
+    <string name="roadsense_type_pothole">坑洞</string>
+    <string name="roadsense_type_hazard">危險</string>
+    <string name="roadsense_type_rough">顛簸路段</string>
     <!-- "Moderate · Pothole" style line -->
     <string name="roadsense_hazard_format">%1$s · %2$s</string>
     <!-- Zone readouts (D-032): cluster of hazards announced as one. -->
     <!-- "3 bumps ahead" — %1$d = count -->
-    <string name="roadsense_zone_count">%1$d bumps ahead</string>
+    <string name="roadsense_zone_count">前方 %1$d 個減速丘</string>
     <!-- "Rough section · 40 m" — %1$d = length in metres -->
-    <string name="roadsense_zone_rough">Rough section · %1$d m</string>
+    <string name="roadsense_zone_rough">顛簸路段 · %1$d m</string>
     <!-- Calibration-Mode confirm card (R-OVL-6) -->
-    <string name="roadsense_confirm_prompt">Was this a hazard?</string>
-    <string name="roadsense_confirm_reject">Not a hazard</string>
-    <string name="roadsense_confirm_accept">Confirm</string>
+    <string name="roadsense_confirm_prompt">這是危害嗎？</string>
+    <string name="roadsense_confirm_reject">非危險</string>
+    <string name="roadsense_confirm_accept">確認</string>
     <!-- content descriptions -->
-    <string name="roadsense_cd_cal_level">Vehicle calibration level</string>
-    <string name="roadsense_cd_direction">Direction to next hazard</string>
+    <string name="roadsense_cd_cal_level">車輛校準等級</string>
+    <string name="roadsense_cd_direction">下一個危險的方向</string>
     <!-- Blind Spot overlay labels (native overlay window). -->
     <string name="blindspot_overlay_left">左</string>
     <string name="blindspot_overlay_right">右</string>
     <!-- ============================================================== -->
     <!-- RoadSense Map (native MapLibre map view + tap-to-verify sheet). -->
     <!-- ============================================================== -->
-    <string name="roadsense_map_title">Map</string>
-    <string name="roadsense_map_route_clear">Clear</string>
-    <string name="roadsense_map_route_unmapped">Not mapped yet</string>
-    <string name="roadsense_map_back">Back</string>
-    <string name="roadsense_map_recenter">Recenter on my location</string>
+    <string name="roadsense_map_title">地圖</string>
+    <string name="roadsense_map_route_clear">清除</string>
+    <string name="roadsense_map_route_unmapped">尚未對應</string>
+    <string name="roadsense_map_back">返回</string>
+    <string name="roadsense_map_recenter">重新置中於我的位置</string>
     <!-- Tap-to-verify bottom sheet -->
-    <string name="roadsense_map_severity_label">Severity</string>
-    <string name="roadsense_map_type_label">Type</string>
-    <string name="roadsense_map_type_unknown">Unknown</string>
-    <string name="roadsense_map_confirm">Confirm</string>
-    <string name="roadsense_map_delete">Delete</string>
+    <string name="roadsense_map_severity_label">嚴重程度</string>
+    <string name="roadsense_map_type_label">類型</string>
+    <string name="roadsense_map_type_unknown">未知</string>
+    <string name="roadsense_map_confirm">確認</string>
+    <string name="roadsense_map_delete">刪除</string>
     <!-- Status chip labels: candidate / on-device / shared with fleet -->
-    <string name="roadsense_map_status_candidate">Candidate</string>
-    <string name="roadsense_map_status_local">On device</string>
-    <string name="roadsense_map_status_cloud">Shared</string>
+    <string name="roadsense_map_status_candidate">候選</string>
+    <string name="roadsense_map_status_local">裝置上</string>
+    <string name="roadsense_map_status_cloud">已分享</string>
     <!-- Meta line: "Moderate · 82% confidence · 3 reports" -->
-    <string name="roadsense_map_meta_format">%1$s · %2$d%% confidence · %3$s</string>
+    <string name="roadsense_map_meta_format">%1$s · %2$d%% 信賴度 · %3$s</string>
     <!-- "3 reports" / "1 report" -->
     <plurals name="roadsense_map_reports">
         <item quantity="other">%1$d reports</item>
     </plurals>
     <!-- Snackbar / toast confirmations -->
-    <string name="roadsense_map_confirmed_toast">Hazard confirmed</string>
-    <string name="roadsense_map_deleted_toast">Hazard removed</string>
-    <string name="roadsense_map_action_failed">Could not reach RoadSense. Try again.</string>
-    <string name="roadsense_map_no_location">Waiting for GPS fix…</string>
+    <string name="roadsense_map_confirmed_toast">已確認危險</string>
+    <string name="roadsense_map_deleted_toast">已移除危險</string>
+    <string name="roadsense_map_action_failed">無法連接 RoadSense。請再試一次。</string>
+    <string name="roadsense_map_no_location">正在等待 GPS 定位…</string>
     <!-- Navigation: search + routing + turn-by-turn -->
-    <string name="roadsense_map_search_hint">Search destination</string>
-    <string name="roadsense_map_search_action">Search</string>
-    <string name="roadsense_map_searching">Searching…</string>
-    <string name="roadsense_map_no_results">No places found</string>
+    <string name="roadsense_map_search_hint">搜尋目的地</string>
+    <string name="roadsense_map_search_action">搜尋</string>
+    <string name="roadsense_map_searching">搜尋中…</string>
+    <string name="roadsense_map_no_results">找不到地點</string>
     <string name="roadsense_map_search_network">無法連線至搜尋服務。請檢查您的網路連線或代理伺服器後再試一次。</string>
-    <string name="roadsense_map_pick_destination">Choose destination</string>
-    <string name="roadsense_map_routing">Finding route…</string>
-    <string name="roadsense_map_route_failed">Could not find a route. Try again.</string>
-    <string name="roadsense_map_need_key">Add a routing key in RoadSense settings to navigate.</string>
-    <string name="roadsense_map_rerouting">Off route — recalculating…</string>
-    <string name="roadsense_map_arrived">You have arrived.</string>
-    <string name="roadsense_map_nav_started">Navigating to %1$s</string>
-    <string name="roadsense_map_nav_ended">Navigation ended</string>
-    <string name="roadsense_map_end_nav">End navigation</string>
-    <string name="roadsense_map_zoom_in">Zoom in</string>
-    <string name="roadsense_map_zoom_out">Zoom out</string>
+    <string name="roadsense_map_pick_destination">選擇目的地</string>
+    <string name="roadsense_map_routing">正在尋找路線…</string>
+    <string name="roadsense_map_route_failed">找不到路線。請再試一次。</string>
+    <string name="roadsense_map_need_key">在 RoadSense 設定中新增路由金鑰以進行導航。</string>
+    <string name="roadsense_map_rerouting">偏離路線 — 重新計算中…</string>
+    <string name="roadsense_map_arrived">您已抵達目的地。</string>
+    <string name="roadsense_map_nav_started">正在導航至 %1$s</string>
+    <string name="roadsense_map_nav_ended">導航已結束</string>
+    <string name="roadsense_map_end_nav">結束導航</string>
+    <string name="roadsense_map_zoom_in">放大</string>
+    <string name="roadsense_map_zoom_out">縮小</string>
     <!-- Hazard visibility filter -->
-    <string name="roadsense_map_hazards_filter">Hazard visibility</string>
-    <string name="roadsense_map_hazards_all">Show all hazards</string>
-    <string name="roadsense_map_hazards_moderate">Moderate and severe</string>
-    <string name="roadsense_map_hazards_severe">Severe only</string>
-    <string name="roadsense_map_hazards_hidden">Hide hazards</string>
+    <string name="roadsense_map_hazards_filter">危險顯示</string>
+    <string name="roadsense_map_hazards_all">顯示所有危險</string>
+    <string name="roadsense_map_hazards_moderate">中等與嚴重</string>
+    <string name="roadsense_map_hazards_severe">僅嚴重</string>
+    <string name="roadsense_map_hazards_hidden">隱藏危險</string>
     <!-- POI along route (EV charging / fuel) -->
-    <string name="roadsense_map_poi_toggle">Charging and fuel</string>
+    <string name="roadsense_map_poi_toggle">充電與燃油</string>
     <!-- 2D / 3D buildings toggle -->
-    <string name="roadsense_map_dimension_toggle">2D / 3D buildings</string>
-    <string name="roadsense_map_3d_on">3D buildings on</string>
-    <string name="roadsense_map_3d_off">3D buildings off</string>
-    <string name="roadsense_map_poi_loading">Finding charging and fuel stops…</string>
-    <string name="roadsense_map_poi_none">No stations found nearby</string>
-    <string name="roadsense_map_poi_need_route">Choose a destination first</string>
+    <string name="roadsense_map_dimension_toggle">2D / 3D 建築</string>
+    <string name="roadsense_map_3d_on">開啟 3D 建築</string>
+    <string name="roadsense_map_3d_off">關閉 3D 建築</string>
+    <string name="roadsense_map_poi_loading">正在尋找充電與加油站…</string>
+    <string name="roadsense_map_poi_none">附近找不到站點</string>
+    <string name="roadsense_map_poi_need_route">請先選擇目的地</string>
     <!-- POI tap action sheet -->
-    <string name="roadsense_map_stop_added">Stop added</string>
-    <string name="roadsense_map_remove_stop_action">Remove stop</string>
-    <string name="roadsense_map_poi_navigate">Navigate here</string>
-    <string name="roadsense_map_poi_kind_charging">Charging station</string>
-    <string name="roadsense_map_poi_kind_fuel">Fuel station</string>
-    <string name="roadsense_map_poi_charging_generic">Charging station</string>
-    <string name="roadsense_map_poi_fuel_generic">Fuel station</string>
-    <string name="roadsense_map_route_switched">Switched route</string>
+    <string name="roadsense_map_stop_added">已新增停靠點</string>
+    <string name="roadsense_map_remove_stop_action">移除停靠點</string>
+    <string name="roadsense_map_poi_navigate">導航至此</string>
+    <string name="roadsense_map_poi_kind_charging">充電站</string>
+    <string name="roadsense_map_poi_kind_fuel">加油站</string>
+    <string name="roadsense_map_poi_charging_generic">充電站</string>
+    <string name="roadsense_map_poi_fuel_generic">加油站</string>
+    <string name="roadsense_map_route_switched">已切換路線</string>
     <!-- "then <next maneuver>" preview shown in the maneuver banner -->
     <string name="roadsense_map_then">然後</string>
     <!-- Roundabout exit ordinal in the maneuver banner (%1$d = exit number) -->
     <string name="roadsense_map_exit_n">結束 %1$d</string>
     <!-- Hazards-along-route pills (%1$d = count) -->
-    <string name="roadsense_map_pill_severe">%1$d severe</string>
-    <string name="roadsense_map_pill_moderate">%1$d moderate</string>
-    <string name="roadsense_map_pill_minor">%1$d minor</string>
+    <string name="roadsense_map_pill_severe">%1$d 嚴重</string>
+    <string name="roadsense_map_pill_moderate">%1$d 中等</string>
+    <string name="roadsense_map_pill_minor">%1$d 輕微</string>
     <!-- Shown briefly if the basemap can\'t be reached. -->
-    <string name="roadsense_map_offline">Map data unavailable offline</string>
+    <string name="roadsense_map_offline">離線時無法取得地圖資料</string>
     <!-- Navigation: autocomplete + route options -->
-    <string name="roadsense_map_clear_search">Clear search</string>
+    <string name="roadsense_map_clear_search">清除搜尋</string>
     <!-- Route-options sheet -->
-    <string name="roadsense_map_routes_title">Choose a route</string>
-    <string name="roadsense_map_routes_to">Routes to %1$s</string>
-    <string name="roadsense_map_routes_cancel">Cancel</string>
+    <string name="roadsense_map_routes_title">選擇路線</string>
+    <string name="roadsense_map_routes_to">路線前往 %1$s</string>
+    <string name="roadsense_map_routes_cancel">取消</string>
     <!-- Per-route row label, %1$d is the 1-based route number. -->
-    <string name="roadsense_map_route_option">Route %1$d</string>
-    <string name="roadsense_map_fastest">Fastest</string>
-    <string name="roadsense_map_start">Start</string>
+    <string name="roadsense_map_route_option">路線 %1$d</string>
+    <string name="roadsense_map_fastest">最快</string>
+    <string name="roadsense_map_start">開始</string>
     <!-- Stops / waypoints in the route-options sheet -->
-    <string name="roadsense_map_your_location">Your location</string>
-    <string name="roadsense_map_add_stop">Add stop</string>
-    <string name="roadsense_map_add_stop_hint">Search a stop to add</string>
-    <string name="roadsense_map_stop_removed">Stop removed</string>
-    <string name="roadsense_map_remove_stop">Remove stop</string>
-    <string name="roadsense_map_move_stop_up">Move stop up</string>
-    <string name="roadsense_map_move_stop_down">Move stop down</string>
+    <string name="roadsense_map_your_location">您的位置</string>
+    <string name="roadsense_map_add_stop">新增停靠點</string>
+    <string name="roadsense_map_add_stop_hint">搜尋要新增的停靠點</string>
+    <string name="roadsense_map_stop_removed">已移除停靠點</string>
+    <string name="roadsense_map_remove_stop">移除停靠點</string>
+    <string name="roadsense_map_move_stop_up">停靠點上移</string>
+    <string name="roadsense_map_move_stop_down">停靠點下移</string>
     <!-- %1$d is the maximum number of stops allowed. -->
-    <string name="roadsense_map_max_stops">Up to %1$d stops allowed</string>
+    <string name="roadsense_map_max_stops">最多允許 %1$d 個停靠點</string>
     <!-- Map day/night override (Auto → Light → Dark) -->
     <string name="roadsense_map_theme_toggle">地圖主題</string>
     <string name="roadsense_map_theme_auto">地圖主題：自動</string>

@@ -45,6 +45,12 @@ public final class BsNativeLayer {
 
     private final int bufferW;
     private final int bufferH;
+    // SurfaceControl layer name (for dumpsys SurfaceFlinger identification) and its
+    // z-order. Configurable so this generic buffer-layer primitive can back a second
+    // on-screen layer (e.g. video playback) at a DIFFERENT z without contending with
+    // the blind-spot card. Defaults preserve the original blind-spot behaviour exactly.
+    private final String layerName;
+    private final int zOrder;
     private Object surfaceControl;     // android.view.SurfaceControl (reflected)
     private Surface surface;           // wraps surfaceControl, fed to EGL
     private volatile boolean shown = false;
@@ -59,8 +65,20 @@ public final class BsNativeLayer {
     private volatile int layerStack = 0;
 
     public BsNativeLayer(int bufferW, int bufferH) {
+        this(bufferW, bufferH, "BlindSpot", Z_ORDER);
+    }
+
+    /**
+     * Full constructor: choose the SurfaceControl layer name and z-order. Use this to
+     * back a second on-screen buffer layer (e.g. video playback) that must sit at a
+     * different z than the blind-spot card. The 2-arg constructor keeps the original
+     * blind-spot name/z.
+     */
+    public BsNativeLayer(int bufferW, int bufferH, String layerName, int zOrder) {
         this.bufferW = bufferW;
         this.bufferH = bufferH;
+        this.layerName = layerName;
+        this.zOrder = zOrder;
     }
 
     /**
@@ -93,7 +111,7 @@ public final class BsNativeLayer {
     /** Create the buffer layer (does NOT show it yet). Returns false on failure. */
     public synchronized boolean create() {
         if (surfaceControl != null) return true;
-        surfaceControl = createBufferLayer("BlindSpot", bufferW, bufferH);
+        surfaceControl = createBufferLayer(layerName, bufferW, bufferH);
         if (surfaceControl == null) {
             logger.warn("create: SurfaceControl buffer layer creation failed");
             return false;
@@ -122,7 +140,7 @@ public final class BsNativeLayer {
      */
     public synchronized void setGeometry(int x, int y, int w, int h) {
         if (surfaceControl == null) return;
-        applyGeometry(surfaceControl, x, y, w, h, Z_ORDER, true, bufferW, bufferH, layerStack);
+        applyGeometry(surfaceControl, x, y, w, h, zOrder, true, bufferW, bufferH, layerStack);
         shown = true;
     }
 
@@ -131,7 +149,7 @@ public final class BsNativeLayer {
      *  a show-then-hide one-frame flash of an unrendered layer. */
     public synchronized void setGeometryHidden(int x, int y, int w, int h) {
         if (surfaceControl == null) return;
-        applyGeometry(surfaceControl, x, y, w, h, Z_ORDER, false, bufferW, bufferH, layerStack);
+        applyGeometry(surfaceControl, x, y, w, h, zOrder, false, bufferW, bufferH, layerStack);
         // shown stays false
     }
 

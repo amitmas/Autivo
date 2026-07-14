@@ -440,7 +440,7 @@ public class TripAnalyticsManager {
             // charge-sustain burn the gauge barely moves on. Guarded on
             // end >= start so a counter reset/rollover falls through to the
             // estimate rather than emitting a negative volume. (This is the
-            // approach the BYD OEM "diplus" app uses; we add the reset guard.)
+            // approach the OEM firmware uses; we add the reset guard.)
             //
             // FALLBACK — legacy fuelPct×tank estimate, for trips logged before
             // the accumulator was captured, or trims that don't report it.

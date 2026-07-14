@@ -54,6 +54,28 @@ public final class VehicleControlCatalog {
         boolean available(BydVehicleData snap);
     }
 
+    /**
+     * Optional reader of an entity's current ON/OFF state from a live snapshot, used
+     * to resolve a {@code "toggle"} payload into a concrete on/off before the command
+     * is built. Returns null when the state is unknown (never reported) so the toggle
+     * can fall back to a safe default. Only meaningful for on/off switch entities.
+     */
+    public interface StateFn {
+        Boolean isOn(BydVehicleData snap);
+    }
+
+    /**
+     * Optional reader of a SELECT entity's current option INDEX (0-based, into its
+     * {@code options} list), used to resolve a {@code "toggle"}/cycle press by reading
+     * the live mode and advancing from it — the same read-then-flip the OEM firmware
+     * does. Returns -1 when the state is unavailable (getter absent on this trim), so
+     * the cycle falls back to the last-commanded cache / default. Distinct from
+     * {@link StateFn} (which is on/off for switches).
+     */
+    public interface SelectStateFn {
+        int currentIndex();
+    }
+
     /** One controllable entity. */
     public static final class ControlEntity {
         public final String key;            // topic key + unique_id suffix
@@ -74,32 +96,131 @@ public final class VehicleControlCatalog {
         public final String onVal, offVal;
         public final CommandFn cmd;
         public final AvailableFn avail;
+        // Optional current-state reader; when set, a "toggle" payload is resolved to
+        // the opposite of this before the command is built. null → no toggle support.
+        public final StateFn state;
+        // Optional SELECT current-index reader; when set, a "toggle"/cycle press reads
+        // the live option index and advances from it (parity with the OEM read-then-flip
+        // toggle). null → cycle falls back to last-commanded cache / default.
+        public final SelectStateFn selectState;
 
         ControlEntity(String key, String platform, String name, String icon, String category,
                       boolean sensitive, String stateKey, double min, double max, double step,
                       String unit, List<String> options, String deviceClass, String onVal, String offVal,
                       CommandFn cmd, AvailableFn avail) {
             this(key, platform, name, icon, category, sensitive, stateKey, min, max, step,
-                    unit, options, deviceClass, onVal, offVal, cmd, avail, null);
+                    unit, options, deviceClass, onVal, offVal, cmd, avail, null, null, null);
         }
 
         ControlEntity(String key, String platform, String name, String icon, String category,
                       boolean sensitive, String stateKey, double min, double max, double step,
                       String unit, List<String> options, String deviceClass, String onVal, String offVal,
                       CommandFn cmd, AvailableFn avail, String stateValueTemplate) {
+            this(key, platform, name, icon, category, sensitive, stateKey, min, max, step,
+                    unit, options, deviceClass, onVal, offVal, cmd, avail, stateValueTemplate, null, null);
+        }
+
+        ControlEntity(String key, String platform, String name, String icon, String category,
+                      boolean sensitive, String stateKey, double min, double max, double step,
+                      String unit, List<String> options, String deviceClass, String onVal, String offVal,
+                      CommandFn cmd, AvailableFn avail, String stateValueTemplate, StateFn state) {
+            this(key, platform, name, icon, category, sensitive, stateKey, min, max, step,
+                    unit, options, deviceClass, onVal, offVal, cmd, avail, stateValueTemplate, state, null);
+        }
+
+        ControlEntity(String key, String platform, String name, String icon, String category,
+                      boolean sensitive, String stateKey, double min, double max, double step,
+                      String unit, List<String> options, String deviceClass, String onVal, String offVal,
+                      CommandFn cmd, AvailableFn avail, String stateValueTemplate, StateFn state,
+                      SelectStateFn selectState) {
             this.key = key; this.platform = platform; this.name = name; this.icon = icon;
             this.category = category; this.sensitive = sensitive; this.stateKey = stateKey;
             this.min = min; this.max = max; this.step = step; this.unit = unit; this.options = options;
             this.deviceClass = deviceClass; this.onVal = onVal; this.offVal = offVal;
             this.cmd = cmd; this.avail = avail; this.stateValueTemplate = stateValueTemplate;
+            this.state = state;
+            this.selectState = selectState;
         }
 
         public boolean isAvailable(BydVehicleData snap) {
             try { return avail == null || avail.available(snap); } catch (Exception e) { return true; }
         }
 
+        /** Whether this entity supports a "toggle" payload (has a state reader). */
+        public boolean supportsToggle() { return state != null; }
+
         public ControlAction toAction(String sub, String payload, BydVehicleData snap) {
-            try { return cmd.build(sub, payload, snap); } catch (Exception e) { return null; }
+            try {
+                if (payload != null && "toggle".equalsIgnoreCase(payload.trim())) {
+                    // Two toggle strategies:
+                    //  (a) SWITCH with a live state reader → flip the reported on/off.
+                    //  (b) SELECT with a fixed option list but NO telemetry readback
+                    //      (regen/steering/brake feel — the HAL exposes no getter) →
+                    //      CYCLE to the next option, tracked by a last-commanded cache
+                    //      so repeated presses walk the list (comfort→sport→comfort…).
+                    if (state != null) {
+                        Boolean on = null;
+                        try { on = state.isOn(snap); } catch (Exception ignored) {}
+                        // Unknown current state (never reported) → default to turning ON,
+                        // the more useful "make it happen" outcome for a single press.
+                        boolean next = (on == null) ? true : !on;
+                        payload = next ? "on" : "off";
+                    } else if (options != null && !options.isEmpty()) {
+                        payload = nextCyclePayload();
+                    }
+                    // Anything else: "toggle" falls through to the builder unchanged
+                    // (which treats the unknown payload via its own default).
+                }
+                ControlAction action = cmd.build(sub, payload, snap);
+                // Remember the last concrete payload we commanded for a cycle-capable
+                // select, so the NEXT "toggle" advances from here even without readback.
+                if (action != null && options != null && !options.isEmpty()
+                        && payload != null && !"toggle".equalsIgnoreCase(payload.trim())) {
+                    LAST_SELECT_PAYLOAD.put(key, payload);
+                }
+                return action;
+            } catch (Exception e) { return null; }
+        }
+
+        /**
+         * Advance a select entity to its next option for a "toggle"/cycle press.
+         *
+         * <p>Current-index resolution, best-to-worst — mirroring how the OEM firmware
+         * toggles (it reads the live mode back):
+         *   1. LIVE READBACK (selectState): the SDK getter for this mode
+         *      (getBrakeFootSense / getEnergyFeedback / getSteerAssist). This is the
+         *      robust source — it reflects a mode changed from the car's own menu and
+         *      survives a daemon restart. Returns the app-level option index, or -1 if
+         *      the getter is unavailable on this trim.
+         *   2. LAST-COMMANDED cache: what we last set (process-lifetime).
+         *   3. DEFAULT assumption: the HAL boots these at option[0] (standard/comfort),
+         *      so with nothing known we assume idx 0 and advance to option[1] — the
+         *      first press then visibly CHANGES the mode instead of re-commanding the
+         *      default and appearing to do nothing.
+         * Cycles option[i] → option[i+1] (wrapping), case-insensitive.
+         */
+        private String nextCyclePayload() {
+            int idx = -1;
+            // 1. Live readback (parity with the OEM firmware's read-then-flip toggle).
+            if (selectState != null) {
+                try {
+                    int live = selectState.currentIndex();
+                    if (live >= 0 && live < options.size()) idx = live;
+                } catch (Exception ignored) {}
+            }
+            // 2. Last-commanded cache.
+            if (idx < 0) {
+                String last = LAST_SELECT_PAYLOAD.get(key);
+                if (last != null) {
+                    for (int i = 0; i < options.size(); i++) {
+                        if (options.get(i).equalsIgnoreCase(last)) { idx = i; break; }
+                    }
+                }
+            }
+            // 3. Default: assume booted at option[0] so the first press flips to [1].
+            if (idx < 0) idx = 0;
+            int nextIdx = (idx + 1) % options.size();
+            return options.get(nextIdx);
         }
 
         /** Build the Home Assistant discovery component (with topics injected). */
@@ -206,6 +327,13 @@ public final class VehicleControlCatalog {
 
     private static final Map<String, ControlEntity> ENTITIES = new LinkedHashMap<>();
 
+    // Last concrete payload commanded per readback-less SELECT entity (regen/steering/
+    // brake feel), so a "toggle"/cycle press can advance to the next option without any
+    // telemetry getter. Written from key-map / MQTT / automation dispatch threads →
+    // concurrent map. Process-lifetime cache; a daemon restart just resets to "start
+    // from first option", which is fine (the first press picks a deterministic option).
+    private static final Map<String, String> LAST_SELECT_PAYLOAD = new java.util.concurrent.ConcurrentHashMap<>();
+
     private static void register(ControlEntity e) { ENTITIES.put(e.key, e); }
 
     public static Collection<ControlEntity> all() { return ENTITIES.values(); }
@@ -216,6 +344,12 @@ public final class VehicleControlCatalog {
                             String onVal, String offVal, CommandFn cmd) {
         return new ControlEntity(key, "switch", name, icon, category, false, stateKey,
                 0, 0, 0, null, null, null, onVal, offVal, cmd, null);
+    }
+    /** Switch with a live state reader → supports a "toggle" payload (flip current). */
+    static ControlEntity sw(String key, String name, String icon, String category, String stateKey,
+                            String onVal, String offVal, CommandFn cmd, StateFn state) {
+        return new ControlEntity(key, "switch", name, icon, category, false, stateKey,
+                0, 0, 0, null, null, null, onVal, offVal, cmd, null, null, state);
     }
     static ControlEntity number(String key, String name, String icon, String category, String stateKey,
                                 double min, double max, double step, String unit, CommandFn cmd) {
@@ -231,6 +365,13 @@ public final class VehicleControlCatalog {
                                 List<String> options, String stateValueTemplate, CommandFn cmd) {
         return new ControlEntity(key, "select", name, icon, category, false, stateKey,
                 0, 0, 0, null, options, null, null, null, cmd, null, stateValueTemplate);
+    }
+    /** Select with a live current-index reader → a "toggle"/cycle press reads the live
+     *  mode and advances from it (parity with the OEM read-then-flip toggle). */
+    static ControlEntity select(String key, String name, String icon, String category, String stateKey,
+                                List<String> options, CommandFn cmd, SelectStateFn selectState) {
+        return new ControlEntity(key, "select", name, icon, category, false, stateKey,
+                0, 0, 0, null, options, null, null, null, cmd, null, null, null, selectState);
     }
     static ControlEntity cover(String key, String name, String icon, String deviceClass, boolean sensitive,
                                String stateKey, CommandFn cmd) {
@@ -271,12 +412,29 @@ public final class VehicleControlCatalog {
     // not a valid operation-mode value, so the HAL rejected the write
     // (ENERGY_COMMAND_INVALID) and the mode never changed. Map the words to the
     // real SDK ints; a raw int passes through.
-    private static final List<String> DRIVE_MODES = java.util.Arrays.asList("eco", "sport");
+    private static final List<String> DRIVE_MODES = java.util.Arrays.asList("normal", "eco", "sport");
+    // Drive mode on the setting-device "drive config" axis (see
+    // BydDataCollector.setDriveConfigMode): NORMAL=1, ECO=2, SPORT=3, SNOW=4.
+    // NOTE: this is the config axis, NOT the energy-device operation-mode axis
+    // (which is eco=1/sport=2 and has no NORMAL).
     private static int driveModeValue(String payload) {
         String p = payload.trim().toLowerCase();
-        if ("eco".equals(p) || "economy".equals(p)) return 1;   // ENERGY_OPERATION_ECONOMY
-        if ("sport".equals(p)) return 2;                        // ENERGY_OPERATION_SPORT
+        if ("normal".equals(p)) return 1;
+        if ("eco".equals(p) || "economy".equals(p)) return 2;
+        if ("sport".equals(p)) return 3;
+        if ("snow".equals(p)) return 4;
         return pInt(payload, 1);
+    }
+
+    /** Config-axis drive-mode int → option word (inverse of driveModeValue). */
+    private static String driveModeWord(int v) {
+        switch (v) {
+            case 1: return "normal";
+            case 2: return "eco";
+            case 3: return "sport";
+            case 4: return "snow";
+            default: return "normal";
+        }
     }
 
     static {
@@ -351,19 +509,21 @@ public final class VehicleControlCatalog {
                 null, false, null, 0, 0, 0, null, null, null, null, null,
                 (sub, payload, snap) -> ControlAction.of(new VehicleCommandRouter.SeatMemoryCommand(1)), null));
 
-        // ── Daytime running lights — switch (real state) ────────────────
+        // ── Daytime running lights — switch (real state, toggle-capable) ─
         register(sw("drl", "Daytime Running Lights", "mdi:car-light-dimmed", null, "light_drl", "1", "0",
-                (sub, payload, snap) -> ControlAction.of(new VehicleCommandRouter.LightsCommand(truthy(payload)))));
+                (sub, payload, snap) -> ControlAction.of(new VehicleCommandRouter.LightsCommand(truthy(payload))),
+                snap -> snap == null ? null : snap.dayTimeLight));
 
         // ── Ambient lights colour — number (real state, 1-based palette index) ──
         register(number("ambient_colour", "Ambient Lights Colour", "mdi:format-color-fill", "config",
                 "ambient_colour", 1, 31, 1, "", (sub, payload, snap) ->
                         ControlAction.of(new VehicleCommandRouter.AmbientColourCommand(pInt(payload, 1)))));
 
-        // ── ADAS speed-limit warning — switch (real state) ──────────────
+        // ── ADAS speed-limit warning — switch (real state, toggle-capable) ─
         register(sw("adas_slw", "Speed Limit Warning", "mdi:speedometer-slow", "config", "speed_limit_warning",
                 "1", "0", (sub, payload, snap) ->
-                        ControlAction.of(new VehicleCommandRouter.AdasSpeedLimitWarningCommand(truthy(payload)))));
+                        ControlAction.of(new VehicleCommandRouter.AdasSpeedLimitWarningCommand(truthy(payload))),
+                snap -> snap == null ? null : snap.speedLimitWarning));
 
         // ── Electronic Stability Program (ESP/ESC) — switch ──────────────
         // SAFETY control. State published to esp_state (1=on/0=off); the ESP feature
@@ -374,13 +534,35 @@ public final class VehicleControlCatalog {
                 "1", "0", (sub, payload, snap) ->
                         ControlAction.of(new VehicleCommandRouter.AdasEspCommand(truthy(payload)))));
 
+        // ── iTAC (Intelligent Torque Adaption Control) — switch ──────────
+        // Performance/traction feature (NOT the ESP stability interlock). No telemetry
+        // state field is published, so the state is optimistic (echo the commanded
+        // value). The iTAC feature ids are decoded from the DiLink APK — verify via
+        // GET /api/vehicle/adas (itac block) before relying on it.
+        register(sw("itac", "iTAC (Torque Control)", "mdi:car-cog", "config", null, "1", "0",
+                (sub, payload, snap) -> ControlAction.echo(
+                        new VehicleCommandRouter.AdasItacCommand(truthy(payload)),
+                        "itac", truthy(payload) ? "1" : "0")));
+
+        // ── ADAS lane assist — select (Off/LDW/LDP/LDW+LDP), live readback ───
+        // Multi-mode via BYDAutoADASDevice.setLKSMode. The payload IS the app-level
+        // mode int ("0".."3"); a "toggle"/cycle press advances to the next option using
+        // the live getLaneAssistMode readback (parity with the OEM read-then-flip).
+        register(select("lane_assist", "Lane Assist", "mdi:road-variant", "config", null,
+                java.util.Arrays.asList("0", "1", "2", "3"),
+                (sub, payload, snap) -> ControlAction.of(
+                        new VehicleCommandRouter.AdasLaneAssistCommand(pInt(payload, 0))),
+                () -> com.overdrive.app.byd.BydDataCollector.getInstance().getLaneAssistMode()));
+
         // ── ADAS child presence detection — switch (real state) ──────────────
         // State is published as 1/0 to child_presence_detection (see MqttConnectionManager +
         // TelemetryFieldCatalog): the raw SDK value 1=on/2=off/3=delay is normalized there, so
         // state_on="1"/state_off="0" here match the wire value. Command maps on→1, off→2.
         register(sw("adas_cpd", "Child Presence Detection", "mdi:car-child-seat", "config", "child_presence_detection",
                 "1", "0", (sub, payload, snap) ->
-                        ControlAction.of(new VehicleCommandRouter.SettingChildPresenceDetectionCommand(truthy(payload) ? 1 : 2))));
+                        ControlAction.of(new VehicleCommandRouter.SettingChildPresenceDetectionCommand(truthy(payload) ? 1 : 2)),
+                // Raw childPresenceDetection: 1=on, 2=off, 3=delay. "on" iff == 1.
+                snap -> snap == null ? null : (snap.childPresenceDetection == 1)));
 
         // ── Charge cap (BEV) — switch + number, optimistic state ────────
         register(sw("charge_cap_enabled", "Charge Limit", "mdi:battery-charging-100", "config", null, "1", "0",
@@ -420,17 +602,20 @@ public final class VehicleControlCatalog {
         // "operation_mode") as a raw int; bind the state topic there and map the
         // int→word via value_template so the HA select accepts live telemetry.
         // The echo emits the option word directly (in-domain).
-        // drive_mode: op_mode telemetry is the raw SDK operation-mode int
-        // (ENERGY_OPERATION_ECONOMY=1, ENERGY_OPERATION_SPORT=2). Echo the word
-        // and map int→word on the state topic using the SAME 1/2 values the SDK
-        // reports, so the live telemetry and the optimistic echo agree.
+        // drive_mode: op_mode telemetry is published on the setting-device "drive
+        // config" axis (NORMAL=1, ECO=2, SPORT=3, SNOW=4) — see
+        // BydDataCollector.collectEnergy, which reads getDriveConfig (or maps the
+        // energy-device getOperationMode up to this axis). Echo the word and map
+        // int→word on the state topic using the SAME 1/2/3/4 values, so live
+        // telemetry and the optimistic echo agree. Adds NORMAL, which the old
+        // energy-device path could not represent.
         register(select("drive_mode", "Drive Mode", "mdi:car-shift-pattern", null, "op_mode",
                 DRIVE_MODES,
-                "{% set m = value | int(-1) %}{{ 'eco' if m == 1 else 'sport' if m == 2 else value }}",
+                "{% set m = value | int(-1) %}{{ 'normal' if m == 1 else 'eco' if m == 2 else 'sport' if m == 3 else 'snow' if m == 4 else value }}",
                 (sub, payload, snap) -> {
                     int m = driveModeValue(payload);
                     return ControlAction.echo(new VehicleCommandRouter.OperationModeCommand(m),
-                            "op_mode", m == 2 ? "sport" : "eco");
+                            "op_mode", driveModeWord(m));
                 }));
         // powertrain_mode: energy_mode telemetry is the raw SDK energy-mode int
         // (ENERGY_MODE_EV=1, ENERGY_MODE_HEV=3; NOTE 0=ENERGY_MODE_STOP, NOT ev).
@@ -448,15 +633,25 @@ public final class VehicleControlCatalog {
                     return ControlAction.echo(new VehicleCommandRouter.EnergyModeCommand(m),
                             "energy_mode", m == 3 ? "hev" : "ev");
                 }));
-        // regen_level: SET_DR_ENERGY_FB_STANDARD = 1, SET_DR_ENERGY_FB_LARGE = 2
-        // (there is no 0). Old code sent 0/1 → the HAL rejected 0.
+        // regen_level: normalized user level fed to BydDataCollector.setEnergyFeedback,
+        // which maps 0..2 -> MCU 2..4. standard = 0 (SETTING_ENERGY_FEEDBACK_STANDARD),
+        // high = 1 (SETTING_ENERGY_FEEDBACK_LARGE) — per the OEM firmware convention.
+        // (Previously sent 1/2, which the setter forwarded raw: 1 was below the valid
+        // MCU range and 2 was the HAL's *standard*, so standard no-op'd and high set
+        // standard.)
         register(select("regen_level", "Energy Recuperation", "mdi:battery-charging-medium", null, null,
                 java.util.Arrays.asList("standard", "high"),
                 (sub, payload, snap) -> {
-                    int lvl = "high".equalsIgnoreCase(payload.trim()) ? 2   // SET_DR_ENERGY_FB_LARGE
-                            : "standard".equalsIgnoreCase(payload.trim()) ? 1 // SET_DR_ENERGY_FB_STANDARD
-                            : pInt(payload, 1);
+                    int lvl = "high".equalsIgnoreCase(payload.trim()) ? 1   // SETTING_ENERGY_FEEDBACK_LARGE
+                            : "standard".equalsIgnoreCase(payload.trim()) ? 0 // SETTING_ENERGY_FEEDBACK_STANDARD
+                            : pInt(payload, 0);
                     return ControlAction.of(new VehicleCommandRouter.EnergyFeedbackCommand(lvl));
+                },
+                // Live readback for toggle: getEnergyFeedback returns app-level 0/1/2;
+                // options are [standard(0), high(1)], so clamp a "max"(2) read to high(1).
+                () -> {
+                    int lvl = com.overdrive.app.byd.BydDataCollector.getInstance().getEnergyFeedback();
+                    return lvl < 0 ? -1 : Math.min(lvl, 1);
                 }));
         // steering_mode: SET_DR_ST_ASSIS_COMFORT = 1, SET_DR_ST_ASSIS_SPORT = 2
         // (there is no 0). Old code sent 0/1 → the HAL rejected 0.
@@ -467,7 +662,22 @@ public final class VehicleControlCatalog {
                           : "comfort".equalsIgnoreCase(payload.trim()) ? 1  // SET_DR_ST_ASSIS_COMFORT
                           : pInt(payload, 1);
                     return ControlAction.of(new VehicleCommandRouter.SteerAssistCommand(m));
-                }));
+                },
+                // Live readback for toggle: getSteerAssist returns app-level 0=comfort/1=sport.
+                () -> com.overdrive.app.byd.BydDataCollector.getInstance().getSteerAssist()));
+        // brake_feel: brake-pedal feel comfort vs sport/strong (BYDAutoADASDevice
+        // setBrakeFootSenseState). App-level 0=comfort/1=sport; the collector maps to
+        // the HAL value (comfort→2, sport→0). No telemetry state field, so optimistic.
+        register(select("brake_feel", "Brake Feel", "mdi:car-brake-alert", null, null,
+                java.util.Arrays.asList("comfort", "sport"),
+                (sub, payload, snap) -> {
+                    int lvl = "sport".equalsIgnoreCase(payload.trim()) ? 1
+                            : "comfort".equalsIgnoreCase(payload.trim()) ? 0
+                            : pInt(payload, 0);
+                    return ControlAction.of(new VehicleCommandRouter.BrakeFeelCommand(lvl));
+                },
+                // Live readback for toggle: getBrakeFootSense returns app-level 0=comfort/1=sport.
+                () -> com.overdrive.app.byd.BydDataCollector.getInstance().getBrakeFootSense()));
 
         // ── Tier 3: curated CAN-backed car settings (local carsettings provider) ──
         for (com.overdrive.app.byd.BydCarSettings.CarSetting s : com.overdrive.app.byd.BydCarSettings.registry()) {

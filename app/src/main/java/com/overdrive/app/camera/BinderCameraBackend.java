@@ -444,7 +444,7 @@ public class BinderCameraBackend {
     // ==================== Full Camera Start (convenience) ====================
 
     /**
-     * Full camera startup sequence matching the commander pattern.
+     * Full camera startup sequence matching the OEM camera pattern.
      * Opens camera, sets surface, configures size/fps, starts preview.
      * 
      * @param cameraId Camera ID to open

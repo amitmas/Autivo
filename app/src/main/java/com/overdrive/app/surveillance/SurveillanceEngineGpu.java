@@ -568,6 +568,21 @@ public class SurveillanceEngineGpu {
     private volatile boolean eventEverSawMovingObject = false;   // any YOLO-classified MOVING (!isStaticForTimeline) vehicle/bike/animal → hard KEEP (parked cars excluded — they are the FP target)
     private volatile boolean eventTriggerWasLateralMass = false; // trigger was a side-cam proximity-mass override → possible real lateral actor a fisheye-distorted YOLO can't classify → hard KEEP
     private volatile boolean eventTriggerWasAiTimeout = false;    // trigger fired on the AI-timeout fallback with NO in-sequence YOLO confirmation → could be a YOLO-missed real actor → hard KEEP
+    // MOTION-EVIDENCE SEVERITY FLOOR (notification fix). When YOLO classifies 0
+    // actors for the WHOLE event (model unloaded, subject too dark/distant/close
+    // for the CPU model, foveated black-crop), eventPeakSeverity stays null and
+    // both notification stages collapse to NOTICE — even though the RECORDING was
+    // committed on a trusted HIGH loiter / NEAR-or-approaching proximity signal
+    // the engine already deemed threat-worthy (the same evidence the AI-timeout
+    // and close-zone-override record paths trust when YOLO is blind). This latch
+    // records that "the trigger itself was a strong threat signal" so the final
+    // notification can floor its severity to ALERT instead of silently NOTICE-ing
+    // a real approach the user never gets pushed. Set once at trigger time (engine
+    // thread), read at stop in publishMotionFinal / sendFinalTelegramNotification,
+    // reset in startRecording. Deliberately NARROW: only trusted-HIGH or
+    // NEAR/approaching triggers set it — plain LOW/MEDIUM passing motion stays
+    // NOTICE so we don't flood the user with Alerts for distant passers-by.
+    private volatile boolean eventTriggerWasStrongThreat = false;
     private volatile float   eventMaxLuma = 0f;                  // brightest quadrant meanLuma seen while recording
     private volatile float   eventMinLuma = Float.MAX_VALUE;     // darkest non-black quadrant meanLuma seen while recording
     // NIGHT-path discriminators (luma-free, YOLO-free) for the dark-scene discard.
@@ -2413,6 +2428,45 @@ public class SurveillanceEngineGpu {
                             shouldSuppress = true;
                         }
                     }
+                    // FAR-UNCONFIRMED TIMEOUT GATE (user-requested tightening).
+                    // The 2s AI-timeout fallback above lets an event record with NO
+                    // YOLO confirmation once motion is merely sustained — regardless
+                    // of distance. On a device where YOLO classifies nothing, that
+                    // fallback fires on EVERY event, so distant/unconfirmed motion
+                    // (a person walking by across the street, a car passing on the
+                    // road) records just like a real close approach. Per user: a FAR,
+                    // unconfirmed detection should NOT record.
+                    //
+                    // So when the recording would fire ONLY because the timeout
+                    // expired (not a YOLO confirmation, not a trusted-HIGH loiter)
+                    // AND the subject never reached the close zone (NEAR|MID —
+                    // peakCloseZoneDuringSequence stays false ⇔ it was FAR/UNKNOWN the
+                    // whole sequence), re-suppress. This is DELIBERATELY narrow:
+                    //   - aiAvailable            → don't change no-YOLO daemon mode.
+                    //   - !aiRecentlyConfirmed   → a YOLO-confirmed object still records.
+                    //   - !cachedHighIsTrusted   → a trusted (coherent/tracker) loiter
+                    //                              still records at any distance.
+                    //   - timeoutExpired         → only the pure-timeout path, not the
+                    //                              within-duration confirmed path.
+                    //   - !peakCloseZoneDuringSequence → only FAR/UNKNOWN-only events;
+                    //                              anything that reached NEAR/MID (incl.
+                    //                              the close-zone override below) records.
+                    // TRADE-OFF (accepted): a real FAR subject YOLO genuinely cannot
+                    // classify is no longer recorded on motion alone. The close-zone
+                    // override still catches it the moment it comes within NEAR/MID.
+                    if (!shouldSuppress
+                            && aiAvailable
+                            && !aiRecentlyConfirmed
+                            && !cachedHighIsTrusted
+                            && timeoutExpired
+                            && !peakCloseZoneDuringSequence) {
+                        shouldSuppress = true;
+                        if (frameCount % 50 == 0) {
+                            logger.info("Far-unconfirmed gate: suppressing timeout-fallback "
+                                    + "recording (no YOLO actor, untrusted, never reached "
+                                    + "NEAR/MID — stayed far)");
+                        }
+                    }
                     // CLOSE-ZONE PROXIMITY OVERRIDE (safety-critical FN fix).
                     // A genuine subject physically CLOSE to the car (NEAR/MID tier,
                     // in the configured close zone) is a real threat regardless of
@@ -2679,6 +2733,56 @@ public class SurveillanceEngineGpu {
                             // a real person/vehicle YOLO never classified leaves
                             // this true and must never be auto-deleted.
                             eventTriggerWasAiTimeout = !sequenceConfirmed;
+                            // MOTION-EVIDENCE SEVERITY FLOOR (notification fix).
+                            // Latch when the trigger itself was a strong threat
+                            // signal, so a YOLO-less event (0 actors → eventPeakSeverity
+                            // null → NOTICE) can still push as ALERT instead of being
+                            // silently swallowed at the NOTICE tier. NARROW by design,
+                            // and MIRRORS SeverityClassifier's proximity rules so this
+                            // never labels something ALERT that a classified actor
+                            // wouldn't be. Only these qualify (ALL gated to MID/NEAR —
+                            // distance is required, see the closeEnough guard below):
+                            //   - a TRUSTED HIGH loiter (coherent translation or an
+                            //     in-zone person tracker holds it — never a flag/shadow,
+                            //     which is gated to MEDIUM and requires YOLO) that is
+                            //     also MID/NEAR, or
+                            //   - proximity reached NEAR (subject physically AT the car
+                            //     — the close zone), or
+                            //   - proximity is MID *and* APPROACHING (closing distance
+                            //     at mid-range — matches SeverityClassifier's
+                            //     "PERSON @ MID + APPROACHING → ALERT" rule).
+                            // Distance is REQUIRED: a FAR or UNKNOWN-tier detection is
+                            // NEVER a strong threat, even a trusted-HIGH loiter or an
+                            // APPROACHING one — "motion detected far away" must stay
+                            // NOTICE, matching the Alert definition ("close enough to
+                            // warrant attention"). Plain MID-stable / far / unknown
+                            // passing motion does NOT set this, so distant passers-by
+                            // stay NOTICE (and under the event-evidence push gate,
+                            // aren't pushed at all).
+                            // Proximity must be at least MID for ANY alert floor —
+                            // a FAR or UNKNOWN-tier detection is never "close enough
+                            // to warrant attention", so it can never be ALERT even if
+                            // it reads HIGH-trusted or APPROACHING. This is the hard
+                            // "far away is never an Alert" guard.
+                            boolean closeEnough = prox != null
+                                    && (prox.tier == DistanceEstimator.Tier.NEAR
+                                        || prox.tier == DistanceEstimator.Tier.MID);
+                            // A trusted HIGH loiter (coherent translation / in-zone
+                            // person tracker) that is also close enough (MID/NEAR).
+                            boolean trustedHighClose =
+                                    maxThreat >= MotionPipelineV2.THREAT_HIGH
+                                    && cachedHighIsTrusted
+                                    && closeEnough;
+                            // Close proximity as its own signal: NEAR (subject at the
+                            // car, any trend) or MID *and* APPROACHING (closing at
+                            // mid-range). Mirrors SeverityClassifier's proximity rules.
+                            boolean closeProximity = prox != null
+                                    && (prox.tier == DistanceEstimator.Tier.NEAR
+                                        || (prox.tier == DistanceEstimator.Tier.MID
+                                            && prox.trend == DistanceEstimator.Trend.APPROACHING));
+                            if (trustedHighClose || closeProximity) {
+                                eventTriggerWasStrongThreat = true;
+                            }
                         }
 
                         // Only fire the start-stage notifications when a recording
@@ -5150,6 +5254,17 @@ public class SurveillanceEngineGpu {
         // the same actor the hero shows — see finalNotificationActors().
         java.util.List<Actor> snap = finalNotificationActors();
         Actor.Severity peakSev = com.overdrive.app.notifications.NotificationGate.maxSeverity(snap);
+        // MOTION-EVIDENCE SEVERITY FLOOR (notification fix) — mirror of
+        // publishMotionFinal. A YOLO-less event (0 actors) collapses to the
+        // NOTICE floor, so a trusted-HIGH / NEAR / approaching trigger the engine
+        // recorded without YOLO would otherwise be gated by the Telegram Notice
+        // tier (off by default) and never reach the chat. Floor to ALERT so the
+        // real approach routes through the Alert tier + header. Only ever raises
+        // NOTICE→ALERT; a real ALERT/CRITICAL actor is untouched. Gated on the
+        // same narrow eventTriggerWasStrongThreat latch.
+        if (peakSev == Actor.Severity.NOTICE && eventTriggerWasStrongThreat) {
+            peakSev = Actor.Severity.ALERT;
+        }
         int persons = 0, vehicles = 0, bikes = 0, animals = 0;
         Actor.Proximity closest = null;
         Actor threat = null;
@@ -5693,34 +5808,43 @@ public class SurveillanceEngineGpu {
             // (event-peak frame) shows the person. See finalNotificationActors().
             java.util.List<Actor> snap = finalNotificationActors();
             Actor.Severity peakSev = com.overdrive.app.notifications.NotificationGate.maxSeverity(snap);
-            // Per-tier gate (config-level): the push toggle for this tier decides
-            // whether to deliver a WEB PUSH — but NOT whether to publish. We
-            // ALWAYS publish to the bus so HistorySink persists every event to
-            // the Notification Log (a durable history the user browses); the
-            // tier decision is applied as a push-only suppression flag read by
-            // PushSink. Before this, a failed gate `return`ed here, dropping the
-            // event before HistorySink/LogSink/TelegramSink ever saw it — so the
-            // Log tab silently missed every NOTICE-tier motion (the common case,
-            // since pushNotices defaults off). Per-device subcategory muting
-            // still happens downstream in PushSink.
-            //
-            // snap is now the event-peak union, so peakSev reflects the event
-            // peak (which the title/hero use). Mirror sendFinalTelegramNotification's
-            // OR-of-both gate so we never SUPPRESS a push the old instantaneous
-            // gate would have sent: the per-tier toggles are INDEPENDENT booleans,
-            // not an ordinal threshold, so a raised peakSev could otherwise flip
-            // SEND→SUPPRESS in a pathological inverted config (e.g. NOTICE-push on,
-            // ALERT-push off). Push if EITHER the live snapshot OR the event peak
-            // passes its own toggle.
-            Actor.Severity liveSev = com.overdrive.app.notifications.NotificationGate
-                    .maxSeverity(lastActors);
-            boolean liveOk = com.overdrive.app.notifications.NotificationGate.shouldPush(liveSev, config);
-            boolean peakOk = com.overdrive.app.notifications.NotificationGate.shouldPush(peakSev, config);
-            final boolean pushOk = liveOk || peakOk;
-            if (!pushOk) {
-                logger.debug("publishMotionFinal: push suppressed by per-tier toggle (live=" + liveSev
-                        + ", peak=" + peakSev + ") — still persisting to Log");
+            // MOTION-EVIDENCE SEVERITY FLOOR (notification fix). maxSeverity()
+            // returns the NOTICE floor when the event classified 0 actors (YOLO
+            // unloaded, or the subject was too dark/distant/close/fisheye-warped
+            // for the CPU model — the exact 0-actor timelines seen in field logs).
+            // In that case eventPeakSeverity is still null and this final push
+            // would go out as bare NOTICE, even though the RECORDING was committed
+            // on a trusted-HIGH loiter or a NEAR/approaching proximity signal the
+            // engine trusts enough to record without YOLO. Floor to ALERT so that
+            // real, YOLO-invisible approach routes to surveillance.motion.alert
+            // (a tier on by default) instead of being silently swallowed at the
+            // NOTICE tier a cautious user may have muted. Gated on the narrow
+            // eventTriggerWasStrongThreat latch (trusted-HIGH / NEAR / approaching
+            // only), so plain LOW/MEDIUM passing motion still pushes as NOTICE.
+            // Only ever RAISES NOTICE→ALERT; a genuine ALERT/CRITICAL from a real
+            // actor is left untouched.
+            if (peakSev == Actor.Severity.NOTICE && eventTriggerWasStrongThreat) {
+                logger.info("publishMotionFinal: flooring severity NOTICE→ALERT "
+                        + "(strong-threat trigger, 0 YOLO actors classified)");
+                peakSev = Actor.Severity.ALERT;
             }
+            // Web-push delivery is governed by TWO gates, in order:
+            //   1. The event-evidence gate below (pushWorthy) — a daemon-side,
+            //      per-EVENT decision: push only when YOLO saw an actor or the
+            //      trigger was a trusted strong threat. This replaced the OLD
+            //      daemon-global pushNotices/pushAlerts/pushCritical flags, which
+            //      had no serializer and no UI/API writer, so they were stuck at
+            //      their defaults forever and the user's toggle could never move
+            //      them. The per-event evidence gate is writable-config-free and
+            //      keys off the actual event, not a dead flag.
+            //   2. Per-device muted-categories (downstream in PushSink via
+            //      subscription.isMuted() against the severity-routed subcategory
+            //      below) — a per-DEVICE decision the Notifications UI controls.
+            // We ALWAYS publish to the bus regardless; suppression is web-push
+            // ONLY. HistorySink persists every event to the Notification Log,
+            // LogSink logs it, TelegramSink forwards it. The pushWorthy decision
+            // is deferred to just before publish() so it can read `threat` (the
+            // classified-actor signal), computed below.
 
             // Build per-class counts + closest proximity from snapshot.
             //
@@ -5795,7 +5919,14 @@ public class SurveillanceEngineGpu {
             int totalActors = persons + vehicles + bikes + animals;
             boolean hasHero = heroJpegName != null && !heroJpegName.isEmpty();
             if (threat == null) {
-                body = "Recording in progress";
+                // No actor classified. If the trigger itself was a strong threat
+                // (the severity-floor case: trusted-HIGH loiter / NEAR / approaching
+                // that YOLO couldn't label), say so — a bare "Recording in progress"
+                // reads as an unactionable non-event and undersells an Alert-tier
+                // push. Otherwise keep the neutral phrasing for plain motion.
+                body = eventTriggerWasStrongThreat
+                        ? "Movement near vehicle — tap to review"
+                        : "Motion recorded";
             } else {
                 StringBuilder sb = new StringBuilder();
                 if (closest != null && closest != Actor.Proximity.UNKNOWN) {
@@ -5908,10 +6039,30 @@ public class SurveillanceEngineGpu {
                             notificationTagFor(videoFilename),
                             url,
                             data);
-            // Tier toggle governs Web Push only — publish regardless so
-            // HistorySink persists it to the Log. suppressPush() makes PushSink
-            // skip delivery when the tier is off; other sinks are unaffected.
-            if (!pushOk) ev.suppressPush();
+            // EVENT-EVIDENCE WEB-PUSH GATE. We ALWAYS publish to the bus so
+            // HistorySink persists every event to the Notification Log, LogSink
+            // logs it, and TelegramSink forwards it — suppression here is
+            // web-push-ONLY (PushSink honours isPushSuppressed()). A web push
+            // fires only when the event carries real threat evidence:
+            //   (a) YOLO classified an actor (threat != null — a person/vehicle/
+            //       bike/animal actually seen), OR
+            //   (b) the trigger itself was a strong threat the engine trusts
+            //       without YOLO (eventTriggerWasStrongThreat: trusted-HIGH loiter
+            //       / NEAR / approaching — already floored to ALERT above).
+            // A 0-actor event from plain or untrusted motion (distant/stable
+            // passing-by, shadow, foliage — the ~80%-of-events bulk that floods
+            // a parked car) is NOT pushed: it stays in the Log for review but
+            // doesn't buzz the phone. This is the intentional replacement for the
+            // removed daemon-global pushNotices gate — gated on per-EVENT evidence
+            // instead of a dead never-writable config flag. Per-device
+            // muted-categories still applies downstream in PushSink for the events
+            // that DO pass this gate.
+            boolean pushWorthy = (threat != null) || eventTriggerWasStrongThreat;
+            if (!pushWorthy) {
+                logger.info("publishMotionFinal: web-push suppressed (no YOLO actor + "
+                        + "weak/untrusted trigger) — still persisting to Log");
+                ev.suppressPush();
+            }
             com.overdrive.app.notifications.NotificationBus.get().publish(ev);
         } catch (Throwable t) {
             logger.debug("publishMotionFinal failed: " + t.getMessage());
@@ -6352,6 +6503,7 @@ public class SurveillanceEngineGpu {
         eventEverSawMovingObject = false;
         eventTriggerWasLateralMass = false;
         eventTriggerWasAiTimeout = false;
+        eventTriggerWasStrongThreat = false;
         eventMaxLuma = 0f;
         eventMinLuma = Float.MAX_VALUE;
         eventEverSawCoherentMotion = false;

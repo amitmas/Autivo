@@ -39,6 +39,22 @@ window.KM = (function () {
         { id: 'find_car',        i18n: 'keymap.act_find_car',        kind: 'vehicle', key: 'find_car' },
         { id: 'windows_all',     i18n: 'keymap.act_windows',         kind: 'catalog', key: 'windows_all',
           payloads: [ { v: 'OPEN', i18n: 'keymap.open' }, { v: 'CLOSE', i18n: 'keymap.close' }, { v: 'STOP', i18n: 'keymap.stop' } ] },
+        // Per-door window position presets. A hardware button binds one fixed door,
+        // so area is baked into the path and ${v} carries the preset percent
+        // (0=closed/15=vent/50=half/100=full) through the closed-loop positioning
+        // endpoint. api kind → allowlisted /api/vehicle/window.
+        { id: 'window_lf',       i18n: 'keymap.act_window_lf',       kind: 'api',
+          method: 'POST', path: '/api/vehicle/window', body: '{"area":1,"targetPercent":${v}}',
+          payloads: [ { v: '0', i18n: 'keymap.win_closed' }, { v: '15', i18n: 'keymap.win_vent' }, { v: '50', i18n: 'keymap.win_half' }, { v: '100', i18n: 'keymap.win_full' } ] },
+        { id: 'window_rf',       i18n: 'keymap.act_window_rf',       kind: 'api',
+          method: 'POST', path: '/api/vehicle/window', body: '{"area":2,"targetPercent":${v}}',
+          payloads: [ { v: '0', i18n: 'keymap.win_closed' }, { v: '15', i18n: 'keymap.win_vent' }, { v: '50', i18n: 'keymap.win_half' }, { v: '100', i18n: 'keymap.win_full' } ] },
+        { id: 'window_lr',       i18n: 'keymap.act_window_lr',       kind: 'api',
+          method: 'POST', path: '/api/vehicle/window', body: '{"area":3,"targetPercent":${v}}',
+          payloads: [ { v: '0', i18n: 'keymap.win_closed' }, { v: '15', i18n: 'keymap.win_vent' }, { v: '50', i18n: 'keymap.win_half' }, { v: '100', i18n: 'keymap.win_full' } ] },
+        { id: 'window_rr',       i18n: 'keymap.act_window_rr',       kind: 'api',
+          method: 'POST', path: '/api/vehicle/window', body: '{"area":4,"targetPercent":${v}}',
+          payloads: [ { v: '0', i18n: 'keymap.win_closed' }, { v: '15', i18n: 'keymap.win_vent' }, { v: '50', i18n: 'keymap.win_half' }, { v: '100', i18n: 'keymap.win_full' } ] },
         { id: 'tailgate',        i18n: 'keymap.act_tailgate',        kind: 'catalog', key: 'tailgate',
           payloads: [ { v: 'OPEN', i18n: 'keymap.open' }, { v: 'CLOSE', i18n: 'keymap.close' }, { v: 'STOP', i18n: 'keymap.stop' } ] },
         { id: 'sunroof',         i18n: 'keymap.act_sunroof',         kind: 'catalog', key: 'sunroof',
@@ -47,10 +63,39 @@ window.KM = (function () {
           payloads: [ { v: 'OPEN', i18n: 'keymap.open' }, { v: 'CLOSE', i18n: 'keymap.close' }, { v: 'STOP', i18n: 'keymap.stop' } ] },
         { id: 'climate',         i18n: 'keymap.act_climate',         kind: 'catalog', key: 'climate', sub: 'mode',
           payloads: [ { v: 'auto', i18n: 'keymap.on' }, { v: 'off', i18n: 'keymap.off' } ] },
+        // AC fan speed — a button binds ONE fixed level (1-7). api kind → allowlisted
+        // /api/vehicle/climate set_fan. ${v} carries the level.
+        { id: 'ac_fan',          i18n: 'keymap.act_ac_fan',           kind: 'api',
+          method: 'POST', path: '/api/vehicle/climate', body: '{"action":"set_fan","fan":${v}}',
+          payloads: [ { v: '1', i18n: 'keymap.fan_1' }, { v: '2', i18n: 'keymap.fan_2' }, { v: '3', i18n: 'keymap.fan_3' }, { v: '4', i18n: 'keymap.fan_4' }, { v: '5', i18n: 'keymap.fan_5' }, { v: '6', i18n: 'keymap.fan_6' }, { v: '7', i18n: 'keymap.fan_7' } ] },
         { id: 'drl',             i18n: 'keymap.act_drl',             kind: 'catalog', key: 'drl',
-          payloads: [ { v: 'on', i18n: 'keymap.on' }, { v: 'off', i18n: 'keymap.off' } ] },
+          payloads: [ { v: 'on', i18n: 'keymap.on' }, { v: 'off', i18n: 'keymap.off' }, { v: 'toggle', i18n: 'keymap.toggle' } ] },
         { id: 'esp_control',     i18n: 'keymap.act_esp',             kind: 'catalog', key: 'esp_control',
           payloads: [ { v: 'on', i18n: 'keymap.on' }, { v: 'off', i18n: 'keymap.off' } ] },
+        { id: 'itac',            i18n: 'keymap.act_itac',            kind: 'catalog', key: 'itac',
+          payloads: [ { v: 'on', i18n: 'keymap.on' }, { v: 'off', i18n: 'keymap.off' } ] },
+        // Camera views on the native SurfaceControl lane (shares blind-spot pipeline;
+        // BS has priority). A button picks WHICH camera; it shows centered on the
+        // head-unit at a chosen SIZE (small/medium/large/full). ${v} = size % → the
+        // preset's sizePct (corner fixed center for a button). api kind → allowlisted
+        // /api/camview. Hide is a separate action.
+        { id: 'camview_all',     i18n: 'keymap.act_camview_all',     kind: 'api',
+          method: 'POST', path: '/api/camview/show?cam=all&target=head_unit&preset=${v}/center', body: '',
+          payloads: [ { v: '25', i18n: 'keymap.size_small' }, { v: '45', i18n: 'keymap.size_medium' }, { v: '70', i18n: 'keymap.size_large' }, { v: '90', i18n: 'keymap.size_full' } ] },
+        { id: 'camview_front',   i18n: 'keymap.act_camview_front',   kind: 'api',
+          method: 'POST', path: '/api/camview/show?cam=front&target=head_unit&preset=${v}/center', body: '',
+          payloads: [ { v: '25', i18n: 'keymap.size_small' }, { v: '45', i18n: 'keymap.size_medium' }, { v: '70', i18n: 'keymap.size_large' }, { v: '90', i18n: 'keymap.size_full' } ] },
+        { id: 'camview_rear',    i18n: 'keymap.act_camview_rear',    kind: 'api',
+          method: 'POST', path: '/api/camview/show?cam=rear&target=head_unit&preset=${v}/center', body: '',
+          payloads: [ { v: '25', i18n: 'keymap.size_small' }, { v: '45', i18n: 'keymap.size_medium' }, { v: '70', i18n: 'keymap.size_large' }, { v: '90', i18n: 'keymap.size_full' } ] },
+        { id: 'camview_left',    i18n: 'keymap.act_camview_left',    kind: 'api',
+          method: 'POST', path: '/api/camview/show?cam=left&target=head_unit&preset=${v}/center', body: '',
+          payloads: [ { v: '25', i18n: 'keymap.size_small' }, { v: '45', i18n: 'keymap.size_medium' }, { v: '70', i18n: 'keymap.size_large' }, { v: '90', i18n: 'keymap.size_full' } ] },
+        { id: 'camview_right',   i18n: 'keymap.act_camview_right',   kind: 'api',
+          method: 'POST', path: '/api/camview/show?cam=right&target=head_unit&preset=${v}/center', body: '',
+          payloads: [ { v: '25', i18n: 'keymap.size_small' }, { v: '45', i18n: 'keymap.size_medium' }, { v: '70', i18n: 'keymap.size_large' }, { v: '90', i18n: 'keymap.size_full' } ] },
+        { id: 'camview_hide',    i18n: 'keymap.act_camview_hide',    kind: 'api',
+          method: 'POST', path: '/api/camview/hide', body: '' },
         { id: 'seat_heat_driver',    i18n: 'keymap.act_seat_heat_driver',    kind: 'catalog', key: 'seat_heat_driver',
           payloads: [ { v: 'off', i18n: 'keymap.off' }, { v: 'low', i18n: 'keymap.low' }, { v: 'high', i18n: 'keymap.high' } ] },
         { id: 'seat_heat_passenger', i18n: 'keymap.act_seat_heat_passenger', kind: 'catalog', key: 'seat_heat_passenger',
@@ -60,17 +105,75 @@ window.KM = (function () {
         { id: 'wireless_charging', i18n: 'keymap.act_wireless_charging', kind: 'catalog', key: 'wireless_charging',
           payloads: [ { v: '1', i18n: 'keymap.on' }, { v: '0', i18n: 'keymap.off' } ] },
         { id: 'drive_mode',      i18n: 'keymap.act_drive_mode',       kind: 'catalog', key: 'drive_mode',
-          payloads: [ { v: 'eco', i18n: 'keymap.mode_eco' }, { v: 'sport', i18n: 'keymap.mode_sport' } ] },
+          payloads: [ { v: 'normal', i18n: 'keymap.mode_normal' }, { v: 'eco', i18n: 'keymap.mode_eco' }, { v: 'sport', i18n: 'keymap.mode_sport' } ] },
         { id: 'powertrain_mode', i18n: 'keymap.act_powertrain_mode',  kind: 'catalog', key: 'powertrain_mode',
           payloads: [ { v: 'ev', i18n: 'keymap.mode_ev' }, { v: 'hev', i18n: 'keymap.mode_hev' } ] },
+        // regen / steering / brake feel: no telemetry readback exists, so "toggle"
+        // CYCLES to the next option (daemon tracks the last-commanded value) — ideal
+        // for a single button that flips between the two modes on each press.
         { id: 'regen_level',     i18n: 'keymap.act_regen',            kind: 'catalog', key: 'regen_level',
-          payloads: [ { v: 'standard', i18n: 'keymap.regen_standard' }, { v: 'high', i18n: 'keymap.regen_high' } ] },
+          payloads: [ { v: 'standard', i18n: 'keymap.regen_standard' }, { v: 'high', i18n: 'keymap.regen_high' }, { v: 'toggle', i18n: 'keymap.toggle' } ] },
         { id: 'steering_mode',   i18n: 'keymap.act_steering',         kind: 'catalog', key: 'steering_mode',
-          payloads: [ { v: 'comfort', i18n: 'keymap.steering_comfort' }, { v: 'sport', i18n: 'keymap.steering_sport' } ] },
-        // Manual-only recording action. This has a dedicated daemon action kind
-        // instead of the automation-shared API path; the two window values are
-        // edited by the clip controls below and persisted directly in the binding.
-        { id: 'manual_clip',     i18n: 'keymap.act_manual_clip',       kind: 'manualClip' },
+          payloads: [ { v: 'comfort', i18n: 'keymap.steering_comfort' }, { v: 'sport', i18n: 'keymap.steering_sport' }, { v: 'toggle', i18n: 'keymap.toggle' } ] },
+        { id: 'brake_feel',      i18n: 'keymap.act_brake_feel',       kind: 'catalog', key: 'brake_feel',
+          payloads: [ { v: 'comfort', i18n: 'keymap.brake_comfort' }, { v: 'sport', i18n: 'keymap.brake_sport' }, { v: 'toggle', i18n: 'keymap.toggle' } ] },
+        // Speed-limit-warning + child-presence: real snapshot state → support toggle
+        // (flip current) alongside explicit on/off. catalog kind resolves toggle daemon-side.
+        { id: 'adas_slw',        i18n: 'keymap.act_slw',              kind: 'catalog', key: 'adas_slw',
+          payloads: [ { v: 'on', i18n: 'keymap.on' }, { v: 'off', i18n: 'keymap.off' }, { v: 'toggle', i18n: 'keymap.toggle' } ] },
+        { id: 'adas_cpd',        i18n: 'keymap.act_cpd',              kind: 'catalog', key: 'adas_cpd',
+          payloads: [ { v: 'on', i18n: 'keymap.on' }, { v: 'off', i18n: 'keymap.off' }, { v: 'toggle', i18n: 'keymap.toggle' } ] },
+        // Lane assist — multi-mode (Off/LDW/LDP/LDW+LDP); "toggle" cycles via live
+        // readback. catalog kind resolves against the "lane_assist" entity daemon-side.
+        { id: 'lane_assist',     i18n: 'keymap.act_lane_assist',      kind: 'catalog', key: 'lane_assist',
+          payloads: [ { v: '0', i18n: 'keymap.lane_off' }, { v: '1', i18n: 'keymap.lane_ldw' }, { v: '2', i18n: 'keymap.lane_ldp' }, { v: '3', i18n: 'keymap.lane_ldw_ldp' }, { v: 'toggle', i18n: 'keymap.toggle' } ] },
+        // ── Display brightness (media handler; allowlisted). A button steps to a
+        //    chosen level — pick the level when binding. ${v} = 0-100 percentage. ──
+        { id: 'screen_brightness', i18n: 'keymap.act_screen_brightness', kind: 'api',
+          method: 'POST', path: '/api/vehicle/media', body: '{"target":"brightness","value":${v}}',
+          payloads: [ { v: '0', i18n: 'keymap.level_0' }, { v: '25', i18n: 'keymap.level_25' }, { v: '50', i18n: 'keymap.level_50' }, { v: '75', i18n: 'keymap.level_75' }, { v: '100', i18n: 'keymap.level_100' } ] },
+        { id: 'cluster_brightness', i18n: 'keymap.act_cluster_brightness', kind: 'api',
+          method: 'POST', path: '/api/vehicle/media', body: '{"target":"cluster_brightness","value":${v}}',
+          payloads: [ { v: '0', i18n: 'keymap.level_0' }, { v: '25', i18n: 'keymap.level_25' }, { v: '50', i18n: 'keymap.level_50' }, { v: '75', i18n: 'keymap.level_75' }, { v: '100', i18n: 'keymap.level_100' } ] },
+        { id: 'hud_brightness', i18n: 'keymap.act_hud_brightness', kind: 'api',
+          method: 'POST', path: '/api/vehicle/media', body: '{"target":"hud_brightness","value":${v}}',
+          payloads: [ { v: '0', i18n: 'keymap.level_0' }, { v: '25', i18n: 'keymap.level_25' }, { v: '50', i18n: 'keymap.level_50' }, { v: '75', i18n: 'keymap.level_75' }, { v: '100', i18n: 'keymap.level_100' } ] },
+        // HUD on/off — no dedicated switch on this platform, so off=brightness 0 /
+        // on=brightness 100 (value IS the brightness the daemon writes).
+        { id: 'hud_power', i18n: 'keymap.act_hud_power', kind: 'api',
+          method: 'POST', path: '/api/vehicle/media', body: '{"target":"hud_power","value":${v}}',
+          payloads: [ { v: '100', i18n: 'keymap.on' }, { v: '0', i18n: 'keymap.off' } ] },
+        // Infotainment screen on/off — proven backlight path (PowerManager
+        // turnBacklightOn/Off → BYDAutoSettingDevice → shell WAKEUP/SLEEP), NOT
+        // goToSleep. Bind a button to Off to blank the panel; On restores it.
+        { id: 'screen_power', i18n: 'keymap.act_screen_power', kind: 'api',
+          method: 'POST', path: '/api/vehicle/media', body: '{"target":"screen_power","value":${v}}',
+          payloads: [ { v: '0', i18n: 'keymap.off' }, { v: '1', i18n: 'keymap.on' } ] },
+        // Media volume on a fixed channel — a button binds ONE channel + one level.
+        // Separate curated entries per channel keep the two-dropdown form to a single
+        // value picker (the channel is baked into the body).
+        // Volume is an ABSOLUTE step (0-40, the car's own volume scale), not a percent.
+        // The daemon clamps to the channel's real stream max.
+        { id: 'volume_media', i18n: 'keymap.act_volume_media', kind: 'api',
+          method: 'POST', path: '/api/vehicle/media', body: '{"target":"volume","channel":"media","value":${v}}',
+          payloads: [ { v: '0', i18n: 'keymap.vol_0' }, { v: '10', i18n: 'keymap.vol_10' }, { v: '20', i18n: 'keymap.vol_20' }, { v: '30', i18n: 'keymap.vol_30' }, { v: '40', i18n: 'keymap.vol_40' } ] },
+        { id: 'volume_navigation', i18n: 'keymap.act_volume_navigation', kind: 'api',
+          method: 'POST', path: '/api/vehicle/media', body: '{"target":"volume","channel":"navigation","value":${v}}',
+          payloads: [ { v: '0', i18n: 'keymap.vol_0' }, { v: '10', i18n: 'keymap.vol_10' }, { v: '20', i18n: 'keymap.vol_20' }, { v: '30', i18n: 'keymap.vol_30' }, { v: '40', i18n: 'keymap.vol_40' } ] },
+        // Play audio: the payload dropdown is populated LIVE from the audio library
+        // (dynamicPayloads:'audio' → GET /api/audio/library), so a button binds one of
+        // the sounds the user uploaded on the Automations page. ${v} = the sound's
+        // filename; the daemon resolves it to the library path. A button fires once
+        // (loop off); for looping/screen use an automation. Stop is payloadless.
+        { id: 'play_audio', i18n: 'keymap.act_play_audio', kind: 'api',
+          method: 'POST', path: '/api/vehicle/play-audio',
+          body: '{"name":"${v}","channel":"media","display":"speakers","loop":false}', dynamicPayloads: 'audio' },
+        // Play a video with its picture on the head-unit screen (same library picker).
+        { id: 'play_video', i18n: 'keymap.act_play_video', kind: 'api',
+          method: 'POST', path: '/api/vehicle/play-audio',
+          body: '{"name":"${v}","channel":"media","display":"screen","loop":false}', dynamicPayloads: 'audio' },
+        { id: 'stop_audio', i18n: 'keymap.act_stop_audio', kind: 'api',
+          method: 'POST', path: '/api/vehicle/stop-audio', body: '' },
         // ── API actions: features with no SDK/catalog entity (routed via the
         //    allowlisted automation bypass). path/body use ${v} for the payload. ──
         { id: 'surveillance',    i18n: 'keymap.act_surveillance',     kind: 'api',
@@ -88,7 +191,11 @@ window.KM = (function () {
           payloads: [ { v: '1', i18n: 'keymap.seat_slot_1' }, { v: '2', i18n: 'keymap.seat_slot_2' } ] },
         { id: 'seat_save',       i18n: 'keymap.act_seat_save',        kind: 'api',
           method: 'POST', path: '/api/vehicle/seat', body: '{"action":"save","position":${v}}',
-          payloads: [ { v: '1', i18n: 'keymap.seat_slot_1' }, { v: '2', i18n: 'keymap.seat_slot_2' } ] }
+          payloads: [ { v: '1', i18n: 'keymap.seat_slot_1' }, { v: '2', i18n: 'keymap.seat_slot_2' } ] },
+        // Manual-only recording action. This has a dedicated daemon action kind
+        // instead of the automation-shared API path; the two window values are
+        // edited by the clip controls below and persisted directly in the binding.
+        { id: 'manual_clip',     i18n: 'keymap.act_manual_clip',       kind: 'manualClip' }
     ];
 
     // Known BYD steering-wheel / dash buttons (keycode → label), from the OEM
@@ -138,6 +245,10 @@ window.KM = (function () {
     var CLIP_MAX_AFTER_SECONDS = 60;
     var CLIP_MAX_TOTAL_SECONDS = 60;
     var CLIP_DEFAULT_PRESET = '30:0';
+    // Monotonic token for async payload-dropdown builds (dynamicPayloads). Bumped on
+    // every onCuratedChange so a late fetch response for a since-changed action is
+    // discarded instead of clobbering the current action's payload options.
+    var payloadReqSeq = 0;
 
     function $(id) { return document.getElementById(id); }
     function tr(key, vars) { return (window.BYD && BYD.i18n) ? (BYD.i18n.t(key, vars) || key) : key; }
@@ -301,6 +412,14 @@ window.KM = (function () {
         pill.textContent = pressLabel(b.pressType);
         row.appendChild(pill);
 
+        // Edit — pre-fill the Add form from this binding and switch to the Add tab.
+        var edit = document.createElement('button');
+        edit.className = 'btn btn-icon';
+        edit.setAttribute('aria-label', tr('keymap.edit'));
+        edit.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:16px;height:16px;"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>';
+        edit.onclick = function () { editBinding(index); };
+        row.appendChild(edit);
+
         var del = document.createElement('button');
         del.className = 'btn btn-icon btn-danger-ghost';
         del.setAttribute('aria-label', tr('keymap.delete'));
@@ -349,10 +468,16 @@ window.KM = (function () {
         if (a.kind === 'api') {
             var ca = curatedById(a.id);
             var nm = ca ? tr(ca.i18n) : (a.path || a.id || 'api');
-            // Surface the chosen value (last path segment for enable/disable, or the
-            // mode from the body) so "Surveillance — enable" reads clearly.
+            // Surface the chosen value so e.g. "Surveillance — enable" reads clearly.
+            // Only show a value we can attribute to a real payload — NOT a blind
+            // last-path-segment, which mislabels fixed-path actions (camview's
+            // ?preset=60/center → "center", stop-audio → "stop-audio").
             var v = '';
-            if (a.body && a.body.indexOf('"mode"') >= 0) {
+            if (a.body && a.body.indexOf('"name"') >= 0) {
+                // Play audio/video: the sound filename is the payload.
+                var mn = a.body.match(/"name"\s*:\s*"([^"]*)"/);
+                if (mn) v = mn[1];
+            } else if (a.body && a.body.indexOf('"mode"') >= 0) {
                 var m = a.body.match(/"mode"\s*:\s*"([^"]*)"/);
                 if (m) v = m[1];
             } else if (a.body && a.body.indexOf('"position"') >= 0) {
@@ -361,15 +486,34 @@ window.KM = (function () {
                 // "Recall seat position — Slot 1" distinguishes the two slots.
                 var mp = a.body.match(/"position"\s*:\s*(\d+)/);
                 if (mp) v = tr('keymap.seat_slot_' + mp[1]) || mp[1];
-            } else if (a.path) {
-                var seg = a.path.split('/');
-                v = seg[seg.length - 1] || '';
+            } else if (ca && ca.path && ca.path.indexOf('${v}') >= 0 && a.path) {
+                // The curated template puts the payload IN the path. It may sit in the
+                // path proper (e.g. /api/surveillance/${v}) OR inside the query string
+                // (e.g. /api/camview/show?...&preset=${v}/center for the camera-view
+                // size). Diff over whichever segment holds ${v}: if the placeholder is
+                // BEFORE any '?', compare path-only (ignoring the query); otherwise
+                // compare the full string so a query-embedded ${v} is recoverable.
+                var q = ca.path.indexOf('?');
+                var vInQuery = q >= 0 && ca.path.indexOf('${v}') > q;
+                var cleanTpl = vInQuery ? ca.path : ca.path.split('?')[0];
+                var cleanPath = vInQuery ? a.path : a.path.split('?')[0];
+                var tv = recoverV(cleanTpl, cleanPath);
+                // Map a recovered camview size % back to its friendly label.
+                if (tv != null && ca.payloads) {
+                    for (var pi = 0; pi < ca.payloads.length; pi++) {
+                        if (ca.payloads[pi].v === tv) { v = tr(ca.payloads[pi].i18n) || tv; break; }
+                    }
+                    if (!v) v = tv;
+                } else if (tv != null) {
+                    v = tv;
+                }
             }
             return v ? (nm + ' — ' + v) : nm;
         }
         if (a.kind === 'openApp') {
             var appName = a.label || a['package'] || '';
-            return tr('keymap.kind_open_app') + ': ' + appName;
+            var suffix = a.split ? ' (' + tr('keymap.split_screen') + ')' : '';
+            return tr('keymap.kind_open_app') + ': ' + appName + suffix;
         }
         if (a.kind === 'shell') return tr('keymap.kind_shell') + ': ' + (a.cmd || '');
         if (a.kind === 'sequence') {
@@ -482,10 +626,17 @@ window.KM = (function () {
         $('kmShellWrap').style.display = kind === 'shell' ? '' : 'none';
         var appWrap = $('kmOpenAppWrap');
         if (appWrap) appWrap.style.display = kind === 'openApp' ? '' : 'none';
-        if (kind === 'openApp') buildAppOptions();
+        if (kind === 'openApp') {
+            var splitEl = $('kmOpenAppSplit');
+            if (splitEl) splitEl.checked = false; // fresh default when switching into openApp
+            buildAppOptions();
+        }
     }
 
-    function onCuratedChange() {
+    // Rebuild the payload dropdown for the selected curated action. `preselect`
+    // (optional) is a payload value to select once options are built — used by
+    // editBinding() to restore a saved choice, including for dynamic (async) lists.
+    function onCuratedChange(preselect) {
         formDirty = true;
         var c = curatedById($('kmCuratedAction').value);
         var row = $('kmPayloadRow');
@@ -495,10 +646,82 @@ window.KM = (function () {
         if (clipWrap) clipWrap.style.display = isManualClip ? '' : 'none';
         sel.innerHTML = '';
         if (isManualClip) {
+            // Manual replay has two numeric dimensions instead of the regular
+            // one-value payload dropdown. Invalidate any in-flight dynamic fetch
+            // and drive the dedicated clip-window controls instead.
+            payloadReqSeq++;
             row.style.display = 'none';
             applyClipPreset(false);
             return;
         }
+        if (c && c.dynamicPayloads === 'audio') {
+            // Live-populate from the audio library (uploaded on the Automations page).
+            row.style.display = '';
+            var loading = document.createElement('option');
+            loading.value = '';
+            loading.textContent = tr('keymap.loading_audio');
+            loading.disabled = true; loading.selected = true;
+            sel.appendChild(loading);
+            // Stale-response guard: a fetch is async, but the user may switch the
+            // curated action before it resolves. Stamp this request; on resolve, bail
+            // if a newer onCuratedChange has run (token bumped) or the selected action
+            // is no longer THIS dynamic one — otherwise a late audio response would
+            // clobber a different action's (synchronously-built) payload dropdown.
+            var myToken = ++payloadReqSeq;
+            var myActionId = c.id;
+            var stillMine = function () {
+                if (myToken !== payloadReqSeq) return false;
+                var cur = curatedById($('kmCuratedAction').value);
+                return !!(cur && cur.id === myActionId && cur.dynamicPayloads === 'audio');
+            };
+            fetch('/api/audio/library', { cache: 'no-store' })
+                .then(function (r) { return r.json(); })
+                .then(function (j) {
+                    if (!stillMine()) return;
+                    var sounds = (j && j.success && j.sounds) ? j.sounds : [];
+                    sel.innerHTML = '';
+                    if (!sounds.length) {
+                        var none = document.createElement('option');
+                        none.value = '';
+                        none.textContent = tr('keymap.no_audio');
+                        none.disabled = true; none.selected = true;
+                        sel.appendChild(none);
+                        return;
+                    }
+                    for (var k = 0; k < sounds.length; k++) {
+                        var so = document.createElement('option');
+                        so.value = sounds[k].name;
+                        so.textContent = sounds[k].name;
+                        sel.appendChild(so);
+                    }
+                    // Restore a saved selection if it's still present; else keep the first.
+                    if (preselect) {
+                        var found = false;
+                        for (var m = 0; m < sel.options.length; m++) {
+                            if (sel.options[m].value === preselect) { found = true; break; }
+                        }
+                        if (!found) {
+                            var miss = document.createElement('option');
+                            miss.value = preselect;
+                            miss.textContent = preselect + ' ' + tr('keymap.audio_missing');
+                            sel.appendChild(miss);
+                        }
+                        sel.value = preselect;
+                    }
+                })
+                ['catch'](function () {
+                    if (!stillMine()) return;
+                    sel.innerHTML = '';
+                    var err = document.createElement('option');
+                    err.value = '';
+                    err.textContent = tr('keymap.no_audio');
+                    err.disabled = true; err.selected = true;
+                    sel.appendChild(err);
+                });
+            return;
+        }
+        // A synchronous rebuild also invalidates any in-flight dynamic fetch.
+        payloadReqSeq++;
         if (c && c.payloads && c.payloads.length) {
             row.style.display = '';
             for (var i = 0; i < c.payloads.length; i++) {
@@ -507,6 +730,7 @@ window.KM = (function () {
                 o.textContent = tr(c.payloads[i].i18n);
                 sel.appendChild(o);
             }
+            if (preselect) sel.value = preselect;
         } else {
             row.style.display = 'none';
         }
@@ -564,6 +788,30 @@ window.KM = (function () {
         applyClipPreset(false);
     }
 
+    // Restore a saved manualClip window into the form when editing a binding.
+    // Selects the matching preset when the pair is one of the presets, else
+    // switches to Custom and reveals both sliders — the inverse of readClipWindow.
+    function applyClipWindowToForm(beforeSeconds, afterSeconds) {
+        var before = parseInt(beforeSeconds, 10);
+        var after = parseInt(afterSeconds, 10);
+        if (isNaN(before) || before < 0) before = 0;
+        if (isNaN(after) || after < 0) after = 0;
+        var beforeEl = $('kmClipBefore');
+        var afterEl = $('kmClipAfter');
+        if (beforeEl) beforeEl.value = before;
+        if (afterEl) afterEl.value = after;
+        var preset = $('kmClipPreset');
+        if (preset) {
+            var pair = before + ':' + after;
+            var matched = false;
+            for (var i = 0; i < preset.options.length; i++) {
+                if (preset.options[i].value === pair) { preset.value = pair; matched = true; break; }
+            }
+            if (!matched) preset.value = 'custom';
+        }
+        applyClipPreset(false);
+    }
+
     // Parse and validate the persisted manualClip contract. HTML range inputs
     // already constrain normal interaction, but this remains strict so a DOM edit
     // cannot save fractions, negatives, or a window longer than the daemon accepts.
@@ -614,11 +862,23 @@ window.KM = (function () {
             ph.textContent = tr('keymap.pick_app');
             ph.disabled = true; ph.selected = true;
             sel.appendChild(ph);
+            var prevFound = false;
             for (var i = 0; i < apps.length; i++) {
                 var o = document.createElement('option');
                 o.value = apps[i]['package'];
                 o.textContent = apps[i].label || apps[i]['package'];
                 sel.appendChild(o);
+                if (prev && apps[i]['package'] === prev) prevFound = true;
+            }
+            // If the previously-selected package (e.g. one injected by editBinding for
+            // an app that's since been uninstalled, or not yet in the fetched list) is
+            // absent, re-add it so the selection round-trips instead of silently
+            // reverting to the placeholder (which would make the edit unsaveable).
+            if (prev && !prevFound) {
+                var keep = document.createElement('option');
+                keep.value = prev;
+                keep.textContent = prev;
+                sel.appendChild(keep);
             }
             if (prev) sel.value = prev;
         };
@@ -752,6 +1012,13 @@ window.KM = (function () {
     // stored as that single action (no needless sequence wrapper).
     var seqSteps = [];
 
+    // Index of the binding currently being edited, or -1 when adding a fresh one.
+    // Set by editBinding(); consumed by addBinding() to replace that exact slot
+    // (so a keycode/pressType change during edit doesn't leave the original behind);
+    // cleared by resetForm(). Kept as an index into state.bindings — the list is not
+    // reordered between opening the editor and saving (persist only happens on save).
+    var editIndex = -1;
+
     // Has the Add-form's action selection been touched since the last "Add step"
     // (or form reset)? Because buildActionFromForm() never returns null for the
     // default curated pick, "Add binding" cannot tell a genuinely-edited-but-not-
@@ -797,7 +1064,12 @@ window.KM = (function () {
             if (!pkg) { toast(tr('keymap.need_app'), 'error'); return null; }
             var label = '';
             if (sel && sel.selectedIndex >= 0) label = sel.options[sel.selectedIndex].textContent;
-            return { kind: 'openApp', 'package': pkg, label: label };
+            var splitEl = $('kmOpenAppSplit');
+            var split = !!(splitEl && splitEl.checked);
+            var act = { kind: 'openApp', 'package': pkg, label: label };
+            // Only carry the flag when set, so existing (non-split) bindings serialize unchanged.
+            if (split) act.split = true;
+            return act;
         }
         if (kind === 'shell') {
             if (!state.allowAdvanced) { toast(tr('keymap.advanced_disabled'), 'error'); return null; }
@@ -843,6 +1115,15 @@ window.KM = (function () {
         renderSteps();
     }
 
+    // Swap step i with its neighbour (dir -1 = up, +1 = down) so a one-key routine runs
+    // in the order the user wants. No-op at the ends.
+    function moveStep(i, dir) {
+        var j = i + dir;
+        if (j < 0 || j >= seqSteps.length) return;
+        var tmp = seqSteps[j]; seqSteps[j] = seqSteps[i]; seqSteps[i] = tmp;
+        renderSteps();
+    }
+
     function renderSteps() {
         var wrap = $('kmSeqSteps');
         if (!wrap) return;
@@ -855,6 +1136,25 @@ window.KM = (function () {
                 var span = document.createElement('span');
                 span.textContent = (idx + 1) + '. ' + describeAction(seqSteps[idx]);
                 chip.appendChild(span);
+                // Reorder arrows (only meaningful with 2+ steps). Disabled at the ends
+                // so the chip layout stays stable.
+                if (seqSteps.length > 1) {
+                    var up = document.createElement('button');
+                    up.className = 'km-step-move';
+                    up.setAttribute('aria-label', tr('keymap.move_up'));
+                    up.innerHTML = '&#8593;'; // ↑
+                    if (idx === 0) up.disabled = true;
+                    else up.onclick = function () { moveStep(idx, -1); };
+                    chip.appendChild(up);
+
+                    var down = document.createElement('button');
+                    down.className = 'km-step-move';
+                    down.setAttribute('aria-label', tr('keymap.move_down'));
+                    down.innerHTML = '&#8595;'; // ↓
+                    if (idx === seqSteps.length - 1) down.disabled = true;
+                    else down.onclick = function () { moveStep(idx, 1); };
+                    chip.appendChild(down);
+                }
                 var x = document.createElement('button');
                 x.className = 'km-step-x';
                 x.setAttribute('aria-label', tr('keymap.delete'));
@@ -903,23 +1203,46 @@ window.KM = (function () {
             label = describeAction(action);
         }
 
-        // Reject an exact keycode+pressType duplicate — the dispatcher's
-        // "newest wins" would otherwise fire both. Replace instead. Snapshot the
-        // list first so a persist failure can roll back to exactly what the
-        // server has — otherwise a phantom binding lingers in local state and a
+        // Snapshot the list first so a persist failure can roll back to exactly what
+        // the server has — otherwise a phantom binding lingers in local state and a
         // later saveConfig()->persist() (from toggling Enable/Advanced) would
         // silently commit it. Mirrors removeBinding's load()-on-failure resync.
         var prev = state.bindings.slice();
+        // Preserve the original enabled flag when editing so a Save doesn't silently
+        // re-enable a binding the user had toggled off.
+        var wasEnabled = (editIndex >= 0 && state.bindings[editIndex])
+            ? (state.bindings[editIndex].enabled !== false) : true;
+        var newBinding = { keycode: keycode, pressType: pressType, enabled: wasEnabled, label: label, action: action };
         var replaced = false;
-        for (var i = 0; i < state.bindings.length; i++) {
-            if (state.bindings[i].keycode === keycode && state.bindings[i].pressType === pressType) {
-                state.bindings[i] = { keycode: keycode, pressType: pressType, enabled: true, label: label, action: action };
-                replaced = true;
-                break;
+
+        if (editIndex >= 0 && editIndex < state.bindings.length) {
+            // Editing an existing binding: replace that exact slot (so a keycode /
+            // press-type change updates in place rather than adding a duplicate).
+            // If the edit collided the keycode+pressType onto ANOTHER existing
+            // binding, drop that other one first so we don't leave a dup the
+            // dispatcher would double-fire.
+            for (var j = state.bindings.length - 1; j >= 0; j--) {
+                if (j !== editIndex && state.bindings[j].keycode === keycode
+                        && state.bindings[j].pressType === pressType) {
+                    state.bindings.splice(j, 1);
+                    if (j < editIndex) editIndex--; // keep the target index valid
+                }
             }
-        }
-        if (!replaced) {
-            state.bindings.push({ keycode: keycode, pressType: pressType, enabled: true, label: label, action: action });
+            state.bindings[editIndex] = newBinding;
+            replaced = true;
+        } else {
+            // Adding: reject an exact keycode+pressType duplicate — the dispatcher's
+            // "newest wins" would otherwise fire both. Replace instead.
+            for (var i = 0; i < state.bindings.length; i++) {
+                if (state.bindings[i].keycode === keycode && state.bindings[i].pressType === pressType) {
+                    state.bindings[i] = newBinding;
+                    replaced = true;
+                    break;
+                }
+            }
+            if (!replaced) {
+                state.bindings.push(newBinding);
+            }
         }
 
         persist(function (ok) {
@@ -929,6 +1252,211 @@ window.KM = (function () {
             paint();
             if (window.OT_setActiveTab) window.OT_setActiveTab('bindings');
         });
+    }
+
+    // ───────────────────────── Edit ─────────────────────────
+
+    // Load an existing binding into the Add form and switch to the Add tab. The
+    // form then behaves exactly like adding, except addBinding() replaces the
+    // original slot (editIndex) on save — so changing the keycode or press type
+    // updates in place instead of leaving a duplicate behind.
+    function editBinding(index) {
+        var b = state.bindings[index];
+        if (!b) return;
+        // Start from a clean form, then populate. resetForm() clears editIndex, so
+        // set it AFTER.
+        resetForm();
+        editIndex = index;
+
+        // Keycode: prefer the Known-button dropdown when the code is known, else the
+        // custom/manual path. Setting the dropdown drives onKnownButtonChange, which
+        // fills the keycode + press-type options for us.
+        var known = knownByCode(b.keycode);
+        var knownSel = $('kmKnownButton');
+        if (known && knownSel) {
+            knownSel.value = String(b.keycode);
+            onKnownButtonChange();
+        } else if (knownSel) {
+            knownSel.value = 'custom';
+            onKnownButtonChange();       // reveals the custom wrap
+            $('kmManualKeycode').value = b.keycode;
+            refreshPressTypeForManual(); // narrow press types for the entered code
+        }
+        // Press type — set after the options are built above so the value sticks.
+        var pt = $('kmPressType');
+        if (pt && !pt.disabled) pt.value = b.pressType || 'single';
+
+        // Action → form. A sequence loads its steps as chips (with the form left
+        // blank so addBinding folds nothing extra); a single action loads into the
+        // action inputs directly.
+        if (b.action && b.action.kind === 'sequence') {
+            seqSteps = (b.action.steps || []).slice();
+            renderSteps();
+        } else if (b.action) {
+            loadActionIntoForm(b.action);
+        }
+        // The programmatic population above tripped the change handlers; the form
+        // faithfully mirrors the saved binding, so treat it as pristine — an
+        // unmodified Save re-persists the same action (not a duplicated step).
+        formDirty = false;
+
+        setFormMode(true);
+        toast(tr('keymap.editing'), 'info');
+        // Suppress the one tab-change we're about to cause, so the active-changed
+        // listener doesn't immediately reset the edit session we just set up.
+        suppressNextTabReset = true;
+        if (window.OT_setActiveTab) window.OT_setActiveTab('add');
+    }
+
+    // True for exactly one 'ot-tabs:active-changed' — the switch editBinding() itself
+    // triggers. Any OTHER switch to the Add tab (manual tab click, empty-state CTA)
+    // means the user wants a FRESH binding, so we reset edit mode then. This closes
+    // the "edit A → tab to Add → save overwrites A" data-loss trap.
+    var suppressNextTabReset = false;
+
+    function onTabChanged(id) {
+        if (id !== 'add') return;
+        if (suppressNextTabReset) { suppressNextTabReset = false; return; }
+        // Entered the Add tab NOT via the edit pencil → start clean.
+        if (editIndex >= 0) resetForm();
+    }
+
+    // Reflect add-vs-edit in the form's title + primary-button label so the user
+    // knows a Save will overwrite the existing binding rather than add a new one.
+    function setFormMode(editing) {
+        var title = $('kmAddTitle');
+        var btn = $('kmAddBtnLabel');
+        if (title) title.textContent = tr(editing ? 'keymap.edit_title' : 'keymap.add_title');
+        if (btn) btn.textContent = tr(editing ? 'keymap.save_changes' : 'keymap.add_binding');
+    }
+
+    // Populate the action inputs (kind + curated action + payload / shell / app)
+    // from a single fire-action object — the inverse of buildActionFromForm(). Falls
+    // back gracefully when a stored action doesn't match a curated entry (e.g. a
+    // hand-crafted api action): the kind is still set so the user sees the closest
+    // editable representation.
+    function loadActionIntoForm(a) {
+        var kindSel = $('kmActionKind');
+        if (a.kind === 'shell') {
+            if (kindSel) kindSel.value = 'shell';
+            onKindChange();
+            $('kmShellCmd').value = a.cmd || '';
+            return;
+        }
+        if (a.kind === 'openApp') {
+            if (kindSel) kindSel.value = 'openApp';
+            onKindChange(); // triggers buildAppOptions()
+            var appSel = $('kmOpenApp');
+            if (appSel) {
+                // The list may still be loading; set now and again once it arrives.
+                var want = a['package'] || '';
+                appSel.value = want;
+                if (!appSel.value && want) {
+                    // App list not populated yet — inject the value so it round-trips.
+                    var o = document.createElement('option');
+                    o.value = want; o.textContent = a.label || want;
+                    appSel.appendChild(o);
+                    appSel.value = want;
+                }
+            }
+            var splitEl = $('kmOpenAppSplit');
+            if (splitEl) splitEl.checked = !!a.split;
+            return;
+        }
+        // Manual instant replay: a curated action with its own two-value clip
+        // window instead of a payload dropdown. Select it, reveal the clip UI via
+        // onCuratedChange, then restore the saved before/after window.
+        if (a.kind === 'manualClip') {
+            if (kindSel) kindSel.value = 'curated';
+            onKindChange();
+            var clipSel = $('kmCuratedAction');
+            if (clipSel) clipSel.value = 'manual_clip';
+            onCuratedChange();
+            applyClipWindowToForm(a.beforeSeconds, a.afterSeconds);
+            return;
+        }
+        // catalog / vehicle / api all live under the "curated" kind, matched back to
+        // a CURATED entry by key (catalog/vehicle) or id (api).
+        if (kindSel) kindSel.value = 'curated';
+        onKindChange();
+        var curatedId = null;
+        if (a.kind === 'vehicle') curatedId = matchCuratedByVehicle(a.action);
+        else if (a.kind === 'catalog') curatedId = matchCuratedByCatalog(a.key, a.sub);
+        else if (a.kind === 'api') curatedId = a.id || matchCuratedByApiPath(a.path, a.body);
+        var curSel = $('kmCuratedAction');
+        if (curSel && curatedId) {
+            curSel.value = curatedId;
+            // Reconstruct the saved payload and pass it as the preselect so
+            // onCuratedChange restores it — this also works for DYNAMIC (async) payload
+            // lists like the audio library, where a synchronous post-set would race the
+            // fetch. For static lists it selects immediately.
+            var payloadVal = reconstructPayload(a);
+            onCuratedChange(payloadVal != null ? payloadVal : undefined);
+        }
+    }
+
+    // Match a curated entry whose kind is 'vehicle' and key equals the action verb.
+    function matchCuratedByVehicle(actionVerb) {
+        for (var i = 0; i < CURATED.length; i++) {
+            if (CURATED[i].kind === 'vehicle' && CURATED[i].key === actionVerb) return CURATED[i].id;
+        }
+        return null;
+    }
+    // Match a curated 'catalog' entry by key (+ sub when the entry carries one).
+    function matchCuratedByCatalog(key, sub) {
+        for (var i = 0; i < CURATED.length; i++) {
+            var c = CURATED[i];
+            if (c.kind === 'catalog' && c.key === key && (c.sub || null) === (sub || null)) return c.id;
+        }
+        return null;
+    }
+    // Match a curated 'api' entry by comparing the path prefix (before any ${v}) and
+    // the body's stable prefix. Used only when a stored api action lost its id.
+    function matchCuratedByApiPath(path, body) {
+        for (var i = 0; i < CURATED.length; i++) {
+            var c = CURATED[i];
+            if (c.kind !== 'api') continue;
+            var cPathPrefix = (c.path || '').split('${v}')[0];
+            if (path && cPathPrefix && path.indexOf(cPathPrefix) === 0) return c.id;
+        }
+        return null;
+    }
+
+    // Reconstruct the payload option value that produced this action, so the payload
+    // dropdown can re-select it. For catalog it's the stored payload; for api we
+    // recover ${v} by diffing the stored path/body against the curated template.
+    function reconstructPayload(a) {
+        if (a.kind === 'catalog') return a.payload != null ? a.payload : null;
+        if (a.kind === 'api') {
+            var c = curatedById(a.id) || null;
+            if (!c) return null;
+            // Recover ${v} from whichever template carried it.
+            var fromPath = recoverV(c.path, a.path);
+            if (fromPath != null) return fromPath;
+            return recoverV(c.body, a.body);
+        }
+        return null;
+    }
+
+    // Given a curated template containing ${v} and the concrete stored string, return
+    // the substring that ${v} expanded to, or null if the template has no ${v} or
+    // doesn't match.
+    function recoverV(template, concrete) {
+        if (!template || concrete == null) return null;
+        var idx = template.indexOf('${v}');
+        if (idx < 0) return null;
+        var before = template.substring(0, idx);
+        var after = template.substring(idx + 4);
+        // Concrete must start with the pre-${v} text; strip it.
+        if (concrete.indexOf(before) !== 0) return null;
+        var rest = concrete.substring(before.length);
+        // …and end with the post-${v} text; strip that too (proper endsWith, ES5-safe).
+        if (after) {
+            if (rest.length < after.length) return null;
+            if (rest.substring(rest.length - after.length) !== after) return null;
+            rest = rest.substring(0, rest.length - after.length);
+        }
+        return rest;
     }
 
     function removeBinding(index) {
@@ -958,6 +1486,7 @@ window.KM = (function () {
 
     function resetForm() {
         captured = null;
+        editIndex = -1;
         $('kmManualKeycode').value = '';
         $('kmCapKeycode').textContent = '—';
         $('kmCapHint').textContent = tr('keymap.capture_idle');
@@ -966,10 +1495,13 @@ window.KM = (function () {
         seqSteps = [];
         formDirty = false;
         renderSteps();
+        setFormMode(false);
     }
 
-    // Empty-state CTA — jump to the Add tab.
+    // Empty-state CTA — jump to the Add tab for a FRESH binding. Reset first so a
+    // leftover edit session (editIndex) can't turn this "add" into an overwrite.
     function goAdd() {
+        resetForm();
         if (window.OT_setActiveTab) window.OT_setActiveTab('add');
     }
 
@@ -988,6 +1520,11 @@ window.KM = (function () {
         onKnownButtonChange(); // set initial custom-wrap visibility (placeholder → hidden)
         onKindChange();
         document.addEventListener('keydown', onKeydown, true);
+        // Reset a stale edit session when the user switches to the Add tab by any
+        // means other than the edit pencil (see onTabChanged) — closes the edit trap.
+        document.addEventListener('ot-tabs:active-changed', function (e) {
+            try { onTabChanged(e && e.detail ? e.detail.id : null); } catch (_) {}
+        }, false);
         // Mark the Add-form touched when the user edits the free-text / payload
         // inputs directly (the two <select>s already flag via their onchange
         // handlers). Lets addBinding() distinguish a real un-added selection from

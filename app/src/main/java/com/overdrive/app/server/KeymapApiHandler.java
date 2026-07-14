@@ -1056,8 +1056,9 @@ public final class KeymapApiHandler {
             response.put("error", "Missing app package");
             return response;
         }
-        boolean ok = com.overdrive.app.launcher.AppLauncher.launch(pkg);
-        logger.info("Keymap openApp '" + pkg + "' -> " + (ok ? "SUCCESS" : "FAILED"));
+        boolean split = req.optBoolean("split", false);
+        boolean ok = com.overdrive.app.launcher.AppLauncher.launch(pkg, split);
+        logger.info("Keymap openApp '" + pkg + "'" + (split ? " [split]" : "") + " -> " + (ok ? "SUCCESS" : "FAILED"));
         response.put("success", ok);
         if (!ok) response.put("error", "Could not launch " + pkg);
         return response;

@@ -23,7 +23,7 @@
     <string name="action_select_all">सभी का चयन करें</string>
     <string name="action_select_all_short">सभी</string>
     <string name="action_delete">हटाएँ</string>
-    <string name="action_share">Share</string>
+    <string name="action_share">साझा करें</string>
     <string name="action_done">किया गया</string>
     <string name="action_remind_me_later">मुझे बाद में याद रखें</string>
     <string name="action_retry">पुनः प्रयास करें</string>
@@ -57,7 +57,7 @@
     <string name="cd_player_quadrant_rear">रियर कैमरा दिखाएँ</string>
     <string name="cd_player_quadrant_left">बायाँ कैमरा दिखाएँ</string>
     <string name="cd_delete">हटाएँ</string>
-    <string name="cd_share">Share</string>
+    <string name="cd_share">साझा करें</string>
     <string name="cd_expand">विस्तार</string>
     <string name="cd_configure">विन्यास</string>
     <string name="cd_download_log">डाउनलोड लॉग</string>
@@ -67,7 +67,7 @@
     <string name="cd_permission_granted">अनुमति दी गई</string>
     <!-- overlay_status -->
     <string name="overlay_rec_inactive_label">REC</string>
-    <string name="overlay_trip_inactive_label">TRIP</string>
+    <string name="overlay_trip_inactive_label">ट्रिप</string>
     <string name="overlay_mic_inactive_label">एमआईसी</string>
     <!-- Quick-action chips revealed by tapping the REC pill: switch
          recording mode without opening the app. Short labels read fine
@@ -75,10 +75,10 @@
          translatable=false to avoid bloating the i18n catalog. The
          _cd content-descriptions are real prose and ARE translatable —
          they go through the NLLB pipeline like every other a11y string. -->
-    <string name="overlay_mode_off_cd">Stop recording</string>
-    <string name="overlay_mode_continuous_cd">Continuous recording</string>
-    <string name="overlay_mode_drive_cd">Drive-mode recording</string>
-    <string name="overlay_mode_proximity_cd">Proximity-guard recording</string>
+    <string name="overlay_mode_off_cd">रिकॉर्डिंग रोकें</string>
+    <string name="overlay_mode_continuous_cd">निरंतर रिकॉर्डिंग</string>
+    <string name="overlay_mode_drive_cd">ड्राइव-मोड रिकॉर्डिंग</string>
+    <string name="overlay_mode_proximity_cd">प्रॉक्सिमिटी-गार्ड रिकॉर्डिंग</string>
     <!-- item_log_entry placeholders (timestamp/tag/message are runtime, but these are
          placeholder/preview text used at design time and visible in some empty states) -->
     <string name="log_entry_default_timestamp">12:34:56</string>
@@ -133,11 +133,11 @@
     <string name="camera_option_5">कैमरा 5</string>
     <string name="camera_selection_hint">ऑटो प्रत्येक बूट पर आपके ट्रिम के लिए सही कैमरा चुनता है। कैमरा 1 = BYD Seal, कैमरा 0 = Atto ट्रिम। सेटिंग को प्रभावी होने के लिए कैमरा आईडी बदलने के बाद डेमोन को पुनरारंभ करें।</string>
     <!-- OEM Dashcam camera ID picker (Phase 5: separate forward-sensor pipeline) -->
-    <string name="camera_oem_dashcam_title">OEM Dashcam Camera ID</string>
-    <string name="camera_oem_dashcam_hint">Pick the AVMCamera id that points at the forward dashcam sensor. Dashcam is the OPPOSITE of pano: Seal/Han pano = 1 → dashcam = 0; Atto / Tang pano = 0 → dashcam = 1. Leave on Auto to let OverDrive pick.</string>
-    <string name="camera_oem_dashcam_auto_resolved">Auto — using id %1$d (pano is id %2$d)</string>
-    <string name="camera_oem_dashcam_auto_unavailable">Auto — pano id is %1$d, can\'t infer dashcam</string>
-    <string name="camera_oem_dashcam_save">Save</string>
+    <string name="camera_oem_dashcam_title">OEM डैशकैम कैमरा ID</string>
+    <string name="camera_oem_dashcam_hint">वह AVMCamera id चुनें जो फ़ॉरवर्ड डैशकैम सेंसर की ओर इंगित करती है। डैशकैम pano के विपरीत है: Seal/Han pano = 1 → dashcam = 0; Atto / Tang pano = 0 → dashcam = 1। OverDrive को चुनने देने के लिए Auto पर छोड़ें।</string>
+    <string name="camera_oem_dashcam_auto_resolved">ऑटो — id %1$d उपयोग कर रहा है (पैनो id %2$d है)</string>
+    <string name="camera_oem_dashcam_auto_unavailable">ऑटो — पैनो id %1$d है, डैशकैम अनुमानित नहीं किया जा सकता</string>
+    <string name="camera_oem_dashcam_save">सहेजें</string>
     <string name="camera_concurrent_probe_label">अगले बूट पर ड्यूल-कैमरा समर्थन जाँचें</string>
     <string name="camera_concurrent_probe_subtitle">एक बार की जाँच जो दोनों कैमरे एक साथ खोलकर पुष्टि करती है कि यह वाहन पैनो + डैशकैम एक साथ चला सकता है। पार्क होने पर अगले रीस्टार्ट पर एक बार चलती है। रिकॉर्डिंग गलत दिखने तक इसे बंद रखें — यह आवश्यक नहीं है और चलने के दौरान कोई रिकॉर्डिंग सक्रिय हो तो उसे थोड़ी देर बाधित कर सकती है।</string>
     <!-- Dashcam-side camera labels — REVERSE of the pano labels above. The
@@ -146,8 +146,8 @@
          dialogs. Without these strings the dashcam picker re-used the pano
          labels and told Seal owners to pick "Camera 1 — Seal" for their
          dashcam, which is the pano camera, not the dashcam. -->
-    <string name="camera_oem_option_0">Camera 0 — Seal / Han (default)</string>
-    <string name="camera_oem_option_1">Camera 1 — Atto / Tang</string>
+    <string name="camera_oem_option_0">कैमरा 0 — Seal / Han (डिफ़ॉल्ट)</string>
+    <string name="camera_oem_option_1">कैमरा 1 — Atto / Tang</string>
     <!-- Camera mapping dialog (multi-vehicle role-to-slice routing) -->
     <string name="camera_mapping_title">कैमरा मैपिंग</string>
     <string name="camera_role_label">भूमिका मानचित्रण</string>
@@ -262,7 +262,7 @@
     <string name="recording_lib_filter_section_severity">गंभीरता</string>
     <string name="recording_lib_filter_section_type">प्रकार</string>
     <string name="recording_lib_filter_section_place">स्थान</string>
-    <string name="recording_lib_place_search_hint">Search places…</string>
+    <string name="recording_lib_place_search_hint">स्थान खोजें…</string>
     <string name="recording_lib_chip_type_normal">सामान्य</string>
     <string name="recording_lib_chip_type_proximity">निकटता</string>
     <string name="recording_lib_date_today">आज</string>
@@ -281,29 +281,29 @@
     <string name="cd_open_filters">खुले फ़िल्टर</string>
     <string name="cd_clear_filter">साफ फ़िल्टर</string>
     <!-- v5 redesign: SOTA empty state with CTA + tile type badges -->
-    <string name="recording_lib_empty_title">No recordings match</string>
-    <string name="recording_lib_empty_body">Try adjusting your date range or chip filters.</string>
-    <string name="recording_lib_empty_clear_filters">Clear filters</string>
+    <string name="recording_lib_empty_title">कोई रिकॉर्डिंग मेल नहीं खाती</string>
+    <string name="recording_lib_empty_body">अपनी दिनांक सीमा या चिप फ़िल्टर समायोजित करने का प्रयास करें।</string>
+    <string name="recording_lib_empty_clear_filters">फ़िल्टर साफ़ करें</string>
     <!-- Shown on the empty-state body when there are zero clips on disk
          (no filter is active). Sets a friendlier tone than "No recordings match". -->
-    <string name="recording_lib_empty_disk_title">Nothing recorded yet</string>
-    <string name="recording_lib_empty_disk_body">Captures will appear here as soon as the dashcam or surveillance pipeline writes a clip.</string>
+    <string name="recording_lib_empty_disk_title">अभी तक कुछ भी रिकॉर्ड नहीं हुआ</string>
+    <string name="recording_lib_empty_disk_body">जैसे ही डैशकैम या सर्विलांस पाइपलाइन कोई क्लिप लिखेगा, कैप्चर यहाँ दिखाई देंगे।</string>
     <!-- Shown while the daemon is warming the H2 recording index on cold
          start. Includes a progress counter when the daemon reports done/total,
          otherwise a static body. The library re-polls every 1.5s and
          transitions out automatically once results land. -->
-    <string name="recording_lib_building_index_title">Building library index</string>
-    <string name="recording_lib_building_index_body">One moment while the daemon scans your recordings.</string>
-    <string name="recording_lib_building_index_progress">Indexed %1$d of %2$d clips…</string>
+    <string name="recording_lib_building_index_title">लाइब्रेरी इंडेक्स बना रहे हैं</string>
+    <string name="recording_lib_building_index_body">डेमन आपकी रिकॉर्डिंग स्कैन कर रहा है, एक क्षण प्रतीक्षा करें।</string>
+    <string name="recording_lib_building_index_progress">%2$d में से %1$d क्लिप अनुक्रमित…</string>
     <!-- Tile type badge labels — short, glanceable, mirrors the on-disk
          filename prefix (cam_/event_/dvr_/proximity_) so power users can
          map a tile back to its file group at a glance. -->
     <string name="recording_lib_type_normal">CAM</string>
-    <string name="recording_lib_type_event">EVENT</string>
+    <string name="recording_lib_type_event">इवेंट</string>
     <string name="recording_lib_type_proximity">PROX</string>
     <string name="recording_lib_type_oem">OEM</string>
     <!-- Toast shown when a multi-select share is dispatched. -->
-    <string name="toast_share_recordings">Sharing %1$d recordings</string>
+    <string name="toast_share_recordings">%1$d रिकॉर्डिंग साझा कर रहे हैं</string>
     <!-- fragment_sentry_config -->
     <!-- fragment_video_player -->
     <string name="player_title_recording">रिकॉर्डिंग</string>
@@ -449,7 +449,7 @@
     <string name="dialog_reset_soh_title">SOH अनुमान को रीसेट करें?</string>
     <string name="dialog_reset_soh_message">यह सभी SOH डेटा को साफ़ करेगा और खरोंच से पुनः अनुमान लगाने के लिए मजबूर करेगा।\n\nइसका उपयोग करें यदिः\n• बैटरी को बदल दिया गया था\n• SOH रीडिंग गलत लगती है\n• आप रीकैलिब्रेट करना चाहते हैं\n\nसिस्टम अगले उपलब्ध डेटा स्रोत (OEM, चार्ज कैलिब्रेशन, या तत्काल रीडिंग) से फिर से बीज होगा।</string>
     <string name="dialog_reset_following_title">निम्नलिखित को रीसेट करें?</string>
-    <string name="dialog_reset_following_message">This cannot be undone.\n\n%1$s</string>
+    <string name="dialog_reset_following_message">इसे पूर्ववत नहीं किया जा सकता।\n\n%1$s</string>
     <string name="dialog_reset_complete_title">पूर्ण रीसेट</string>
     <string name="dialog_traffic_cannot_check_title">स्थिति की जांच नहीं कर सका</string>
     <string name="dialog_traffic_cannot_check_message">एडीबी कनेक्शन अभी तक तैयार नहीं है। सिस्टम पैकेज प्रबंधित करने के लिए एप्लिकेशन को एडीबी एक्सेस की आवश्यकता है। कृपया सुनिश्चित करें किः\n\n• USB डिबगिंग डेवलपर विकल्पों में सक्षम है\n• एडीबी प्राधिकरण प्रलोभन स्वीकार किया गया है\n\nएक बार कनेक्ट होने पर स्थिति स्वचालित रूप से अपडेट हो जाएगी।</string>
@@ -548,7 +548,7 @@
     <!-- Braveheart log send (upload to Cloudflare or share-sheet) -->
     <string name="logs_send_title">%1$s लॉग भेजें</string>
     <string name="logs_send_title_plain">सेवा लॉग भेजें</string>
-    <string name="logs_send_subtitle">%1$s · choose how to send it to us</string>
+    <string name="logs_send_subtitle">%1$s · चुनें कि इसे हमें कैसे भेजें</string>
     <string name="logs_send_upload">अपलोड करें और कोड प्राप्त करें</string>
     <string name="logs_send_upload_desc">लॉग हमें भेजता है और आपको एक छोटा कोड देता है। समर्थन के लिए सबसे आसान।</string>
     <string name="logs_send_share">फ़ाइल साझा करें…</string>
@@ -557,7 +557,7 @@
     <string name="logs_uploading_subtitle">गोपनीय जानकारी हटाना और सुरक्षित रूप से भेजना</string>
     <string name="logs_uploaded_title">लॉग अपलोड हो गया</string>
     <string name="logs_uploaded_instructions">यह कोड हमारे साथ साझा करें, साथ ही एक नोट भी दें कि जब यह टूटा तो आप क्या कर रहे थे। इसे Discord, GitHub Issues या WhatsApp पर पोस्ट करें — लिंक \'About\' स्क्रीन पर हैं।</string>
-    <string name="logs_uploaded_privacy">Secrets redacted · the log auto-expires</string>
+    <string name="logs_uploaded_privacy">गुप्त जानकारी संपादित · लॉग स्वतः समाप्त हो जाता है</string>
     <string name="logs_copy_code">कोड कॉपी करें</string>
     <string name="logs_done">हो गया</string>
     <string name="placeholder_dash">—</string>
@@ -599,7 +599,7 @@
     <string name="nav_page_telegram">Telegram</string>
     <string name="nav_page_abrp">ABRP</string>
     <string name="nav_page_mqtt">MQTT</string>
-    <string name="nav_page_byd_cloud">BYD Cloud</string>
+    <string name="nav_page_byd_cloud">BYD क्लाउड</string>
     <!-- StatusOverlayService persistent notification (foreground service) -->
     <string name="status_overlay_notif_title">OverDrive स्थिति</string>
     <string name="status_overlay_notif_text">स्थिति ओवरले सक्रिय</string>
@@ -608,10 +608,10 @@
          notifications into one shade entry. The summary text is intentionally
          generic so it stays accurate whether all three services are running
          or only the keepalive survived an OOM respawn. -->
-    <string name="daemon_keepalive_notif_title">Overdrive Active</string>
-    <string name="daemon_keepalive_notif_text">Monitoring vehicle systems</string>
+    <string name="daemon_keepalive_notif_title">Overdrive सक्रिय</string>
+    <string name="daemon_keepalive_notif_text">वाहन प्रणालियों की निगरानी</string>
     <string name="overdrive_status_summary_title">Overdrive</string>
-    <string name="overdrive_status_summary_text">Background services running</string>
+    <string name="overdrive_status_summary_text">बैकग्राउंड सेवाएँ चल रही हैं</string>
     <!-- ============================================================== -->
     <!-- M3 Revamp: navigation rail + settings sub-rail + theme picker  -->
     <!-- ============================================================== -->
@@ -631,7 +631,7 @@
     <string name="settings_section_daemons">डेमोन</string>
     <string name="settings_section_privacy">गोपनीयता और डेटा</string>
     <string name="settings_section_overlay">स्थिति ओवरले</string>
-    <string name="settings_section_security">Security</string>
+    <string name="settings_section_security">सुरक्षा</string>
     <string name="settings_overlay_subtitle">फ्लोटिंग स्टेटस पिल के कौन से से सेगमेंट दिखाई देते हैं, चुनें।</string>
     <string name="settings_overlay_camera_title">कैमरा संकेत</string>
     <string name="settings_overlay_camera_subtitle">रिकॉर्डिंग सक्रिय होने पर REC/PROX बैज दिखाएं।</string>
@@ -853,56 +853,56 @@
          The lock guards the OverDrive UI only. Cam daemon, AccSentry,
          surveillance, recording, Telegram alerts, status overlay, and the
          deterrent screen all run independently regardless of this state. -->
-    <string name="settings_security_title">Security</string>
-    <string name="settings_security_subtitle">Lock the OverDrive app so passengers and valets can\'t open it without your PIN.</string>
-    <string name="settings_security_stance_title">UI lock only</string>
-    <string name="settings_security_stance_body">Surveillance, recording, deterrent, alerts, and background services keep running while the app is locked. The PIN gates the OverDrive interface, nothing else.</string>
-    <string name="settings_security_overline_lock">App lock</string>
-    <string name="settings_security_overline_recovery">If you forget your PIN</string>
-    <string name="settings_security_toggle_title">Require PIN</string>
-    <string name="settings_security_toggle_subtitle_off">Off — anyone can open OverDrive.</string>
-    <string name="settings_security_toggle_subtitle_on">On — PIN required to open OverDrive.</string>
-    <string name="settings_security_change_title">Change PIN</string>
-    <string name="settings_security_change_subtitle">Confirm current PIN, then set a new one.</string>
-    <string name="settings_security_autolock_title">Auto-lock</string>
-    <string name="settings_security_autolock_immediate">Lock immediately</string>
-    <string name="settings_security_autolock_1min">After 1 minute</string>
-    <string name="settings_security_autolock_5min">After 5 minutes</string>
-    <string name="settings_security_autolock_15min">After 15 minutes</string>
-    <string name="settings_security_autolock_never">Never auto-lock by time</string>
-    <string name="settings_security_recovery_title">ADB recovery</string>
-    <string name="settings_security_recovery_body">Forgotten PIN can be cleared from a host machine over USB debugging without a factory reset. Run this command, then reopen the app.</string>
+    <string name="settings_security_title">सुरक्षा</string>
+    <string name="settings_security_subtitle">OverDrive ऐप को लॉक करें ताकि यात्री और वैलेट आपके PIN के बिना इसे न खोल सकें।</string>
+    <string name="settings_security_stance_title">केवल UI लॉक</string>
+    <string name="settings_security_stance_body">ऐप लॉक रहने के दौरान सर्विलांस, रिकॉर्डिंग, डिटरेंट, अलर्ट और बैकग्राउंड सेवाएँ चलती रहती हैं। PIN केवल OverDrive इंटरफ़ेस को रोकता है, और कुछ नहीं।</string>
+    <string name="settings_security_overline_lock">ऐप लॉक</string>
+    <string name="settings_security_overline_recovery">यदि आप अपना PIN भूल जाते हैं</string>
+    <string name="settings_security_toggle_title">PIN अनिवार्य करें</string>
+    <string name="settings_security_toggle_subtitle_off">बंद — कोई भी OverDrive खोल सकता है।</string>
+    <string name="settings_security_toggle_subtitle_on">चालू — OverDrive खोलने के लिए PIN आवश्यक।</string>
+    <string name="settings_security_change_title">PIN बदलें</string>
+    <string name="settings_security_change_subtitle">वर्तमान PIN की पुष्टि करें, फिर एक नया सेट करें।</string>
+    <string name="settings_security_autolock_title">ऑटो-लॉक</string>
+    <string name="settings_security_autolock_immediate">तुरंत लॉक करें</string>
+    <string name="settings_security_autolock_1min">1 मिनट बाद</string>
+    <string name="settings_security_autolock_5min">5 मिनट बाद</string>
+    <string name="settings_security_autolock_15min">15 मिनट बाद</string>
+    <string name="settings_security_autolock_never">समय के अनुसार कभी ऑटो-लॉक न करें</string>
+    <string name="settings_security_recovery_title">ADB रिकवरी</string>
+    <string name="settings_security_recovery_body">भूला हुआ PIN फ़ैक्ट्री रीसेट के बिना USB डिबगिंग के माध्यम से किसी होस्ट मशीन से साफ़ किया जा सकता है। यह कमांड चलाएँ, फिर ऐप फिर से खोलें।</string>
     <!-- Verbatim ADB command. translatable=false so the i18n pipeline
          doesn't localize the literal path/command — translators following
          Crowdin would otherwise risk breaking the only recovery path. -->
-    <string name="settings_security_dialog_set_title">Set PIN</string>
-    <string name="settings_security_dialog_set_body">Pick a 4–8 digit PIN. You\'ll need this every time you open the app.</string>
-    <string name="settings_security_dialog_disable_title">Turn off PIN lock?</string>
-    <string name="settings_security_dialog_disable_body">Confirm your current PIN to turn off the app lock.</string>
-    <string name="settings_security_dialog_change_step1_title">Confirm current PIN</string>
-    <string name="settings_security_dialog_change_step1_body">Enter your current PIN, then you\'ll set a new one.</string>
-    <string name="settings_security_action_set">Set PIN</string>
-    <string name="settings_security_action_disable">Turn off lock</string>
-    <string name="settings_security_action_continue">Continue</string>
+    <string name="settings_security_dialog_set_title">PIN सेट करें</string>
+    <string name="settings_security_dialog_set_body">4–8 अंकों का PIN चुनें। हर बार ऐप खोलने पर आपको इसकी आवश्यकता होगी।</string>
+    <string name="settings_security_dialog_disable_title">PIN लॉक बंद करें?</string>
+    <string name="settings_security_dialog_disable_body">ऐप लॉक बंद करने के लिए अपने वर्तमान PIN की पुष्टि करें।</string>
+    <string name="settings_security_dialog_change_step1_title">वर्तमान PIN की पुष्टि करें</string>
+    <string name="settings_security_dialog_change_step1_body">अपना वर्तमान PIN दर्ज करें, फिर आप एक नया सेट करेंगे।</string>
+    <string name="settings_security_action_set">PIN सेट करें</string>
+    <string name="settings_security_action_disable">लॉक बंद करें</string>
+    <string name="settings_security_action_continue">जारी रखें</string>
     <string name="settings_security_pin_hint">PIN</string>
-    <string name="settings_security_pin_confirm_hint">Confirm PIN</string>
-    <string name="settings_security_error_length">PIN must be 4 to 8 digits</string>
-    <string name="settings_security_error_numeric">Digits only</string>
-    <string name="settings_security_error_mismatch">PINs don\'t match</string>
-    <string name="settings_security_error_wrong">Wrong PIN</string>
-    <string name="settings_security_error_locked_out">Too many attempts. Try again in a moment.</string>
-    <string name="settings_security_error_persist">Couldn\'t save the PIN. Try again.</string>
-    <string name="settings_security_toast_set_ok">PIN set. App lock is on.</string>
-    <string name="settings_security_toast_disable_ok">App lock turned off.</string>
+    <string name="settings_security_pin_confirm_hint">PIN की पुष्टि करें</string>
+    <string name="settings_security_error_length">PIN 4 से 8 अंकों का होना चाहिए</string>
+    <string name="settings_security_error_numeric">केवल अंक</string>
+    <string name="settings_security_error_mismatch">PIN मेल नहीं खाते</string>
+    <string name="settings_security_error_wrong">गलत PIN</string>
+    <string name="settings_security_error_locked_out">बहुत अधिक प्रयास। कुछ क्षण में पुनः प्रयास करें।</string>
+    <string name="settings_security_error_persist">PIN सहेजा नहीं जा सका। पुनः प्रयास करें।</string>
+    <string name="settings_security_toast_set_ok">PIN सेट किया गया। ऐप लॉक चालू है।</string>
+    <string name="settings_security_toast_disable_ok">ऐप लॉक बंद कर दिया गया।</string>
     <!-- PIN unlock screen (PinLockActivity). Shown over MainActivity when
          the app lock is enabled and the session isn\'t fresh. -->
-    <string name="pin_lock_title">Enter PIN</string>
-    <string name="pin_lock_title_unlocked">Unlocked</string>
-    <string name="pin_lock_subtitle_default">Unlock OverDrive to continue.</string>
-    <string name="pin_lock_subtitle_wrong">Wrong PIN. Try again.</string>
-    <string name="pin_lock_subtitle_locked_out">Too many attempts. Try again shortly.</string>
+    <string name="pin_lock_title">PIN दर्ज करें</string>
+    <string name="pin_lock_title_unlocked">अनलॉक किया गया</string>
+    <string name="pin_lock_subtitle_default">जारी रखने के लिए OverDrive अनलॉक करें।</string>
+    <string name="pin_lock_subtitle_wrong">गलत PIN। पुनः प्रयास करें।</string>
+    <string name="pin_lock_subtitle_locked_out">बहुत अधिक प्रयास। शीघ्र ही पुनः प्रयास करें।</string>
     <!-- %1$s is a formatted countdown like "30s" or "2:45". -->
-    <string name="pin_lock_subtitle_locked_out_countdown">Locked. Try again in %1$s.</string>
+    <string name="pin_lock_subtitle_locked_out_countdown">लॉक किया गया। %1$s में पुनः प्रयास करें।</string>
     <string name="pin_lock_lockout_seconds">%1$ds</string>
     <string name="pin_lock_lockout_minutes">%1$d:%2$02d</string>
     <!-- Lock-screen recovery hint. Two-part: a translatable prose prefix
@@ -910,8 +910,8 @@
          settings_security_recovery_command resource so a future edit to
          the command stays in sync across both surfaces). The lock screen
          concatenates them at runtime via String.format. -->
-    <string name="pin_lock_recovery_hint_prefix">Forgot your PIN? Run from a connected computer:\n%1$s</string>
-    <string name="pin_lock_backspace_cd">Backspace</string>
+    <string name="pin_lock_recovery_hint_prefix">अपना PIN भूल गए? किसी कनेक्टेड कंप्यूटर से चलाएँ:\n%1$s</string>
+    <string name="pin_lock_backspace_cd">बैकस्पेस</string>
     <plurals name="pin_lock_dot_a11y">
         <item quantity="one">%1$d digit entered</item>
         <item quantity="other">%1$d digits entered</item>
@@ -959,7 +959,7 @@
          placeholder shape so the bold-ifier still finds the digits. -->
     <string name="dashboard_insight_kwh_format">%1$.1f kWh</string>
     <string name="dashboard_insight_percent_format">%1$.1f%%</string>
-    <string name="dashboard_insight_hours_minutes">%1$d hr %2$d min</string>
+    <string name="dashboard_insight_hours_minutes">%1$d घंटा %2$d मिनट</string>
     <!-- Today's clips. -->
     <plurals name="dashboard_insight_today_clips">
         <item quantity="one">%1$d क्लिप आज रिकॉर्ड किया गया</item>
@@ -989,47 +989,47 @@
     <string name="rail_roadsense">RoadSense</string>
     <string name="rail_hazard_map">नक्शा</string>
     <string name="roadsense_title">RoadSense</string>
-    <string name="roadsense_pill_scanning">Scanning</string>
+    <string name="roadsense_pill_scanning">स्कैन हो रहा है</string>
     <string name="roadsense_pill_idle">RoadSense</string>
-    <string name="roadsense_status_idle">Idle</string>
+    <string name="roadsense_status_idle">निष्क्रिय</string>
     <!-- VEHICLE calibration (suspension-learning) — the green/orange/red dot. Worded
          about the car, not the route, since that's what maturity actually measures. -->
-    <string name="roadsense_cal_learning">Learning your vehicle</string>
-    <string name="roadsense_cal_ready">Vehicle calibrated</string>
-    <string name="roadsense_cal_partial">Calibration improving</string>
+    <string name="roadsense_cal_learning">आपके वाहन को सीख रहा है</string>
+    <string name="roadsense_cal_ready">वाहन कैलिब्रेट किया गया</string>
+    <string name="roadsense_cal_partial">कैलिब्रेशन बेहतर हो रहा है</string>
     <!-- Idle caption — ROUTE coverage (distinct from vehicle calibration). "Clear
          ahead" only when we've actually mapped this stretch; "New road" when we
          haven't, so an unsurveyed road isn't mistaken for confirmed-safe. -->
-    <string name="roadsense_clear_ahead">Clear ahead</string>
-    <string name="roadsense_road_mapped">Road mapped · clear</string>
-    <string name="roadsense_road_new">New road · learning</string>
+    <string name="roadsense_clear_ahead">आगे रास्ता साफ़</string>
+    <string name="roadsense_road_mapped">सड़क मैप की गई · साफ़</string>
+    <string name="roadsense_road_new">नई सड़क · सीख रहा है</string>
     <string name="roadsense_unit_meters">m</string>
     <string name="roadsense_dash_distance">—</string>
-    <string name="roadsense_warn_label">Warn</string>
-    <string name="roadsense_toggle_audio">Audio</string>
-    <string name="roadsense_toggle_visual">Visual</string>
+    <string name="roadsense_warn_label">चेतावनी दें</string>
+    <string name="roadsense_toggle_audio">ऑडियो</string>
+    <string name="roadsense_toggle_visual">दृश्य</string>
     <!-- severity / type readouts (formatted at runtime) -->
-    <string name="roadsense_sev_minor">Minor</string>
-    <string name="roadsense_sev_moderate">Moderate</string>
-    <string name="roadsense_sev_severe">Severe</string>
-    <string name="roadsense_type_breaker">Speed breaker</string>
-    <string name="roadsense_type_pothole">Pothole</string>
-    <string name="roadsense_type_hazard">Hazard</string>
-    <string name="roadsense_type_rough">Rough section</string>
+    <string name="roadsense_sev_minor">मामूली</string>
+    <string name="roadsense_sev_moderate">मध्यम</string>
+    <string name="roadsense_sev_severe">गंभीर</string>
+    <string name="roadsense_type_breaker">स्पीड ब्रेकर</string>
+    <string name="roadsense_type_pothole">गड्ढा</string>
+    <string name="roadsense_type_hazard">खतरा</string>
+    <string name="roadsense_type_rough">उबड़-खाबड़ खंड</string>
     <!-- "Moderate · Pothole" style line -->
     <string name="roadsense_hazard_format">%1$s · %2$s</string>
     <!-- Zone readouts (D-032): cluster of hazards announced as one. -->
     <!-- "3 bumps ahead" — %1$d = count -->
-    <string name="roadsense_zone_count">%1$d bumps ahead</string>
+    <string name="roadsense_zone_count">आगे %1$d बंप</string>
     <!-- "Rough section · 40 m" — %1$d = length in metres -->
-    <string name="roadsense_zone_rough">Rough section · %1$d m</string>
+    <string name="roadsense_zone_rough">उबड़-खाबड़ खंड · %1$d m</string>
     <!-- Calibration-Mode confirm card (R-OVL-6) -->
-    <string name="roadsense_confirm_prompt">Was this a hazard?</string>
-    <string name="roadsense_confirm_reject">Not a hazard</string>
-    <string name="roadsense_confirm_accept">Confirm</string>
+    <string name="roadsense_confirm_prompt">क्या यह एक खतरा था?</string>
+    <string name="roadsense_confirm_reject">खतरा नहीं</string>
+    <string name="roadsense_confirm_accept">पुष्टि करें</string>
     <!-- content descriptions -->
-    <string name="roadsense_cd_cal_level">Vehicle calibration level</string>
-    <string name="roadsense_cd_direction">Direction to next hazard</string>
+    <string name="roadsense_cd_cal_level">वाहन कैलिब्रेशन स्तर</string>
+    <string name="roadsense_cd_direction">अगले खतरे की दिशा</string>
     <!-- Blind Spot overlay labels (native overlay window). -->
     <string name="blindspot_overlay_left">बायाँ</string>
     <string name="blindspot_overlay_right">दायाँ</string>
@@ -1052,7 +1052,7 @@
     <string name="roadsense_map_status_local">डिवाइस पर</string>
     <string name="roadsense_map_status_cloud">साझा किया गया</string>
     <!-- Meta line: "Moderate · 82% confidence · 3 reports" -->
-    <string name="roadsense_map_meta_format">%1$s · %2$d%% confidence · %3$s</string>
+    <string name="roadsense_map_meta_format">%1$s · %2$d%% विश्वास · %3$s</string>
     <!-- "3 reports" / "1 report" -->
     <plurals name="roadsense_map_reports">
         <item quantity="one">%1$d report</item>
@@ -1251,7 +1251,7 @@
     <string name="onboarding_expert_finish">समाप्त करें</string>
     <string name="onboarding_expert_reset_body">यह रिकॉर्डिंग, इवेंट और सेटिंग्स मिटा देता है और इसे वापस नहीं किया जा सकता। यह तब के लिए है जब आप कभी गाड़ी बेचें — सामान्य उपयोग का हिस्सा नहीं।</string>
     <string name="onboarding_camera_dashcam_title">अब सामने सड़क वाला कैमरा खोजें</string>
-    <string name="onboarding_expert_blindspot_title">Blind Spot</string>
+    <string name="onboarding_expert_blindspot_title">ब्लाइंड स्पॉट</string>
     <string name="onboarding_camera_verify_title">त्वरित जाँच</string>
     <string name="onboarding_dash_chips_body_land">आपकी लाइव स्थिति — रिकॉर्डिंग, सेवाएँ और रिमोट लिंक — यहाँ दिखती है। यह अपने आप अपडेट होती है।</string>
     <string name="onboarding_next">आगे</string>

@@ -527,6 +527,19 @@ BYD.units = {
     /** Per-100 consumption label: "kWh/100km" or "kWh/100mi". */
     consumptionLabel() { return this.mode === 'mi' ? 'kWh/100mi' : 'kWh/100km'; },
 
+    /**
+     * Convert a "distance-per-kWh" efficiency (km/kWh) to the user's unit.
+     * This is the inverse-facing sibling of per100Val: higher is better.
+     * In miles mode, mi/kWh = km/kWh × KM_TO_MI (distance shrinks per unit).
+     */
+    effVal(kmPerKwh) {
+        if (kmPerKwh == null || isNaN(kmPerKwh)) return 0;
+        return this.mode === 'mi' ? kmPerKwh * this.KM_TO_MI : kmPerKwh;
+    },
+
+    /** Distance-per-energy efficiency label: "km/kWh" or "mi/kWh". */
+    efficiencyLabel() { return this.mode === 'mi' ? 'mi/kWh' : 'km/kWh'; },
+
     /** "per km" or "per mi" for cost display. */
     perDistLabel() { return this.mode === 'mi' ? '/mi' : '/km'; },
 

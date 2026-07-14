@@ -125,6 +125,7 @@ class DaemonKeepaliveService : Service() {
             Log.w(TAG, "Failed to kick status overlay: ${e.message}")
         }
 
+
         // Same for the RoadSense overlay: it must be visible whenever the feature is
         // enabled, NOT only after the user opens MainActivity (its sole other launch
         // path, onResume). The app process is killed/respawned across ACC cycles, so

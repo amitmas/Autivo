@@ -2,6 +2,7 @@ package com.overdrive.app.automation.condition;
 
 import com.overdrive.app.automation.type.EnumType;
 import com.overdrive.app.automation.type.IntType;
+import com.overdrive.app.automation.type.StringType;
 import com.overdrive.app.automation.type.TimeType;
 import com.overdrive.app.automation.value.Label;
 import com.overdrive.app.server.Messages;
@@ -111,6 +112,12 @@ public class Conditions {
                 new Label("temperature", "automation.temperature"),
                 "automation.temperature_description",
                 new IntType(new Label("celsius", "automation.celsius"), 0, 100)));
+        // Outside/ambient temperature — allows sub-zero values (frost automations),
+        // hence the -40..60 range vs the cabin-oriented 0..100 above.
+        addCondition(new EventCondition(
+                new Label("outsideTemp", "automation.outside_temperature"),
+                "automation.outside_temperature_description",
+                new IntType(new Label("celsius", "automation.celsius"), -40, 60)));
         addCondition(new EventCondition(
                 new Label("speed", "automation.speed"),
                 "automation.speed_description",
@@ -119,10 +126,97 @@ public class Conditions {
                         new Label("units", "automation.units"),
                         new Label("kmph", "automation.kmph"),
                         new Label("mph", "automation.mph"))));
+        // Accelerator / brake pedal deepness (0-100%). Already ingested every
+        // snapshot; the RoadSense fast poll (250ms) keeps them fresh when running.
+        addCondition(new EventCondition(
+                new Label("accelerator", "automation.accelerator"),
+                "automation.accelerator_description",
+                new IntType(new Label("percent", "automation.percent"), 0, 100)));
+        addCondition(new EventCondition(
+                new Label("brake", "automation.brake"),
+                "automation.brake_description",
+                new IntType(new Label("percent", "automation.percent"), 0, 100)));
+        // Steering-wheel angle in signed degrees (negative = left, positive = right).
+        // ±540 covers 1.5 turns each way — wider than typical driving, narrower than
+        // the SDK's ±780 hard limit, so the slider stays usable.
+        addCondition(new EventCondition(
+                new Label("steeringAngle", "automation.steering_angle"),
+                "automation.steering_angle_description",
+                new IntType(new Label("degrees", "automation.degrees"), -540, 540)));
+        // Turn indicators, per side, as an on/off edge (blink-debounced). The `side`
+        // sub-variable selects left vs right so one condition schema serves both.
+        addCondition(new EventCondition(
+                new Label("turnSignal", "automation.turn_signal"),
+                "automation.turn_signal_description",
+                new EnumType(new Label("state", "automation.state"), new Label("on", "automation.on"), new Label("off", "automation.off")),
+                new EnumType(
+                        new Label("side", "automation.side"),
+                        new Label("left", "automation.turn_left"),
+                        new Label("right", "automation.turn_right"))));
         addCondition(new EventCondition(
                 new Label("time", "automation.time"),
                 "automation.time_description",
                 new TimeType(new Label("time", "automation.time"))));
+        // WiFi connection state + SSID. wifiState is an on/off edge; wifiSsid lets a
+        // condition match a specific network name (the "connect to <name>" pattern).
+        addCondition(new EventCondition(
+                new Label("wifiState", "automation.wifi_state"),
+                "automation.wifi_state_description",
+                new EnumType(new Label("state", "automation.state"), new Label("on", "automation.connected"), new Label("off", "automation.disconnected"))));
+        addCondition(new EventCondition(
+                new Label("wifiSsid", "automation.wifi_ssid"),
+                "automation.wifi_ssid_description",
+                new StringType(new Label("ssid", "automation.wifi_ssid"), 64)));
+        // Bluetooth connection state + connected-device name. Mirrors WiFi: btState is
+        // an on/off edge; btDeviceName lets a condition match a specific phone by name.
+        addCondition(new EventCondition(
+                new Label("btState", "automation.bt_state"),
+                "automation.bt_state_description",
+                new EnumType(new Label("state", "automation.state"), new Label("on", "automation.connected"), new Label("off", "automation.disconnected"))));
+        addCondition(new EventCondition(
+                new Label("btDeviceName", "automation.bt_device_name"),
+                "automation.bt_device_name_description",
+                new StringType(new Label("name", "automation.bt_device_name"), 64)));
+        // Location zone — fires when the car enters/leaves a geofence. The value is a
+        // zone NAME (as defined in Safe Locations, map-picked with a radius down to
+        // 15m), or "none" when outside every zone. So "location = Home" matches while
+        // inside the Home zone, and a trigger on this event fires on any enter/leave.
+        addCondition(new EventCondition(
+                new Label("locationZone", "automation.location_zone"),
+                "automation.location_zone_description",
+                new StringType(new Label("zone", "automation.location_zone"), 64)));
+        // ── Safety / ADAS events ─────────────────────────────────────────
+        // Emergency alarm — the closest "incident" signal this HAL exposes (no true
+        // collision/airbag event exists on this firmware).
+        addCondition(new EventCondition(
+                new Label("emergencyAlarm", "automation.emergency_alarm"),
+                "automation.emergency_alarm_description",
+                new EnumType(new Label("state", "automation.state"), new Label("on", "automation.on"), new Label("off", "automation.off"))));
+        // Tyre pressure warning (worst wheel): normal / under / over.
+        addCondition(new EventCondition(
+                new Label("tyrePressureWarn", "automation.tyre_pressure_warn"),
+                "automation.tyre_pressure_warn_description",
+                new EnumType(
+                        new Label("state", "automation.state"),
+                        new Label("normal", "automation.tyre_normal"),
+                        new Label("under", "automation.tyre_under"),
+                        new Label("over", "automation.tyre_over"))));
+        // Tyre air-leak warning (worst wheel): normal / slow / fast.
+        addCondition(new EventCondition(
+                new Label("tyreLeakWarn", "automation.tyre_leak_warn"),
+                "automation.tyre_leak_warn_description",
+                new EnumType(
+                        new Label("state", "automation.state"),
+                        new Label("normal", "automation.tyre_normal"),
+                        new Label("slow", "automation.tyre_leak_slow"),
+                        new Label("fast", "automation.tyre_leak_fast"))));
+        // System boot — a one-shot event published shortly after a genuine device
+        // boot. Only "on" is ever published (see NetworkEvent), so this is meant as a
+        // trigger; a condition can still gate on it being "on".
+        addCondition(new EventCondition(
+                new Label("boot", "automation.boot"),
+                "automation.boot_description",
+                new EnumType(new Label("state", "automation.state"), new Label("on", "automation.on"))));
         addCondition(new EventCondition(
                 new Label("day", "automation.day"),
                 "automation.day_description",
@@ -135,6 +229,113 @@ public class Conditions {
                         new Label("friday", "automation.friday"),
                         new Label("saturday", "automation.saturday"),
                         new Label("sunday", "automation.sunday"))));
+        // Door / lid open or closed, per opening plus an "any" convenience. Fed by the
+        // event-driven DoorEvent (raw bodywork open/close edges), so a trigger fires the
+        // instant a door opens. The `area` sub-variable picks which opening; "any"
+        // matches when any door/lid is open.
+        addCondition(new EventCondition(
+                new Label("doorState", "automation.door_state"),
+                "automation.door_state_description",
+                new EnumType(new Label("state", "automation.state"), new Label("open", "automation.open"), new Label("closed", "automation.closed")),
+                new EnumType(
+                        new Label("area", "automation.area"),
+                        new Label("any", "automation.area_any"),
+                        new Label("driver", "automation.door_driver"),
+                        new Label("passenger", "automation.door_passenger"),
+                        new Label("rearLeft", "automation.door_rear_left"),
+                        new Label("rearRight", "automation.door_rear_right"),
+                        new Label("hood", "automation.door_hood"),
+                        new Label("trunk", "automation.door_trunk"),
+                        new Label("fuelCap", "automation.door_fuel_cap"))));
+        // ── Charging ─────────────────────────────────────────────────────
+        // Fused charging verdict (on/off) + physical gun-connected edge.
+        addCondition(new EventCondition(
+                new Label("chargingState", "automation.charging_state"),
+                "automation.charging_state_description",
+                new EnumType(new Label("state", "automation.state"), new Label("on", "automation.charging_on"), new Label("off", "automation.charging_off"))));
+        addCondition(new EventCondition(
+                new Label("chargeGun", "automation.charge_gun"),
+                "automation.charge_gun_description",
+                new EnumType(new Label("state", "automation.state"), new Label("connected", "automation.connected"), new Label("disconnected", "automation.disconnected"))));
+        // ── Battery health + auxiliary batteries (percent) ──
+        addCondition(new EventCondition(
+                new Label("batterySoh", "automation.battery_soh"),
+                "automation.battery_soh_description",
+                new IntType(new Label("percent", "automation.percent"), 0, 100)));
+        // Key-fob + 12V battery are LOW/NORMAL enums (not percents — the SDK reports a
+        // 2-state level, not a gauge), so compare against low/normal.
+        addCondition(new EventCondition(
+                new Label("keyBattery", "automation.key_battery"),
+                "automation.key_battery_description",
+                new EnumType(new Label("state", "automation.state"), new Label("low", "automation.battery_low_state"), new Label("normal", "automation.battery_normal_state"))));
+        addCondition(new EventCondition(
+                new Label("aux12vBattery", "automation.aux_12v_battery"),
+                "automation.aux_12v_battery_description",
+                new EnumType(new Label("state", "automation.state"), new Label("low", "automation.battery_low_state"), new Label("normal", "automation.battery_normal_state"))));
+        // ── Fuel (PHEV) percent ──
+        addCondition(new EventCondition(
+                new Label("fuelLevel", "automation.fuel_level"),
+                "automation.fuel_level_description",
+                new IntType(new Label("percent", "automation.percent"), 0, 100)));
+        // ── Air quality PM2.5 (µg/m³), inside + outside via the `area` sub-variable ──
+        addCondition(new EventCondition(
+                new Label("pm25", "automation.pm25"),
+                "automation.pm25_description",
+                new IntType(new Label("value", "automation.pm25_value"), 0, 1000),
+                new EnumType(
+                        new Label("area", "automation.area"),
+                        new Label("inside", "automation.pm25_inside"),
+                        new Label("outside", "automation.pm25_outside"))));
+        // ── Road slope / incline (signed degrees) ──
+        addCondition(new EventCondition(
+                new Label("slope", "automation.slope"),
+                "automation.slope_description",
+                new IntType(new Label("degrees", "automation.degrees"), -60, 60)));
+        // ── Parking-radar nearest obstacle (cm) ──
+        addCondition(new EventCondition(
+                new Label("radarNearest", "automation.radar_nearest"),
+                "automation.radar_nearest_description",
+                new IntType(new Label("cm", "automation.centimetres"), 0, 155)));
+        // ── Seatbelts (buckled/unbuckled), per seat ──
+        addCondition(new EventCondition(
+                new Label("seatbelt", "automation.seatbelt"),
+                "automation.seatbelt_description",
+                new EnumType(new Label("state", "automation.state"), new Label("on", "automation.buckled"), new Label("off", "automation.unbuckled")),
+                new EnumType(
+                        new Label("seat", "automation.seat"),
+                        new Label("driver", "automation.driver"),
+                        new Label("passenger", "automation.passenger"))));
+        // ── Tier-2 sensors ──
+        // Auto-wiper engaged (the rain proxy — no rain-intensity sensor exists).
+        addCondition(new EventCondition(
+                new Label("autoWiper", "automation.auto_wiper"),
+                "automation.auto_wiper_description",
+                new EnumType(new Label("state", "automation.state"), new Label("on", "automation.on"), new Label("off", "automation.off"))));
+        // Wipers active (any speed).
+        addCondition(new EventCondition(
+                new Label("wiperActive", "automation.wiper_active"),
+                "automation.wiper_active_description",
+                new EnumType(new Label("state", "automation.state"), new Label("on", "automation.on"), new Label("off", "automation.off"))));
+        // Auto-headlights engaged (the "it's dark" proxy — no lux value exists).
+        addCondition(new EventCondition(
+                new Label("autoLights", "automation.auto_lights"),
+                "automation.auto_lights_description",
+                new EnumType(new Label("state", "automation.state"), new Label("on", "automation.on"), new Label("off", "automation.off"))));
+        // Seat occupancy (someone sitting), per seat.
+        addCondition(new EventCondition(
+                new Label("occupant", "automation.occupant"),
+                "automation.occupant_description",
+                new EnumType(new Label("state", "automation.state"), new Label("occupied", "automation.occupied"), new Label("empty", "automation.empty")),
+                new EnumType(
+                        new Label("seat", "automation.seat"),
+                        new Label("driver", "automation.driver"),
+                        new Label("passenger", "automation.passenger"))));
+        // User variable / flag — free-text name + string value (eq/neq). Set by the
+        // "Set Variable" action; lets an automation gate on its own or another's marker
+        // ("if Parking_Mode != true"). VariableCondition handles the free-text name (not
+        // an enum), so it's a dedicated subclass rather than a plain EventCondition.
+        addCondition(new VariableCondition(
+                new Label("variable", "automation.variable"), "automation.variable_description"));
     }
 
     /**
@@ -188,6 +389,17 @@ public class Conditions {
             triggers.put("required", 1);
             // Conditions are not required as an automation may need to be run when the value changes overall
             conditions.put("required", 0);
+            // Advertise the optional AND/OR combining toggle for the conditions
+            // section. The form reads formData.conditionLogic ("AND" default / "OR");
+            // an automation that never sets it keeps the pre-existing AND behaviour.
+            JSONObject logic = new JSONObject();
+            logic.put("field", "conditionLogic");
+            logic.put("default", "AND");
+            JSONArray logicOptions = new JSONArray();
+            logicOptions.put(new JSONObject().put("value", "AND").put("label", Messages.get("automation.logic_and")));
+            logicOptions.put(new JSONObject().put("value", "OR").put("label", Messages.get("automation.logic_or")));
+            logic.put("options", logicOptions);
+            conditions.put("logic", logic);
             json.put(triggers);
             json.put(conditions);
         } catch (Exception e) {

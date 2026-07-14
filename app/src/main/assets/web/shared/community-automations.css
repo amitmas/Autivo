@@ -127,6 +127,12 @@
     margin-top: 2px;
 }
 
+.community-badge-mine {
+    background: var(--brand-primary, #00d4aa);
+    border-color: var(--brand-primary, #00d4aa);
+    color: #05100c;
+    margin-left: 6px;
+}
 .community-badge {
     flex-shrink: 0;
     padding: 3px 10px;

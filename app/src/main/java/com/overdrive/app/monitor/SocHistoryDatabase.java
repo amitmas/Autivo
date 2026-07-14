@@ -829,7 +829,8 @@ public class SocHistoryDatabase {
                             // Peak-guarded so a misread DC gun on a low-power charge isn't stored as DC.
                             int isDc = deriveIsDc(chargingGunState, chargingPeakPower);
                             int rangeGained = rangeGainedFromEnergy(energyAdded);
-                            double rate = getElectricityRate();
+                            // DC sessions bill at the separate DC tariff when set.
+                            double rate = effectiveRate(isDc);
                             String curr = getCurrencySymbol();
                             double cost = (rate > 0 && energyAdded > 0) ? energyAdded * rate : -1;
                             int ttf = chargingTimeToFullMin;
@@ -1043,7 +1044,9 @@ public class SocHistoryDatabase {
                 // elecRangeKm delta was unavailable during parked charging (always
                 // blank) and noisy. Same basis as the live in-progress card.
                 int rangeGained = rangeGainedFromEnergy(energyAdded);
-                double rate = getElectricityRate();
+                // DC sessions bill at the separate DC tariff when set; AC/unknown
+                // fall back to the base rate (see effectiveRate).
+                double rate = effectiveRate(isDc);
                 String curr = getCurrencySymbol();
                 double cost = (rate > 0 && energyAdded > 0) ? energyAdded * rate : -1;
                 // Use the value latched WHILE charging — re-reading now would
@@ -1516,9 +1519,7 @@ public class SocHistoryDatabase {
             }
             double avgPower = count > 0 ? sum / count : -1;
             int rangeGained = rangeGainedFromEnergy(energyAdded);
-            double rate = getElectricityRate();
-            double cost = (rate > 0 && energyAdded > 0) ? energyAdded * rate : -1;
-            String curr = getCurrencySymbol();
+            // Determine AC/DC first — the DC tariff selection depends on it.
             int gun = -1;
             try (PreparedStatement r = connection.prepareStatement(
                     "SELECT gun_state FROM " + TABLE_CHARGING + " WHERE start_time = ?;")) {
@@ -1526,6 +1527,10 @@ public class SocHistoryDatabase {
                 try (ResultSet rs = r.executeQuery()) { if (rs.next()) gun = rs.getInt(1); }
             }
             int isDc = deriveIsDc(gun, peak);  // peak-guarded against a misread DC gun
+            // DC sessions bill at the separate DC tariff when set.
+            double rate = effectiveRate(isDc);
+            double cost = (rate > 0 && energyAdded > 0) ? energyAdded * rate : -1;
+            String curr = getCurrencySymbol();
             double tAvg = lastTemp > -999 ? lastTemp : -999;
 
             try (PreparedStatement upd = connection.prepareStatement(
@@ -1801,6 +1806,41 @@ public class SocHistoryDatabase {
             }
         } catch (Exception ignored) {}
         return -1;
+    }
+
+    /**
+     * Optional separate DC-fast tariff (per kWh), read-through to the
+     * {@code chargingAnalytics} config section (its owner — see ChargingConfig).
+     * DC fast-charging is often billed at a higher public rate than home AC, so
+     * a user can set this to price DC sessions correctly. Returns 0 when unset,
+     * which the caller treats as "fall back to the base rate".
+     */
+    private double getDcRate() {
+        try {
+            org.json.JSONObject cfg = com.overdrive.app.config.UnifiedConfigManager.loadConfig();
+            org.json.JSONObject charging = cfg != null ? cfg.optJSONObject("chargingAnalytics") : null;
+            if (charging != null) {
+                double r = charging.optDouble("dcRate", 0);
+                if (r > 0) return r;
+            }
+        } catch (Exception ignored) {}
+        return 0;
+    }
+
+    /**
+     * Effective per-kWh rate for a session's cost. Uses the separate DC tariff
+     * ONLY when the session is confidently DC ({@code isDc == 1}) and a DC rate
+     * is configured; otherwise the base (AC/home) rate. A tri-state {@code isDc}
+     * of -1 (unknown / peak-downgraded gun misread) or 0 (AC) both use the base
+     * rate — the safe default. This is the single rate-selection point shared by
+     * every cost-writing path so DC and AC sessions can't diverge.
+     */
+    private double effectiveRate(int isDc) {
+        if (isDc == 1) {
+            double dc = getDcRate();
+            if (dc > 0) return dc;
+        }
+        return getElectricityRate();
     }
 
     private String getCurrencySymbol() {
@@ -2167,7 +2207,10 @@ public class SocHistoryDatabase {
                 }
                 if (e > 0) {
                     o.put("energyAdded", e);
-                    double rate2 = getElectricityRate();
+                    // DC sessions bill at the separate DC tariff when set — same
+                    // classifier + rate selection as the SESSION END path, so this
+                    // live card cost matches the value persisted when it closes.
+                    double rate2 = effectiveRate(deriveIsDc(chargingGunState, chargingPeakPower));
                     if (rate2 > 0) o.put("cost", e * rate2);
                     // Range gained derived from energy × efficiency (the car's
                     // elecRangeKm delta is unavailable while parked/charging).

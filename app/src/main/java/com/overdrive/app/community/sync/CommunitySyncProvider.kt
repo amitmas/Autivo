@@ -52,17 +52,19 @@ class CommunitySyncProvider(
     )
 
     /** GET /automations with the raw query string already assembled by the caller
-     *  (the handler forwards the web page's whitelisted params verbatim). */
-    fun list(query: String): Result {
+     *  (the handler forwards the web page's whitelisted params verbatim). [viewerDeviceId],
+     *  when set, is sent as X-Device-Id so the Worker can flag which rows are the
+     *  caller's own (`mine`) — advisory UX only, never required. */
+    fun list(query: String, viewerDeviceId: String? = null): Result {
         val base = baseUrl() ?: return fail("no community worker URL configured")
         val url = if (query.isEmpty()) "$base/automations" else "$base/automations?$query"
-        return httpGet(url)
+        return httpGet(url, viewerDeviceId)
     }
 
-    /** GET /automations/{id} — full record including the rules blob. */
-    fun get(id: String): Result {
+    /** GET /automations/{id} — full record including the rules blob. [viewerDeviceId] as in [list]. */
+    fun get(id: String, viewerDeviceId: String? = null): Result {
         val base = baseUrl() ?: return fail("no community worker URL configured")
-        return httpGet("$base/automations/${enc(id)}")
+        return httpGet("$base/automations/${enc(id)}", viewerDeviceId)
     }
 
     /** POST /automations — publish. [rules] is the Automation.toJson() object. */
@@ -124,8 +126,10 @@ class CommunitySyncProvider(
 
     // ── HTTP plumbing ────────────────────────────────────────────────────────
 
-    private fun httpGet(url: String): Result = try {
-        exec(Request.Builder().url(url).get().build())
+    private fun httpGet(url: String, viewerDeviceId: String? = null): Result = try {
+        val b = Request.Builder().url(url).get()
+        if (!viewerDeviceId.isNullOrEmpty()) b.header("X-Device-Id", viewerDeviceId)
+        exec(b.build())
     } catch (t: Throwable) {
         fail(t.message ?: "GET error")
     }

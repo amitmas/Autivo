@@ -34,6 +34,7 @@ import java.io.OutputStream;
  *   POST /api/vehicle/lights        — SDK_ONLY
  *   POST /api/vehicle/adas          — SDK_ONLY
  *   POST /api/vehicle/setting       — SDK_ONLY
+ *   POST /api/vehicle/media         — media volume (AudioManager) + screen brightness (setting HAL)
  *   POST /api/vehicle/battery-heat  — CLOUD_ONLY
  *   GET  /api/vehicle/charging-schedule  — local mirror { enabled, startChargeTime, endChargeTime, chargeWay }
  *   POST /api/vehicle/charging-schedule  — { startChargeTime, endChargeTime, chargeWay, enabled } CLOUD_ONLY
@@ -129,6 +130,29 @@ public class VehicleControlApiHandler {
         // POST /api/vehicle/setting
         if (cleanPath.equals("/api/vehicle/setting") && method.equals("POST")) {
             handleSetting(out, body);
+            return true;
+        }
+
+        // POST /api/vehicle/media — media volume + screen brightness. These are
+        // Android-level controls (AudioManager / BYD setting HAL), not cloud/CAN.
+        if (cleanPath.equals("/api/vehicle/media") && method.equals("POST")) {
+            handleMedia(out, body);
+            return true;
+        }
+
+        // POST /api/vehicle/play-audio — play a user file (MP3/WAV/MP4) on a channel
+        // through the daemon MediaPlayer. POST /api/vehicle/stop-audio — stop it.
+        // Under the already-allowlisted /api/vehicle/ prefix so automation + keymap
+        // reach it without widening the bypass surface.
+        if (cleanPath.equals("/api/vehicle/play-audio") && method.equals("POST")) {
+            handlePlayAudio(out, body);
+            return true;
+        }
+        if (cleanPath.equals("/api/vehicle/stop-audio") && method.equals("POST")) {
+            com.overdrive.app.byd.AudioPlaybackController.stop();
+            JSONObject r = new JSONObject();
+            r.put("success", true);
+            HttpResponse.sendJson(out, r.toString());
             return true;
         }
 
@@ -789,6 +813,12 @@ public class VehicleControlApiHandler {
                 cmd = new VehicleCommandRouter.AdasSpeedLimitWarningCommand(enable);
             } else if ("esp".equals(target)) {
                 cmd = new VehicleCommandRouter.AdasEspCommand(enable);
+            } else if ("laneAssist".equals(target)) {
+                // Multi-mode (not on/off): 0=Off, 1=LDW, 2=LDP, 3=LDW+LDP. Accept an
+                // explicit "mode" int; fall back to mapping the on/off "enable" to
+                // Off(0) / LDW+LDP(3) so a plain toggle still does something sensible.
+                int mode = req.has("mode") ? req.optInt("mode", 0) : (enable ? 3 : 0);
+                cmd = new VehicleCommandRouter.AdasLaneAssistCommand(mode);
             } else {
                 response.put("success", false);
                 response.put("error", Messages.get("errors.vehicle_unsupported_target_with_target", target));
@@ -817,14 +847,22 @@ public class VehicleControlApiHandler {
     private static void handleAdasState(OutputStream out) throws Exception {
         JSONObject response = new JSONObject();
         try {
-            int espRaw = BydDataCollector.getInstance().getEspState();
-            response.put("success", espRaw >= 0);
+            BydDataCollector collector = BydDataCollector.getInstance();
+            int espRaw = collector.getEspState();
+            int itacRaw = collector.getItacState();
+            // success if either readback yielded a usable value
+            response.put("success", espRaw >= 0 || itacRaw >= 0);
             JSONObject esp = new JSONObject();
             esp.put("raw", espRaw);
             if (espRaw == 1) esp.put("on", true);
             else if (espRaw == 0) esp.put("on", false);
             // any other value (incl. -1) → "on" omitted: unavailable / unknown encoding
             response.put("esp", esp);
+            JSONObject itac = new JSONObject();
+            itac.put("raw", itacRaw);
+            if (itacRaw == 1) itac.put("on", true);
+            else if (itacRaw == 0) itac.put("on", false);
+            response.put("itac", itac);
             HttpResponse.sendJson(out, response.toString());
         } catch (Exception e) {
             logger.warn("Adas state read failed: " + e.getMessage());
@@ -863,6 +901,234 @@ public class VehicleControlApiHandler {
             response.put("success", false);
             response.put("error", e.getMessage());
             HttpResponse.sendJson(out, response.toString());
+        }
+    }
+
+    /**
+     * Media controls — Android-level, not cloud/CAN.
+     * Body: { "target": "volume", "value": 0-100, "channel": "media" }
+     *          → volume on the chosen audio channel as a percentage
+     *       { "target": "brightness", "value": 0-100 } → infotainment screen brightness
+     *       { "target": "cluster_brightness", "value": 0-100 } → driver-cluster brightness
+     *       { "target": "hud_brightness", "value": 0-100 } → head-up-display brightness
+     *
+     * Volume is applied via AudioManager on the daemon's app context, mapping the
+     * 0-100 percentage onto the chosen stream's real max index so it is
+     * device-independent. The optional "channel" selects the Android stream
+     * (media/navigation/voice/phone/system/alarm/ring); default "media" (STREAM_MUSIC)
+     * preserves the original single-channel behaviour. Brightness targets reuse the
+     * proven dedicated BydAutoSettingDevice setters (setInfotainmentBrightness /
+     * setDriverDisplayBrightness / setHUDBrightness), all 0-100.
+     */
+    private static void handleMedia(OutputStream out, String body) throws Exception {
+        JSONObject response = new JSONObject();
+        try {
+            JSONObject req = new JSONObject(body);
+            String target = req.optString("target", null);
+            int value = req.optInt("value", -1);
+            // Volume is an ABSOLUTE step index (0..stream max, ~40 for media on this head
+            // unit — matching the car's own volume button), NOT a 0-100 percentage; its
+            // upper bound is the real stream max, enforced by clamping in
+            // setChannelVolumeIndex. Brightness stays a 0-100 percentage. So only
+            // brightness targets are range-checked to 0-100 here; volume just needs >= 0.
+            boolean isVolume = "volume".equals(target);
+            if (value < 0 || (!isVolume && value > 100)) {
+                response.put("success", false);
+                response.put("error", isVolume ? "value must be >= 0" : "value must be 0-100");
+                HttpResponse.sendJson(out, response.toString());
+                return;
+            }
+            boolean ok;
+            if (isVolume) {
+                // Optional channel; default "media" keeps the pre-existing behaviour.
+                String channel = req.optString("channel", "media");
+                ok = setChannelVolumeIndex(channel, value);
+            } else if ("brightness".equals(target)) {
+                ok = BydDataCollector.getInstance().setInfotainmentBrightness(value);
+            } else if ("cluster_brightness".equals(target)) {
+                ok = BydDataCollector.getInstance().setDriverDisplayBrightness(value);
+            } else if ("hud_brightness".equals(target)) {
+                ok = BydDataCollector.getInstance().setHudBrightness(value);
+            } else if ("hud_power".equals(target)) {
+                // This platform has no dedicated HUD on/off switch (confirmed against
+                // the OEM firmware — only setHUDBrightness exists). So "off" = brightness
+                // 0 (dims the HUD out), "on" = full brightness. The action sends value=0
+                // for off and value=100 for on; anything >0 is treated as on-at-that-level.
+                ok = BydDataCollector.getInstance().setHudBrightness(value);
+            } else if ("screen_power".equals(target)) {
+                // Turn the infotainment (centre) screen fully on/off via the proven
+                // backlight path (PowerManager.turnBacklightOn/Off → BYDAutoSettingDevice
+                // → shell WAKEUP/SLEEP keyevent). NOT goToSleep — the car's ACC-on
+                // keep-awake logic fights a real sleep. value=0 → off, anything >0 → on.
+                ok = BydDataCollector.getInstance().setScreenPower(value > 0);
+            } else {
+                response.put("success", false);
+                response.put("error", Messages.get("errors.vehicle_unsupported_target_with_target", target));
+                HttpResponse.sendJson(out, response.toString());
+                return;
+            }
+            logger.info("Media: target=" + target + " value=" + value + " ok=" + ok);
+            response.put("success", ok);
+            response.put("target", target);
+            response.put("value", value);
+            HttpResponse.sendJson(out, response.toString());
+        } catch (Exception e) {
+            logger.warn("Media command failed: " + e.getMessage());
+            response.put("success", false);
+            response.put("error", e.getMessage());
+            HttpResponse.sendJson(out, response.toString());
+        }
+    }
+
+    // Audio library dir (mirror of AudioApiHandler.AUDIO_DIR) — where uploaded
+    // sounds picked by the "Play Audio" action live. A "name" payload resolves here.
+    private static final String AUDIO_LIBRARY_DIR = "/data/local/tmp/.overdrive/audio";
+
+    /**
+     * Play an uploaded sound (by library {@code name}) or an explicit {@code path} on
+     * a chosen channel via the daemon MediaPlayer. Body:
+     * { "name": "alert.mp3", "channel": "media" }  — library file (the normal path,
+     * chosen by the AudioType picker), or
+     * { "path": "/storage/emulated/0/Music/x.mp3", "channel": "media" } — explicit
+     * path (advanced). Channel defaults to "media". The controller validates the file
+     * (exists, readable, under an allowed media root) and plays asynchronously, so
+     * this returns as soon as playback is queued.
+     */
+    private static void handlePlayAudio(OutputStream out, String body) throws Exception {
+        JSONObject response = new JSONObject();
+        try {
+            JSONObject req = (body == null || body.isEmpty()) ? new JSONObject() : new JSONObject(body);
+            String channel = req.optString("channel", "media");
+            boolean loop = req.optBoolean("loop", false);
+            // "display": "screen" shows an MP4's picture on the head-unit SurfaceControl
+            // lane; anything else (default) is audio-only (speakers). Audio files ignore it.
+            boolean onScreen = "screen".equalsIgnoreCase(req.optString("display", "speakers"));
+            // Prefer a library "name"; fall back to an explicit "path".
+            String name = req.optString("name", null);
+            String path = req.optString("path", null);
+            String resolved = null;
+            if (name != null && !name.trim().isEmpty()) {
+                // Resolve the library name to its path. Guard against traversal by
+                // taking only the basename before joining to the library dir.
+                String base = new java.io.File(name.trim()).getName();
+                resolved = new java.io.File(AUDIO_LIBRARY_DIR, base).getAbsolutePath();
+            } else if (path != null && !path.trim().isEmpty()) {
+                resolved = path.trim();
+            }
+            if (resolved == null) {
+                response.put("success", false);
+                response.put("error", "name or path is required");
+                HttpResponse.sendJson(out, response.toString());
+                return;
+            }
+            boolean ok = onScreen
+                    ? com.overdrive.app.byd.AudioPlaybackController.playVideoOnScreen(resolved, channel, loop)
+                    : com.overdrive.app.byd.AudioPlaybackController.play(resolved, channel, loop);
+            response.put("success", ok);
+            response.put("path", resolved);
+            response.put("channel", channel);
+            if (!ok) response.put("error", "could not play (missing/unreadable file, or playback unavailable)");
+            HttpResponse.sendJson(out, response.toString());
+        } catch (Exception e) {
+            logger.warn("play-audio failed: " + e.getMessage());
+            response.put("success", false);
+            response.put("error", e.getMessage());
+            HttpResponse.sendJson(out, response.toString());
+        }
+    }
+
+    /**
+     * Map a channel name to its Android {@code AudioManager.STREAM_*} type. Channel→
+     * stream mapping per the OEM firmware's per-channel volume setters (media =
+     * STREAM_MUSIC(3), navigation ≈ STREAM_NAVI(14), voice(16/17), phone =
+     * STREAM_VOICE_CALL(0)). We use only the stable public STREAM constants so
+     * behaviour is deterministic across SDK levels; the OEM-extended navi/voice
+     * streams are approximated by the closest public stream (navigation→
+     * STREAM_MUSIC-adjacent is unreliable, so navigation maps to the public
+     * STREAM_NOTIFICATION-independent choice below is avoided — see mapping). Unknown
+     * channel → STREAM_MUSIC.
+     */
+    private static int streamForChannel(String channel) {
+        if (channel == null) return android.media.AudioManager.STREAM_MUSIC;
+        switch (channel.trim().toLowerCase()) {
+            case "phone":
+            case "call":        return android.media.AudioManager.STREAM_VOICE_CALL;
+            case "system":      return android.media.AudioManager.STREAM_SYSTEM;
+            case "alarm":       return android.media.AudioManager.STREAM_ALARM;
+            case "ring":        return android.media.AudioManager.STREAM_RING;
+            case "navigation":
+            case "voice":
+                // BYD routes navigation/TTS prompts through STREAM_MUSIC on the public
+                // API surface (the OEM-extended NAVI/VOICE streams 14-17 are not part
+                // of the public AudioManager contract and setting them by raw int is
+                // firmware-specific). Map to STREAM_MUSIC so the write always lands on
+                // a valid stream; a future OEM-stream path can override this.
+            case "media":
+            default:            return android.media.AudioManager.STREAM_MUSIC;
+        }
+    }
+
+    /**
+     * Set the given audio channel's volume to an ABSOLUTE step index via AudioManager
+     * on the daemon's app context — the same 0..max scale as the car's own volume
+     * button (media max is 40 on this head unit). The index is clamped to the stream's
+     * real max so a too-high value pins to max rather than failing. Returns false when
+     * no context / AudioManager is available.
+     */
+    private static boolean setChannelVolumeIndex(String channel, int index) {
+        try {
+            android.content.Context ctx = com.overdrive.app.daemon.CameraDaemon.getAppContext();
+            if (ctx == null) {
+                logger.warn("setChannelVolumeIndex: no context available");
+                return false;
+            }
+            android.media.AudioManager am = (android.media.AudioManager)
+                    ctx.getSystemService(android.content.Context.AUDIO_SERVICE);
+            if (am == null) {
+                logger.warn("setChannelVolumeIndex: AudioManager unavailable");
+                return false;
+            }
+            int stream = streamForChannel(channel);
+            int max = am.getStreamMaxVolume(stream);
+            if (max <= 0) return false;
+            int clamped = Math.max(0, Math.min(max, index));
+            am.setStreamVolume(stream, clamped, 0);
+            // OEM parameter write for the MEDIA channel. On some BYD trims a plain
+            // setStreamVolume updates the Android stream index WITHOUT moving the
+            // amplifier — the head unit's real knob is the "volume_music" AudioManager
+            // parameter. The OEM firmware writes setStreamVolume LAST, behind this
+            // parameter, which is strong evidence it's the authoritative path. We issue
+            // both (belt-and-suspenders): setStreamVolume above for trims where it works,
+            // and the volume_music parameter here for trims where it's the real lever.
+            // "8" is the OEM's media stream id; the three forms match the firmware's own
+            // variants. Best-effort — parameter writes never throw fatally.
+            if (stream == android.media.AudioManager.STREAM_MUSIC) {
+                setMediaVolumeParameter(am, clamped);
+            }
+            logger.info("setChannelVolumeIndex: channel=" + channel + " index=" + clamped + "/" + max);
+            return true;
+        } catch (Exception e) {
+            logger.warn("setChannelVolumeIndex failed: " + e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Write the OEM "volume_music" AudioManager parameter for the media stream — the
+     * lever the head-unit firmware itself uses for media volume (mirrors the OEM
+     * firmware's setMediaVolumeViaParameters, which tries these three forms). The "8"
+     * is the OEM media stream id. Best-effort: setParameters is a fire-and-forget OEM
+     * hook that may be a no-op on trims that don't recognise it, so failures are
+     * swallowed — the setStreamVolume write already ran as the standard-Android path.
+     */
+    private static void setMediaVolumeParameter(android.media.AudioManager am, int level) {
+        String[] forms = {
+                "volume_music=" + level,
+                "volume_music=8," + level,
+                "volume_music=" + level + ",8",
+        };
+        for (String form : forms) {
+            try { am.setParameters(form); } catch (Throwable ignored) { /* OEM hook may reject */ }
         }
     }
 

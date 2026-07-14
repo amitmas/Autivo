@@ -51,6 +51,12 @@ public final class PermissionGranter {
         "android.permission.DEVICE_ACC",
         "android.permission.DEVICE_POWER",
         "android.permission.VIBRATE",
+        // Standard Bluetooth read access for the automation Bluetooth trigger. On
+        // targetSdk 25 these are normal (install-time) perms auto-granted at install,
+        // so pm grant typically reports "not a changeable permission" (→ skipped,
+        // harmless); listed here so the grant is attempted anyway and intent is clear.
+        "android.permission.BLUETOOTH",
+        "android.permission.BLUETOOTH_ADMIN",
 
         // --- BYD HAL: core vehicle subsystems ---
         "android.permission.BYDAUTO_AC_COMMON",

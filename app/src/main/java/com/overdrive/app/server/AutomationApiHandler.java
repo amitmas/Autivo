@@ -180,22 +180,44 @@ public final class AutomationApiHandler {
         return true;
     }
 
+    // Off-HTTP-thread executor for running tested action chains. A test fires the
+    // chain which may now contain blocking steps (pause up to 5 min, waitUntil up to
+    // 10 min); running it inline would tie up an HttpServer pool thread for that whole
+    // time (and repeated tests could exhaust the fixed pool and stall the web UI /
+    // telemetry serving). So /test returns as soon as it confirms the automation
+    // EXISTS and dispatches the actual firing here. Daemon thread so it never blocks
+    // process exit; single-thread so two tests queue rather than pile up.
+    private static final java.util.concurrent.ExecutorService TEST_EXECUTOR =
+            java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "AutomationTest");
+                t.setDaemon(true);
+                return t;
+            });
+
     /**
      * Run an automation's actions without checking its conditions so a user can test them.
      * Returns 404 for an unknown id; a known automation (even a disabled one) reports success, since
-     * triggerActions reports only existence and intentionally allows testing without firing when the
-     * automation is disabled.
+     * a known automation always "exists" (testing a disabled one is an accepted no-op).
+     *
+     * <p>The action chain is fired on {@link #TEST_EXECUTOR}, NOT inline, so a chain
+     * containing a blocking {@code pause}/{@code waitUntil} step cannot hold the
+     * HttpServer pool thread for minutes (which would risk pool exhaustion). The
+     * response reports that the test was ACCEPTED (the automation exists); the actions
+     * then run in the background exactly as an event-triggered fire would.
      *
      * @param id  The id of the automation to test
      * @param out The output stream to write the response to
      * @return true so the router treats the request as handled
      */
     private static boolean testAutomation(String id, OutputStream out) throws Exception {
-        if (Automations.triggerActions(id, false)) {
-            HttpResponse.sendJsonSuccess(out);
-        } else {
+        if (!Automations.exists(id)) {
             HttpResponse.sendError(out, 404, "Automation not found.");
+            return true;
         }
+        // Fire off-thread; triggerActions already wraps action execution in
+        // catch(Throwable), so a misbehaving action can't kill the test executor.
+        TEST_EXECUTOR.submit(() -> Automations.triggerActions(id, false));
+        HttpResponse.sendJsonSuccess(out);
         return true;
     }
 

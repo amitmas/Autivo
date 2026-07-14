@@ -121,11 +121,10 @@ public class ChargingConfig {
     public double getElectricityRate() { return electricityRate; }
     public String getCurrency() { return currency; }
 
-    /** Effective rate for a session: DC tariff when isDc and a dcRate is set, else base rate. */
-    public double effectiveRate(boolean isDc) {
-        if (isDc && dcRate > 0) return dcRate;
-        return electricityRate;
-    }
+    // Rate selection for cost (DC tariff vs base) lives in SocHistoryDatabase
+    // .effectiveRate(int isDc) — the single point shared by every cost-writing
+    // path — since that is where sessions are priced and the is_dc verdict is
+    // computed. ChargingConfig only owns the stored dcRate value (see getDcRate).
 
     // ==================== SETTERS ====================
 

@@ -39,12 +39,37 @@ public final class AppLauncher {
     private AppLauncher() {}
 
     /**
-     * Launch the given package by resolving its default launcher activity.
+     * Launch the given package (full-screen) by resolving its default launcher activity.
      *
      * @param pkg the target application package name
      * @return true if a launch was dispatched (Intent or shell), false otherwise
      */
     public static boolean launch(String pkg) {
+        return launch(pkg, false);
+    }
+
+    /**
+     * Launch the given package, optionally into split-screen (multi-window).
+     *
+     * <p>Full-screen ({@code split=false}) keeps the original behaviour: a clean
+     * {@code getLaunchIntentForPackage} + {@code startActivity}, falling back to
+     * {@code monkey}.
+     *
+     * <p>Split-screen ({@code split=true}) uses {@code am start --windowingMode 3
+     * -n <component>} — the field-tested command. Windowing mode 3 is
+     * SPLIT_SCREEN_PRIMARY: it docks this app to one half so the app the user
+     * launches next lands in the other half. It REQUIRES the explicit launcher
+     * {@code <package>/<activity>} component (the flag has no effect on a plain
+     * {@code monkey}/category launch), so we resolve the component first via the
+     * PackageManager, then via {@code cmd package resolve-activity}. If the
+     * component can't be resolved (or the split am-start fails) we fall back to a
+     * normal full-screen launch rather than silently doing nothing.
+     *
+     * @param pkg   the target application package name
+     * @param split true to dock into split-screen, false for a normal launch
+     * @return true if a launch was dispatched, false otherwise
+     */
+    public static boolean launch(String pkg, boolean split) {
         if (pkg == null || pkg.trim().isEmpty()) {
             logger.warn("openApp: missing package");
             return false;
@@ -58,6 +83,23 @@ public final class AppLauncher {
         if (!isValidPackageName(pkg)) {
             logger.warn("openApp: rejected invalid package name");
             return false;
+        }
+
+        if (split) {
+            String component = resolveLauncherComponent(pkg);
+            if (component != null) {
+                // --windowingMode 3 = SPLIT_SCREEN_PRIMARY. The activity comes from
+                // the trusted PackageManager/cmd resolver and pkg is [A-Za-z0-9._];
+                // shell-quote the component defensively before dispatch.
+                if (runShell("am start --user 0 --windowingMode 3 -n " + shellQuote(component))) {
+                    logger.info("openApp: launched " + pkg + " in split-screen (" + component + ")");
+                    return true;
+                }
+                logger.warn("openApp: split-screen am start failed for " + component + " — falling back to full-screen");
+            } else {
+                logger.warn("openApp: could not resolve launcher component for " + pkg + " — falling back to full-screen");
+            }
+            // Fall through to the normal full-screen path below.
         }
 
         // 1) Intent path via the daemon's app Context (cleanest; no shell).
@@ -210,6 +252,49 @@ public final class AppLauncher {
             logger.warn("runShell failed: " + t.getMessage());
             return false;
         }
+    }
+
+    /**
+     * Resolve the {@code package/activity} launcher component for a package.
+     * Split-screen's {@code am start -n} needs the explicit component. Tries the
+     * PackageManager (daemon Context) first, then a shell
+     * {@code cmd package resolve-activity} fallback. Returns null if neither
+     * yields a component.
+     */
+    private static String resolveLauncherComponent(String pkg) {
+        Context ctx = CameraDaemon.getAppContext();
+        if (ctx != null) {
+            try {
+                PackageManager pm = ctx.getPackageManager();
+                Intent launch = pm.getLaunchIntentForPackage(pkg);
+                if (launch != null && launch.getComponent() != null) {
+                    return launch.getComponent().flattenToShortString();
+                }
+            } catch (Throwable t) {
+                logger.warn("resolveLauncherComponent: PackageManager failed for " + pkg + " (" + t.getMessage() + ")");
+            }
+        }
+        // Shell fallback: parse `cmd package resolve-activity --brief` for the component.
+        try {
+            Process p = new ProcessBuilder("sh", "-c",
+                    "cmd package resolve-activity --brief -c android.intent.category.LAUNCHER " + shellQuote(pkg))
+                    .redirectErrorStream(true).start();
+            StringBuilder sb = new StringBuilder();
+            InputStream is = p.getInputStream();
+            byte[] buf = new byte[4096];
+            int n;
+            while ((n = is.read(buf)) != -1) sb.append(new String(buf, 0, n));
+            p.waitFor(5, TimeUnit.SECONDS);
+            try { is.close(); } catch (Throwable ignored) { }
+            for (String line : sb.toString().split("\\r?\\n")) {
+                line = line.trim();
+                // A resolved component line looks like "pkg/.Activity" or "pkg/pkg.Activity".
+                if (line.startsWith(pkg + "/")) return line;
+            }
+        } catch (Throwable t) {
+            logger.warn("resolveLauncherComponent: shell resolve failed for " + pkg + " (" + t.getMessage() + ")");
+        }
+        return null;
     }
 
     /** Minimal shell quoting for a package name (defensive; pkg names are [A-Za-z0-9._]). */

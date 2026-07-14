@@ -210,7 +210,162 @@ public class StreamingApiHandler {
             handleBsTarget(out, path.substring("/api/bs/target/".length()));
             return true;
         }
+        // ── Camera-view (shares the BS lane; blind-spot priority) ──────────────
+        if (path.startsWith("/api/camview/")) {
+            return handleCamView(path, out);
+        }
         return false;
+    }
+
+    /**
+     * Camera-view routes. An on-demand camera view (front/rear/left/right/all-4)
+     * on the SAME native SurfaceControl lane the blind-spot feature uses.
+     *   POST /api/camview/show?cam=front&target=head_unit&preset=60/center&autoHide=0
+     *     (cam ∈ all|front|right|rear|left OR a raw int 0-4; target ∈ head_unit|cluster;
+     *      preset=sizePct/corner OR geometry=x/y/w/h; autoHide seconds, 0=until hidden)
+     *   POST /api/camview/hide
+     *   GET  /api/camview/status
+     */
+    private static boolean handleCamView(String path, OutputStream out) throws Exception {
+        GpuSurveillancePipeline pipeline = CameraDaemon.getGpuPipeline();
+        int q = path.indexOf('?');
+        String clean = q >= 0 ? path.substring(0, q) : path;
+        String query = q >= 0 ? path.substring(q + 1) : "";
+
+        if (clean.equals("/api/camview/status")) {
+            JSONObject r = new JSONObject();
+            r.put("success", true);
+            r.put("active", pipeline != null && pipeline.isCamViewActive());
+            if (pipeline != null) {
+                r.put("mode", pipeline.getCamViewMode());
+                r.put("target", pipeline.getCamViewTargetString());
+            }
+            HttpResponse.sendJson(out, r.toString());
+            return true;
+        }
+        if (pipeline == null) {
+            HttpResponse.sendJsonError(out, Messages.get("errors.streaming_pipeline_not_available"));
+            return true;
+        }
+        if (clean.equals("/api/camview/hide")) {
+            pipeline.disableCamView();
+            // Persist enabled=false so a daemon restart doesn't re-show it.
+            try { com.overdrive.app.config.UnifiedConfigManager.setCamViewValues(
+                java.util.Collections.singletonMap("enabled", false)); } catch (Throwable ignored) {}
+            JSONObject r = new JSONObject(); r.put("success", true); r.put("active", false);
+            HttpResponse.sendJson(out, r.toString());
+            return true;
+        }
+        if (clean.equals("/api/camview/show")) {
+            // Cold-start pano if needed (same dedup as BS); caller re-polls.
+            if (!ensurePanoStartedNonBlocking(pipeline)) {
+                JSONObject pending = new JSONObject();
+                pending.put("success", false); pending.put("starting", true);
+                pending.put("error", "Pipeline starting — try again in a few seconds");
+                pending.put("errorCode", "pano_starting");
+                HttpResponse.sendJson(out, pending.toString());
+                return true;
+            }
+            java.util.Map<String, String> p = parseQuery(query);
+            int mode = parseCamMode(p.get("cam"));
+            String target = "cluster".equals(p.get("target")) ? "cluster" : "head_unit";
+            int autoHide = 0;
+            try { if (p.containsKey("autoHide")) autoHide = Integer.parseInt(p.get("autoHide")); }
+            catch (NumberFormatException ignored) {}
+            // Persist geometry (preset or absolute) + selection BEFORE enabling so
+            // resolveCamViewGeometry reads it. Per-target geometry key.
+            persistCamViewGeometry(p, target);
+            try {
+                java.util.Map<String, Object> cvVals = new java.util.HashMap<>();
+                cvVals.put("enabled", true);
+                cvVals.put("mode", mode);
+                cvVals.put("target", target);
+                if (autoHide > 0) cvVals.put("autoHideSec", autoHide);
+                com.overdrive.app.config.UnifiedConfigManager.setCamViewValues(cvVals);
+            } catch (Throwable ignored) {}
+            try {
+                pipeline.enableCamView(mode, target, autoHide);
+            } catch (GpuSurveillancePipeline.BlindSpotNotReadyException nr) {
+                JSONObject pending = new JSONObject();
+                pending.put("success", false); pending.put("starting", true);
+                pending.put("error", "Camera-view lane arming — try again");
+                pending.put("errorCode", "camview_starting");
+                HttpResponse.sendJson(out, pending.toString());
+                return true;
+            }
+            JSONObject r = new JSONObject();
+            r.put("success", pipeline.isCamViewActive());
+            r.put("active", pipeline.isCamViewActive());
+            r.put("mode", mode); r.put("target", target);
+            HttpResponse.sendJson(out, r.toString());
+            return true;
+        }
+        HttpResponse.sendJsonError(out, "unknown camview endpoint");
+        return true;
+    }
+
+    /** Map a cam token to a scaler view mode: all/mosaic=0, front=1, right=2,
+     *  rear=3, left=4; a raw int 0-4 is accepted; default 0 (all-4). */
+    private static int parseCamMode(String cam) {
+        if (cam == null) return 0;
+        String c = cam.trim().toLowerCase();
+        switch (c) {
+            case "all": case "mosaic": case "all4": case "0": return 0;
+            case "front": case "1": return 1;
+            case "right": case "2": return 2;
+            case "rear": case "3": return 3;
+            case "left": case "4": return 4;
+            default:
+                try { int v = Integer.parseInt(c); return (v >= 0 && v <= 4) ? v : 0; }
+                catch (NumberFormatException e) { return 0; }
+        }
+    }
+
+    /** Persist camview geometry from the query (preset=sizePct/corner OR
+     *  geometry=x/y/w/h) into the per-target geometry key. No-op if neither given. */
+    private static void persistCamViewGeometry(java.util.Map<String, String> p, String target) {
+        try {
+            String geomKey = "cluster".equals(target) ? "geometryCluster" : "geometry";
+            JSONObject geo = null;
+            if (p.containsKey("preset")) {
+                String[] parts = p.get("preset").split("/");
+                if (parts.length >= 1) {
+                    geo = new JSONObject();
+                    geo.put("sizePct", Integer.parseInt(parts[0].trim()));
+                    if (parts.length >= 2) geo.put("corner", parts[1].trim());
+                }
+            } else if (p.containsKey("geometry")) {
+                String[] parts = p.get("geometry").split("/");
+                if (parts.length == 4) {
+                    geo = new JSONObject();
+                    geo.put("x", Integer.parseInt(parts[0].trim()));
+                    geo.put("y", Integer.parseInt(parts[1].trim()));
+                    geo.put("w", Integer.parseInt(parts[2].trim()));
+                    geo.put("h", Integer.parseInt(parts[3].trim()));
+                }
+            }
+            if (geo != null) {
+                com.overdrive.app.config.UnifiedConfigManager.setCamViewValues(
+                    java.util.Collections.singletonMap(geomKey, (Object) geo));
+            }
+        } catch (Throwable t) {
+            CameraDaemon.log("persistCamViewGeometry: " + t.getMessage());
+        }
+    }
+
+    /** Minimal query-string parser (k=v&k2=v2) → map. */
+    private static java.util.Map<String, String> parseQuery(String query) {
+        java.util.Map<String, String> m = new java.util.HashMap<>();
+        if (query == null || query.isEmpty()) return m;
+        for (String pair : query.split("&")) {
+            int eq = pair.indexOf('=');
+            if (eq > 0) {
+                String k = pair.substring(0, eq);
+                String v = pair.substring(eq + 1);
+                m.put(k, v);
+            }
+        }
+        return m;
     }
 
     /** POST /api/bs/target/{head_unit|cluster} — set the blind-spot display target.

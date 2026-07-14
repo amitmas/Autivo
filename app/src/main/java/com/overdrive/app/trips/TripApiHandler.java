@@ -265,13 +265,20 @@ public class TripApiHandler {
         int days = getIntParam(params, "days", 7);
         int limit = getIntParam(params, "limit", 50);
         int offset = getIntParam(params, "offset", 0);
+        // Custom date range (epoch ms). When either bound is present we take
+        // the explicit-range path; otherwise fall back to the "last N days"
+        // window so existing callers (and the day-preset filters) are unchanged.
+        long fromMs = getLongParam(params, "from", 0L);
+        long toMs = getLongParam(params, "to", 0L);
 
         TripDatabase db = manager.getDatabase();
         if (db == null) {
             return errorResponse("Trip database not available", 500);
         }
 
-        List<TripRecord> trips = db.getTrips(days, limit, offset);
+        List<TripRecord> trips = (fromMs > 0 || toMs > 0)
+                ? db.getTripsBetween(fromMs, toMs, limit, offset)
+                : db.getTrips(days, limit, offset);
         JSONArray tripsArray = new JSONArray();
         for (TripRecord trip : trips) {
             enrichTripEnergy(trip);
@@ -1278,6 +1285,20 @@ public class TripApiHandler {
         if (value == null || value.isEmpty()) return defaultValue;
         try {
             return Integer.parseInt(value);
+        } catch (NumberFormatException e) {
+            return defaultValue;
+        }
+    }
+
+    /**
+     * Get a long query parameter with a default value. Used for epoch-ms
+     * range bounds, which overflow the int range {@link #getIntParam} parses.
+     */
+    private long getLongParam(Map<String, String> params, String key, long defaultValue) {
+        String value = params.get(key);
+        if (value == null || value.isEmpty()) return defaultValue;
+        try {
+            return Long.parseLong(value);
         } catch (NumberFormatException e) {
             return defaultValue;
         }

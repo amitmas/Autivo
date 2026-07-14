@@ -23,6 +23,9 @@ const copyIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" str
 const editIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>';
 const deleteIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>';
 const infoIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg>';
+// Reorder arrows for multi-row sections (move a step up / down in the chain).
+const moveUpIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m18 15-6-6-6 6"/></svg>';
+const moveDownIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>';
 
 // Automation ids and the schema section ids are user / server supplied. They
 // are safe to interpolate into text, but NOT into class names (a leading
@@ -236,9 +239,25 @@ BYD.automations = {
             for (const section of sections) {
                 if (section.options && section.options.length) {
                     const sectionData = (automation[section.id] != null) ? automation[section.id] : [];
+                    // Skip an empty else section entirely so automations without an
+                    // else branch read exactly as before.
+                    if (section.id === 'elseActions' && sectionData.length === 0) continue;
                     for (let i = 0; i < sectionData.length; i++) {
                         const entry = sectionData[i] || {};
-                        result += i === 0 ? section.label : BYD.i18n.t('automation.extra_row');
+                        // Between rows, show the joiner. For a section with a logic
+                        // descriptor (conditions) use the chosen AND/OR word; otherwise
+                        // fall back to the generic extra_row label ("And"). Use ONE or
+                        // the other — never both — so a logic section doesn't render
+                        // "AND And".
+                        const hasLogic = !!(section.logic && section.logic.field);
+                        if (i === 0) {
+                            result += section.label;
+                        } else if (hasLogic) {
+                            const lg = (automation[section.logic.field] || section.logic.default || 'AND');
+                            result += BYD.i18n.t('automation.logic_' + lg.toLowerCase());
+                        } else {
+                            result += BYD.i18n.t('automation.extra_row');
+                        }
                         result += ' ';
                         const data = section.options.find(option => option.id === entry.type);
                         if (!data) continue;
@@ -306,25 +325,74 @@ BYD.automations = {
             if (section.description) {
                 sectionDiv.append(this.createRowDescription(section));
             }
+            // Optional AND/OR combining toggle for a section that advertises `logic`
+            // (currently the conditions section). Stored on formData under the
+            // descriptor's field name (e.g. "conditionLogic"); absent → server default.
+            if (section.logic && section.logic.field) {
+                sectionDiv.append(this.createLogicToggle(section.logic));
+            }
             for (let i = 0; i < this.formData[section.id].length; i++) {
                 if (i > 0) {
                     sectionDiv.append(this.createRowLabel({ id: section.id, label: BYD.i18n.t('automation.extra_row') }));
                 }
                 const row = this.createRow(section, i);
-                if (this.formData[section.id].length > required) {
-                    const deleteContainer = document.createElement('div');
-                    deleteContainer.classList.add(token + '-delete-container', 'delete-container');
+                const rowCount = this.formData[section.id].length;
+                const showReorder = rowCount > 1;   // only meaningful with 2+ rows
+                const showDelete = rowCount > required;
+                if (showReorder || showDelete) {
+                    const actionsContainer = document.createElement('div');
+                    actionsContainer.classList.add(token + '-delete-container', 'delete-container');
 
-                    const deleteBtn = document.createElement('button');
-                    deleteBtn.classList.add(token + '-delete', 'delete', 'icon-btn', 'danger');
-                    deleteBtn.title = BYD.i18n.t('automation.delete_row');
-                    deleteBtn.innerHTML = deleteIcon;
-                    deleteBtn.addEventListener('click', () => {
-                        this.formData[section.id].splice(i, 1);
-                        this.renderForm();
-                    });
-                    deleteContainer.append(deleteBtn);
-                    row.append(deleteContainer);
+                    // Reorder arrows — move this step up/down so a chain runs in the
+                    // order the user wants (actions run top-to-bottom). Swap adjacent
+                    // entries in formData and re-render. First row has no "up", last no
+                    // "down" (rendered disabled so the column stays aligned).
+                    if (showReorder) {
+                        const upBtn = document.createElement('button');
+                        upBtn.classList.add(token + '-move', 'move-up', 'icon-btn');
+                        upBtn.title = BYD.i18n.t('automation.move_up');
+                        upBtn.innerHTML = moveUpIcon;
+                        if (i === 0) {
+                            upBtn.disabled = true;
+                            upBtn.classList.add('unknown');
+                        } else {
+                            upBtn.addEventListener('click', () => {
+                                const arr = this.formData[section.id];
+                                const tmp = arr[i - 1]; arr[i - 1] = arr[i]; arr[i] = tmp;
+                                this.renderForm();
+                            });
+                        }
+                        actionsContainer.append(upBtn);
+
+                        const downBtn = document.createElement('button');
+                        downBtn.classList.add(token + '-move', 'move-down', 'icon-btn');
+                        downBtn.title = BYD.i18n.t('automation.move_down');
+                        downBtn.innerHTML = moveDownIcon;
+                        if (i === rowCount - 1) {
+                            downBtn.disabled = true;
+                            downBtn.classList.add('unknown');
+                        } else {
+                            downBtn.addEventListener('click', () => {
+                                const arr = this.formData[section.id];
+                                const tmp = arr[i + 1]; arr[i + 1] = arr[i]; arr[i] = tmp;
+                                this.renderForm();
+                            });
+                        }
+                        actionsContainer.append(downBtn);
+                    }
+
+                    if (showDelete) {
+                        const deleteBtn = document.createElement('button');
+                        deleteBtn.classList.add(token + '-delete', 'delete', 'icon-btn', 'danger');
+                        deleteBtn.title = BYD.i18n.t('automation.delete_row');
+                        deleteBtn.innerHTML = deleteIcon;
+                        deleteBtn.addEventListener('click', () => {
+                            this.formData[section.id].splice(i, 1);
+                            this.renderForm();
+                        });
+                        actionsContainer.append(deleteBtn);
+                    }
+                    row.append(actionsContainer);
                 }
                 sectionDiv.append(row);
             }
@@ -352,6 +420,36 @@ BYD.automations = {
             sectionDiv.append(row);
         }
         return sectionDiv;
+    },
+
+    // Render the AND/OR combining selector for a section that advertises a `logic`
+    // descriptor. The chosen value is written to this.formData[field] so it is
+    // serialized with the rest of the automation on save. Defaults to the
+    // descriptor's default (or the current formData value when editing).
+    createLogicToggle(logic) {
+        const field = logic.field;
+        const options = logic.options || [];
+        const current = (this.formData[field] != null) ? this.formData[field] : (logic.default || 'AND');
+        // Seed formData so a save without touching the control still persists a value.
+        this.formData[field] = current;
+
+        const row = document.createElement('div');
+        row.classList.add('logic-toggle', 'row');
+
+        const selector = document.createElement('select');
+        selector.classList.add('input', 'enum', 'logic-select');
+        for (const opt of options) {
+            const o = document.createElement('option');
+            o.value = opt.value;
+            o.textContent = opt.label || opt.value;
+            if (opt.value === current) o.selected = true;
+            selector.appendChild(o);
+        }
+        selector.addEventListener('change', () => {
+            this.formData[field] = selector.value;
+        });
+        row.append(selector);
+        return row;
     },
 
     createRow({ id, label, options }, index) {
@@ -474,6 +572,7 @@ BYD.automations = {
             case 'colour': return this.createColourInput(data, defaultValue, eventListener);
             case 'time': return this.createTimeInput(data, defaultValue, eventListener);
             case 'app': return this.createAppInput(data, defaultValue, eventListener);
+            case 'audio': return this.createAudioInput(data, defaultValue, eventListener);
             default: return this.createFallbackInput(data);
         }
     },
@@ -734,6 +833,62 @@ BYD.automations = {
         this.loadAppList().then(fill).catch(() => { changeEvent(); this._syncSaveDisabled(); });
         changeEvent();
         return selector;
+    },
+
+    // Uploaded-sound dropdown, populated live from GET /api/audio/library. The value
+    // stored is the sound's filename; options are NOT in the schema (they differ per
+    // device and change as the user uploads/deletes). Mirrors createAppInput.
+    createAudioInput(data, defaultValue, eventListener) {
+        const selector = document.createElement('select');
+        selector.classList.add('input', 'enum', 'audio');
+        const placeholder = document.createElement('option');
+        placeholder.value = '';
+        placeholder.textContent = data.label;
+        placeholder.disabled = true;
+        placeholder.selected = true;
+        placeholder.hidden = true;
+        selector.append(placeholder);
+
+        const fill = (sounds) => {
+            while (selector.options.length > 1) selector.remove(1);
+            for (const s of sounds) {
+                const opt = document.createElement('option');
+                opt.value = s.name;
+                opt.textContent = s.name;
+                selector.append(opt);
+            }
+            // If the stored sound was deleted since, keep showing it so the binding
+            // reveals what it points at rather than silently blanking.
+            if (defaultValue && !sounds.some(s => s.name === defaultValue)) {
+                const opt = document.createElement('option');
+                opt.value = defaultValue;
+                opt.textContent = defaultValue + ' (missing)';
+                selector.append(opt);
+            }
+            if (defaultValue) selector.value = defaultValue;
+            changeEvent();
+            this._syncSaveDisabled();
+        };
+
+        const changeEvent = () => {
+            const ok = !!selector.value;
+            selector.classList.toggle('invalid', !ok);
+            if (ok && eventListener) eventListener(selector, selector.value);
+        };
+        selector.addEventListener('change', changeEvent);
+
+        this.loadAudioList().then(fill).catch(() => { changeEvent(); this._syncSaveDisabled(); });
+        changeEvent();
+        return selector;
+    },
+
+    // Fetch (fresh each render — no cache, since the user may have just uploaded a
+    // sound in the library panel) the audio library. Resolves to [{name,path,size}].
+    loadAudioList() {
+        return fetch('/api/audio/library', { cache: 'no-store' })
+            .then(r => r.json())
+            .then(j => (j && j.success && Array.isArray(j.sounds)) ? j.sounds : [])
+            .catch(() => []);
     },
 
     // Fetch + cache the installed-app list. Resolves to [{package, label}].

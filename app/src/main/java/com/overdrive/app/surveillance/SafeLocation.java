@@ -14,7 +14,7 @@ public class SafeLocation {
     private String name;
     private double latitude;
     private double longitude;
-    private int radiusMeters;  // 50-500m
+    private int radiusMeters;  // 15-500m
     private boolean enabled;
     private long createdAt;
 
@@ -23,7 +23,7 @@ public class SafeLocation {
         this.name = name;
         this.latitude = latitude;
         this.longitude = longitude;
-        this.radiusMeters = Math.max(50, Math.min(500, radiusMeters));
+        this.radiusMeters = Math.max(15, Math.min(500, radiusMeters));
         this.enabled = true;
         this.createdAt = System.currentTimeMillis();
     }
@@ -34,7 +34,10 @@ public class SafeLocation {
         this.name = json.optString("name", "Unnamed");
         this.latitude = json.optDouble("lat", 0.0);
         this.longitude = json.optDouble("lng", 0.0);
-        this.radiusMeters = json.optInt("radiusM", 150);
+        // Clamp on load too (not just the value ctor / setter): the config file is
+        // world-writable, so an out-of-range radiusM (e.g. 1 = unreachable, or a huge
+        // earth-covering value = permanent suppression) could otherwise be honored.
+        this.radiusMeters = Math.max(15, Math.min(500, json.optInt("radiusM", 150)));
         this.enabled = json.optBoolean("enabled", true);
         this.createdAt = json.optLong("createdAt", System.currentTimeMillis());
     }
@@ -67,6 +70,6 @@ public class SafeLocation {
     public void setName(String name) { this.name = name; }
     public void setLatitude(double lat) { this.latitude = lat; }
     public void setLongitude(double lng) { this.longitude = lng; }
-    public void setRadiusMeters(int r) { this.radiusMeters = Math.max(50, Math.min(500, r)); }
+    public void setRadiusMeters(int r) { this.radiusMeters = Math.max(15, Math.min(500, r)); }
     public void setEnabled(boolean enabled) { this.enabled = enabled; }
 }

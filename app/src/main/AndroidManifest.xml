@@ -28,6 +28,11 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <!-- Standard Bluetooth read access for the automation Bluetooth trigger (bonded +
+         connected device names). targetSdk=25 → no runtime-permission wall; these are
+         install-time. BYDAUTO_BLUETOOTH_GET/SET (below) cover the OEM HAL. -->
+    <uses-permission android:name="android.permission.BLUETOOTH" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.READ_LOGS" />
     <uses-permission android:name="android.permission.WRITE_SETTINGS" />
@@ -471,6 +476,7 @@
             android:name="com.overdrive.app.overlay.StatusOverlayService"
             android:foregroundServiceType="specialUse"
             android:exported="false" />
+
 
         <!-- AccessibilityService Keep-Alive - Highest process priority protection.
              Prevents BYD firmware from killing the app after 24 hours.

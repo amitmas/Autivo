@@ -1,7 +1,9 @@
 package com.overdrive.app.community.config
 
 import com.overdrive.app.config.UnifiedConfigManager
+import com.overdrive.app.roadsense.sync.DeviceId
 import org.json.JSONObject
+import java.util.UUID
 
 /**
  * Typed accessor for the `community` section of [UnifiedConfigManager] — config for
@@ -47,6 +49,7 @@ object CommunityConfig {
     // Keys (also the JSON field names the web settings page reads/writes).
     private const val K_WORKER_URL = "workerUrl"     // user-configurable community-edge URL
     private const val K_AUTHOR_NAME = "authorName"   // remembered display name for publishing
+    private const val K_PUBLISHER_ID = "publisherId" // STABLE per-install id — the ownership key
 
     /** Immutable snapshot of the section — read once per use. */
     data class Snapshot(
@@ -76,6 +79,38 @@ object CommunityConfig {
                         else DEFAULT_WORKER_URL,
             authorName = s.optString(K_AUTHOR_NAME, "").ifEmpty { null },
         )
+    }
+
+    /**
+     * The STABLE community publisher id — the ownership key for publish/delete/rate/
+     * report. This is DELIBERATELY separate from [DeviceId.current], which ROTATES every
+     * 30 days for RoadSense location-privacy: if community reused the rotating id, then
+     * after a rotation the genuine author's new id would no longer match the
+     * `author_device` stored on the rows they published, and they could never delete
+     * their own uploads. Community has no location-linkage risk (an automation blob isn't
+     * geo-anchored) and the id is never exposed to other users (the Worker keeps
+     * author_device private and only emits a computed `mine` flag), so a stable id is
+     * correct here — ownership must persist for the life of the install.
+     *
+     * SEEDING: on first use we seed it from the CURRENT [DeviceId.current] value rather
+     * than a fresh random UUID, so any automations already published under the current
+     * (not-yet-rotated) device id remain owned by this install after the upgrade. If
+     * DeviceId can't be read, fall back to a fresh UUID. First call mints + persists;
+     * later calls reuse forever (no rotation).
+     */
+    fun publisherId(): String {
+        val root = UnifiedConfigManager.forceReload()
+        val existing = root.optJSONObject(SECTION)?.optString(K_PUBLISHER_ID, "")?.ifEmpty { null }
+        if (existing != null) return existing
+        // Seed from the current rotating device id so already-published rows stay owned;
+        // fall back to a fresh UUID if that read fails.
+        val seed = try {
+            DeviceId.current(System.currentTimeMillis())
+        } catch (_: Throwable) { null } ?: UUID.randomUUID().toString()
+        try {
+            UnifiedConfigManager.updateSection(SECTION, JSONObject().put(K_PUBLISHER_ID, seed))
+        } catch (_: Throwable) { /* if persist fails we'll re-seed next call; harmless */ }
+        return seed
     }
 
     /** Persist the remembered author display name (so a user types it once). */

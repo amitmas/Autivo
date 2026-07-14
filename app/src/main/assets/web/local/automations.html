@@ -33,8 +33,8 @@
     </script>
     <script src="../shared/app-tabs.js"></script>
     <link rel="stylesheet" href="../shared/styles.css?v=16">
-    <link rel="stylesheet" href="../shared/automations.css?v=shell6">
-    <link rel="stylesheet" href="../shared/community-automations.css?v=2">
+    <link rel="stylesheet" href="../shared/automations.css?v=av33">
+    <link rel="stylesheet" href="../shared/community-automations.css?v=3">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
 </head>
@@ -121,6 +121,32 @@
                     </div>
                 </div>
 
+                <!-- Audio Library: upload sounds the "Play Audio" action can use.
+                     Mirrors the Screen Deterrent image upload (base64 → daemon). -->
+                <div class="card" data-tab="automations">
+                    <div class="card-header">
+                        <div class="card-title">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+                            <span data-i18n="automation.audio_library_title">Audio Library</span>
+                        </div>
+                    </div>
+                    <div class="card-body">
+                        <div class="setting-row" style="border-bottom:none; align-items:flex-start;">
+                            <div class="setting-info">
+                                <div class="setting-name" data-i18n="automation.audio_library">Uploaded sounds</div>
+                                <div class="setting-desc" data-i18n="automation.audio_library_desc">Upload MP3, WAV or MP4 sounds (max 48 MB). The Play Audio action and key mapping can play any sound here.</div>
+                            </div>
+                            <div class="setting-control">
+                                <input type="file" id="audioLibFile" accept="audio/*,video/mp4,.mp3,.wav,.m4a,.aac,.ogg" style="display:none;" onchange="AudioLibrary.upload(this.files[0])">
+                                <button class="btn btn-secondary" onclick="document.getElementById('audioLibFile').click()">
+                                    <span id="audioLibUploadLabel" data-i18n="automation.audio_upload">Upload</span>
+                                </button>
+                            </div>
+                        </div>
+                        <div id="audioLibList"></div>
+                    </div>
+                </div>
+
                 <!-- Community tab: browse + import shared automations. All
                      elements tagged data-tab="community" so app-tabs shows them
                      only on the Community tab. Populated by community-automations.js. -->
@@ -168,8 +194,9 @@
     <script src="../shared/auth.js"></script>
     <script src="../shared/core.js"></script>
     <script src="../shared/update-flow.js"></script>
-    <script src="../shared/automations.js?v=shell5"></script>
-    <script src="../shared/community-automations.js?v=3"></script>
+    <script src="../shared/automations.js?v=av33"></script>
+    <script src="../shared/audio-library.js?v=2"></script>
+    <script src="../shared/community-automations.js?v=4"></script>
     <script>
         function toggleSidebar() {
             document.getElementById('sidebar').classList.toggle('open');

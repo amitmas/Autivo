@@ -23,7 +23,7 @@
     <string name="action_select_all">Tümünü seç</string>
     <string name="action_select_all_short">Hepsi .</string>
     <string name="action_delete">Sil</string>
-    <string name="action_share">Share</string>
+    <string name="action_share">Paylaş</string>
     <string name="action_done">Yapıldı</string>
     <string name="action_remind_me_later">Beni daha sonra hatırla .</string>
     <string name="action_retry">Tekrar dene</string>
@@ -57,7 +57,7 @@
     <string name="cd_player_quadrant_rear">Arka kamerayı göster</string>
     <string name="cd_player_quadrant_left">Sol kamerayı göster</string>
     <string name="cd_delete">Sil</string>
-    <string name="cd_share">Share</string>
+    <string name="cd_share">Paylaş</string>
     <string name="cd_expand">Genişle</string>
     <string name="cd_configure">Yapılandırma</string>
     <string name="cd_download_log">İndirme günlüğü</string>
@@ -67,18 +67,18 @@
     <string name="cd_permission_granted">Verilmiş izin</string>
     <!-- overlay_status -->
     <string name="overlay_rec_inactive_label">REC</string>
-    <string name="overlay_trip_inactive_label">TRIP</string>
-    <string name="overlay_mic_inactive_label">MIC</string>
+    <string name="overlay_trip_inactive_label">YOLCULUK</string>
+    <string name="overlay_mic_inactive_label">MİK</string>
     <!-- Quick-action chips revealed by tapping the REC pill: switch
          recording mode without opening the app. Short labels read fine
          cross-locale (matches existing REC/MIC/TRIP precedent), so
          translatable=false to avoid bloating the i18n catalog. The
          _cd content-descriptions are real prose and ARE translatable —
          they go through the NLLB pipeline like every other a11y string. -->
-    <string name="overlay_mode_off_cd">Stop recording</string>
-    <string name="overlay_mode_continuous_cd">Continuous recording</string>
-    <string name="overlay_mode_drive_cd">Drive-mode recording</string>
-    <string name="overlay_mode_proximity_cd">Proximity-guard recording</string>
+    <string name="overlay_mode_off_cd">Kaydı durdur</string>
+    <string name="overlay_mode_continuous_cd">Sürekli kayıt</string>
+    <string name="overlay_mode_drive_cd">Sürüş modu kaydı</string>
+    <string name="overlay_mode_proximity_cd">Yakınlık koruması kaydı</string>
     <!-- item_log_entry placeholders (timestamp/tag/message are runtime, but these are
          placeholder/preview text used at design time and visible in some empty states) -->
     <string name="log_entry_default_timestamp">12:34:56\'da.</string>
@@ -133,11 +133,11 @@
     <string name="camera_option_5">Kamera 5</string>
     <string name="camera_selection_hint">Otomatik olarak her çubukta trim için doğru kamera seçilir. Kamera 1 = BYD Seal, Kamera 0 = Atto trimler. Kurulumun yürürlüğe girmesi için kamera kimliğini değiştirdikten sonra daemon\'u yeniden başlatın.</string>
     <!-- OEM Dashcam camera ID picker (Phase 5: separate forward-sensor pipeline) -->
-    <string name="camera_oem_dashcam_title">OEM Dashcam Camera ID</string>
-    <string name="camera_oem_dashcam_hint">Pick the AVMCamera id that points at the forward dashcam sensor. Dashcam is the OPPOSITE of pano: Seal/Han pano = 1 → dashcam = 0; Atto / Tang pano = 0 → dashcam = 1. Leave on Auto to let OverDrive pick.</string>
-    <string name="camera_oem_dashcam_auto_resolved">Auto — using id %1$d (pano is id %2$d)</string>
-    <string name="camera_oem_dashcam_auto_unavailable">Auto — pano id is %1$d, can\'t infer dashcam</string>
-    <string name="camera_oem_dashcam_save">Save</string>
+    <string name="camera_oem_dashcam_title">OEM Dashcam Kamera Kimliği</string>
+    <string name="camera_oem_dashcam_hint">Ön dashcam sensörünü gösteren AVMCamera kimliğini seçin. Dashcam pano\'nun TERSİDİR: Seal/Han pano = 1 → dashcam = 0; Atto / Tang pano = 0 → dashcam = 1. OverDrive\'ın seçmesi için Auto\'da bırakın.</string>
+    <string name="camera_oem_dashcam_auto_resolved">Otomatik — id %1$d kullanılıyor (pano id %2$d)</string>
+    <string name="camera_oem_dashcam_auto_unavailable">Otomatik — pano id %1$d, dashcam çıkarılamıyor</string>
+    <string name="camera_oem_dashcam_save">Kaydet</string>
     <string name="camera_concurrent_probe_label">Sonraki açılışta çift kamera desteğini test et</string>
     <string name="camera_concurrent_probe_subtitle">Bu aracın pano + araç kamerasını eşzamanlı çalıştırabildiğini doğrulamak için her iki kamerayı aynı anda açan tek seferlik bir kontrol. Park halindeyken bir sonraki yeniden başlatmada bir kez çalışır. Kayıtlar hatalı görünmedikçe KAPALI bırakın — gerekli değildir ve çalışırken etkin bir kayıt varsa onu kısa süreliğine kesintiye uğratabilir.</string>
     <!-- Dashcam-side camera labels — REVERSE of the pano labels above. The
@@ -146,8 +146,8 @@
          dialogs. Without these strings the dashcam picker re-used the pano
          labels and told Seal owners to pick "Camera 1 — Seal" for their
          dashcam, which is the pano camera, not the dashcam. -->
-    <string name="camera_oem_option_0">Camera 0 — Seal / Han (default)</string>
-    <string name="camera_oem_option_1">Camera 1 — Atto / Tang</string>
+    <string name="camera_oem_option_0">Kamera 0 — Seal / Han (varsayılan)</string>
+    <string name="camera_oem_option_1">Kamera 1 — Atto / Tang</string>
     <!-- Camera mapping dialog (multi-vehicle role-to-slice routing) -->
     <string name="camera_mapping_title">Kamera Haritası</string>
     <string name="camera_role_label">Rol haritası</string>
@@ -262,7 +262,7 @@
     <string name="recording_lib_filter_section_severity">Ağırlık</string>
     <string name="recording_lib_filter_section_type">Tür</string>
     <string name="recording_lib_filter_section_place">Yer</string>
-    <string name="recording_lib_place_search_hint">Search places…</string>
+    <string name="recording_lib_place_search_hint">Yer ara…</string>
     <string name="recording_lib_chip_type_normal">Normal</string>
     <string name="recording_lib_chip_type_proximity">Yakınlık</string>
     <string name="recording_lib_date_today">Bugün</string>
@@ -281,29 +281,29 @@
     <string name="cd_open_filters">Açık filtreler</string>
     <string name="cd_clear_filter">Açık filtre</string>
     <!-- v5 redesign: SOTA empty state with CTA + tile type badges -->
-    <string name="recording_lib_empty_title">No recordings match</string>
-    <string name="recording_lib_empty_body">Try adjusting your date range or chip filters.</string>
-    <string name="recording_lib_empty_clear_filters">Clear filters</string>
+    <string name="recording_lib_empty_title">Eşleşen kayıt yok</string>
+    <string name="recording_lib_empty_body">Tarih aralığınızı veya çip filtrelerinizi ayarlamayı deneyin.</string>
+    <string name="recording_lib_empty_clear_filters">Filtreleri temizle</string>
     <!-- Shown on the empty-state body when there are zero clips on disk
          (no filter is active). Sets a friendlier tone than "No recordings match". -->
-    <string name="recording_lib_empty_disk_title">Nothing recorded yet</string>
-    <string name="recording_lib_empty_disk_body">Captures will appear here as soon as the dashcam or surveillance pipeline writes a clip.</string>
+    <string name="recording_lib_empty_disk_title">Henüz kayıt yok</string>
+    <string name="recording_lib_empty_disk_body">Dashcam veya gözetim hattı bir klip yazar yazmaz görüntüler burada görünür.</string>
     <!-- Shown while the daemon is warming the H2 recording index on cold
          start. Includes a progress counter when the daemon reports done/total,
          otherwise a static body. The library re-polls every 1.5s and
          transitions out automatically once results land. -->
-    <string name="recording_lib_building_index_title">Building library index</string>
-    <string name="recording_lib_building_index_body">One moment while the daemon scans your recordings.</string>
-    <string name="recording_lib_building_index_progress">Indexed %1$d of %2$d clips…</string>
+    <string name="recording_lib_building_index_title">Kitaplık dizini oluşturuluyor</string>
+    <string name="recording_lib_building_index_body">Daemon kayıtlarınızı tararken bir dakika bekleyin.</string>
+    <string name="recording_lib_building_index_progress">%2$d klipten %1$d tanesi dizinlendi…</string>
     <!-- Tile type badge labels — short, glanceable, mirrors the on-disk
          filename prefix (cam_/event_/dvr_/proximity_) so power users can
          map a tile back to its file group at a glance. -->
     <string name="recording_lib_type_normal">CAM</string>
-    <string name="recording_lib_type_event">EVENT</string>
+    <string name="recording_lib_type_event">OLAY</string>
     <string name="recording_lib_type_proximity">PROX</string>
     <string name="recording_lib_type_oem">OEM</string>
     <!-- Toast shown when a multi-select share is dispatched. -->
-    <string name="toast_share_recordings">Sharing %1$d recordings</string>
+    <string name="toast_share_recordings">%1$d kayıt paylaşılıyor</string>
     <!-- fragment_sentry_config -->
     <!-- fragment_video_player -->
     <string name="player_title_recording">Kayıt</string>
@@ -382,23 +382,23 @@
     <!-- Update dialog + version picker -->
     <string name="update_dialog_available_title">Güncelleme mevcut</string>
     <string name="update_dialog_subtitle">Daha yeni bir sürüm yüklenmeye hazır</string>
-    <string name="update_dialog_current">Current: v%1$s</string>
-    <string name="update_dialog_new">New: v%1$s</string>
+    <string name="update_dialog_current">Mevcut: v%1$s</string>
+    <string name="update_dialog_new">Yeni: v%1$s</string>
     <string name="update_dialog_current_label">Yüklendi</string>
     <string name="update_dialog_new_label">Yeni sürüm</string>
-    <string name="update_dialog_whats_new">What\'s new</string>
+    <string name="update_dialog_whats_new">Yenilikler</string>
     <string name="update_dialog_install_now">Şimdi yükle</string>
-    <string name="update_dialog_later">Later</string>
+    <string name="update_dialog_later">Daha sonra</string>
     <string name="update_picker_title">Bir sürüm seçin</string>
     <string name="update_picker_subtitle">Yayınlanmış herhangi bir sürümü yükleyin — yeni veya eski</string>
     <string name="update_picker_empty">Henüz sürüm yayınlanmadı.</string>
     <string name="update_picker_current_suffix">%1$s (yüklü)</string>
-    <string name="update_picker_older_suffix">%1$s (older)</string>
+    <string name="update_picker_older_suffix">%1$s (eski)</string>
     <!-- Update progress (title + per-step status; no emoji — state icon carries the cue) -->
     <string name="update_progress_title">Overdrive güncelleniyor</string>
     <string name="update_step_downloading">Güncelleme indiriliyor…</string>
     <string name="update_step_verifying">İndirme doğrulanıyor…</string>
-    <string name="update_step_stopping">Stopping daemons…</string>
+    <string name="update_step_stopping">Daemon\'lar durduruluyor…</string>
     <string name="update_step_installing">Güncelleme yükleniyor…</string>
     <string name="update_step_installed">Güncelleme yüklendi</string>
     <string name="update_step_restarting">Uygulama yeniden başlatılıyor…</string>
@@ -407,10 +407,10 @@
     <string name="update_error_daemon_down">Kamera servisi çalışmıyor. Servisler ekranından başlatın, ardından tekrar güncellemeyi deneyin.</string>
     <string name="update_error_start_failed">Güncelleme başlatılamadı: %1$s</string>
     <string name="update_error_lost_headunit">Yükleme bitmeden ana üniteyle bağlantı kesildi. Bir tünelde misiniz? Yeni URL için Telegram\'ı kontrol edin veya yerel IP\'yi kullanın.</string>
-    <string name="update_hide">Hide</string>
+    <string name="update_hide">Gizle</string>
     <!-- Update channel selector (Settings → About) -->
     <string name="settings_update_channel_title">Güncelleme kanalı</string>
-    <string name="settings_update_channel_alpha">Alpha</string>
+    <string name="settings_update_channel_alpha">Alfa</string>
     <string name="settings_update_channel_braveheart">Braveheart</string>
     <string name="settings_update_channel_alpha_desc">Kararlı sürüm. Yayınlanan her sürüm saklanır — yüklemek için herhangi birini seçin (eski sürüme geçişe izin verilir). Günlük kullanım için önerilir.</string>
     <string name="settings_update_channel_braveheart_desc">Yayınlandıkları anda sunulan en yeni sürümler. Yeni özelliklere ilk siz sahip olursunuz, ancak bunlar kararsız veya hatalı olabilir. Bir sorun oluşursa, Servisler ekranını açın, bir servisin günlüğüne dokunun, \"Yükle ve kod al\" seçeneğini seçin ve kodu topluluk kanallarımızda bizimle paylaşın.</string>
@@ -449,7 +449,7 @@
     <string name="dialog_reset_soh_title">SOH Tahmini yeniden ayarlayalım mı?</string>
     <string name="dialog_reset_soh_message">Bu, tüm SOH verilerini temizleyecek ve sıfırdan yeniden değerlendirmeyi zorlayacaktır.\n\nBattery değiştirildiyse bunu kullanın\n• SOH okuma yanlış görünüyor\n• Yeniden kalibrlemek isterseniz\n\nSistem bir sonraki mevcut veri kaynağından (OEM, şarj kalibrasyonu veya anlık okuma) yeniden üretecektir.</string>
     <string name="dialog_reset_following_title">Aşağıdakileri yeniden ayarlıyor musun?</string>
-    <string name="dialog_reset_following_message">This cannot be undone.\n\n%1$s</string>
+    <string name="dialog_reset_following_message">Bu geri alınamaz.\n\n%1$s</string>
     <string name="dialog_reset_complete_title">Yeniden ayarlama tamamlandı</string>
     <string name="dialog_traffic_cannot_check_title">Durumu kontrol edemiyorum</string>
     <string name="dialog_traffic_cannot_check_message">ADB bağlantısı henüz hazır değil.\n\nSistem paketlerini yönetmek için uygulamaya ADB erişimi gerekir. Lütfen emin olun:\n\n• USB Debugging geliştiricisi seçeneklerinde etkinleştirilmiştir\n• ADB yetki sorusu kabul edilmiştir\n\nStatus otomatik olarak bağlandıktan sonra güncellenir.</string>
@@ -539,7 +539,7 @@
     <string name="toast_daemon_manager_unavailable">Daemon yöneticisi hazır değil, bir an sonra tekrar dene.</string>
     <string name="toast_log_save_failed">Kayıt kaydedilemedi: %1$s</string>
     <string name="toast_log_not_found">Günlük dosyası bulunamadı veya okunamıyor</string>
-    <string name="log_share_title">%1$s Log - %2$s</string>
+    <string name="log_share_title">%1$s Günlüğü - %2$s</string>
     <string name="log_share_chooser">Paylaşım %1$s Log</string>
     <string name="log_header_title">%1$s Log</string>
     <string name="log_header_source">Kaynak: %1$s</string>
@@ -548,7 +548,7 @@
     <!-- Braveheart log send (upload to Cloudflare or share-sheet) -->
     <string name="logs_send_title">%1$s günlüğünü gönder</string>
     <string name="logs_send_title_plain">Servis günlüğünü gönder</string>
-    <string name="logs_send_subtitle">%1$s · choose how to send it to us</string>
+    <string name="logs_send_subtitle">%1$s · bize nasıl göndereceğinizi seçin</string>
     <string name="logs_send_upload">Yükle ve kod al</string>
     <string name="logs_send_upload_desc">Günlüğü bize gönderir ve size kısa bir kod verir. Destek için en kolay yol.</string>
     <string name="logs_send_share">Dosyayı paylaş…</string>
@@ -557,9 +557,9 @@
     <string name="logs_uploading_subtitle">Gizli bilgiler gizleniyor ve güvenli bir şekilde gönderiliyor</string>
     <string name="logs_uploaded_title">Günlük yüklendi</string>
     <string name="logs_uploaded_instructions">Bu kodu, sorun oluştuğunda ne yaptığınıza dair bir notla birlikte bizimle paylaşın. Discord, GitHub Issues veya WhatsApp\'ta yayınlayın — bağlantılar Hakkında ekranında bulunmaktadır.</string>
-    <string name="logs_uploaded_privacy">Secrets redacted · the log auto-expires</string>
-    <string name="logs_copy_code">Copy code</string>
-    <string name="logs_done">Done</string>
+    <string name="logs_uploaded_privacy">Gizli bilgiler gizlendi · günlük otomatik olarak sona erer</string>
+    <string name="logs_copy_code">Kodu kopyala</string>
+    <string name="logs_done">Bitti</string>
     <string name="placeholder_dash">—</string>
     <string name="errors_network">Ağ hatası</string>
     <!-- Recording controls -->
@@ -608,10 +608,10 @@
          notifications into one shade entry. The summary text is intentionally
          generic so it stays accurate whether all three services are running
          or only the keepalive survived an OOM respawn. -->
-    <string name="daemon_keepalive_notif_title">Overdrive Active</string>
-    <string name="daemon_keepalive_notif_text">Monitoring vehicle systems</string>
+    <string name="daemon_keepalive_notif_title">Overdrive Etkin</string>
+    <string name="daemon_keepalive_notif_text">Araç sistemleri izleniyor</string>
     <string name="overdrive_status_summary_title">Overdrive</string>
-    <string name="overdrive_status_summary_text">Background services running</string>
+    <string name="overdrive_status_summary_text">Arka plan hizmetleri çalışıyor</string>
     <!-- ============================================================== -->
     <!-- M3 Revamp: navigation rail + settings sub-rail + theme picker  -->
     <!-- ============================================================== -->
@@ -631,7 +631,7 @@
     <string name="settings_section_daemons">Şeytanlar</string>
     <string name="settings_section_privacy">Gizlilik &amp; Veriler</string>
     <string name="settings_section_overlay">Durum örtüsü</string>
-    <string name="settings_section_security">Security</string>
+    <string name="settings_section_security">Güvenlik</string>
     <string name="settings_overlay_subtitle">Uçan durum hapının hangi bölümlerinin görünür kalmasını seçin.</string>
     <string name="settings_overlay_camera_title">Kamera göstergesi</string>
     <string name="settings_overlay_camera_subtitle">Kayıt aktifken REC / PROX badgesini göster.</string>
@@ -853,56 +853,56 @@
          The lock guards the OverDrive UI only. Cam daemon, AccSentry,
          surveillance, recording, Telegram alerts, status overlay, and the
          deterrent screen all run independently regardless of this state. -->
-    <string name="settings_security_title">Security</string>
-    <string name="settings_security_subtitle">Lock the OverDrive app so passengers and valets can\'t open it without your PIN.</string>
-    <string name="settings_security_stance_title">UI lock only</string>
-    <string name="settings_security_stance_body">Surveillance, recording, deterrent, alerts, and background services keep running while the app is locked. The PIN gates the OverDrive interface, nothing else.</string>
-    <string name="settings_security_overline_lock">App lock</string>
-    <string name="settings_security_overline_recovery">If you forget your PIN</string>
-    <string name="settings_security_toggle_title">Require PIN</string>
-    <string name="settings_security_toggle_subtitle_off">Off — anyone can open OverDrive.</string>
-    <string name="settings_security_toggle_subtitle_on">On — PIN required to open OverDrive.</string>
-    <string name="settings_security_change_title">Change PIN</string>
-    <string name="settings_security_change_subtitle">Confirm current PIN, then set a new one.</string>
-    <string name="settings_security_autolock_title">Auto-lock</string>
-    <string name="settings_security_autolock_immediate">Lock immediately</string>
-    <string name="settings_security_autolock_1min">After 1 minute</string>
-    <string name="settings_security_autolock_5min">After 5 minutes</string>
-    <string name="settings_security_autolock_15min">After 15 minutes</string>
-    <string name="settings_security_autolock_never">Never auto-lock by time</string>
-    <string name="settings_security_recovery_title">ADB recovery</string>
-    <string name="settings_security_recovery_body">Forgotten PIN can be cleared from a host machine over USB debugging without a factory reset. Run this command, then reopen the app.</string>
+    <string name="settings_security_title">Güvenlik</string>
+    <string name="settings_security_subtitle">Yolcuların ve vale görevlilerinin PIN\'iniz olmadan açamaması için OverDrive uygulamasını kilitleyin.</string>
+    <string name="settings_security_stance_title">Yalnızca arayüz kilidi</string>
+    <string name="settings_security_stance_body">Uygulama kilitliyken gözetim, kayıt, caydırıcı, uyarılar ve arka plan hizmetleri çalışmaya devam eder. PIN yalnızca OverDrive arayüzünü kısıtlar, başka hiçbir şeyi değil.</string>
+    <string name="settings_security_overline_lock">Uygulama kilidi</string>
+    <string name="settings_security_overline_recovery">PIN\'inizi unutursanız</string>
+    <string name="settings_security_toggle_title">PIN gerektir</string>
+    <string name="settings_security_toggle_subtitle_off">Kapalı — herkes OverDrive\'ı açabilir.</string>
+    <string name="settings_security_toggle_subtitle_on">Açık — OverDrive\'ı açmak için PIN gerekli.</string>
+    <string name="settings_security_change_title">PIN Değiştir</string>
+    <string name="settings_security_change_subtitle">Mevcut PIN\'i onaylayın, ardından yeni bir tane belirleyin.</string>
+    <string name="settings_security_autolock_title">Otomatik kilit</string>
+    <string name="settings_security_autolock_immediate">Hemen kilitle</string>
+    <string name="settings_security_autolock_1min">1 dakika sonra</string>
+    <string name="settings_security_autolock_5min">5 dakika sonra</string>
+    <string name="settings_security_autolock_15min">15 dakika sonra</string>
+    <string name="settings_security_autolock_never">Zamana göre otomatik kilitleme</string>
+    <string name="settings_security_recovery_title">ADB kurtarma</string>
+    <string name="settings_security_recovery_body">Unutulan PIN, fabrika ayarlarına dönmeden USB hata ayıklama üzerinden bir ana bilgisayardan temizlenebilir. Bu komutu çalıştırın, ardından uygulamayı yeniden açın.</string>
     <!-- Verbatim ADB command. translatable=false so the i18n pipeline
          doesn't localize the literal path/command — translators following
          Crowdin would otherwise risk breaking the only recovery path. -->
-    <string name="settings_security_dialog_set_title">Set PIN</string>
-    <string name="settings_security_dialog_set_body">Pick a 4–8 digit PIN. You\'ll need this every time you open the app.</string>
-    <string name="settings_security_dialog_disable_title">Turn off PIN lock?</string>
-    <string name="settings_security_dialog_disable_body">Confirm your current PIN to turn off the app lock.</string>
-    <string name="settings_security_dialog_change_step1_title">Confirm current PIN</string>
-    <string name="settings_security_dialog_change_step1_body">Enter your current PIN, then you\'ll set a new one.</string>
-    <string name="settings_security_action_set">Set PIN</string>
-    <string name="settings_security_action_disable">Turn off lock</string>
-    <string name="settings_security_action_continue">Continue</string>
+    <string name="settings_security_dialog_set_title">PIN Ayarla</string>
+    <string name="settings_security_dialog_set_body">4–8 haneli bir PIN seçin. Uygulamayı her açtığınızda buna ihtiyacınız olacak.</string>
+    <string name="settings_security_dialog_disable_title">PIN kilidi kapatılsın mı?</string>
+    <string name="settings_security_dialog_disable_body">Uygulama kilidini kapatmak için mevcut PIN\'inizi onaylayın.</string>
+    <string name="settings_security_dialog_change_step1_title">Mevcut PIN\'i onayla</string>
+    <string name="settings_security_dialog_change_step1_body">Mevcut PIN\'inizi girin, ardından yeni bir tane belirleyeceksiniz.</string>
+    <string name="settings_security_action_set">PIN Ayarla</string>
+    <string name="settings_security_action_disable">Kilidi kapat</string>
+    <string name="settings_security_action_continue">Devam</string>
     <string name="settings_security_pin_hint">PIN</string>
-    <string name="settings_security_pin_confirm_hint">Confirm PIN</string>
-    <string name="settings_security_error_length">PIN must be 4 to 8 digits</string>
-    <string name="settings_security_error_numeric">Digits only</string>
-    <string name="settings_security_error_mismatch">PINs don\'t match</string>
-    <string name="settings_security_error_wrong">Wrong PIN</string>
-    <string name="settings_security_error_locked_out">Too many attempts. Try again in a moment.</string>
-    <string name="settings_security_error_persist">Couldn\'t save the PIN. Try again.</string>
-    <string name="settings_security_toast_set_ok">PIN set. App lock is on.</string>
-    <string name="settings_security_toast_disable_ok">App lock turned off.</string>
+    <string name="settings_security_pin_confirm_hint">PIN\'i Onayla</string>
+    <string name="settings_security_error_length">PIN 4 ile 8 haneli olmalıdır</string>
+    <string name="settings_security_error_numeric">Yalnızca rakam</string>
+    <string name="settings_security_error_mismatch">PIN\'ler eşleşmiyor</string>
+    <string name="settings_security_error_wrong">Yanlış PIN</string>
+    <string name="settings_security_error_locked_out">Çok fazla deneme. Birazdan tekrar deneyin.</string>
+    <string name="settings_security_error_persist">PIN kaydedilemedi. Tekrar deneyin.</string>
+    <string name="settings_security_toast_set_ok">PIN ayarlandı. Uygulama kilidi açık.</string>
+    <string name="settings_security_toast_disable_ok">Uygulama kilidi kapatıldı.</string>
     <!-- PIN unlock screen (PinLockActivity). Shown over MainActivity when
          the app lock is enabled and the session isn\'t fresh. -->
-    <string name="pin_lock_title">Enter PIN</string>
-    <string name="pin_lock_title_unlocked">Unlocked</string>
-    <string name="pin_lock_subtitle_default">Unlock OverDrive to continue.</string>
-    <string name="pin_lock_subtitle_wrong">Wrong PIN. Try again.</string>
-    <string name="pin_lock_subtitle_locked_out">Too many attempts. Try again shortly.</string>
+    <string name="pin_lock_title">PIN girin</string>
+    <string name="pin_lock_title_unlocked">Kilidi açıldı</string>
+    <string name="pin_lock_subtitle_default">Devam etmek için OverDrive\'ın kilidini açın.</string>
+    <string name="pin_lock_subtitle_wrong">Yanlış PIN. Tekrar deneyin.</string>
+    <string name="pin_lock_subtitle_locked_out">Çok fazla deneme. Kısa süre sonra tekrar deneyin.</string>
     <!-- %1$s is a formatted countdown like "30s" or "2:45". -->
-    <string name="pin_lock_subtitle_locked_out_countdown">Locked. Try again in %1$s.</string>
+    <string name="pin_lock_subtitle_locked_out_countdown">Kilitlendi. %1$s sonra tekrar deneyin.</string>
     <string name="pin_lock_lockout_seconds">%1$ds</string>
     <string name="pin_lock_lockout_minutes">%1$d:%2$02d</string>
     <!-- Lock-screen recovery hint. Two-part: a translatable prose prefix
@@ -910,8 +910,8 @@
          settings_security_recovery_command resource so a future edit to
          the command stays in sync across both surfaces). The lock screen
          concatenates them at runtime via String.format. -->
-    <string name="pin_lock_recovery_hint_prefix">Forgot your PIN? Run from a connected computer:\n%1$s</string>
-    <string name="pin_lock_backspace_cd">Backspace</string>
+    <string name="pin_lock_recovery_hint_prefix">PIN\'inizi mi unuttunuz? Bağlı bir bilgisayardan çalıştırın:\n%1$s</string>
+    <string name="pin_lock_backspace_cd">Geri Sil</string>
     <plurals name="pin_lock_dot_a11y">
         <item quantity="one">%1$d digit entered</item>
         <item quantity="other">%1$d digits entered</item>
@@ -959,7 +959,7 @@
          placeholder shape so the bold-ifier still finds the digits. -->
     <string name="dashboard_insight_kwh_format">%1$.1f kWh</string>
     <string name="dashboard_insight_percent_format">%1$.1f%%</string>
-    <string name="dashboard_insight_hours_minutes">%1$d hr %2$d min</string>
+    <string name="dashboard_insight_hours_minutes">%1$d sa %2$d dk</string>
     <!-- Today's clips. -->
     <plurals name="dashboard_insight_today_clips">
         <item quantity="one">%1$d klipi bugün kaydedildi .</item>
@@ -987,72 +987,72 @@
          RoadSense — road-hazard detection feature
          ============================================================ -->
     <string name="rail_roadsense">RoadSense</string>
-    <string name="rail_hazard_map">Map</string>
+    <string name="rail_hazard_map">Harita</string>
     <string name="roadsense_title">RoadSense</string>
-    <string name="roadsense_pill_scanning">Scanning</string>
+    <string name="roadsense_pill_scanning">Taranıyor</string>
     <string name="roadsense_pill_idle">RoadSense</string>
-    <string name="roadsense_status_idle">Idle</string>
+    <string name="roadsense_status_idle">Boşta</string>
     <!-- VEHICLE calibration (suspension-learning) — the green/orange/red dot. Worded
          about the car, not the route, since that's what maturity actually measures. -->
-    <string name="roadsense_cal_learning">Learning your vehicle</string>
-    <string name="roadsense_cal_ready">Vehicle calibrated</string>
-    <string name="roadsense_cal_partial">Calibration improving</string>
+    <string name="roadsense_cal_learning">Aracınız öğreniliyor</string>
+    <string name="roadsense_cal_ready">Araç kalibre edildi</string>
+    <string name="roadsense_cal_partial">Kalibrasyon iyileşiyor</string>
     <!-- Idle caption — ROUTE coverage (distinct from vehicle calibration). "Clear
          ahead" only when we've actually mapped this stretch; "New road" when we
          haven't, so an unsurveyed road isn't mistaken for confirmed-safe. -->
-    <string name="roadsense_clear_ahead">Clear ahead</string>
-    <string name="roadsense_road_mapped">Road mapped · clear</string>
-    <string name="roadsense_road_new">New road · learning</string>
+    <string name="roadsense_clear_ahead">İleri açık</string>
+    <string name="roadsense_road_mapped">Yol haritalandı · temiz</string>
+    <string name="roadsense_road_new">Yeni yol · öğreniliyor</string>
     <string name="roadsense_unit_meters">m</string>
     <string name="roadsense_dash_distance">—</string>
-    <string name="roadsense_warn_label">Warn</string>
-    <string name="roadsense_toggle_audio">Audio</string>
-    <string name="roadsense_toggle_visual">Visual</string>
+    <string name="roadsense_warn_label">Uyar</string>
+    <string name="roadsense_toggle_audio">Ses</string>
+    <string name="roadsense_toggle_visual">Görsel</string>
     <!-- severity / type readouts (formatted at runtime) -->
-    <string name="roadsense_sev_minor">Minor</string>
-    <string name="roadsense_sev_moderate">Moderate</string>
-    <string name="roadsense_sev_severe">Severe</string>
-    <string name="roadsense_type_breaker">Speed breaker</string>
-    <string name="roadsense_type_pothole">Pothole</string>
-    <string name="roadsense_type_hazard">Hazard</string>
-    <string name="roadsense_type_rough">Rough section</string>
+    <string name="roadsense_sev_minor">Hafif</string>
+    <string name="roadsense_sev_moderate">Orta</string>
+    <string name="roadsense_sev_severe">Ciddi</string>
+    <string name="roadsense_type_breaker">Hız kesici</string>
+    <string name="roadsense_type_pothole">Çukur</string>
+    <string name="roadsense_type_hazard">Tehlike</string>
+    <string name="roadsense_type_rough">Engebeli bölüm</string>
     <!-- "Moderate · Pothole" style line -->
     <string name="roadsense_hazard_format">%1$s · %2$s</string>
     <!-- Zone readouts (D-032): cluster of hazards announced as one. -->
     <!-- "3 bumps ahead" — %1$d = count -->
-    <string name="roadsense_zone_count">%1$d bumps ahead</string>
+    <string name="roadsense_zone_count">İleride %1$d tümsek</string>
     <!-- "Rough section · 40 m" — %1$d = length in metres -->
-    <string name="roadsense_zone_rough">Rough section · %1$d m</string>
+    <string name="roadsense_zone_rough">Engebeli bölüm · %1$d m</string>
     <!-- Calibration-Mode confirm card (R-OVL-6) -->
-    <string name="roadsense_confirm_prompt">Was this a hazard?</string>
-    <string name="roadsense_confirm_reject">Not a hazard</string>
-    <string name="roadsense_confirm_accept">Confirm</string>
+    <string name="roadsense_confirm_prompt">Bu bir tehlike miydi?</string>
+    <string name="roadsense_confirm_reject">Tehlike değil</string>
+    <string name="roadsense_confirm_accept">Onayla</string>
     <!-- content descriptions -->
-    <string name="roadsense_cd_cal_level">Vehicle calibration level</string>
-    <string name="roadsense_cd_direction">Direction to next hazard</string>
+    <string name="roadsense_cd_cal_level">Araç kalibrasyon seviyesi</string>
+    <string name="roadsense_cd_direction">Sonraki tehlikeye yön</string>
     <!-- Blind Spot overlay labels (native overlay window). -->
-    <string name="blindspot_overlay_left">LEFT</string>
+    <string name="blindspot_overlay_left">SOL</string>
     <string name="blindspot_overlay_right">SAĞ</string>
     <!-- ============================================================== -->
     <!-- RoadSense Map (native MapLibre map view + tap-to-verify sheet). -->
     <!-- ============================================================== -->
-    <string name="roadsense_map_title">Map</string>
-    <string name="roadsense_map_route_clear">Clear</string>
+    <string name="roadsense_map_title">Harita</string>
+    <string name="roadsense_map_route_clear">Temizle</string>
     <string name="roadsense_map_route_unmapped">Henüz haritalanmadı</string>
-    <string name="roadsense_map_back">Back</string>
-    <string name="roadsense_map_recenter">Recenter on my location</string>
+    <string name="roadsense_map_back">Geri</string>
+    <string name="roadsense_map_recenter">Konumuma göre yeniden ortala</string>
     <!-- Tap-to-verify bottom sheet -->
     <string name="roadsense_map_severity_label">Şiddet</string>
     <string name="roadsense_map_type_label">Tür</string>
-    <string name="roadsense_map_type_unknown">Unknown</string>
-    <string name="roadsense_map_confirm">Confirm</string>
-    <string name="roadsense_map_delete">Delete</string>
+    <string name="roadsense_map_type_unknown">Bilinmiyor</string>
+    <string name="roadsense_map_confirm">Onayla</string>
+    <string name="roadsense_map_delete">Sil</string>
     <!-- Status chip labels: candidate / on-device / shared with fleet -->
-    <string name="roadsense_map_status_candidate">Candidate</string>
-    <string name="roadsense_map_status_local">On device</string>
+    <string name="roadsense_map_status_candidate">Aday</string>
+    <string name="roadsense_map_status_local">Cihazda</string>
     <string name="roadsense_map_status_cloud">Paylaşılan</string>
     <!-- Meta line: "Moderate · 82% confidence · 3 reports" -->
-    <string name="roadsense_map_meta_format">%1$s · %2$d%% confidence · %3$s</string>
+    <string name="roadsense_map_meta_format">%1$s · %2$d%% güven · %3$s</string>
     <!-- "3 reports" / "1 report" -->
     <plurals name="roadsense_map_reports">
         <item quantity="one">%1$d report</item>
@@ -1062,22 +1062,22 @@
     <string name="roadsense_map_confirmed_toast">Tehlike onaylandı</string>
     <string name="roadsense_map_deleted_toast">Tehlike kaldırıldı</string>
     <string name="roadsense_map_action_failed">RoadSense\'e ulaşılamadı. Tekrar deneyin.</string>
-    <string name="roadsense_map_no_location">Waiting for GPS fix…</string>
+    <string name="roadsense_map_no_location">GPS sinyali bekleniyor…</string>
     <!-- Navigation: search + routing + turn-by-turn -->
-    <string name="roadsense_map_search_hint">Search destination</string>
-    <string name="roadsense_map_search_action">Search</string>
+    <string name="roadsense_map_search_hint">Hedef ara</string>
+    <string name="roadsense_map_search_action">Ara</string>
     <string name="roadsense_map_searching">Aranıyor…</string>
     <string name="roadsense_map_no_results">Yer bulunamadı</string>
     <string name="roadsense_map_search_network">Arama hizmetine ulaşılamadı. Bağlantınızı veya proxy ayarınızı kontrol edip tekrar deneyin.</string>
     <string name="roadsense_map_pick_destination">Hedef seçin</string>
-    <string name="roadsense_map_routing">Finding route…</string>
+    <string name="roadsense_map_routing">Rota bulunuyor…</string>
     <string name="roadsense_map_route_failed">Rota bulunamadı. Tekrar deneyin.</string>
     <string name="roadsense_map_need_key">Navigasyon için RoadSense ayarlarından bir rota anahtarı ekleyin.</string>
     <string name="roadsense_map_rerouting">Rotadan sapıldı — yeniden hesaplanıyor…</string>
     <string name="roadsense_map_arrived">Hedefe ulaştınız.</string>
-    <string name="roadsense_map_nav_started">Navigating to %1$s</string>
-    <string name="roadsense_map_nav_ended">Navigation ended</string>
-    <string name="roadsense_map_end_nav">End navigation</string>
+    <string name="roadsense_map_nav_started">%1$s konumuna gidiliyor</string>
+    <string name="roadsense_map_nav_ended">Navigasyon sona erdi</string>
+    <string name="roadsense_map_end_nav">Navigasyonu bitir</string>
     <string name="roadsense_map_zoom_in">Yakınlaştır</string>
     <string name="roadsense_map_zoom_out">Uzaklaştır</string>
     <!-- Hazard visibility filter -->
@@ -1085,83 +1085,83 @@
     <string name="roadsense_map_hazards_all">Tüm tehlikeleri göster</string>
     <string name="roadsense_map_hazards_moderate">Orta ve şiddetli</string>
     <string name="roadsense_map_hazards_severe">Sadece şiddetli</string>
-    <string name="roadsense_map_hazards_hidden">Hide hazards</string>
+    <string name="roadsense_map_hazards_hidden">Tehlikeleri gizle</string>
     <!-- POI along route (EV charging / fuel) -->
     <string name="roadsense_map_poi_toggle">Şarj ve yakıt</string>
     <!-- 2D / 3D buildings toggle -->
-    <string name="roadsense_map_dimension_toggle">2D / 3D buildings</string>
+    <string name="roadsense_map_dimension_toggle">2D / 3D binalar</string>
     <string name="roadsense_map_3d_on">3B binalar açık</string>
     <string name="roadsense_map_3d_off">3B binalar kapalı</string>
     <string name="roadsense_map_poi_loading">Şarj ve yakıt istasyonları aranıyor…</string>
     <string name="roadsense_map_poi_none">Yakınlarda istasyon bulunamadı</string>
     <string name="roadsense_map_poi_need_route">Önce bir hedef seçin</string>
     <!-- POI tap action sheet -->
-    <string name="roadsense_map_stop_added">Stop added</string>
+    <string name="roadsense_map_stop_added">Durak eklendi</string>
     <string name="roadsense_map_remove_stop_action">Durağı kaldır</string>
-    <string name="roadsense_map_poi_navigate">Navigate here</string>
+    <string name="roadsense_map_poi_navigate">Buraya git</string>
     <string name="roadsense_map_poi_kind_charging">Şarj istasyonu</string>
     <string name="roadsense_map_poi_kind_fuel">Yakıt istasyonu</string>
     <string name="roadsense_map_poi_charging_generic">Şarj istasyonu</string>
     <string name="roadsense_map_poi_fuel_generic">Yakıt istasyonu</string>
     <string name="roadsense_map_route_switched">Rota değiştirildi</string>
     <!-- "then <next maneuver>" preview shown in the maneuver banner -->
-    <string name="roadsense_map_then">then</string>
+    <string name="roadsense_map_then">sonra</string>
     <!-- Roundabout exit ordinal in the maneuver banner (%1$d = exit number) -->
     <string name="roadsense_map_exit_n">çıkış %1$d</string>
     <!-- Hazards-along-route pills (%1$d = count) -->
     <string name="roadsense_map_pill_severe">%1$d şiddetli</string>
-    <string name="roadsense_map_pill_moderate">%1$d moderate</string>
-    <string name="roadsense_map_pill_minor">%1$d minor</string>
+    <string name="roadsense_map_pill_moderate">%1$d orta</string>
+    <string name="roadsense_map_pill_minor">%1$d hafif</string>
     <!-- Shown briefly if the basemap can\'t be reached. -->
     <string name="roadsense_map_offline">Harita verileri çevrimdışı kullanılamıyor</string>
     <!-- Navigation: autocomplete + route options -->
     <string name="roadsense_map_clear_search">Aramayı temizle</string>
     <!-- Route-options sheet -->
     <string name="roadsense_map_routes_title">Bir rota seçin</string>
-    <string name="roadsense_map_routes_to">Routes to %1$s</string>
+    <string name="roadsense_map_routes_to">%1$s konumuna yönlendirir</string>
     <string name="roadsense_map_routes_cancel">İptal</string>
     <!-- Per-route row label, %1$d is the 1-based route number. -->
-    <string name="roadsense_map_route_option">Route %1$d</string>
+    <string name="roadsense_map_route_option">Rota %1$d</string>
     <string name="roadsense_map_fastest">En hızlı</string>
     <string name="roadsense_map_start">Başlat</string>
     <!-- Stops / waypoints in the route-options sheet -->
-    <string name="roadsense_map_your_location">Your location</string>
-    <string name="roadsense_map_add_stop">Add stop</string>
+    <string name="roadsense_map_your_location">Konumunuz</string>
+    <string name="roadsense_map_add_stop">Durak ekle</string>
     <string name="roadsense_map_add_stop_hint">Eklenecek bir durak arayın</string>
     <string name="roadsense_map_stop_removed">Durak kaldırıldı</string>
     <string name="roadsense_map_remove_stop">Durağı kaldır</string>
     <string name="roadsense_map_move_stop_up">Durağı yukarı taşı</string>
     <string name="roadsense_map_move_stop_down">Durağı aşağı taşı</string>
     <!-- %1$d is the maximum number of stops allowed. -->
-    <string name="roadsense_map_max_stops">Up to %1$d stops allowed</string>
+    <string name="roadsense_map_max_stops">En fazla %1$d durağa izin verilir</string>
     <!-- Map day/night override (Auto → Light → Dark) -->
     <string name="roadsense_map_theme_toggle">Harita teması</string>
     <string name="roadsense_map_theme_auto">Harita teması: Otomatik</string>
     <string name="roadsense_map_theme_light">Harita teması: Açık</string>
     <string name="roadsense_map_theme_dark">Harita teması: Koyu</string>
     <!-- Saved places (Home / Work / custom favourites) -->
-    <string name="roadsense_map_saved_home">Home</string>
+    <string name="roadsense_map_saved_home">Ana Sayfa</string>
     <string name="roadsense_map_saved_work">İş</string>
-    <string name="roadsense_map_saved_set_home">Set Home</string>
+    <string name="roadsense_map_saved_set_home">Evi Ayarla</string>
     <string name="roadsense_map_saved_set_work">İş olarak ayarla</string>
     <!-- Short action label for the "save as a custom favourite" button. -->
-    <string name="roadsense_map_saved_favourite">Favourite</string>
-    <string name="roadsense_map_save_place">Save place</string>
-    <string name="roadsense_map_save_as_home">Save as Home</string>
+    <string name="roadsense_map_saved_favourite">Favori</string>
+    <string name="roadsense_map_save_place">Yeri kaydet</string>
+    <string name="roadsense_map_save_as_home">Ev olarak kaydet</string>
     <string name="roadsense_map_save_as_work">İş olarak kaydet</string>
-    <string name="roadsense_map_save_as_custom">Save as favourite…</string>
-    <string name="roadsense_map_saved_added">Saved</string>
+    <string name="roadsense_map_save_as_custom">Favori olarak kaydet…</string>
+    <string name="roadsense_map_saved_added">Kaydedildi</string>
     <string name="roadsense_map_saved_removed">Kaydedilenlerden kaldırıldı</string>
     <string name="roadsense_map_saved_remove">Kaldır</string>
     <string name="roadsense_map_recent_remove">Son kullanılanlardan kaldır</string>
     <string name="roadsense_map_recent_removed">Son kullanılanlardan kaldırıldı</string>
     <string name="roadsense_map_custom_label_hint">Etiket (örn. Spor Salonu, Anne\'nin Evi)</string>
     <string name="roadsense_map_custom_label_title">Bu yeri adlandır</string>
-    <string name="roadsense_map_save">Save</string>
+    <string name="roadsense_map_save">Kaydet</string>
     <string name="roadsense_map_cancel">İptal</string>
     <!-- Place-action sheet (long-press the map or a search result to save/navigate) -->
     <string name="roadsense_map_dropped_pin">Bırakılan pin</string>
-    <string name="roadsense_map_navigate_here">Navigate here</string>
+    <string name="roadsense_map_navigate_here">Buraya git</string>
     <!-- Shown after tapping an unset Home/Work chip: search picks the place to save. -->
     <string name="roadsense_map_search_to_save">%1$s olarak ayarlamak için bir yer arayın</string>
     <!-- Shown when re-entering the map with a previously-set trip restored. -->

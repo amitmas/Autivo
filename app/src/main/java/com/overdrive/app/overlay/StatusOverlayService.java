@@ -219,6 +219,33 @@ public class StatusOverlayService extends Service {
     private static final int DRAG_THRESHOLD = 10;
     private WindowManager.LayoutParams layoutParams;
 
+    // ── Camera-view CLOSE button (folded in here so it shares THIS service's
+    // foreground notification — no second notification — and this service's
+    // reliable lifecycle: it's started from MainActivity AND DaemonKeepaliveService,
+    // so its receiver is live whenever a camera view can be opened, even from a
+    // keymap/automation with the UI never launched).
+    //
+    // The camera view renders into a daemon-owned SurfaceControl layer with NO input
+    // channel, so a tappable close must live in an app overlay window. The daemon
+    // broadcasts an open/close edge (event-driven, zero poll/GPU) and we attach/detach
+    // a small ✕ window. Separate window + flag from the status pill so the two never
+    // interfere. ──
+    public static final String ACTION_CAMVIEW_STATE = "com.overdrive.app.action.CAMVIEW_STATE";
+    private android.view.View camCloseButton;
+    private WindowManager.LayoutParams camCloseParams;
+    private boolean camCloseAttached = false;
+    private boolean camCloseReceiverRegistered = false;
+    private final android.content.BroadcastReceiver camCloseReceiver = new android.content.BroadcastReceiver() {
+        @Override public void onReceive(Context context, Intent intent) {
+            if (intent == null || !ACTION_CAMVIEW_STATE.equals(intent.getAction())) return;
+            boolean active = intent.getBooleanExtra("active", false);
+            // Head-unit only — the cluster is a separate display we can't overlay.
+            String target = intent.getStringExtra("target");
+            boolean headUnit = target == null || !"cluster".equals(target);
+            setCamCloseVisible(active && headUnit);
+        }
+    };
+
 
     @Override
     public void onCreate() {
@@ -242,6 +269,9 @@ public class StatusOverlayService extends Service {
         if (windowManager == null) {
             windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
         }
+
+        // Arm the camera-view close-button receiver once (idempotent across restarts).
+        registerCamCloseReceiver();
 
         // Theme refresh — caller flipped the app's day/night setting.
         // Rebuild the overlay against the new uiMode. rebuildOverlay() also
@@ -310,6 +340,96 @@ public class StatusOverlayService extends Service {
         return null;
     }
 
+    // ── Camera-view close button ──────────────────────────────────────────
+
+    /** Register the camview-state broadcast receiver once. The sender is the daemon
+     *  (shell/UID-2000) via `am broadcast`, so on API 33+ the receiver must be exported;
+     *  on the API-29 head unit the plain register path is used. */
+    private void registerCamCloseReceiver() {
+        if (camCloseReceiverRegistered) return;
+        try {
+            android.content.IntentFilter f = new android.content.IntentFilter(ACTION_CAMVIEW_STATE);
+            if (android.os.Build.VERSION.SDK_INT >= 33) {
+                registerReceiver(camCloseReceiver, f, Context.RECEIVER_EXPORTED);
+            } else {
+                registerReceiver(camCloseReceiver, f);
+            }
+            camCloseReceiverRegistered = true;
+        } catch (Throwable t) {
+            Log.w(TAG, "camClose receiver register failed: " + t.getMessage());
+        }
+    }
+
+    /** Lazily build the ✕ button + its layout params (once). */
+    private void buildCamCloseButton() {
+        if (camCloseButton != null) return;
+        TextView tv = new TextView(this);
+        tv.setText("✕"); // ✕
+        tv.setTextColor(android.graphics.Color.WHITE);
+        tv.setTextSize(20);
+        tv.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+        tv.setGravity(Gravity.CENTER);
+        android.graphics.drawable.GradientDrawable bg = new android.graphics.drawable.GradientDrawable();
+        bg.setShape(android.graphics.drawable.GradientDrawable.OVAL);
+        bg.setColor(android.graphics.Color.parseColor("#CC000000"));
+        bg.setStroke(2, android.graphics.Color.parseColor("#80FFFFFF"));
+        tv.setBackground(bg);
+        int pad = camDp(6);
+        tv.setPadding(pad, pad, pad, pad);
+        tv.setOnClickListener(v -> onCamCloseTapped());
+        camCloseButton = tv;
+
+        int size = camDp(40);
+        camCloseParams = new WindowManager.LayoutParams(
+                size, size,
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                PixelFormat.TRANSLUCENT);
+        camCloseParams.gravity = Gravity.TOP | Gravity.END;
+        camCloseParams.x = camDp(16);
+        camCloseParams.y = camDp(16);
+    }
+
+    /** Attach/detach the ✕ window. Always runs on the main thread (WindowManager
+     *  add/removeView requirement); the broadcast receiver already runs on main. */
+    private void setCamCloseVisible(boolean visible) {
+        handler.post(() -> {
+            if (!Settings.canDrawOverlays(this)) return;
+            buildCamCloseButton();
+            if (camCloseButton == null || windowManager == null) return;
+            try {
+                if (visible && !camCloseAttached) {
+                    windowManager.addView(camCloseButton, camCloseParams);
+                    camCloseAttached = true;
+                } else if (!visible && camCloseAttached) {
+                    windowManager.removeView(camCloseButton);
+                    camCloseAttached = false;
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "setCamCloseVisible(" + visible + ") failed: " + e.getMessage());
+            }
+        });
+    }
+
+    private void onCamCloseTapped() {
+        setCamCloseVisible(false); // immediate feedback; daemon confirms via broadcast
+        executor.execute(() -> {
+            java.net.HttpURLConnection conn = null;
+            try {
+                conn = com.overdrive.app.util.DaemonHttpClient.open("/api/camview/hide", "POST", 1500, 3000);
+                conn.getResponseCode();
+            } catch (Exception e) {
+                Log.w(TAG, "camview hide failed: " + e.getMessage());
+            } finally {
+                if (conn != null) conn.disconnect();
+            }
+        });
+    }
+
+    private int camDp(int v) {
+        return Math.round(v * getResources().getDisplayMetrics().density);
+    }
+
     @Override
     public void onDestroy() {
         // Order matters here:
@@ -335,6 +455,15 @@ public class StatusOverlayService extends Service {
         audioController = null;
         if (ctrl != null) {
             try { ctrl.stop(); } catch (Exception ignored) {}
+        }
+        // Tear down the camera-view close button + its receiver.
+        if (camCloseReceiverRegistered) {
+            try { unregisterReceiver(camCloseReceiver); } catch (Throwable ignored) {}
+            camCloseReceiverRegistered = false;
+        }
+        if (camCloseAttached && camCloseButton != null && windowManager != null) {
+            try { windowManager.removeView(camCloseButton); } catch (Throwable ignored) {}
+            camCloseAttached = false;
         }
         removeOverlay();
         super.onDestroy();

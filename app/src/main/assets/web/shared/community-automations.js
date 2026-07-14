@@ -314,6 +314,15 @@ BYD.communityAutomations = {
         badge.setAttribute('data-i18n', 'community.cat_' + (item.category || 'other'));
         badge.textContent = t('community.cat_' + (item.category || 'other'));
         head.appendChild(badge);
+        // "Yours" badge on automations this install published (server-computed `mine`),
+        // so a user can spot their own uploads at a glance in the catalogue.
+        if (item.mine) {
+            var mineBadge = document.createElement('span');
+            mineBadge.className = 'community-badge community-badge-mine';
+            mineBadge.setAttribute('data-i18n', 'community.mine');
+            mineBadge.textContent = t('community.mine');
+            head.appendChild(mineBadge);
+        }
         card.appendChild(head);
 
         // Description (clamped by CSS).
@@ -483,14 +492,17 @@ BYD.communityAutomations = {
         var actions = document.createElement('div');
         actions.className = 'soh-modal-actions community-detail-actions';
 
-        // Delete-my-upload: only the publishing device can delete (server device-match).
-        // Ownership isn't in the record, so we always offer it and let the server decide
-        // — a non-owner gets a friendly "not yours" toast, never a false success.
-        var delBtn = document.createElement('button');
-        delBtn.className = 'btn btn-danger community-unpublish-btn';
-        delBtn.innerHTML = C_trashIcon + '<span data-i18n="community.unpublish">' + BYD.core._esc(t('community.unpublish')) + '</span>';
-        delBtn.addEventListener('click', function () { self.unpublish(a.id, a.name, dismiss); });
-        actions.appendChild(delBtn);
+        // Remove-my-upload: shown ONLY on automations THIS install published. The server
+        // sets `mine:true` by matching the stable publisher id against the row's (private)
+        // author_device, so a stranger never sees this button. The DELETE endpoint
+        // re-checks ownership regardless, so this is a UX gate, not the security boundary.
+        if (a.mine) {
+            var delBtn = document.createElement('button');
+            delBtn.className = 'btn btn-danger community-unpublish-btn';
+            delBtn.innerHTML = C_trashIcon + '<span data-i18n="community.unpublish">' + BYD.core._esc(t('community.unpublish')) + '</span>';
+            delBtn.addEventListener('click', function () { self.unpublish(a.id, a.name, dismiss); });
+            actions.appendChild(delBtn);
+        }
 
         var reportBtn = document.createElement('button');
         reportBtn.className = 'btn btn-secondary community-report-btn';

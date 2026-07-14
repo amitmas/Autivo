@@ -7,7 +7,6 @@ import com.overdrive.app.community.config.CommunityConfig
 import com.overdrive.app.community.sync.CommunitySyncProvider
 import com.overdrive.app.logging.DaemonLogger
 import com.overdrive.app.mqtt.VehicleControlCatalog
-import com.overdrive.app.roadsense.sync.DeviceId
 import com.overdrive.app.server.HttpResponse
 import org.json.JSONArray
 import org.json.JSONObject
@@ -97,9 +96,10 @@ object CommunityApiHandler {
 
     // ── Browse ───────────────────────────────────────────────────────────────
 
-    /** GET list — forward the (already query-string-shaped) whitelisted params to the Worker. */
+    /** GET list — forward the (already query-string-shaped) whitelisted params to the Worker.
+     *  Passes our publisher id so the Worker flags this install's own rows (`mine`). */
     private fun listCatalog(query: String, out: OutputStream): Boolean {
-        forward(provider.list(query), out)
+        forward(provider.list(query, CommunityConfig.publisherId()), out)
         return true
     }
 
@@ -110,7 +110,7 @@ object CommunityApiHandler {
      */
     private fun getOne(id: String?, out: OutputStream): Boolean {
         if (id.isNullOrBlank()) { safeError(out, 400, "missing id"); return true }
-        val res = provider.get(id)
+        val res = provider.get(id, CommunityConfig.publisherId())
         if (!res.ok || res.body == null) { forward(res, out); return true }
         val automation = res.body.optJSONObject("automation")
         if (automation != null) {
@@ -155,8 +155,12 @@ object CommunityApiHandler {
         if (authorName.isEmpty()) { safeError(out, 400, "authorName required"); return true }
         CommunityConfig.setAuthorName(authorName)
 
-        val deviceId = DeviceId.current(System.currentTimeMillis())
-        val res = provider.publish(deviceId, authorName, name, description, category, canonical, SCHEMA_VERSION)
+        // Ownership key = the STABLE community publisher id (NOT DeviceId.current, which
+        // rotates every 30 days — see CommunityConfig.publisherId). This is what the
+        // server stores as author_device and later matches on delete, so the author can
+        // still remove their upload after a RoadSense id rotation.
+        val publisherId = CommunityConfig.publisherId()
+        val res = provider.publish(publisherId, authorName, name, description, category, canonical, SCHEMA_VERSION)
         forward(res, out)
         return true
     }
@@ -205,20 +209,22 @@ object CommunityApiHandler {
         val json = parseBody(body) ?: run { safeError(out, 400, "invalid JSON body"); return true }
         val stars = json.optInt("stars", 0)
         if (stars < 1 || stars > 5) { safeError(out, 400, "stars must be 1..5"); return true }
-        forward(provider.rate(id, DeviceId.current(System.currentTimeMillis()), stars), out)
+        forward(provider.rate(id, CommunityConfig.publisherId(), stars), out)
         return true
     }
 
     private fun report(id: String?, body: String?, out: OutputStream): Boolean {
         if (id.isNullOrBlank()) { safeError(out, 400, "missing id"); return true }
         val reason = parseBody(body)?.optString("reason", "")?.trim()
-        forward(provider.report(id, DeviceId.current(System.currentTimeMillis()), reason), out)
+        forward(provider.report(id, CommunityConfig.publisherId(), reason), out)
         return true
     }
 
     private fun deleteOwn(id: String?, out: OutputStream): Boolean {
         if (id.isNullOrBlank()) { safeError(out, 400, "missing id"); return true }
-        forward(provider.delete(id, DeviceId.current(System.currentTimeMillis())), out)
+        // Delete uses the STABLE publisher id (the ownership key the row was published
+        // under), so the author can still remove it after a RoadSense id rotation.
+        forward(provider.delete(id, CommunityConfig.publisherId()), out)
         return true
     }
 

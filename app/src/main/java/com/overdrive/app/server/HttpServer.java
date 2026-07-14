@@ -340,10 +340,20 @@ public class HttpServer {
             // Read POST body if present
             // SOTA: Loop read for large payloads (e.g., base64 image uploads)
             // BufferedReader.read() may return fewer chars than requested in a single call
-            // Hard cap at 16 MB — the largest legitimate payload is a base64-
-            // encoded 8 MB asset (~10.7 MB). Above this we 413 instead of
-            // letting an attacker allocate arbitrary heap on the GUI process.
-            final int MAX_BODY_BYTES = 16 * 1024 * 1024;
+            // Default hard cap 16 MB — the largest legitimate generic payload is a
+            // base64-encoded 8 MB asset (~10.7 MB). Above this we 413 instead of
+            // letting an attacker allocate arbitrary heap on the daemon process.
+            //
+            // EXCEPTION: the audio-library upload accepts short video clips (48 MB max,
+            // see AudioApiHandler.MAX_AUDIO_BYTES) as a base64 JSON body (~64 MB) — raise
+            // the cap to 72 MB for JUST that one endpoint so a legitimate clip isn't
+            // pre-rejected here, while every other endpoint keeps the tight 16 MB cap.
+            // The body is still buffered then decoded (peak ~200 MB transient for a
+            // 48 MB clip), which is safe on this head unit; a materially larger limit
+            // would require a stream-to-disk upload rewrite rather than this bump.
+            final boolean isAudioUpload = requestLine.startsWith("POST /api/audio/library")
+                    && !requestLine.startsWith("POST /api/audio/library/"); // the /play,/stop subpaths stay tight
+            final int MAX_BODY_BYTES = isAudioUpload ? (72 * 1024 * 1024) : (16 * 1024 * 1024);
             String body = null;
             if (contentLength > MAX_BODY_BYTES) {
                 HttpResponse.sendError(out, 413, "Payload too large");
@@ -631,6 +641,7 @@ public class HttpServer {
         "/api/surveillance/",  // surveillance enable / disable
         "/api/recording/mode", // recording mode
         "/api/apps/launch",    // open-app action: launch a user-selected app (NOT /api/apps/list)
+        "/api/camview/",       // camera-view show/hide (native lane, shares blind-spot pipeline)
     };
 
     /** Whether an automation-originated request path is inside the allowlist above. */
@@ -745,7 +756,7 @@ public class HttpServer {
 
         // Blind-spot dedicated-pipeline API (separate from /api/stream so it
         // never shares the live-view stream's view/quality state).
-        if (path.startsWith("/api/bs/")) {
+        if (path.startsWith("/api/bs/") || path.startsWith("/api/camview/")) {
             return StreamingApiHandler.handleBlindSpot(method, path, body, out);
         }
 
@@ -848,9 +859,9 @@ public class HttpServer {
             }
         }
 
-        // Audio Test API (AVAS speaker test)
+        // Audio API (library playback + AVAS speaker)
         if (path.startsWith("/api/audio/")) {
-            return AudioTestApiHandler.handle(method, path, body, out);
+            return AudioApiHandler.handle(method, path, body, out);
         }
 
         // Vehicle Control API

@@ -933,6 +933,7 @@ public class BydDataCollector {
             collectSpeed(b);        // speed, accel, brake
             collectEngine(b);       // enginePower, motorSpeed/torque
             collectGearbox(b);      // gearMode
+            collectSteeringAngle(b);// live steering angle (init-only otherwise → dead trigger)
         } else {
             boolean possiblyCharging =
                 (!Double.isNaN(b.chargingPowerKw) && Math.abs(b.chargingPowerKw) > 0.1)
@@ -1620,10 +1621,21 @@ public class BydDataCollector {
                 double v = ((Number) speed).doubleValue();
                 if (v != BydFeatureIds.SDK_NOT_AVAILABLE) b.speedKmh(v * distanceToKmFactor);
             }
+            // Guard the SDK_NOT_AVAILABLE sentinel exactly like getCurrentSpeed above:
+            // getAccelerateDeepness/getBrakeDeepness can return it, and it is NOT the
+            // BydVehicleData.UNAVAILABLE (Integer.MIN_VALUE) that the automation
+            // publish-guard checks — so an unguarded sentinel would flow through as a
+            // bogus ~-2.1e9 pedal value and false-fire a "pedal < N" automation.
             Object accel = BydDeviceHelper.callGetter(speedDevice, "getAccelerateDeepness");
-            if (accel instanceof Number) b.accelPercent(((Number) accel).intValue());
+            if (accel instanceof Number) {
+                int a = ((Number) accel).intValue();
+                if (a != BydFeatureIds.SDK_NOT_AVAILABLE) b.accelPercent(a);
+            }
             Object brake = BydDeviceHelper.callGetter(speedDevice, "getBrakeDeepness");
-            if (brake instanceof Number) b.brakePercent(((Number) brake).intValue());
+            if (brake instanceof Number) {
+                int br = ((Number) brake).intValue();
+                if (br != BydFeatureIds.SDK_NOT_AVAILABLE) b.brakePercent(br);
+            }
         } catch (Exception e) {
             logger.debug("collectSpeed error: " + e.getMessage());
         }
@@ -2215,7 +2227,7 @@ public class BydDataCollector {
             // External charging power. Two scaling regimes seen across BYD firmware:
             //
             //   - Listener path (onExternalChargingPowerChanged) — SDK pre-scales
-            //     to kW. This matches BYDCarController in autocommander, which
+            //     to kW. This matches the OEM firmware convention, which
             //     treats the listener arg as kW directly.
             //   - Polled getter — some firmware (Seal U DM-i PHEV, build 1124xxx)
             //     returns the raw CAN value in hectowatts (centiKW). Observed:
@@ -2405,6 +2417,11 @@ public class BydDataCollector {
             b.hazard(getLightStatus(8) == 1);
             Object dayTime = BydDeviceHelper.callGetter(lightDevice, "getDayTimeLightState");
             if (dayTime instanceof Number) b.dayTimeLight(((Number) dayTime).intValue() == 1);
+            // Auto-headlight (light-sensor) mode: 1=on, 0=off. The usable "it's dark"
+            // proxy — no lux value exists on this platform. Named getter on the light
+            // device, matching the OEM firmware's getLightAutoStatus.
+            Object autoLight = BydDeviceHelper.callGetter(lightDevice, "getLightAutoStatus");
+            if (autoLight instanceof Number) b.lightAutoStatus(((Number) autoLight).intValue());
         } catch (Exception e) {
             logger.debug("collectLight error: " + e.getMessage());
         }
@@ -2657,25 +2674,97 @@ public class BydDataCollector {
         }
     }
 
+    // Seatbelt raw values that are NOT a real belt state — SDK failure/unavailable
+    // codes. Matches the OEM firmware's FAILURE_STATUS_CODES set exactly. These are RAW
+    // 32-bit negatives, so sanitizeSeatbelt tests them BEFORE the &0xFFFF mask (see the
+    // ORDER MATTERS note there); a raw read equal to any of these — or masked to 2
+    // (INVALID) — is dropped to "unknown" rather than mis-reported as buckled/unbuckled.
+    private static final java.util.Set<Integer> SEATBELT_FAILURE_CODES = new java.util.HashSet<>(
+            java.util.Arrays.asList(-2147482647, -2147482648, -2147482645, -2147482646,
+                    -10011, Integer.MIN_VALUE, -1, -10013));
+
+    /**
+     * Read per-seat seatbelt buckled/unbuckled state.
+     *
+     * <p>CORRECTED to match the OEM firmware after a parity audit found the previous
+     * implementation was reading a method ({@code getSafetyBeltStatus(int)}) that does
+     * not exist on this SDK, off the wrong device ({@code safetyBeltDevice}) — so it
+     * silently returned -1 for every seat, and stored raw un-sanitized values. The OEM
+     * firmware reads the belt state from the INSTRUMENT device via two feature-ids
+     * (driver = main, passenger = deputy), masks the low 16 bits, and drops failure
+     * codes and the INVALID(2) value. There are only TWO real seatbelt signals on this
+     * platform (driver + front passenger); no rear-seat feature-ids exist.
+     *
+     * <p>Stores a 2-slot array: index 0 = driver, index 1 = passenger. Each slot is the
+     * sanitized value {@code 0 = unbuckled}, {@code 1 = buckled}, or
+     * {@link BydVehicleData#UNAVAILABLE} when unknown/dropped — so a consumer can tell
+     * "unbuckled" from "no reading".
+     */
     private void collectSafetyBelt(BydVehicleData.Builder b) {
-        if (safetyBeltDevice == null) return;
+        if (instrumentDevice == null) return;
         try {
-            int[] belts = new int[5];
-            for (int i = 0; i < 5; i++) {
-                Object s = BydDeviceHelper.callGetter(safetyBeltDevice, "getSafetyBeltStatus", i + 1);
-                belts[i] = (s instanceof Number) ? ((Number) s).intValue() : -1;
+            int driver = sanitizeSeatbelt(BydDeviceHelper.callGetSingle(
+                    instrumentDevice, BydFeatureIds.INSTRUMENT_DD_MAIN_SAFETYBELT_STATE));
+            int passenger = sanitizeSeatbelt(BydDeviceHelper.callGetSingle(
+                    instrumentDevice, BydFeatureIds.INSTRUMENT_DD_DEPUTY_SAFETYBELT_STATE));
+            // Only publish the array if at least one seat gave a real reading, so a trim
+            // that doesn't expose these feature-ids leaves seatbeltStatus null (unseeded)
+            // rather than a pair of UNAVAILABLE sentinels.
+            if (driver != BydVehicleData.UNAVAILABLE || passenger != BydVehicleData.UNAVAILABLE) {
+                b.seatbeltStatus(new int[]{ driver, passenger });
             }
-            b.seatbeltStatus(belts);
         } catch (Exception e) {
             logger.debug("collectSafetyBelt error: " + e.getMessage());
         }
+        // Seat occupancy (someone present) — separate from belt state. The OEM firmware
+        // reads getPassengerStatus(area) off the safety-belt device: NOBODY=0, SOMEBODY=1,
+        // INVALID=2. Areas 1=driver, 2=front passenger. Stored as a 2-slot array
+        // (index 0=driver, 1=passenger); leave null if the getter is unavailable.
+        if (safetyBeltDevice != null) {
+            try {
+                int od = occupantOf(1), op = occupantOf(2);
+                if (od != BydVehicleData.UNAVAILABLE || op != BydVehicleData.UNAVAILABLE) {
+                    b.passengerDetection(new int[]{ od, op });
+                }
+            } catch (Exception e) {
+                logger.debug("collectSafetyBelt occupancy error: " + e.getMessage());
+            }
+        }
+    }
+
+    /** Read one seat's occupancy via getPassengerStatus(area): 1=SOMEBODY, 0=NOBODY,
+     *  else UNAVAILABLE (INVALID/unknown). */
+    private int occupantOf(int area) {
+        Object s = BydDeviceHelper.callGetter(safetyBeltDevice, "getPassengerStatus", area);
+        if (!(s instanceof Number)) return BydVehicleData.UNAVAILABLE;
+        int v = ((Number) s).intValue();
+        if (v == 1) return 1;
+        if (v == 0) return 0;
+        return BydVehicleData.UNAVAILABLE;
+    }
+
+    /** Sanitize a raw instrument seatbelt read → 0 (unbuckled) / 1 (buckled) /
+     *  {@link BydVehicleData#UNAVAILABLE} (unknown). Mirrors the OEM firmware's
+     *  sanitizeSeatbeltState: drop failure codes, then mask &0xFFFF and drop INVALID(2).
+     *
+     *  <p>ORDER MATTERS: the failure codes are RAW 32-bit negatives (e.g.
+     *  Integer.MIN_VALUE, -1, -10011), so they must be tested against the RAW value
+     *  BEFORE masking. If tested after &0xFFFF, Integer.MIN_VALUE would mask to 0 and be
+     *  mis-reported as "unbuckled" — a spurious belt-off trigger. */
+    private static int sanitizeSeatbelt(int raw) {
+        if (SEATBELT_FAILURE_CODES.contains(raw)) return BydVehicleData.UNAVAILABLE;
+        int masked = raw & 0xFFFF;
+        if (masked == 2) return BydVehicleData.UNAVAILABLE;  // INVALID
+        if (masked == 0) return 0;   // unbuckled
+        if (masked == 1) return 1;   // buckled
+        return BydVehicleData.UNAVAILABLE;
     }
 
     private void collectTyre(BydVehicleData.Builder b) {
         if (tyreDevice == null) return;
         try {
-            // Pressure value (kPa, raw int — confirmed by BYD-DiLink commander app's
-            // UnitFormatter.formatPressure(): no scaling for kPa, *0.1450377 for psi,
+            // Pressure value (kPa, raw int — per the OEM firmware's pressure
+            // formatter: no scaling for kPa, *0.1450377 for psi,
             // /100 for bar). Areas: 1=FL, 2=FR, 3=RL, 4=RR.
             int[] pressures = new int[4];
             int[] pressureStates = new int[4];
@@ -3489,8 +3578,28 @@ public class BydDataCollector {
         try {
             Object mode = BydDeviceHelper.callGetter(energyDevice, "getEnergyMode");
             if (mode instanceof Number) b.energyMode(((Number) mode).intValue());
-            Object opMode = BydDeviceHelper.callGetter(energyDevice, "getOperationMode");
-            if (opMode instanceof Number) b.operationMode(((Number) opMode).intValue());
+            // Drive mode is published on the SETTING-device "drive config" axis
+            // (1=normal/2=eco/3=sport/4=snow) so read and write share one axis and
+            // NORMAL is representable. Prefer getDriveConfig; if that HAL getter is
+            // absent, fall back to the energy-device getOperationMode (ECO=1/SPORT=2)
+            // mapped UP to the config axis (1→2 eco, 2→3 sport) so eco/sport still
+            // display correctly on builds without the drive-config getter.
+            int driveConfig = getDriveConfigMode();
+            // Only accept the valid config axis (1=normal..4=snow). Some firmwares
+            // may return 0 as an "unset" sentinel; treat that (and the -1 read-fail)
+            // as "no drive-config getter" and fall back to the energy getter, rather
+            // than publishing a meaningless op_mode:0.
+            if (driveConfig >= 1 && driveConfig <= 4) {
+                b.operationMode(driveConfig);
+            } else {
+                Object opMode = BydDeviceHelper.callGetter(energyDevice, "getOperationMode");
+                if (opMode instanceof Number) {
+                    int energyAxis = ((Number) opMode).intValue();
+                    // 1(eco)→2, 2(sport)→3; leave anything else as-is.
+                    int mapped = energyAxis == 1 ? 2 : energyAxis == 2 ? 3 : energyAxis;
+                    b.operationMode(mapped);
+                }
+            }
             
             // SOC fallback: EnergyDevice.getElecPercentageValue() — try if statistic didn't provide SOC
             if (Double.isNaN(b.socPercent)) {
@@ -3835,19 +3944,38 @@ public class BydDataCollector {
      * Extended bodywork data: steering angle, auto system state, 12V level, sunroof, sunshade.
      * Called from collectAllFull() only (display-only, on-demand).
      */
-    private void collectBodyworkExtended(BydVehicleData.Builder b) {
+    /**
+     * Read the live steering-wheel angle into the builder. Extracted so the periodic
+     * poll ({@link #collectAll}) can refresh it every cycle — {@code
+     * collectBodyworkExtended} runs ONLY at init ({@code collectAllFull}), and the
+     * live listener {@code handleSteeringAngleChanged} is unwired, so without this the
+     * angle was seeded once at boot (wheel centered → 0) and carried forward forever:
+     * the "steeringAngle" automation event never saw a transition and could never
+     * fire. Guards the SDK sentinel + the same ±780° sanity range the listener uses.
+     */
+    private void collectSteeringAngle(BydVehicleData.Builder b) {
         if (bodyworkDevice == null) return;
-
-        // Steering wheel angle
         try {
             Object steering = BydDeviceHelper.callGetter(bodyworkDevice, "getSteeringWheelValue", 1);
             if (steering instanceof Number) {
                 double angle = ((Number) steering).doubleValue();
-                b.steeringAngleDegrees(angle);
+                // Guard the SDK not-available sentinel and clamp to the physical range
+                // (mirrors handleSteeringAngleChanged): a bogus value would false-fire
+                // a steering-angle automation.
+                if (angle != BydFeatureIds.SDK_NOT_AVAILABLE && angle >= -780 && angle <= 780) {
+                    b.steeringAngleDegrees(angle);
+                }
             }
         } catch (Exception e) {
-            logger.debug("collectBodyworkExtended steering error: " + e.getMessage());
+            logger.debug("collectSteeringAngle error: " + e.getMessage());
         }
+    }
+
+    private void collectBodyworkExtended(BydVehicleData.Builder b) {
+        if (bodyworkDevice == null) return;
+
+        // Steering wheel angle (shared with the periodic poll via collectSteeringAngle).
+        collectSteeringAngle(b);
 
         // Auto system state (0=normal, 1=set_secure, 2=start_secure)
         try {
@@ -3877,6 +4005,28 @@ public class BydDataCollector {
             }
         } catch (Exception e) {
             logger.debug("collectBodyworkExtended sunroofState error: " + e.getMessage());
+        }
+
+        // Front wiper state (raw). Per the OEM firmware the wiper getters live on the
+        // BODYWORK device (not a dedicated wiper device). Raw int; consumers threshold
+        // it (0/off vs any active level). Populates the pre-existing wiperState field.
+        try {
+            Object wiper = BydDeviceHelper.callGetter(bodyworkDevice, "getFrontWiperState");
+            if (wiper instanceof Number) {
+                b.wiperState(((Number) wiper).intValue());
+            }
+        } catch (Exception e) {
+            logger.debug("collectBodyworkExtended frontWiperState error: " + e.getMessage());
+        }
+        // Auto-wiper (rain-sensing wipe) enabled — the closest "it's raining" proxy this
+        // platform exposes; there is no rain-intensity sensor. getAutoWiperState: 1=on.
+        try {
+            Object autoWiper = BydDeviceHelper.callGetter(bodyworkDevice, "getAutoWiperState");
+            if (autoWiper instanceof Number) {
+                b.autoWiperState(((Number) autoWiper).intValue());
+            }
+        } catch (Exception e) {
+            logger.debug("collectBodyworkExtended autoWiperState error: " + e.getMessage());
         }
 
         // Sunroof position (if available)
@@ -4467,7 +4617,7 @@ public class BydDataCollector {
         // The ChargingDevice fires events for many different metrics (voltage, current,
         // capacity, temperature, etc.) and we cannot reliably distinguish power from other
         // values without knowing the specific event ID mapping.
-        // The commander app does NOT use onDataEventChanged for power — it only uses
+        // The OEM firmware does NOT use onDataEventChanged for power — it only uses
         // onExternalChargingPowerChanged from InstrumentDevice (see onInstrumentCallback).
         // We skip this path entirely to avoid misinterpreting non-power values as kW.
         if ("onDataEventChanged".equals(method) && args != null && args.length >= 2) {
@@ -4939,7 +5089,7 @@ public class BydDataCollector {
         // AC compressor/blower. This caused "turn off" to merely disable auto mode
         // while the AC kept running in manual mode.
         //
-        // Reference: BYDCarController.setAcState() calls acDevice.start(0) / acDevice.stop(0)
+        // Per the OEM firmware: the AC state setter calls acDevice.start(0) / acDevice.stop(0)
         // Parameter 0 = default zone (all zones).
         // Return value: 0 = success, 1 = failed, 2 = timeout, 3 = busy, 4 = invalid value
         try {
@@ -5299,7 +5449,7 @@ public class BydDataCollector {
     }
 
     public boolean closeTailgate() {
-        // SOTA FIX: Commander app uses value 3 for close via SETTING_VOICE_CTRL_BACK_DOOR_SET
+        // SOTA FIX: the OEM firmware uses value 3 for close via SETTING_VOICE_CTRL_BACK_DOOR_SET
         // Values: 1=open, 2=stop, 3=close (confirmed from AutoCommander decompilation)
         
         // Method 1: SettingDevice sendSetCommand with value 3 (close)
@@ -5335,7 +5485,7 @@ public class BydDataCollector {
     }
 
     public boolean stopTailgate() {
-        // SOTA FIX: Commander app uses value 2 for stop
+        // SOTA FIX: the OEM firmware uses value 2 for stop
         // Values: 1=open, 2=stop, 3=close
         
         // Method 1: SettingDevice sendSetCommand with value 2 (stop)
@@ -5671,7 +5821,7 @@ public class BydDataCollector {
             if (position < 1 || position > 4) return false;
             if (level < 0 || level > 3) return false;
             // Level normalization: coerceIn(level, 0, 2) + 1 → 0→1(off), 1→2(low), 2→3(high).
-            // Matches Commander's BYDCarController.normalizeSeatLevel().
+            // Matches the OEM firmware's seat-level normalization.
             int normalizedLevel = Math.min(level, 2) + 1;
 
             // Capability gate via BYDAutoSettingDevice.hasFeature(). The
@@ -5689,13 +5839,12 @@ public class BydDataCollector {
                 }
             }
 
-            // Use the canonical SDK method directly. Commander uses the same
-            // call (BYDCarController.setSeatVentilationInternal at line 3017
-            // of the decompile) and the BYD stub SDK at
+            // Use the canonical SDK method directly. This matches the OEM
+            // firmware's seat-ventilation setter, and the BYD stub SDK at
             // android/hardware/bydauto/setting/BYDAutoSettingDevice.java only
             // defines this name. The previous "fallback chain" of
             // setSeatBlowingState / setSeatCoolingState / etc. was guesswork
-            // — none of those exist in either Commander's reference or the
+            // — none of those exist in the OEM firmware or the
             // stub SDK. Removed.
             Method m;
             try {
@@ -5857,12 +6006,78 @@ public class BydDataCollector {
         }
     }
 
+    /**
+     * Lane-assist mode (Lane Departure Warning / Prevention) via the OEM firmware's
+     * dedicated {@code BYDAutoADASDevice.setLKSMode(int)} method — NOT the generic
+     * {@code set(featureId,value)} path, and NOT the ELKA (emergency) switch the old
+     * impl mistakenly wrote to on the wrong (setting) device.
+     *
+     * <p>Takes an APP-LEVEL mode and maps it to the MCU value the HAL expects, per the
+     * OEM firmware: {@code 0→0 (Off), 1→1 (LDW), 2→4 (LDP), 3→3 (LDW+LDP)}. Note the
+     * non-contiguous 2→4 — LDP is MCU value 4, so a naive pass-through would set the
+     * wrong mode. Probed by name so an SDK rename surfaces at WARN rather than silently
+     * writing to a dead device.
+     */
     public boolean setLaneAssistMode(int mode) {
-        try {
-            return BydDeviceHelper.sendSetCommand(settingDevice, BydFeatureIds.ADAS_ELKA_SWITCH_SET, mode);
-        } catch (Exception e) {
-            logger.debug("setLaneAssistMode failed: " + e.getMessage());
+        if (adasDevice == null) {
+            logger.warn("setLaneAssistMode: adasDevice unavailable");
             return false;
+        }
+        int mcuValue;
+        switch (mode) {
+            case 1:  mcuValue = 1; break; // LDW
+            case 2:  mcuValue = 4; break; // LDP (MCU 4, not 2)
+            case 3:  mcuValue = 3; break; // LDW + LDP
+            case 0:
+            default: mcuValue = 0; break; // Off
+        }
+        Method m;
+        try {
+            m = adasDevice.getClass().getMethod("setLKSMode", int.class);
+        } catch (NoSuchMethodException nsme) {
+            logger.warn("setLKSMode: method not present on "
+                + adasDevice.getClass().getSimpleName()
+                + " — lane-assist control unsupported on this OEM build");
+            return false;
+        } catch (Exception e) {
+            logger.warn("setLKSMode lookup failed: " + e.getMessage());
+            return false;
+        }
+        try {
+            Object r = m.invoke(adasDevice, mcuValue);
+            return isSdkWriteSuccess(adasDevice, r, "setLKSMode");
+        } catch (Exception e) {
+            logger.warn("setLKSMode(mode=" + mode + " mcu=" + mcuValue + ") failed: " + e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Current lane-assist mode as app-level {@code 0=Off / 1=LDW / 2=LDP / 3=LDW+LDP},
+     * or -1 if unavailable. Reads {@code BYDAutoADASDevice.getLKSMode()} and undoes the
+     * setter's app→MCU mapping (MCU {@code 0→0, 1→1, 4→2, 3→3}). Used for toggle/cycle
+     * readback and UI state.
+     */
+    public int getLaneAssistMode() {
+        if (adasDevice == null) return -1;
+        try {
+            Method m = adasDevice.getClass().getMethod("getLKSMode");
+            Object r = m.invoke(adasDevice);
+            if (!(r instanceof Number)) return -1;
+            int mcu = ((Number) r).intValue();
+            if (mcu == BydFeatureIds.SDK_NOT_AVAILABLE) return -1;
+            switch (mcu) {
+                case 0: return 0; // Off
+                case 1: return 1; // LDW
+                case 4: return 2; // LDP
+                case 3: return 3; // LDW + LDP
+                default: return -1;
+            }
+        } catch (NoSuchMethodException nsme) {
+            return -1;
+        } catch (Exception e) {
+            logger.debug("getLaneAssistMode failed: " + e.getMessage());
+            return -1;
         }
     }
 
@@ -5972,6 +6187,42 @@ public class BydDataCollector {
         }
     }
 
+    /**
+     * iTAC (Intelligent Torque Adaption Control) on/off via the setting HAL
+     * ({@code SETTING_ITAC_STATE_SET}). Unlike ESP this is a performance/traction
+     * feature, not a stability-safety interlock. Returns false if the write path
+     * threw. The feature ids are decoded from the DiLink APK (see BydFeatureIds);
+     * verify with {@link #getItacState()} on-car before trusting the toggle.
+     *
+     * <p>Value convention per the OEM firmware's
+     * {@code setItacEnabled}: the HAL wants {@code on=1 / off=2} (the same 1=on/2=off
+     * convention as CPD), NOT {@code off=0}. Sending 0 was ignored by the HAL, which
+     * is why the toggle appeared to do nothing.
+     */
+    public boolean setItacState(boolean enabled) {
+        try {
+            return BydDeviceHelper.sendSetCommand(settingDevice, BydFeatureIds.SETTING_ITAC_STATE_SET, enabled ? 1 : 2);
+        } catch (Exception e) {
+            logger.debug("setItacState failed: " + e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Read the raw iTAC state via the setting HAL ({@code SETTING_ITAC_STATE}).
+     * Returns the raw SDK int (typically 1=on / 0=off), or -1 when the read fails /
+     * device is unavailable. Exposed for on-device verification of the iTAC feature
+     * ids before the toggle is trusted (mirrors {@link #getEspState()}).
+     */
+    public int getItacState() {
+        try {
+            return BydDeviceHelper.callGetSingle(settingDevice, BydFeatureIds.SETTING_ITAC_STATE);
+        } catch (Exception e) {
+            logger.debug("getItacState failed: " + e.getMessage());
+            return -1;
+        }
+    }
+
     public boolean setIslaSwitch(boolean enabled) {
         try {
             return BydDeviceHelper.sendSetCommand(settingDevice, BydFeatureIds.ADAS_ISLA_SWITCH_SET, enabled ? 1 : 0);
@@ -6053,34 +6304,233 @@ public class BydDataCollector {
 
     // --- Display ---
 
-    public boolean setInfotainmentBrightness(int level) {
-        try {
-            if (level < 0 || level > 100) return false;
-            return BydDeviceHelper.sendSetCommand(settingDevice, BydFeatureIds.SETTING_BRIGHTNESS_GEAR_SET, level);
-        } catch (Exception e) {
-            logger.debug("setInfotainmentBrightness failed: " + e.getMessage());
+    /**
+     * Invoke a dedicated {@code BYDAutoSettingDevice.<methodName>(int)} brightness
+     * method (0..100) by reflection. Per the OEM firmware:
+     * screen brightness is driven through dedicated methods
+     * ({@code setInfotainmentBrightness} / {@code setDriverDisplayBrightness} /
+     * {@code setHUDBrightness}), NOT the generic {@code set(SET_BRIGHTNESS_GEAR_SET,
+     * EventValue)} feature-id path — that feature id is dead code in the SDK and
+     * writing to it does nothing. Probed by name so an SDK rename surfaces at WARN.
+     *
+     * <p>SUCCESS SEMANTICS: the OEM firmware's own brightness setters INVOKE and then
+     * return their own {@code true} on no-exception — they DO NOT inspect the SDK
+     * method's return value. We match that: {@code isSdkWriteSuccess} was
+     * mis-rejecting physically-successful writes for these void/int-returning setters
+     * (a non-zero-but-benign return read as failure), which is why the control
+     * reported failure even when it worked. So here: if the invoke does not throw, the
+     * write was accepted → return {@code true}. Only a missing method or a thrown
+     * invoke is a real failure.
+     */
+    private boolean setBrightnessViaMethod(String methodName, int level) {
+        if (settingDevice == null) {
+            logger.warn(methodName + ": settingDevice unavailable");
             return false;
         }
+        if (level < 0 || level > 100) return false;
+        Method m;
+        try {
+            m = settingDevice.getClass().getMethod(methodName, int.class);
+        } catch (NoSuchMethodException nsme) {
+            logger.warn(methodName + ": method not present on "
+                + settingDevice.getClass().getSimpleName()
+                + " — brightness control unsupported on this OEM build");
+            return false;
+        } catch (Exception e) {
+            logger.warn(methodName + " lookup failed: " + e.getMessage());
+            return false;
+        }
+        try {
+            m.invoke(settingDevice, level);
+            // Accept on no-exception (mirrors the OEM firmware's own setter contract);
+            // do NOT gate on the return value — these setters return a non-success-coded
+            // int/void that isSdkWriteSuccess wrongly treated as failure.
+            logger.info(methodName + "(" + level + ") invoked");
+            return true;
+        } catch (Exception e) {
+            logger.warn(methodName + "(" + level + ") failed: " + e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Infotainment (centre) screen brightness. The centre screen is the MAIN Android
+     * display, so besides the BYD SDK setter we ALSO drive the Android
+     * {@code Settings.System.SCREEN_BRIGHTNESS} via the shell (the daemon runs as UID
+     * 2000 / shell, which holds WRITE_SETTINGS). This is the lever that actually moves
+     * the panel when the SDK setter is a no-op on a trim, and it also disables
+     * auto-brightness first (otherwise the ambient-light sensor immediately overrides
+     * a manual set — the observed "brightness does nothing" symptom). The 0..100
+     * percentage maps onto the Android 0..255 range. Best-effort: succeeds if EITHER
+     * path is accepted.
+     */
+    public boolean setInfotainmentBrightness(int level) {
+        if (level < 0 || level > 100) return false;
+        boolean sdkOk = setBrightnessViaMethod("setInfotainmentBrightness", level);
+        boolean shellOk = setAndroidScreenBrightness(level);
+        return sdkOk || shellOk;
     }
 
     public boolean setDriverDisplayBrightness(int level) {
+        return setBrightnessViaMethod("setDriverDisplayBrightness", level);
+    }
+
+    public boolean setHudBrightness(int level) {
+        return setBrightnessViaMethod("setHUDBrightness", level);
+    }
+
+    /**
+     * Drive the main Android display brightness via {@code settings put system}. The
+     * daemon is UID 2000 (shell), so {@code settings put} writes System settings
+     * directly — the same mechanism used elsewhere for Secure settings. Turns
+     * auto-brightness OFF first ({@code screen_brightness_mode 0}) so a manual level
+     * isn't instantly overridden by the ambient sensor, then sets the 0..255 value
+     * scaled from the 0..100 input. Bounded exec so a stuck {@code settings} can never
+     * park the caller. Returns true when the write command completes without error.
+     */
+    private boolean setAndroidScreenBrightness(int percent) {
+        int v255 = Math.max(0, Math.min(255, Math.round(percent / 100f * 255f)));
+        String script = "settings put system screen_brightness_mode 0; "
+                + "settings put system screen_brightness " + v255;
         try {
-            if (level < 0 || level > 100) return false;
-            // Driver display brightness uses the same feature ID — the instrument cluster
-            // adjusts both displays together on most BYD models
-            return BydDeviceHelper.sendSetCommand(settingDevice, BydFeatureIds.SETTING_BRIGHTNESS_GEAR_SET, level);
-        } catch (Exception e) {
-            logger.debug("setDriverDisplayBrightness failed: " + e.getMessage());
+            Process p = new ProcessBuilder("sh", "-c", script)
+                    .redirectErrorStream(true).start();
+            // Drain + bound so the child can't wedge on a full pipe or outlive the call.
+            final java.io.InputStream is = p.getInputStream();
+            Thread drain = new Thread(() -> {
+                byte[] buf = new byte[512];
+                try { while (is.read(buf) != -1) { /* discard */ } } catch (Throwable ignored) {}
+            }, "screen-brightness-drain");
+            drain.setDaemon(true);
+            drain.start();
+            boolean done = p.waitFor(3, java.util.concurrent.TimeUnit.SECONDS);
+            if (!done) { p.destroyForcibly(); logger.warn("setAndroidScreenBrightness: settings put timed out"); return false; }
+            try { is.close(); } catch (Throwable ignored) {}
+            boolean ok = p.exitValue() == 0;
+            logger.info("setAndroidScreenBrightness: " + percent + "% (=" + v255 + "/255) shell ok=" + ok);
+            return ok;
+        } catch (Throwable t) {
+            logger.warn("setAndroidScreenBrightness failed: " + t.getMessage());
             return false;
         }
     }
 
-    public boolean setHudBrightness(int level) {
+    // --- Screen power (backlight on/off) ---
+    //
+    // Turn the infotainment (centre) screen fully on/off. This is the SAME
+    // proven mechanism the ACC-sentry daemon uses to blank the panel while
+    // keeping CPU/radio alive — deliberately NOT PowerManager.goToSleep()
+    // (which the car's ACC-on keep-awake logic fights, causing the panel to
+    // flick back on). The probe order, verified working on this hardware, is:
+    //   1. PowerManager.turnBacklightOn/turnBacklightOff(long)   — lowercase
+    //   2. PowerManager.TurnBacklightOn/TurnBacklightOff(long)   — PascalCase
+    //   3. BYDAutoSettingDevice.turnBacklightOn/turnBacklightOff()
+    //   4. shell: settings put system screen_brightness + input keyevent
+    //      224 (WAKEUP) / 223 (SLEEP)
+    // First success short-circuits. Every tier is independently try/caught so
+    // a missing method just falls through to the next. Returns true when any
+    // tier is accepted.
+    private volatile Method screenBacklightLowerOn;
+    private volatile Method screenBacklightLowerOff;
+    private volatile boolean screenBacklightLowerProbed;
+    private volatile Method screenBacklightPascalOn;
+    private volatile Method screenBacklightPascalOff;
+    private volatile boolean screenBacklightPascalProbed;
+
+    public boolean setScreenPower(boolean on) {
+        logger.info("setScreenPower: " + (on ? "ON" : "OFF"));
+        // Tier 1 + 2: PowerManager backlight reflection (the primary path).
+        Context ctx = context;
+        if (ctx != null) {
+            try {
+                android.os.PowerManager pm =
+                        (android.os.PowerManager) ctx.getSystemService(Context.POWER_SERVICE);
+                if (pm != null) {
+                    Class<?> pmClass = pm.getClass();
+                    long now = android.os.SystemClock.uptimeMillis();
+                    // Tier 1 — lowercase turnBacklightOn/Off(long).
+                    if (!screenBacklightLowerProbed) {
+                        try { screenBacklightLowerOn = pmClass.getMethod("turnBacklightOn", long.class); } catch (Throwable ignored) {}
+                        try { screenBacklightLowerOff = pmClass.getMethod("turnBacklightOff", long.class); } catch (Throwable ignored) {}
+                        screenBacklightLowerProbed = true;
+                    }
+                    Method lower = on ? screenBacklightLowerOn : screenBacklightLowerOff;
+                    if (lower != null) {
+                        try {
+                            lower.invoke(pm, now);
+                            logger.info("setScreenPower: PowerManager." + (on ? "turnBacklightOn" : "turnBacklightOff") + " OK");
+                            return true;
+                        } catch (Throwable t) {
+                            logger.debug("PowerManager backlight (lower) invoke failed: " + t.getMessage());
+                        }
+                    }
+                    // Tier 2 — PascalCase TurnBacklightOn/Off(long).
+                    if (!screenBacklightPascalProbed) {
+                        try { screenBacklightPascalOn = pmClass.getMethod("TurnBacklightOn", long.class); } catch (Throwable ignored) {}
+                        try { screenBacklightPascalOff = pmClass.getMethod("TurnBacklightOff", long.class); } catch (Throwable ignored) {}
+                        screenBacklightPascalProbed = true;
+                    }
+                    Method pascal = on ? screenBacklightPascalOn : screenBacklightPascalOff;
+                    if (pascal != null) {
+                        try {
+                            pascal.invoke(pm, now);
+                            logger.info("setScreenPower: PowerManager." + (on ? "TurnBacklightOn" : "TurnBacklightOff") + " OK");
+                            return true;
+                        } catch (Throwable t) {
+                            logger.debug("PowerManager backlight (pascal) invoke failed: " + t.getMessage());
+                        }
+                    }
+                }
+            } catch (Throwable t) {
+                logger.debug("setScreenPower PowerManager path failed: " + t.getMessage());
+            }
+        }
+        // Tier 3 — BYDAutoSettingDevice.turnBacklightOn/turnBacklightOff() (no-arg).
+        if (settingDevice != null) {
+            try {
+                Method m = settingDevice.getClass().getMethod(on ? "turnBacklightOn" : "turnBacklightOff");
+                m.invoke(settingDevice);
+                logger.info("setScreenPower: BYDAutoSettingDevice." + (on ? "turnBacklightOn" : "turnBacklightOff") + " OK");
+                return true;
+            } catch (NoSuchMethodException nsme) {
+                logger.debug("setScreenPower: BYDAutoSettingDevice backlight method absent");
+            } catch (Throwable t) {
+                logger.debug("setScreenPower BYD path failed: " + t.getMessage());
+            }
+        }
+        // Tier 4 — shell fallback: set brightness then WAKEUP/SLEEP keyevent.
+        return setScreenPowerViaShell(on);
+    }
+
+    /**
+     * Shell fallback for screen power (daemon is UID 2000 / shell). Mirrors the
+     * ACC-sentry daemon's fallback: nudge brightness (128 on / 0 off) then inject
+     * KEYCODE_WAKEUP (224) / KEYCODE_SLEEP (223). Bounded exec so a stuck child
+     * never parks the caller. Returns true when the command completes cleanly.
+     */
+    private boolean setScreenPowerViaShell(boolean on) {
+        int brightness = on ? 128 : 0;
+        int keyevent = on ? 224 : 223; // 224=WAKEUP, 223=SLEEP
+        String script = "settings put system screen_brightness " + brightness + "; "
+                + "input keyevent " + keyevent;
         try {
-            if (level < 0 || level > 100) return false;
-            return BydDeviceHelper.sendSetCommand(settingDevice, BydFeatureIds.SETTING_BRIGHTNESS_GEAR_SET, level);
-        } catch (Exception e) {
-            logger.debug("setHudBrightness failed: " + e.getMessage());
+            Process p = new ProcessBuilder("sh", "-c", script)
+                    .redirectErrorStream(true).start();
+            final java.io.InputStream is = p.getInputStream();
+            Thread drain = new Thread(() -> {
+                byte[] buf = new byte[512];
+                try { while (is.read(buf) != -1) { /* discard */ } } catch (Throwable ignored) {}
+            }, "screen-power-drain");
+            drain.setDaemon(true);
+            drain.start();
+            boolean done = p.waitFor(3, java.util.concurrent.TimeUnit.SECONDS);
+            if (!done) { p.destroyForcibly(); logger.warn("setScreenPowerViaShell: timed out"); return false; }
+            try { is.close(); } catch (Throwable ignored) {}
+            boolean ok = p.exitValue() == 0;
+            logger.info("setScreenPowerViaShell: " + (on ? "ON" : "OFF") + " (kev " + keyevent + ") shell ok=" + ok);
+            return ok;
+        } catch (Throwable t) {
+            logger.warn("setScreenPowerViaShell failed: " + t.getMessage());
             return false;
         }
     }
@@ -6177,6 +6627,94 @@ public class BydDataCollector {
     }
 
     /**
+     * Drive mode on the SETTING-device "drive config" axis, which — unlike the
+     * energy-device {@link #setOperationMode} (ECO=1/SPORT=2 only) — supports
+     * NORMAL. Value convention per the OEM firmware's setOperationMode
+     * chain. The value is on the drive-config axis:
+     * <pre>NORMAL = 1, ECO = 2, SPORT = 3, SNOW = 4</pre>
+     * (NOTE: distinct from the energy-device numbering — do not mix them.)
+     *
+     * <p>Fallback chain (first that sticks wins), per the OEM firmware:
+     * <ol>
+     *   <li>{@code settingDevice.setDriveConfig(int)} — the dedicated method;</li>
+     *   <li>generic {@code set(SETTING_TARGET_DRIVING_MODE, value)};</li>
+     *   <li>generic {@code set(SETTING_TARGET_DRIVING_MODE_ALT, value)};</li>
+     *   <li>last resort for ECO/SPORT only: the energy-device
+     *       {@code setOperationMode} on ITS axis (config 2/3 → energy 1/2). NORMAL
+     *       and SNOW have no energy-axis equivalent, so they are not down-converted.</li>
+     * </ol>
+     *
+     * @param configMode drive mode on the config axis (1=normal, 2=eco, 3=sport, 4=snow)
+     * @return true if any path reported success
+     */
+    public boolean setDriveConfigMode(int configMode) {
+        // 1) Dedicated setting-device method — judged with isSdkWriteSuccess (checks
+        //    the resolved COMMAND_SUCCESS constant), so a real success is trustworthy.
+        if (settingDevice != null) {
+            Method m = null;
+            try {
+                m = settingDevice.getClass().getMethod("setDriveConfig", int.class);
+            } catch (NoSuchMethodException ignored) {
+                // fall through to the fallbacks
+            } catch (Exception e) {
+                logger.debug("setDriveConfig lookup failed: " + e.getMessage());
+            }
+            if (m != null) {
+                try {
+                    Object r = m.invoke(settingDevice, configMode);
+                    if (isSdkWriteSuccess(settingDevice, r, "setDriveConfig")) return true;
+                } catch (Exception e) {
+                    logger.debug("setDriveConfig(" + configMode + ") failed: " + e.getMessage());
+                }
+            }
+        }
+
+        boolean ecoOrSport = (configMode == 2 || configMode == 3);
+
+        // 2) For ECO/SPORT, prefer the KNOWN-GOOD energy-device path before the
+        //    guessed target-driving-mode feature ids. The feature ids are
+        //    resolveOrFallback guesses and BydDeviceHelper.sendSetCommand treats any
+        //    code >= 0 as success — so a HAL that returns >= 0 for an unrecognized id
+        //    would falsely "succeed" and starve the working energy fallback. eco/sport
+        //    have a proven energy equivalent (config 2/3 → energy 1/2), so use it
+        //    first; NORMAL/SNOW have no energy equivalent and MUST use the feature ids.
+        if (ecoOrSport && setOperationMode(configMode - 1)) {
+            return true;
+        }
+
+        // 3) + 4) Generic feature-id writes on the setting device. For NORMAL/SNOW this
+        //    is the only path; for eco/sport it is a further fallback if the energy
+        //    path above didn't stick.
+        if (settingDevice != null) {
+            if (BydDeviceHelper.sendSetCommand(settingDevice, BydFeatureIds.SETTING_TARGET_DRIVING_MODE, configMode)) {
+                return true;
+            }
+            if (BydDeviceHelper.sendSetCommand(settingDevice, BydFeatureIds.SETTING_TARGET_DRIVING_MODE_ALT, configMode)) {
+                return true;
+            }
+        }
+        logger.warn("setDriveConfigMode(" + configMode + "): no working drive-config path on this build");
+        return false;
+    }
+
+    /**
+     * Read the drive mode on the setting-device drive-config axis
+     * (1=normal/2=eco/3=sport/4=snow). Returns the raw int, or -1 when the getter
+     * is unavailable / read failed. Used as the primary source for the published
+     * drive-mode telemetry so read and write share one axis.
+     */
+    public int getDriveConfigMode() {
+        if (settingDevice == null) return -1;
+        try {
+            Object r = BydDeviceHelper.callGetter(settingDevice, "getDriveConfig");
+            if (r instanceof Number) return ((Number) r).intValue();
+        } catch (Exception e) {
+            logger.debug("getDriveConfig failed: " + e.getMessage());
+        }
+        return -1;
+    }
+
+    /**
      * Energy/powertrain mode: EV vs HEV (BYD SDK EnergyMode enum, matches the
      * value read back as energyMode). Only meaningful on DM/PHEV vehicles.
      *
@@ -6184,8 +6722,20 @@ public class BydDataCollector {
      * (confirmed present in the OEM implementation). Same signature-permission
      * caveat as {@link #setOperationMode}: resolves, but the HAL may reject the
      * write from our UID. Invoked defensively via {@link #invokeOptionalModeSetter}.
+     *
+     * <p><b>Value guard:</b> the ONLY valid values are {@code 1 = EV} and
+     * {@code 3 = HEV} — the OEM firmware hard-rejects anything else. In particular
+     * {@code 0 = STOP} (NOT EV): an out-of-range or 0 value reaching the HAL would
+     * either be ignored or, worse, command STOP. The catalog word→int mapping only
+     * ever produces 1 or 3, but this method is public, so guard here too — a caller
+     * that bypasses the mapping can never drive the powertrain to an unintended mode.
      */
     public boolean setEnergyMode(int mode) {
+        if (mode != 1 && mode != 3) {
+            logger.warn("setEnergyMode: refusing invalid mode " + mode
+                + " (only 1=EV / 3=HEV are valid; 0=STOP)");
+            return false;
+        }
         return invokeOptionalModeSetter(energyDevice, "setEnergyMode", mode,
                 "energy/powertrain mode (EV/HEV)");
     }
@@ -6303,12 +6853,25 @@ public class BydDataCollector {
         return resolved;
     }
 
-    /** Energy recuperation / regen-braking strength (BYDAutoSettingDevice). */
+    /**
+     * Energy recuperation / regen-braking strength (BYDAutoSettingDevice).
+     *
+     * <p>Takes a normalized user level 0..2 (0 = standard/low, 1 = high/large,
+     * 2 = max) and converts it to the raw MCU value the HAL expects. Per the OEM
+     * firmware's regen-level mapping: the SDK's
+     * {@code setEnergyFeedback} wants MCU values {@code 2/3/4}, NOT {@code 0/1/2}.
+     * The earlier mapping sent {@code standard=1} (below the valid MCU range — a
+     * silent no-op) and {@code high=2} (which is the HAL's *standard* MCU value), so
+     * "standard did nothing" and "high set standard" — exactly the observed bug.
+     */
     public boolean setEnergyFeedback(int level) {
         if (settingDevice == null) {
             logger.warn("setEnergyFeedback: settingDevice unavailable");
             return false;
         }
+        // Normalize the user level (0..2) then map to the MCU value: 0->2, 1->3, 2->4.
+        int normalized = Math.max(0, Math.min(2, level));
+        int mcuValue = normalized + 2;
         // Probe by name (like setSteerAssist) so an SDK rename of
         // "setEnergyFeedback" surfaces at WARN instead of silently returning
         // NOT_SUPPORTED for every regen_level command.
@@ -6325,10 +6888,10 @@ public class BydDataCollector {
             return false;
         }
         try {
-            Object r = m.invoke(settingDevice, level);
+            Object r = m.invoke(settingDevice, mcuValue);
             return isSdkWriteSuccess(settingDevice, r, "setEnergyFeedback");
         } catch (Exception e) {
-            logger.warn("setEnergyFeedback(" + level + ") failed: " + e.getMessage());
+            logger.warn("setEnergyFeedback(level=" + level + " mcu=" + mcuValue + ") failed: " + e.getMessage());
             return false;
         }
     }
@@ -6377,6 +6940,127 @@ public class BydDataCollector {
         } catch (Exception e) {
             logger.debug("setNavigationActive failed: " + e.getMessage());
             return false;
+        }
+    }
+
+    /**
+     * Brake-pedal feel ("comfort" vs "sport"/"strong") via {@code
+     * BYDAutoADASDevice.setBrakeFootSenseState(int)}. Value convention per the OEM
+     * firmware: the app-level choice {@code 0 = comfort / 1 = sport} maps to HAL
+     * values {@code comfort → 2}, {@code sport → 0}. This method takes the app-level
+     * 0/1 and applies that mapping, so callers use the same 0=comfort/1=sport
+     * convention the UI shows.
+     *
+     * <p>Probed by name on {@code adasDevice} (same device the SLW/ESP controls use)
+     * so an SDK rename surfaces at WARN instead of silently no-opping. Returns false
+     * when the ADAS device is unavailable or the write path threw.
+     */
+    public boolean setBrakeFootSense(int appLevel) {
+        if (adasDevice == null) {
+            logger.warn("setBrakeFootSense: adasDevice unavailable");
+            return false;
+        }
+        // App-level 0=comfort/1=sport → HAL 2=comfort/0=sport (OEM firmware mapping).
+        int mcuValue = (appLevel == 0) ? 2 : 0;
+        Method m;
+        try {
+            m = adasDevice.getClass().getMethod("setBrakeFootSenseState", int.class);
+        } catch (NoSuchMethodException nsme) {
+            logger.warn("setBrakeFootSenseState: method not present on "
+                + adasDevice.getClass().getSimpleName()
+                + " — brake-feel control unsupported on this OEM build");
+            return false;
+        } catch (Exception e) {
+            logger.warn("setBrakeFootSenseState lookup failed: " + e.getMessage());
+            return false;
+        }
+        try {
+            Object r = m.invoke(adasDevice, mcuValue);
+            return isSdkWriteSuccess(adasDevice, r, "setBrakeFootSenseState");
+        } catch (Exception e) {
+            logger.warn("setBrakeFootSenseState(app=" + appLevel + " mcu=" + mcuValue + ") failed: " + e.getMessage());
+            return false;
+        }
+    }
+
+    // ── Drive-mode readbacks (for toggle/cycle + UI state) ────────────────────
+    // These mirror the OEM firmware's own getters so a "toggle" flips the ACTUAL
+    // current mode (including one set from the car's own menu), not a stale cache.
+    // Each returns the APP-LEVEL value (matching the corresponding setter's input),
+    // or a negative sentinel when unavailable so the caller can fall back gracefully.
+
+    /**
+     * Current brake-pedal feel as app-level {@code 0=comfort / 1=sport}, or -1 if
+     * unavailable. Reads {@code BYDAutoADASDevice.getBrakeFootSenseState()} and applies
+     * the OEM firmware's own mapping: HAL {@code 2 → comfort(0)}, anything else {@code
+     * → sport(1)} (matching setBrakeFootSense's inverse comfort→2/sport→0).
+     */
+    public int getBrakeFootSense() {
+        if (adasDevice == null) return -1;
+        try {
+            Method m = adasDevice.getClass().getMethod("getBrakeFootSenseState");
+            Object r = m.invoke(adasDevice);
+            if (!(r instanceof Number)) return -1;
+            int hal = ((Number) r).intValue();
+            if (hal == BydFeatureIds.SDK_NOT_AVAILABLE) return -1;
+            // HAL 2 = comfort → app 0; anything else → sport (app 1). Mirrors the OEM.
+            return (hal == 2) ? 0 : 1;
+        } catch (NoSuchMethodException nsme) {
+            return -1; // getter absent on this trim
+        } catch (Exception e) {
+            logger.debug("getBrakeFootSense failed: " + e.getMessage());
+            return -1;
+        }
+    }
+
+    /**
+     * Current energy-recuperation (regen) level as app-level {@code 0=standard / 1=high
+     * / 2=max}, or -1 if unavailable. Reads {@code BYDAutoSettingDevice.getEnergyFeedback()}
+     * (raw HAL MCU value 2/3/4) and undoes setEnergyFeedback's {@code app+2} mapping.
+     */
+    public int getEnergyFeedback() {
+        if (settingDevice == null) return -1;
+        try {
+            Method m = settingDevice.getClass().getMethod("getEnergyFeedback");
+            Object r = m.invoke(settingDevice);
+            if (!(r instanceof Number)) return -1;
+            int mcu = ((Number) r).intValue();
+            if (mcu == BydFeatureIds.SDK_NOT_AVAILABLE) return -1;
+            int app = mcu - 2; // inverse of setEnergyFeedback's normalized+2
+            return (app >= 0 && app <= 2) ? app : -1;
+        } catch (NoSuchMethodException nsme) {
+            return -1;
+        } catch (Exception e) {
+            logger.debug("getEnergyFeedback failed: " + e.getMessage());
+            return -1;
+        }
+    }
+
+    /**
+     * Current steering-assist weighting as app-level {@code 0=comfort / 1=sport}, or -1
+     * if unavailable. Reads {@code BYDAutoSettingDevice.getSteerAssis()} and applies the
+     * OEM firmware's own mapping: HAL {@code 1 → comfort(0)}, HAL {@code 2 → sport(1)}.
+     */
+    public int getSteerAssist() {
+        if (settingDevice == null) return -1;
+        try {
+            Method m;
+            try {
+                m = settingDevice.getClass().getMethod("getSteerAssis");
+            } catch (NoSuchMethodException nsme) {
+                m = settingDevice.getClass().getMethod("getSteerAssist"); // with-'t' fallback
+            }
+            Object r = m.invoke(settingDevice);
+            if (!(r instanceof Number)) return -1;
+            int hal = ((Number) r).intValue();
+            if (hal == 1) return 0;      // comfort
+            if (hal == 2) return 1;      // sport
+            return -1;                    // unknown / unavailable
+        } catch (NoSuchMethodException nsme) {
+            return -1;
+        } catch (Exception e) {
+            logger.debug("getSteerAssist failed: " + e.getMessage());
+            return -1;
         }
     }
 

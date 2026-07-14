@@ -1,0 +1,175 @@
+package com.overdrive.app.automation.action;
+
+import com.overdrive.app.automation.AutomationAction;
+import com.overdrive.app.automation.Automations;
+import com.overdrive.app.automation.condition.BydEvent;
+import com.overdrive.app.automation.condition.EventData;
+import com.overdrive.app.automation.type.EnumType;
+import com.overdrive.app.automation.type.IntType;
+import com.overdrive.app.automation.type.Type;
+import com.overdrive.app.automation.value.IntValue;
+import com.overdrive.app.automation.value.Label;
+import com.overdrive.app.automation.value.Value;
+import com.overdrive.app.server.Messages;
+
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Automation action that blocks the action chain until a chosen scalar vehicle
+ * signal satisfies a comparison, or a timeout elapses.
+ *
+ * <p>Example: "when I park (gear = P) → wait until speed = 0 → close windows". The
+ * wait runs on the single {@link com.overdrive.app.automation.AutomationQueue} worker
+ * thread, so — like {@link PauseAction} — it delays only the rest of THIS
+ * automation's chain, never the telemetry/HTTP threads or other automations.
+ *
+ * <p>It polls the SAME live automation state ({@link Automations#getStateValue}) that
+ * triggers and conditions evaluate against, so it observes exactly the values the
+ * telemetry/network/bluetooth events publish. Polling (not event-driven blocking) is
+ * deliberate: the worker must stay simple and killable, and a short poll interval is
+ * cheap for a bounded wait.
+ *
+ * <p>Scope is intentionally the SCALAR signals for which "wait until &lt;x&gt;
+ * &lt;compare&gt; &lt;n&gt;" is meaningful (speed, pedals, steering, battery,
+ * temperature, range). Enum/string signals (gear, lights, wifi) are better expressed
+ * as a trigger+condition; keeping this to numeric signals avoids the multi-variable
+ * sub-key plumbing and keeps the form a flat, self-explanatory row.
+ */
+public class WaitUntilAction extends BaseAction {
+    private static final String TYPE = "waitUntil";
+
+    // Poll cadence + absolute ceiling. The worker sleeps POLL_MS between state reads;
+    // the wait can never exceed the user's timeout (clamped to MAX_TIMEOUT_S) so a
+    // never-satisfied condition can't park the worker forever.
+    private static final long POLL_MS = 250L;
+    private static final int MAX_TIMEOUT_S = 600; // 10 min hard ceiling
+    private static final int DEFAULT_TIMEOUT_S = 30;
+
+    private final Label label;
+    private final String description;
+    private final List<Type> variables;
+
+    public WaitUntilAction(Label label, String description) {
+        this.label = label;
+        this.description = description;
+        // event: which scalar signal to watch. The ids MUST match the EventData keys
+        // published by BydEvent so resolveEvent() can map them back. comparator/value
+        // reuse the IntValue comparators + a 0..1000 int (wide enough for range/temp/
+        // speed/percent; signed steering handled by allowing negatives via min).
+        this.variables = List.of(
+                new EnumType(new Label("event", "automation.wait_signal"),
+                        new Label("speedKmph", "automation.speed"),
+                        new Label("speedMph", "automation.speed_mph_opt"),
+                        new Label("accelerator", "automation.accelerator"),
+                        new Label("brake", "automation.brake"),
+                        new Label("steeringAngle", "automation.steering_angle"),
+                        new Label("batteryLevel", "automation.battery_level"),
+                        new Label("estimatedRange", "automation.estimated_range"),
+                        new Label("temperature", "automation.temperature"),
+                        new Label("outsideTemp", "automation.outside_temperature")),
+                // Reuse the shared IntValue comparator set (eq/neq/gt/lt/gte/lte).
+                cloneComparators(),
+                new IntType(new Label("value", "automation.value"), -540, 1000),
+                new IntType(new Label("timeout", "automation.wait_timeout"), 1, MAX_TIMEOUT_S));
+    }
+
+    /** A comparator picker backed by the same enum IntValue exposes to conditions. */
+    private static EnumType cloneComparators() {
+        return IntValue.COMPARATORS;
+    }
+
+    public String getType() { return TYPE; }
+
+    public Label getLabel() { return label; }
+
+    public String getDescription() { return Messages.get(description); }
+
+    public List<Type> getVariables() { return variables; }
+
+    /**
+     * Map the picker's event id to the published {@link EventData}. Returns null for
+     * an unknown id (defensive — a hand-edited config), which makes trigger() a no-op.
+     */
+    private static EventData resolveEvent(String id) {
+        if (id == null) return null;
+        switch (id) {
+            case "speedKmph":      return BydEvent.SPEED_KMPH;
+            case "speedMph":       return BydEvent.SPEED_MPH;
+            case "accelerator":    return BydEvent.ACCELERATOR;
+            case "brake":          return BydEvent.BRAKE;
+            case "steeringAngle":  return BydEvent.STEERING_ANGLE;
+            case "batteryLevel":   return BydEvent.BATTERY_LEVEL;
+            case "estimatedRange": return BydEvent.ESTIMATED_RANGE;
+            case "temperature":    return BydEvent.TEMPERATURE;
+            case "outsideTemp":    return BydEvent.OUTSIDE_TEMPERATURE;
+            default:               return null;
+        }
+    }
+
+    /**
+     * Block until the chosen signal satisfies (comparator, value) or the timeout
+     * elapses. Polls the shared automation state every {@link #POLL_MS}. Returns
+     * immediately if the condition is already met. Interrupt (worker teardown) is
+     * re-asserted so the worker unwinds cleanly.
+     */
+    public void trigger(AutomationAction automationAction) {
+        Map<String, Object> vars = automationAction.getVariables();
+        EventData event = resolveEvent(str(vars.get("event")));
+        String comparator = str(vars.get("comparator"));
+        Integer target = toInt(vars.get("value"));
+        int timeoutS = clampTimeout(toInt(vars.get("timeout")));
+
+        if (event == null || comparator == null || target == null) {
+            logger.warn("WaitUntilAction: missing/invalid parameters, skipping");
+            return;
+        }
+
+        long deadline = System.currentTimeMillis() + timeoutS * 1000L;
+        // Compare using the SAME IntValue semantics conditions use: build an IntValue
+        // from the live state and compare it against the target with the comparator.
+        while (true) {
+            if (conditionMet(event, comparator, target)) {
+                logger.info("WaitUntilAction: satisfied (" + event.getType() + " " + comparator + " " + target + ")");
+                return;
+            }
+            if (System.currentTimeMillis() >= deadline) {
+                logger.info("WaitUntilAction: timed out after " + timeoutS + "s waiting for "
+                        + event.getType() + " " + comparator + " " + target);
+                return;
+            }
+            try {
+                Thread.sleep(POLL_MS);
+            } catch (InterruptedException ie) {
+                // Worker teardown — re-assert and bail so take() unwinds the thread.
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+    }
+
+    /**
+     * Whether the live value of {@code event} satisfies (comparator, target). A
+     * never-fired signal (null state) is treated as "not yet met" so the wait keeps
+     * polling until it appears or times out — never NPEs.
+     */
+    private static boolean conditionMet(EventData event, String comparator, int target) {
+        Value current = Automations.getStateValue(event);
+        if (current == null) return false;
+        Boolean r = current.compare(target, comparator);
+        return Boolean.TRUE.equals(r);
+    }
+
+    private static int clampTimeout(Integer t) {
+        if (t == null) return DEFAULT_TIMEOUT_S;
+        return Math.max(1, Math.min(MAX_TIMEOUT_S, t));
+    }
+
+    private static String str(Object o) { return o == null ? null : o.toString(); }
+
+    private static Integer toInt(Object o) {
+        if (o == null) return null;
+        if (o instanceof Number) return ((Number) o).intValue();
+        try { return Integer.parseInt(o.toString().trim()); } catch (Exception e) { return null; }
+    }
+}

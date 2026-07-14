@@ -187,6 +187,12 @@ public class BydVehicleData {
 
     // ==================== EXTENDED BODYWORK ====================
     public final int wiperState;
+    // Auto-wiper (rain-sensing) engaged: 1=on, 0=off. Closest "it's raining" proxy —
+    // no rain-intensity sensor exists on this platform. Read from the bodywork device.
+    public final int autoWiperState;
+    // Auto-headlight (light-sensor-driven) engaged: 1=on, 0=off. The usable "it's dark"
+    // proxy; there is no lux value on this platform. Read from the light device.
+    public final int lightAutoStatus;
     public final int sunroofState;
     public final int sunroofPosition;
     public final int sunshadePercent;
@@ -312,6 +318,8 @@ public class BydVehicleData {
         this.oilLevel = b.oilLevel;
         this.engineCode = b.engineCode;
         this.wiperState = b.wiperState;
+        this.autoWiperState = b.autoWiperState;
+        this.lightAutoStatus = b.lightAutoStatus;
         this.sunroofState = b.sunroofState;
         this.sunroofPosition = b.sunroofPosition;
         this.sunshadePercent = b.sunshadePercent;
@@ -606,6 +614,8 @@ public class BydVehicleData {
             // Extended Bodywork
             JSONObject extBody = new JSONObject();
             if (wiperState != UNAVAILABLE) extBody.put("wiperState", wiperState);
+            if (autoWiperState != UNAVAILABLE) extBody.put("autoWiperState", autoWiperState);
+            if (lightAutoStatus != UNAVAILABLE) extBody.put("lightAutoStatus", lightAutoStatus);
             if (sunroofState != UNAVAILABLE) extBody.put("sunroofState", sunroofState);
             if (sunroofPosition != UNAVAILABLE) extBody.put("sunroofPosition", sunroofPosition);
             if (sunshadePercent != UNAVAILABLE) extBody.put("sunshadePercent", sunshadePercent);
@@ -700,6 +710,7 @@ public class BydVehicleData {
         b.currentTripConsumptionKwh = currentTripConsumptionKwh;
         b.engineCoolantLevel = engineCoolantLevel; b.oilLevel = oilLevel;
         b.engineCode = engineCode; b.wiperState = wiperState;
+        b.autoWiperState = autoWiperState; b.lightAutoStatus = lightAutoStatus;
         b.sunroofState = sunroofState; b.sunroofPosition = sunroofPosition;
         b.sunshadePercent = sunshadePercent; b.wirelessChargingStatus = wirelessChargingStatus;
         b.driftModeEnabled = driftModeEnabled;
@@ -772,6 +783,8 @@ public class BydVehicleData {
         int oilLevel = UNAVAILABLE;
         String engineCode;
         int wiperState = UNAVAILABLE;
+        int autoWiperState = UNAVAILABLE;
+        int lightAutoStatus = UNAVAILABLE;
         int sunroofState = UNAVAILABLE;
         int sunroofPosition = UNAVAILABLE;
         int sunshadePercent = UNAVAILABLE;
@@ -890,6 +903,8 @@ public class BydVehicleData {
         public Builder oilLevel(int v) { oilLevel = v; return this; }
         public Builder engineCode(String v) { engineCode = v; return this; }
         public Builder wiperState(int v) { wiperState = v; return this; }
+        public Builder autoWiperState(int v) { autoWiperState = v; return this; }
+        public Builder lightAutoStatus(int v) { lightAutoStatus = v; return this; }
         public Builder sunroofState(int v) { sunroofState = v; return this; }
         public Builder sunroofPosition(int v) { sunroofPosition = v; return this; }
         public Builder sunshadePercent(int v) { sunshadePercent = v; return this; }

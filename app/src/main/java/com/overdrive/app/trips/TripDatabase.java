@@ -564,6 +564,43 @@ public class TripDatabase {
     }
 
     /**
+     * List trips whose start_time falls within an explicit [fromMs, toMs]
+     * window (both epoch ms, inclusive), newest first. Backs the custom
+     * date-range filter in the Trips UI, complementing the "last N days"
+     * {@link #getTrips(int, int, int)} path.
+     *
+     * <p>Both bounds are clamped defensively: a swapped pair is reordered so
+     * callers can't produce an empty window by accident, and a non-positive
+     * upper bound falls back to "now" so an open-ended range still returns
+     * recent trips. The {@code start_time} index makes the range scan cheap.
+     */
+    public synchronized List<TripRecord> getTripsBetween(long fromMs, long toMs, int limit, int offset) {
+        List<TripRecord> trips = new ArrayList<>();
+        if (!ensureConnection()) return trips;
+        if (offset < 0) offset = 0;
+        if (toMs <= 0) toMs = System.currentTimeMillis();
+        if (fromMs > toMs) { long t = fromMs; fromMs = toMs; toMs = t; }
+
+        String sql = "SELECT * FROM trips WHERE start_time >= ? AND start_time <= ? "
+                + "ORDER BY start_time DESC LIMIT ? OFFSET ?";
+        try (PreparedStatement pstmt = connection.prepareStatement(sql)) {
+            pstmt.setLong(1, fromMs);
+            pstmt.setLong(2, toMs);
+            pstmt.setInt(3, limit);
+            pstmt.setInt(4, offset);
+            try (ResultSet rs = pstmt.executeQuery()) {
+                while (rs.next()) {
+                    trips.add(readTripFromResultSet(rs));
+                }
+            }
+        } catch (Exception e) {
+            logger.error("Failed to get trips in range", e);
+            reconnect();
+        }
+        return trips;
+    }
+
+    /**
      * Delete a trip by id. Returns true if a row was deleted.
      */
     public synchronized boolean deleteTrip(long id) {

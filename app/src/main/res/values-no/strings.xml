@@ -187,6 +187,107 @@
     <string name="setup_overlay_title">Tillat visning av andre apper</string>
     <string name="setup_overlay_body">Aktiver denne for å vise en flytende statusindikator for opptak og reisesporing over andre programmer.</string>
     <string name="setup_overlay_button">Åpne overlegg innstillinger</string>
+    <!-- Onboarding guide (novice track). Parked-only, glanceable. Overdrive is a
+         protected brand name — keep it verbatim. -->
+    <!-- Shared button labels -->
+    <string name="onboarding_next">Neste</string>
+    <string name="onboarding_back">Tilbake</string>
+    <string name="onboarding_skip">Hopp</string>
+    <string name="onboarding_later">Gjør dette senere</string>
+    <string name="onboarding_dismiss">Avvis</string>
+    <string name="onboarding_exit">Avslutt tur</string>
+    <string name="onboarding_done_short">Har det</string>
+    <!-- Step 0: authorize the daemon (system ADB popup) -->
+    <string name="onboarding_authorize_title">Vekk overjakt</string>
+    <string name="onboarding_authorize_body">Overkjøre kjører kameraet via en liten hjelpemiddel på enheten. Android vil spørre om en gang for å tillate USB-feilsøking - trykk <b>Allow</b> og sjekk <b>Alltid tillate fra denne enheten</b> så den forblir ved hver omstart.</string>
+    <string name="onboarding_authorize_button">Tillat tilgang</string>
+    <string name="onboarding_authorize_waiting_title">Venter på tillatelse…</string>
+    <string name="onboarding_authorize_waiting_body">Godta Android-popup-vinduet. Hvis du ikke ser det, kan den allerede få - dette vil fortsette alene.</string>
+    <string name="onboarding_authorize_retry_title">Fremdeles ikke tilkoblet</string>
+    <string name="onboarding_authorize_retry_body">Hjelperen kjører ikke ennå. Android tillatelsen kan ha blitt avvist. Prøv igjen og husk å sjekke <b>Alltid tillat</b>.</string>
+    <string name="onboarding_authorize_retry_button">Prøv igjen</string>
+    <!-- Camera mapping chapter -->
+    <string name="onboarding_camera_step_label">Kamera · Steg %1$d av %2$d</string>
+    <string name="onboarding_camera_intro_title">Still opp kameraene dine</string>
+    <string name="onboarding_camera_intro_body">La oss la oss fortelle overdrive hvilket kamera som er 30-displayet ditt, og hvilket som er dashbordet. Det tar omtrent et minutt, og du kan endre det senere.</string>
+    <string name="onboarding_camera_intro_primary">Begynn</string>
+    <string name="onboarding_camera_opening_title">Åpner kamera oppsett…</string>
+    <string name="onboarding_camera_opening_body">Laster inn en direkte forhåndsvisning fra kameraene dine. Dette kan ta noen sekunder.</string>
+    <string name="onboarding_camera_pano_title">Dette er 36-visningen din</string>
+    <string name="onboarding_camera_pano_body">Bruk pilene til å finne det 4 gjennomsyrede bildet. Les det fra FLASSO: nederst venstre er REAR, nederst høyre er LEFT-siden.</string>
+    <string name="onboarding_camera_dashcam_title">Finn nå kameraet fremover</string>
+    <string name="onboarding_camera_dashcam_body">Gå gjennom kameraene med pilene og stopp på den som viser frontruten / foroversikt. Legg merke til tallet — du vil velge den neste.</string>
+    <string name="onboarding_camera_pick_title">Velg 360 kamera</string>
+    <string name="onboarding_camera_pick_body">I det øverste kortet, velg nummeret for 360 / normalkameraet. Ikke overla det stå på AUTO og Overdrive det ut.</string>
+    <string name="onboarding_camera_pick_primary">Neste</string>
+    <string name="onboarding_camera_pick_dash_title">Velg ditt dashcam kamera</string>
+    <string name="onboarding_camera_pick_dash_body">I dette kortet, velg dashbordnummeret du fant tidligere – eller la det stå på AUTO.</string>
+    <string name="onboarding_camera_save_primary">Lagre &amp; start på nytt</string>
+    <string name="onboarding_camera_applying_title">Bruke - starte kamera på nytt</string>
+    <string name="onboarding_camera_applying_body">Fôret vil gå mørk og blinke i omtrent 10 sekunder. Dette er normalt - henge stramt.</string>
+    <string name="onboarding_camera_verify_title">Rask sjekk</string>
+    <string name="onboarding_camera_verify_body">Vises bildet som er sydd og dashbordet, vise veien foran? Hvis matingen ser feil ut, trykk på Re-pick — ingenting er ødelagt.</string>
+    <string name="onboarding_camera_verify_ok">Ser ut til høyre</string>
+    <string name="onboarding_camera_verify_repick">Gjenplukk</string>
+    <string name="onboarding_camera_windshield_title">Bånd på vegforutgående opptak? (valgfritt)</string>
+    <string name="onboarding_camera_windshield_body">For OEM-oppsettet – frontrute kameraet som stripe oppå opptak – velg Windshield i rollemenyen, for å bruke dashbordet. velg kameraet fremover og lagre. De fleste eiere kan hoppe over dette.</string>
+    <string name="onboarding_camera_windshield_primary">Vis meg</string>
+    <string name="onboarding_camera_windshield_skip">Nei takk</string>
+    <!-- Vehicle profile chapter -->
+    <string name="onboarding_vehicle_title">Sørg for å overkjøre batteriet</string>
+    <string name="onboarding_vehicle_body">Velg din modell og vi fyller ut kWh, eller skriv den selv (15–120). Dette gjør rekkevidde og ladingsestimater nøyaktig. Du kan hoppe over og sette den senere.</string>
+    <string name="onboarding_vehicle_primary">Angi batteri</string>
+    <!-- Dashboard orientation chapter -->
+    <string name="onboarding_dash_tiles_title">Din cockpit med et titt</string>
+    <string name="onboarding_dash_tiles_body">Disse kortene er knappene – Trykk for å åpne Live kamera, Opptaksninger, Tjenester eller Kjøretøyet.</string>
+    <string name="onboarding_dash_chips_title">Disse viser bare status</string>
+    <string name="onboarding_dash_chips_body">Filmene opp toppen viser opptak, tjenester og fjernlenke. De oppdaterer seg alene — de er ikke knapper.</string>
+    <string name="onboarding_dash_chips_body_land">Din live status - opptak, tjenester og fjernkobling - vises her. Den oppdaterer seg selv.</string>
+    <!-- Completion -->
+    <string name="onboarding_done_title">Cockpit klar</string>
+    <string name="onboarding_done_body">Kameraer kartlagt og har batteri. Trykk Live for å se dine feeds — eller utforsk de dypere innstillingene når som helst.</string>
+    <string name="onboarding_done_primary">Ferdig</string>
+    <string name="onboarding_done_secondary">Utforsk oppsett</string>
+    <!-- Expert track (chaptered walkthrough of deeper config; footguns warned, never fired) -->
+    <string name="onboarding_help_cd">Fikk omvisning</string>
+    <string name="onboarding_reset_toast">Onboarding reset - spille guiden på nytt</string>
+    <string name="onboarding_expert_chapter_label">Kapittel %1$d av %2$d</string>
+    <string name="onboarding_expert_finish">Fullfør</string>
+    <string name="onboarding_expert_menu_title">Fikk omvisning</string>
+    <string name="onboarding_expert_menu_body">En rask gå gjennom det dypere oppsettet – kjøretøyprofilen din, integreringen, overvåkingen, diagnostikk, tjenester og sikkerhet. Du kan stoppe når som helst.</string>
+    <string name="onboarding_expert_menu_start">Start tur</string>
+    <string name="onboarding_expert_vehicle_title">Kjøretøyets profil</string>
+    <string name="onboarding_expert_vehicle_body">Trykk på Kjøretøyet for å angi batterimengde og -modell - den gir nøyaktig rekkevidde og helseestimater.</string>
+    <string name="onboarding_expert_recordings_title">Dine opptak</string>
+    <string name="onboarding_expert_recordings_body">Veksle mellom Dashcam (kontinuerlig + nærhet klipp) og Overvåking (parkerte enkehendelser) med denne bryteren - hvert holder sitt eget bibliotek. Trykk på et klipp for å spille den.</string>
+    <string name="onboarding_expert_live_title">Live kameraer</string>
+    <string name="onboarding_expert_live_body">Åpne Live herfra for å se alle kameraene i sanntid. Håndter for å sjekke visningen før en stasjon eller mens kameraet er parkert i nærheten.</string>
+    <string name="onboarding_expert_trips_title">Tur historie</string>
+    <string name="onboarding_expert_trips_body">Reiselogger hver stasjon — rute, avstand, varighet og energibruk — slik at du kan gjennomgå hvor bilen har vært.</string>
+    <string name="onboarding_expert_roadsense_title">Vei</string>
+    <string name="onboarding_expert_roadsense_body">RoadSense bruker bilens bevegelsessensorer og GPS til å oppdage vegfarer – humper, bolter, fartsbrytere – og advarer deg før kjente feil. Nettsidene detekterer, farekart, advarselsbilder, og Blind Spot. Slå på hovedbryteren for å bruke noe av det.</string>
+    <string name="onboarding_expert_blindspot_title">Blind Spot</string>
+    <string name="onboarding_expert_blindspot_body">Aktiver Blind Spot i fanen her, og når du signerer en sving, en sidekameravisning vises automatisk på skjermen – venstre for et venstre signal, høyre for en høyre - deretter skjuler det kort tid etter. Den kjører bare mens et sving-signal er på.</string>
+    <string name="onboarding_expert_maps_title">Navigation</string>
+    <string name="onboarding_expert_maps_body">Åpne kartet for full turn-for-sving-navigasjon - søk etter destinasjon, få rute- og live-veiledning, I tillegg til nærliggende betraktningspunkter og eventuelle vegfarer RoadSense har det vært logget underveis. Du kan også auto-prosjektere det inn på instrumentklyngen når du begynner å kjøre – noe som slår liv på i RoadSenses kartfane.</string>
+    <string name="onboarding_expert_integrations_title">Integrasjoner</string>
+    <string name="onboarding_expert_integrations_body">Koble til Telegram-varsler, en bedre ruteplanlegger, MQTT eller BYD Cloud. Hvert kort åpner oppsettet inne i appen. Fyllen med toppen snur grønt når alt er knyttet sammen.</string>
+    <string name="onboarding_expert_bydcloud_title">BYD Sky låser opp ekstern kontroll</string>
+    <string name="onboarding_expert_bydcloud_body">Kobling av din BYD konto her muliggjør fjernlås, flash- og horn fra telefonen. Behandle den koblede kontoen og tilgangskoden som sensitiv.</string>
+    <string name="onboarding_expert_surveillance_title">Overvåking &amp; opptak</string>
+    <string name="onboarding_expert_surveillance_body">Finjuster deteksjon, kvalitet og lagring her. Disse åpne som konfigurasjonssidene på appen har sittet fra bilen din – en tom skjerm betyr at hjelperen fortsatt starter.</string>
+    <string name="onboarding_expert_camprobe_title">Kamera sonde – forsiktig</string>
+    <string name="onboarding_expert_camprobe_body">Dette kartlegger som fysisk kamera strømmer inn hver rolle, og starter kameraene på nytt. Endre dette kun hvis en feed ser feil ut - du setter dette opp tidligere i guiden.</string>
+    <string name="onboarding_expert_traffic_title">Trafikkmonitor - kreves for fjerntilgang</string>
+    <string name="onboarding_expert_traffic_body">BYDs innebygde TrafikkMonitor blokkerer andre apper fra å bruke bilens innebygde SIM. Hvis du vil nå bilen eksternt over BYD SIM, må du deaktivere den her. Hodeenheten starter opp igjen for å bruke endringen.</string>
+    <string name="onboarding_expert_daemons_title">Tjenester — håndtak med forsiktighet</string>
+    <string name="onboarding_expert_daemons_body">Disse bryterne starter og stopper bakenfortjenestene. Skrur av kamera, overvåking eller ACC stansing av opptaket og holder dem borte til du slår dem på - selv etter en omstart.</string>
+    <string name="onboarding_expert_security_title">Lås med en PIN</string>
+    <string name="onboarding_expert_security_body">Angi en PIN til å gate appen for delte kjøretøyer. Overvåking og opptak kjører mens appen er låst. En glemt PIN-kode kan bare fjernes fra en datamaskin over USB.</string>
+    <string name="onboarding_expert_reset_title">Tilbakestille data — permanent</string>
+    <string name="onboarding_expert_reset_body">Dette sletter opptak, hendelser og innstillinger og kan ikke angres. Det er her hvis du noen gang selger bilen — ikke en del av vanlig bruk.</string>
+    <string name="onboarding_expert_done_title">Det er rundturen</string>
+    <string name="onboarding_expert_done_body">Du har sett de dypere innstillingene. Åpne denne guiden igjen når som helst på hjelp-knappen.</string>
     <!-- Language picker (drawer footer + bottom sheet) -->
     <string name="cd_close">Lukk</string>
     <string name="language_picker_title">Språk</string>
@@ -262,6 +363,12 @@
     <string name="recording_lib_filter_section_severity">Alvorlighetsgrad</string>
     <string name="recording_lib_filter_section_type">Type:</string>
     <string name="recording_lib_filter_section_place">Sted</string>
+    <string name="recording_lib_filter_section_storage">Lagring</string>
+    <!-- Storage filter chip labels (full words; the tile badge uses the short
+         SD/USB/INT forms above). -->
+    <string name="recording_lib_storage_filter_internal">Intern</string>
+    <string name="recording_lib_storage_filter_sd">SD kort</string>
+    <string name="recording_lib_storage_filter_usb">USB</string>
     <string name="recording_lib_place_search_hint">Søke steder…</string>
     <string name="recording_lib_chip_type_normal">Vanlig</string>
     <string name="recording_lib_chip_type_proximity">Nærhet</string>
@@ -302,6 +409,11 @@
     <string name="recording_lib_type_event">EVENT</string>
     <string name="recording_lib_type_proximity">PROX</string>
     <string name="recording_lib_type_oem">OE</string>
+    <!-- Per-clip storage tag — where the clip actually landed. Surfaces the
+         silent SD→internal fallback (SD bridged behind the USB power rail). -->
+    <string name="recording_lib_storage_sd">SD</string>
+    <string name="recording_lib_storage_usb">USB</string>
+    <string name="recording_lib_storage_internal">Inn</string>
     <!-- Toast shown when a multi-select share is dispatched. -->
     <string name="toast_share_recordings">Deler %1$d opptak</string>
     <!-- fragment_sentry_config -->
@@ -621,6 +733,9 @@
     <string name="rail_recordings">Opptak</string>
     <string name="rail_vehicle">Kjøretøy</string>
     <string name="rail_trips">Reiser</string>
+    <string name="rail_charging">Lader</string>
+    <string name="rail_automations">Automatisering</string>
+    <string name="rail_key_mapping">Nøkkel tilordning</string>
     <string name="rail_integrations">Integrasjoner</string>
     <string name="rail_diagnostics">Diagnostikk</string>
     <string name="rail_settings">Innstillinger</string>
@@ -652,6 +767,33 @@
     <string name="settings_about_version_label">Versjon</string>
     <string name="settings_about_package_label">Versjon</string>
     <string name="settings_about_check_update_value">Sjekk den nyeste GitHub versjonen og installer hvis nyere.</string>
+    <!-- Backup & Restore (same-device). The backup file contains credentials +
+         the device key, so the copy warns the user to keep it private. -->
+    <string name="settings_backup_export_title">Eksporter innstillingene</string>
+    <string name="settings_backup_export_value">Lagre en sikkerhetskopifil av dine gjeldende innstillinger. Behold den privat – den har din legitimasjon.</string>
+    <string name="settings_backup_import_title">Gjenopprett innstillinger</string>
+    <string name="settings_backup_import_value">Last inn en sikkerhetskopifil som er gjort på dette hodet enhet.</string>
+    <string name="settings_backup_default_filename">overdrive-backup.json</string>
+    <string name="settings_backup_exporting">Lager sikkerhetskopi…</string>
+    <string name="settings_backup_export_failed">Eksport av sikkerhetskopiering mislyktes</string>
+    <string name="settings_backup_saved">Sikkerhetskopi lagret</string>
+    <string name="settings_backup_saved_to">Sikkerhetskopi lagret til %1$s</string>
+    <string name="settings_backup_save_failed">Kunne ikke lagre sikkerhetskopifilen</string>
+    <string name="settings_backup_pick_file">Velg en backup å gjenopprette</string>
+    <string name="settings_backup_no_files">Ingen sikkerhetskopifiler funnet. Eksporter først eller kopier en sikkerhetskopi .json til %1$s, og prøv på nytt.</string>
+    <string name="settings_backup_read_failed">Kan ikke lese filen</string>
+    <string name="settings_backup_invalid_file">Den filen er ikke en gyldig overdriv-sikkerhetskopi</string>
+    <string name="settings_backup_restoring">Gjenoppretter…</string>
+    <string name="settings_backup_restored">Innstillinger gjenopprettet</string>
+    <string name="settings_backup_restore_failed">Gjenoppretting mislyktes</string>
+    <string name="settings_backup_daemon_down">Kameratjenesten må kjøres for å sikkerhetskopiere eller gjenopprette. Start den fra Daemons, og prøv på nytt.</string>
+    <string name="settings_backup_restore_confirm_title">Gjenopprett innstillinger?</string>
+    <string name="settings_backup_restore_confirm_msg">Dette erstatter de gjeldende Overdriv-innstillingene med backup og reload tjenesten. Det fungerer bare på samme hode enhet som sikkerhetskopien ble tatt på.</string>
+    <string name="settings_backup_restore_confirm_btn">Gjenopprett</string>
+    <string name="settings_backup_restart_hint">Innstillinger gjenopprettet. Start kameraets daemon på nytt (Daemons → Kamera → Restart) for å sikre at alle gjenopprettede innstillinger brukes.</string>
+    <string name="settings_backup_trips_prompt">Inkluder reiseloggen (distanse, energi, kostnad, poengsum, start/slutt-plassering)? Detaljerte telemetri per tur er ikke inkludert. Filen vil inneholde din posisjonshistorikk - behold den privat.</string>
+    <string name="settings_backup_settings_only">Kun innstillinger</string>
+    <string name="settings_backup_with_trips">Inkluder reiser</string>
     <!-- Support-development section: tiered options, low-cost first.
          star → spread → coffee, in that visual order. Copy aims for
          personality without being corny — short, warm, specific. -->
@@ -1068,10 +1210,14 @@
     <string name="roadsense_map_search_action">Søk</string>
     <string name="roadsense_map_searching">Searching…</string>
     <string name="roadsense_map_no_results">Ingen steder funnet</string>
+    <string name="roadsense_map_search_network">Kunne ikke nå søketjenesten. Sjekk tilkoblingen eller proxyen din og prøv igjen.</string>
     <string name="roadsense_map_pick_destination">Velg mål</string>
     <string name="roadsense_map_routing">Finner rute…</string>
     <string name="roadsense_map_route_failed">Kunne ikke finne en rute. Prøv igjen.</string>
     <string name="roadsense_map_need_key">Legg til en rutingsnøkkel i RoadSense innstillinger for å navigere.</string>
+    <string name="roadsense_map_route_key_rejected">Rutenøkkel avvist. Sjekk nøkkelen i RoadSense innstillinger.</string>
+    <string name="roadsense_map_route_network">Nettverk er for treg til å finne en rute. Sjekk tilkoblingen din og prøv igjen.</string>
+    <string name="roadsense_map_route_http">Routing service feil (%1$d). Prøv igjen snart.</string>
     <string name="roadsense_map_rerouting">Av rute — omberegne…</string>
     <string name="roadsense_map_arrived">Du har ankommet.</string>
     <string name="roadsense_map_nav_started">Naviger til %1$s</string>
@@ -1165,12 +1311,13 @@
     <string name="roadsense_map_search_to_save">Søk et sted for å angi som %1$s</string>
     <!-- Shown when re-entering the map with a previously-set trip restored. -->
     <string name="roadsense_map_trip_restored">Reise gjenopprettet</string>
-    <!-- dialog_cloudflared_settings -->
-    <string name="cloudflared_token_storage_note">Tokenet lagres sikkert og deles mellom app- og daemon-prosesser.</string>
-    <string name="cloudflared_token_hint">Skriv inn cloudflared-token</string>
+    <!-- Cloudflared paid-tunnel settings -->
+    <string name="cloudflared_token_storage_note">Token lagres sikkert og delt mellom app og daemon-prosesser.</string>
+    <string name="cloudflared_token_hint">Angi skyvnet token</string>
     <string name="cloudflare_paid_version">Cloudflare betalt versjon</string>
-    <string name="dialog_cloudflared_settings_title">🌐 Cloudflared-innstillinger</string>
-    <string name="dialog_cloudflared_settings_message">Definer om du bruker betalt Cloudflare eller trycloudflare. Hvis du bruker betalt Cloudflare, skriv inn tunnel-tokenet ditt.</string>
-    <string name="toast_cloudflared_token_cannot_be_empty">Hvis satt til betalt versjon, kan ikke tokenet være tomt</string>
-    <string name="toast_cloudflared_saved_settings">Cloudflared-innstillinger lagret</string>
+    <string name="dialog_cloudflared_settings_title">🌐 Innstillinger for Cloudflared</string>
+    <string name="dialog_cloudflared_settings_message">Definer om du bruker betalt Cloudflare eller trycloudflare. Hvis du bruker betalt Cloudflare, skriv inn tunnel token.</string>
+    <string name="toast_cloudflared_token_cannot_be_empty">Hvis du har satt til betalt versjon, kan tokenet ikke være tomt</string>
+    <string name="toast_cloudflared_token_invalid">Ugyldig token: bruk bare bokstaver, tall og . _ - = tegn</string>
+    <string name="toast_cloudflared_saved_settings">Innstillinger lagret i skyflensen</string>
 </resources>

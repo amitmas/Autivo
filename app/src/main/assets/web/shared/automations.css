@@ -220,9 +220,27 @@
         flex: 0 0 calc(100% - 10px);
     }
 }
+/* Every dropdown/field in an inputs row fills its flex cell, so a row of
+   type + value selects (e.g. Play Audio: sound + channel + loop) all render the
+   SAME width instead of each sizing to its longest option — a Chrome-58 flex
+   quirk where equal flex-basis still lets intrinsic content width leak through. */
+.form-grid .row .inputs > .input,
+.form-grid .row .inputs > select,
+.form-grid .row .inputs > input {
+    width: 100%;
+    min-width: 0;
+}
 .form-grid .row .inputs > .type-selector {
     display: flex;
     align-items: center;
+}
+/* The type-selector shares its 25% cell between the dropdown and an optional
+   info icon; let the dropdown take the remaining space so it lines up in width
+   with the sibling value dropdowns. */
+.form-grid .row .inputs > .type-selector > select,
+.form-grid .row .inputs > .type-selector > .input {
+    flex: 1 1 auto;
+    min-width: 0;
 }
 .form-grid .row .inputs > .type-selector > .description-icon {
     width: 20px;
@@ -291,6 +309,15 @@
     display: flex;
     margin-bottom: 5px;
 }
+/* Row actions (move up / move down / delete) sit together; sibling margin gives the
+   gap since Chrome-58 ignores flex gap. */
+.form-grid .delete-container > * + * { margin-left: 6px; }
+/* Reorder arrows reuse .icon-btn; brand-tint on hover, and the disabled end arrow
+   (.unknown) is dimmed + non-interactive by the shared .unknown rule below. */
+.form-grid .move-up:hover, .form-grid .move-down:hover {
+    border-color: var(--brand-primary); color: var(--brand-primary);
+}
+.form-grid .move-up.unknown, .form-grid .move-down.unknown { pointer-events: none; }
 .form-grid .add-button {
     margin-top: 12px;
 }

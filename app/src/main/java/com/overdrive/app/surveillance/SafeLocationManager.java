@@ -37,6 +37,11 @@ public class SafeLocationManager {
     private static final String CONFIG_FILE = "/data/local/tmp/safe_locations.json";
     private static final int MAX_ZONES = 10;
     private static final double EARTH_RADIUS_M = 6_371_000.0;
+    // Exit-hysteresis margin (m). Once inside a zone, the car must move beyond
+    // radius + this to be considered "left", so GPS jitter can't flap enter/leave at
+    // the boundary. Sized to cover typical GPS error, which matters most for small
+    // (down to 15m) zones. Entry uses the exact radius (no early trigger).
+    private static final int HYSTERESIS_M = 20;
 
     private static volatile SafeLocationManager instance;
 
@@ -186,10 +191,16 @@ public class SafeLocationManager {
                 cachedDistanceM = Double.MAX_VALUE;
                 onLeftSafeZone();
             }
+            // The surveillance-suppression side is gated off (or has no zones), but an
+            // automation may still want the geofence event. Compute + publish it
+            // independently when zones exist and an automation is enabled — this does
+            // NOT touch surveillance state (no onEntered/LeftSafeZone camera control).
+            if (!zones.isEmpty()) publishLocationForAutomations(lat, lng);
             return;
         }
 
         boolean wasInZone = cachedInSafeZone;
+        String prevZoneName = cachedZoneName;
         boolean nowInZone = false;
         String zoneName = null;
         double nearestDist = Double.MAX_VALUE;
@@ -201,7 +212,20 @@ public class SafeLocationManager {
             if (dist < nearestDist) {
                 nearestDist = dist;
             }
-            if (dist <= zone.getRadiusMeters()) {
+            // Exit hysteresis: once inside a zone, keep it "inside" until the car is
+            // beyond radius + HYSTERESIS_M. This stops GPS jitter (±5-20m) from
+            // flapping enter/leave at the boundary — critical now that the radius can
+            // be as small as 15m (≤ typical GPS error), which would otherwise churn
+            // the camera lifecycle and spam location automations on every ~2s tick.
+            // Entry still uses the exact radius, so a zone never triggers early.
+            // Keyed off cachedZoneName (== prevZoneName) alone — a non-null cached zone
+            // name already means "we resolved inside that zone last tick", which is the
+            // hysteresis precondition. This matches the suppression-off path
+            // (publishLocationForAutomations) exactly, so both paths share one tracker
+            // and agree at the boundary across a feature toggle (no spurious leave).
+            boolean isCurrent = zone.getName() != null && zone.getName().equals(prevZoneName);
+            double effectiveRadius = isCurrent ? zone.getRadiusMeters() + HYSTERESIS_M : zone.getRadiusMeters();
+            if (dist <= effectiveRadius) {
                 nowInZone = true;
                 zoneName = zone.getName();
                 nearestDist = dist;
@@ -219,6 +243,64 @@ public class SafeLocationManager {
         } else if (wasInZone && !nowInZone) {
             onLeftSafeZone();
         }
+
+        // Publish the geofence event for automations (shared with the suppression-off
+        // path below). Free/no-op when no automation is enabled.
+        publishLocationEvent(zoneName);
+    }
+
+    /**
+     * Compute the current zone name from GPS and publish the automation geofence event
+     * WITHOUT touching surveillance-suppression state. Used only on the path where the
+     * surveillance safe-zone feature is disabled (or its camera control isn't wanted)
+     * but an automation still wants a location trigger. Kept separate from the main
+     * onLocationUpdate body so it can never fire onEntered/LeftSafeZone camera
+     * lifecycle.
+     */
+    private void publishLocationForAutomations(double lat, double lng) {
+        // Same exit-hysteresis as the main path (see onLocationUpdate). CRITICAL: this
+        // shares the SAME cachedZoneName tracker the main path uses, not a separate
+        // one — otherwise toggling the surveillance feature (which switches which path
+        // runs) while parked in a zone's hysteresis annulus would reset the tracker and
+        // spuriously fire a leave. One tracker = the two paths agree at the boundary
+        // across a feature toggle. cachedInSafeZone is left to the main path (it drives
+        // camera lifecycle); this path only needs the zone-name identity for hysteresis.
+        String prevZoneName = cachedZoneName;
+        String zoneName = null;
+        for (SafeLocation zone : zones) {
+            if (!zone.isEnabled()) continue;
+            double dist = haversine(lat, lng, zone.getLatitude(), zone.getLongitude());
+            boolean isCurrent = zone.getName() != null && zone.getName().equals(prevZoneName);
+            double effectiveRadius = isCurrent ? zone.getRadiusMeters() + HYSTERESIS_M : zone.getRadiusMeters();
+            if (dist <= effectiveRadius) { zoneName = zone.getName(); break; }
+        }
+        cachedZoneName = zoneName;
+        publishLocationEvent(zoneName);
+    }
+
+    /**
+     * Publish the current geofence zone to automations. Uses the zone name, or "none"
+     * when outside every zone. Called every location tick from BOTH the suppression
+     * path and the automation-only path.
+     *
+     * <p>We deliberately do NOT keep a local "last value" dedup latch here.
+     * {@link com.overdrive.app.automation.Automations#update} is the single source of
+     * truth: it is a no-op when no automation is enabled, and it commits + fires ONLY
+     * on a real value transition (atomic compare-and-set on the shared state map). A
+     * local latch in front of it was subtly wrong — it advanced even while update()
+     * early-returned on the disabled feature, so the state map never got seeded and the
+     * FIRST real transition after a location automation was enabled got swallowed by
+     * the null→X seed guard. Re-publishing the same value every tick (exactly what the
+     * WiFi/Bluetooth events do) is free — update() dedups — and correct across the
+     * disabled→enabled boundary. Best-effort — never let an automation-layer hiccup
+     * disturb the surveillance geofence.
+     */
+    private void publishLocationEvent(String zoneName) {
+        String value = zoneName != null ? zoneName : "none";
+        try {
+            com.overdrive.app.automation.Automations.update(
+                    com.overdrive.app.automation.condition.BydEvent.LOCATION_ZONE, value);
+        } catch (Throwable ignored) {}
     }
 
     /** Force re-evaluation with current GPS (after zone add/remove/toggle). */

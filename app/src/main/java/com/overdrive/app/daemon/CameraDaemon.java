@@ -1809,6 +1809,26 @@ public class CameraDaemon {
             }
         }, 5, 10, java.util.concurrent.TimeUnit.MINUTES);
         log("Geo backfill armed on dedicated thread (10-minute cadence)");
+
+        // Privacy-preserving DAU/MAU ping (analytics-edge). At most ONE tiny POST
+        // per install per UTC day; maybePing() short-circuits cheaply when already
+        // pinged today or disabled (analytics.enabled kill-switch, default on). We
+        // tick HOURLY so a day-boundary crossing (or a boot after midnight) sends
+        // promptly; the day guard + server-side (day,id) PK make repeat ticks
+        // no-ops. Piggy-backed on memoryLogScheduler: the work is a rare, short,
+        // proxy-aware HTTP call that swallows all failures internally, so it can't
+        // stall the watchdog cadence. Same try/catch guard as the ticks above —
+        // scheduleAtFixedRate cancels a recurring task on first uncaught throw.
+        memoryLogScheduler.scheduleAtFixedRate(() -> {
+            try {
+                com.overdrive.app.analytics.AnalyticsPinger.INSTANCE.maybePing(
+                    System.currentTimeMillis());
+            } catch (Throwable t) {
+                log("Analytics ping tick failed: "
+                    + t.getClass().getSimpleName() + ": " + t.getMessage());
+            }
+        }, 2, 60, java.util.concurrent.TimeUnit.MINUTES);
+        log("Analytics DAU/MAU ping armed (hourly check, <=1 send/day)");
     }
 
     private static void logMemoryStatus() {
@@ -4310,10 +4330,42 @@ public class CameraDaemon {
                     try {
                         com.overdrive.app.surveillance.SurveillanceSchedule schedule =
                             com.overdrive.app.config.UnifiedConfigManager.getSurveillanceSchedule();
-                        
-                        // Schedule disabled = always active, nothing to check
-                        if (schedule == null || !schedule.isEnabled()) continue;
-                        
+
+                        // Schedule disabled = always active, no window to check — but
+                        // still SELF-HEAL a dead sentry pipeline. Without a schedule
+                        // the window-transition block below never runs, so a pipeline
+                        // torn down mid-park (e.g. the live-view WebSocket idle-timeout
+                        // auto-stop, or any stop() that fired while armed) would stay
+                        // dead until the user manually toggles surveillance or cycles
+                        // ACC — the "have to turn it off and on again" symptom. Re-arm
+                        // when we still INTEND to be watching but the pipeline isn't
+                        // actually in surveillance mode.
+                        //
+                        // Gate on doorLockListenerArmed (the authoritative "we armed
+                        // this park" truth, set by both power- and lock-arm paths and
+                        // reverted on unlock / ACC-ON / declined-enable — but NOT by a
+                        // pipeline teardown). This is deliberately NOT surveillanceEnabled,
+                        // which is a looser intent flag that can read true even when lock
+                        // mode intentionally stayed disarmed on an unlocked car. When a
+                        // schedule IS configured, the in-window branch below already
+                        // self-heals (it re-enables when currentlyActive is false), so
+                        // this only covers the no-schedule case.
+                        if (schedule == null || !schedule.isEnabled()) {
+                            boolean intendWatching = doorLockListenerArmed && !safeZoneSuppressed;
+                            boolean actuallyRunning = gpuPipeline != null
+                                && gpuPipeline.isRunning() && gpuPipeline.isSurveillanceMode();
+                            if (intendWatching && !actuallyRunning
+                                    && com.overdrive.app.config.UnifiedConfigManager.isSurveillanceEnabled()) {
+                                log("SELF-HEAL: surveillance armed but pipeline not in sentry mode "
+                                    + "(pipeline=" + (gpuPipeline != null)
+                                    + ", running=" + (gpuPipeline != null && gpuPipeline.isRunning())
+                                    + ", survMode=" + (gpuPipeline != null && gpuPipeline.isSurveillanceMode())
+                                    + ") — re-enabling");
+                                enableSurveillance();
+                            }
+                            continue;
+                        }
+
                         boolean withinWindow = schedule.isActiveNow();
                         boolean currentlyActive = surveillanceEnabled && gpuPipeline != null 
                                 && gpuPipeline.isSurveillanceMode();

@@ -78,14 +78,29 @@ public final class ManualClipService {
         return INSTANCE;
     }
 
-    /** Largest enabled manual-clip total window currently persisted in Key Mapping. */
+    /**
+     * Largest enabled manual-clip total window persisted anywhere that can fire
+     * a replay: Key Mapping bindings AND automation actions. The pre-record ring
+     * is sized to this so a clip configured only in an automation (never in Key
+     * Mapping) still has enough encoded history to export.
+     */
     public static int getConfiguredRetentionSeconds() {
+        int keymapSeconds;
         try {
-            return getConfiguredRetentionSeconds(
+            keymapSeconds = getConfiguredRetentionSeconds(
                     com.overdrive.app.config.UnifiedConfigManager.getKeymap());
         } catch (Throwable t) {
-            return 0;
+            keymapSeconds = 0;
         }
+        int automationSeconds;
+        try {
+            automationSeconds =
+                    com.overdrive.app.automation.Automations.getMaxManualClipRetentionSeconds();
+        } catch (Throwable t) {
+            automationSeconds = 0;
+        }
+        return Math.min(ManualClipWindow.MAX_SECONDS,
+                Math.max(keymapSeconds, automationSeconds));
     }
 
     /** Package-visible for validation tests and config-save propagation. */
@@ -128,9 +143,15 @@ public final class ManualClipService {
      * Apply a saved binding edit to the live encoder before the next key press.
      * Returns true when the fixed native arena is too small and needs a manual
      * camera-daemon cold restart; this method never performs that restart.
+     *
+     * <p>The retention APPLIED is always the combined Key-Mapping + automation
+     * maximum ({@link #getConfiguredRetentionSeconds()}), not the keymap-only
+     * value — otherwise saving a keymap edit would shrink the ring below what an
+     * automation-only replay still needs. The restart flag is likewise computed
+     * from the combined requirement so the banner reflects the real arena need.
      */
     public boolean onKeymapConfigChanged(JSONObject keymap) {
-        int seconds = getConfiguredRetentionSeconds(keymap);
+        int seconds = getConfiguredRetentionSeconds();
         try {
             HardwareEventRecorderGpu encoder = currentEncoder();
             if (encoder == null) return false;
@@ -142,9 +163,34 @@ public final class ManualClipService {
         }
     }
 
-    /** Read-only status for the Key Mapping page's persistent restart notice. */
+    /**
+     * Re-derive retention from ALL replay sources (Key Mapping + automations)
+     * and push it to the live encoder. Called after an automation mutation so a
+     * newly-saved replay action widens the pre-record window immediately.
+     * Unlike {@link #onKeymapConfigChanged}, it does not read a single section —
+     * it uses the combined {@link #getConfiguredRetentionSeconds()} so an
+     * automation edit never shrinks the ring a Key Mapping binding still needs.
+     */
+    public void reapplyLiveRetention() {
+        try {
+            HardwareEventRecorderGpu encoder = currentEncoder();
+            if (encoder == null) return;
+            encoder.setManualClipRetentionDuration(getConfiguredRetentionSeconds());
+        } catch (Throwable t) {
+            logger.warn("Could not reapply live replay retention: " + t.getMessage());
+        }
+    }
+
+    /**
+     * Read-only status for the Key Mapping page's persistent restart notice.
+     * Uses the combined Key-Mapping + automation requirement: the pre-record
+     * arena is shared, so if an automation needs a larger ring than is currently
+     * allocated, the Key Mapping page's own replay bindings are truncated too —
+     * the banner must reflect that. The {@code keymap} argument is accepted for
+     * call-site symmetry but retention is always derived from all sources.
+     */
     public boolean isCameraDaemonRestartRequired(JSONObject keymap) {
-        int seconds = getConfiguredRetentionSeconds(keymap);
+        int seconds = getConfiguredRetentionSeconds();
         if (seconds <= 0) return false;
         try {
             HardwareEventRecorderGpu encoder = currentEncoder();

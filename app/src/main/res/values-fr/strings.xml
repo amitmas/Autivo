@@ -735,6 +735,7 @@
     <string name="rail_trips">Trajets</string>
     <string name="rail_charging">Recharge en cours</string>
     <string name="rail_automations">Automatisations</string>
+    <string name="rail_key_mapping">Cartographie des touches</string>
     <string name="rail_integrations">Les intégrations</string>
     <string name="rail_diagnostics">Diagnostics</string>
     <string name="rail_settings">Paramètres</string>

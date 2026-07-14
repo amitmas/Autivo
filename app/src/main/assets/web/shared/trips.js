@@ -419,6 +419,7 @@ const TRIPS = {
         var distLbl = BYD.units.distLabel();
         var speedLbl = BYD.units.speedLabel();
         var consLbl = BYD.units.consumptionLabel();
+        var effLbl = BYD.units.efficiencyLabel();
         var perDistLbl = BYD.units.perDistLabel();
 
         // Cost card
@@ -432,12 +433,16 @@ const TRIPS = {
         if (summaryDistLbl) summaryDistLbl.textContent = distLbl;
         var summaryConsLbl = document.getElementById('summaryConsumptionLabel');
         if (summaryConsLbl) summaryConsLbl.textContent = consLbl;
+        var summaryEffLbl = document.getElementById('summaryEfficiency2Label');
+        if (summaryEffLbl) summaryEffLbl.textContent = effLbl;
 
         // Trip detail card
         var detailDistLbl = document.getElementById('detailDistanceLabel');
         if (detailDistLbl) detailDistLbl.textContent = distLbl;
         var detailConsLbl = document.getElementById('detailConsumptionLabel');
         if (detailConsLbl) detailConsLbl.textContent = consLbl;
+        var detailEffLbl = document.getElementById('detailEfficiency2Label');
+        if (detailEffLbl) detailEffLbl.textContent = effLbl;
         // For Avg/Max speed labels we keep the localized prefix (Avg / Max) and
         // swap only the unit. The HTML default ("Avg km/h") works as a template
         // we can derive from — fall back to data-i18n value, then replace the
@@ -948,228 +953,230 @@ const TRIPS = {
         } catch (e) { /* CDR info not critical */ }
     },
 
-    // Calendar state
-    calendarMonth: null,
-    calendarYear: null,
-    selectedDate: null,
+    // Custom date-range state (epoch-ms). When rangeFromMs != null the trip
+    // list + period summary query by [from,to] instead of currentDays.
+    // Mirrors the charging-page picker (From → To pills + Apply + shared
+    // calendar popup) so the two pages share one interaction model.
+    rangeFromMs: null,
+    rangeToMs: null,
+    // Calendar popup working state: which field ('from'|'to') is being picked,
+    // the visible month, and the picked endpoints as "YYYY-MM-DD" local keys.
+    _calTarget: null,
+    _calMonth: null,
+    _calFromKey: null,
+    _calToKey: null,
 
     filterByDays(days) {
-        document.querySelectorAll('.filter-tab').forEach(btn => {
+        document.querySelectorAll('#tripFilters .filter-tab').forEach(btn => {
             btn.classList.toggle('active', parseInt(btn.dataset.days) === days);
         });
         this.currentDays = days;
         this.currentOffset = 0;
         this.trips = [];
-        this.selectedDate = null;
-        const toggle = document.getElementById('calendarToggle');
-        const btnText = document.getElementById('calendarBtnText');
-        if (toggle) toggle.classList.remove('has-date');
-        if (btnText) btnText.textContent = BYD.i18n.t('trip.select_date');
+        this.rangeFromMs = null;   // leaving custom-range mode
+        this.rangeToMs = null;
+        const row = document.getElementById('tripRangeRow');
+        if (row) row.classList.remove('open');
+        const btn = document.getElementById('loadMoreBtn');
+        if (btn) btn.style.display = 'none';
         this.loadTrips(days, 0);
         this.loadSummary(days);
     },
 
     quickFilter(days, btn) {
-        document.querySelectorAll('.filter-tab').forEach(b => b.classList.remove('active'));
+        document.querySelectorAll('#tripFilters .filter-tab').forEach(b => b.classList.remove('active'));
         if (btn) btn.classList.add('active');
         this.filterByDays(days);
     },
 
-    filterByDateRange() {
-        // Not used anymore — kept for compat
+    // Reveal/hide the custom From → To range row (height+fade via .open).
+    // Seeds a sensible default span (last ~30 days) the first time.
+    toggleCustomRange(btn) {
+        const row = document.getElementById('tripRangeRow');
+        if (!row) return;
+        if (row.classList.contains('open')) { row.classList.remove('open'); return; }
+        row.classList.add('open');
+        if (this._calFromKey == null) this._calFromKey = this._dateKey(new Date(Date.now() - 30 * 86400000));
+        if (this._calToKey == null) this._calToKey = this._dateKey(new Date());
+        this._updateRangeButtons();
+        document.querySelectorAll('#tripFilters .filter-tab').forEach(b => b.classList.remove('active'));
+        if (btn) btn.classList.add('active');
     },
 
-    // Calendar popup
-    toggleCalendar() {
-        const popup = document.getElementById('calendarPopup');
-        if (popup.classList.contains('active')) {
-            this.closeCalendar();
-        } else {
-            const now = new Date();
-            this.calendarMonth = now.getMonth();
-            this.calendarYear = now.getFullYear();
-            this.renderCalendar();
-            popup.classList.add('active');
+    // Apply the picked From/To range (From = start of day, To = end of day
+    // inclusive). Either side may be unset → open-ended.
+    applyCustomRange() {
+        const fromMs = this._calFromKey ? this._keyToMs(this._calFromKey, false) : null;
+        const toMs = this._calToKey ? this._keyToMs(this._calToKey, true) : null;
+        if (fromMs == null && toMs == null) return;
+        if (fromMs != null && toMs != null && fromMs > toMs) return;
+        this.rangeFromMs = fromMs != null ? fromMs : 0;
+        this.rangeToMs = toMs;   // null = open-ended (daemon treats as no upper bound)
+        this.currentOffset = 0;
+        this.trips = [];
+        this.renderTripList([]);
+        const empty = document.getElementById('tripEmptyState');
+        if (empty) empty.style.display = 'none';
+        // No loadSummary() here: the weekly/monthly rollups are keyed to
+        // calendar periods, not arbitrary ranges, and would describe the wrong
+        // window. updatePeriodSummary() (invoked from renderTripList off the
+        // loaded range trips) is the correct, range-accurate source instead.
+        this.loadTripsBetween(this.rangeFromMs, this.rangeToMs, 0);
+    },
+
+    // Fetch one page of the active custom range. offset=0 resets the list;
+    // non-zero appends (Load More). Bounds are held on the instance so
+    // loadMore() can page without re-deriving them.
+    async loadTripsBetween(fromMs, toMs, offset) {
+        const off = offset || 0;
+        try {
+            let q = '/api/trips?from=' + fromMs;
+            if (toMs != null) q += '&to=' + toMs;
+            q += '&limit=' + this.pageSize + '&offset=' + off;
+            const resp = await fetch(q);
+            const data = await resp.json();
+            this._applyTripsPayload(data, off);
+        } catch (e) {
+            console.warn('[Trips] Load trips for range failed:', e);
+            const skel = document.getElementById('tripListSkeleton');
+            if (skel) skel.style.display = 'none';
+            const empty = document.getElementById('tripEmptyState');
+            if (empty) empty.style.display = 'flex';
         }
     },
 
+    // ---- Shared calendar (range picker) — mirrors charging.js -------------
+
+    // Open the calendar to pick the 'from' or 'to' endpoint.
+    openCalendar(which) {
+        this._calTarget = which;   // 'from' | 'to'
+        const seed = (which === 'to' ? this._calToKey : this._calFromKey);
+        this._calMonth = seed ? new Date(seed + 'T00:00:00') : new Date();
+        this._calMonth.setDate(1);
+        this.renderCalendar();
+        const pop = document.getElementById('calendarPopup');
+        if (pop) pop.classList.add('active');
+    },
+
     closeCalendar() {
-        document.getElementById('calendarPopup').classList.remove('active');
+        const pop = document.getElementById('calendarPopup');
+        if (pop) pop.classList.remove('active');
     },
 
-    prevMonth() {
-        this.calendarMonth--;
-        if (this.calendarMonth < 0) { this.calendarMonth = 11; this.calendarYear--; }
-        this.renderCalendar();
-    },
-
-    nextMonth() {
-        this.calendarMonth++;
-        if (this.calendarMonth > 11) { this.calendarMonth = 0; this.calendarYear++; }
-        this.renderCalendar();
-    },
+    prevMonth() { this._calMonth.setMonth(this._calMonth.getMonth() - 1); this.renderCalendar(); },
+    nextMonth() { this._calMonth.setMonth(this._calMonth.getMonth() + 1); this.renderCalendar(); },
 
     renderCalendar() {
         const grid = document.getElementById('calendarGrid');
         const title = document.getElementById('calendarTitle');
-        if (!grid) return;
-
-        const months = ['January','February','March','April','May','June','July','August','September','October','November','December'];
-        title.textContent = months[this.calendarMonth] + ' ' + this.calendarYear;
+        if (!grid || !this._calMonth) return;
+        const lang = BYD.i18n.getLang();
+        const year = this._calMonth.getFullYear(), month = this._calMonth.getMonth();
+        const monthDate = new Date(year, month, 1);
+        try { title.textContent = new Intl.DateTimeFormat(lang, { month: 'long' }).format(monthDate) + ' ' + year; }
+        catch (e) { title.textContent = monthDate.toLocaleDateString(lang, { month: 'long' }) + ' ' + year; }
 
         grid.innerHTML = '';
-        const weekdays = ['Su','Mo','Tu','We','Th','Fr','Sa'];
-        weekdays.forEach(d => {
+        let wkFmt; try { wkFmt = new Intl.DateTimeFormat(lang, { weekday: 'short' }); } catch (e) { wkFmt = null; }
+        for (let w = 0; w < 7; w++) {
+            const dd = new Date(2024, 0, 7 + w);   // 2024-01-07 is a Sunday
             const el = document.createElement('div');
             el.className = 'calendar-weekday';
-            el.textContent = d;
-            grid.appendChild(el);
-        });
-
-        const firstDay = new Date(this.calendarYear, this.calendarMonth, 1).getDay();
-        const daysInMonth = new Date(this.calendarYear, this.calendarMonth + 1, 0).getDate();
-        const today = new Date();
-
-        // Build set of days that have trips
-        const tripDays = new Set();
-        this.trips.forEach(t => {
-            const d = new Date(t.startTime || t.start_time);
-            if (d.getMonth() === this.calendarMonth && d.getFullYear() === this.calendarYear) {
-                tripDays.add(d.getDate());
-            }
-        });
-
-        // Previous month padding
-        const prevDays = new Date(this.calendarYear, this.calendarMonth, 0).getDate();
-        for (let i = firstDay - 1; i >= 0; i--) {
-            const el = document.createElement('div');
-            el.className = 'calendar-day other-month';
-            el.textContent = prevDays - i;
+            el.textContent = wkFmt ? wkFmt.format(dd) : dd.toLocaleDateString(lang, { weekday: 'short' });
             grid.appendChild(el);
         }
 
-        // Current month days
-        for (let d = 1; d <= daysInMonth; d++) {
-            const el = document.createElement('div');
-            el.className = 'calendar-day';
-            el.textContent = d;
+        const firstDay = new Date(year, month, 1).getDay();
+        const daysInMonth = new Date(year, month + 1, 0).getDate();
+        const daysInPrev = new Date(year, month, 0).getDate();
+        const todayKey = this._dateKey(new Date());
+        for (let i = firstDay - 1; i >= 0; i--) this._calDayCell(grid, daysInPrev - i, this._dateKey(new Date(year, month - 1, daysInPrev - i)), true, todayKey);
+        for (let day = 1; day <= daysInMonth; day++) this._calDayCell(grid, day, this._dateKey(new Date(year, month, day)), false, todayKey);
+        for (let d2 = 1; grid.children.length - 7 + d2 <= 42; d2++) this._calDayCell(grid, d2, this._dateKey(new Date(year, month + 1, d2)), true, todayKey);
 
-            const dateObj = new Date(this.calendarYear, this.calendarMonth, d);
-            if (dateObj > today) el.classList.add('other-month');
-            if (d === today.getDate() && this.calendarMonth === today.getMonth() && this.calendarYear === today.getFullYear()) {
-                el.classList.add('today');
-            }
-            if (this.selectedDate && d === this.selectedDate.getDate() && this.calendarMonth === this.selectedDate.getMonth() && this.calendarYear === this.selectedDate.getFullYear()) {
-                el.classList.add('selected');
-            }
-            if (tripDays.has(d)) {
-                el.classList.add('has-trips');
-            }
-
-            el.onclick = () => this.selectCalendarDate(d);
-            grid.appendChild(el);
-        }
-
-        // Also fetch trip dates for this month if we don't have them cached
+        // Overlay dots on days that have trips (trips-specific enhancement).
         this.loadCalendarDots();
     },
 
+    _calDayCell(grid, day, dateKey, otherMonth, todayKey) {
+        const self = this;
+        const el = document.createElement('div');
+        el.className = 'calendar-day';
+        el.textContent = day;
+        el.dataset.date = dateKey;
+        if (otherMonth) el.classList.add('other-month');
+        if (dateKey === todayKey) el.classList.add('today');
+        if (dateKey === this._calFromKey || dateKey === this._calToKey) el.classList.add('selected');
+        else if (this._calFromKey && this._calToKey && dateKey > this._calFromKey && dateKey < this._calToKey) el.classList.add('in-range');
+        // Disable future dates.
+        const today = new Date(); today.setHours(0, 0, 0, 0);
+        if (new Date(dateKey + 'T00:00:00') > today) el.classList.add('disabled');
+        else el.addEventListener('click', function () { self._calPick(dateKey); });
+        grid.appendChild(el);
+    },
+
+    _calPick(dateKey) {
+        if (this._calTarget === 'to') {
+            this._calToKey = dateKey;
+            // Keep order sane: if To precedes From, pull From back.
+            if (this._calFromKey && this._calToKey < this._calFromKey) this._calFromKey = dateKey;
+        } else {
+            this._calFromKey = dateKey;
+            if (this._calToKey && this._calFromKey > this._calToKey) this._calToKey = dateKey;
+        }
+        this._updateRangeButtons();
+        this.closeCalendar();
+    },
+
+    _updateRangeButtons() {
+        const lang = BYD.i18n.getLang();
+        const fromTxt = document.getElementById('tripFromText');
+        const toTxt = document.getElementById('tripToText');
+        const fmt = (key) => {
+            try { return new Date(key + 'T00:00:00').toLocaleDateString(lang, { month: 'short', day: 'numeric', year: 'numeric' }); }
+            catch (e) { return key; }
+        };
+        const fromLabel = BYD.i18n.t('trip.daterange.from');
+        const toLabel = BYD.i18n.t('trip.daterange.to');
+        if (fromTxt) fromTxt.textContent = this._calFromKey ? (fromLabel + ': ' + fmt(this._calFromKey)) : fromLabel;
+        if (toTxt) toTxt.textContent = this._calToKey ? (toLabel + ': ' + fmt(this._calToKey)) : toLabel;
+    },
+
+    // Overlay "has-trips" dots on the currently rendered month (best-effort).
     async loadCalendarDots() {
+        if (!this._calMonth) return;
         try {
-            const startOfMonth = new Date(this.calendarYear, this.calendarMonth, 1);
-            const endOfMonth = new Date(this.calendarYear, this.calendarMonth + 1, 0);
-            const days = Math.ceil((endOfMonth - startOfMonth) / 86400000) + 1;
-            const resp = await fetch('/api/trips?days=' + days + '&limit=200');
+            const year = this._calMonth.getFullYear(), month = this._calMonth.getMonth();
+            const startOfMonth = new Date(year, month, 1);
+            const days = Math.ceil((Date.now() - startOfMonth) / 86400000) + 1;
+            if (days <= 0) return;
+            const resp = await fetch('/api/trips?days=' + days + '&limit=300');
             const data = await resp.json();
             if (data.success && data.trips) {
                 const tripDays = new Set();
                 data.trips.forEach(t => {
                     const d = new Date(t.startTime || t.start_time);
-                    if (d.getMonth() === this.calendarMonth && d.getFullYear() === this.calendarYear) {
-                        tripDays.add(d.getDate());
-                    }
+                    if (d.getMonth() === month && d.getFullYear() === year) tripDays.add(this._dateKey(d));
                 });
-                // Update dots on existing calendar days
-                document.querySelectorAll('#calendarGrid .calendar-day:not(.other-month)').forEach(el => {
-                    const day = parseInt(el.textContent);
-                    if (tripDays.has(day)) el.classList.add('has-trips');
+                document.querySelectorAll('#calendarGrid .calendar-day').forEach(el => {
+                    if (tripDays.has(el.dataset.date)) el.classList.add('has-trips');
                 });
             }
-        } catch (e) { /* silent */ }
+        } catch (e) { /* silent — dots are cosmetic */ }
     },
 
-    selectCalendarDate(day) {
-        this.selectedDate = new Date(this.calendarYear, this.calendarMonth, day);
-        const toggle = document.getElementById('calendarToggle');
-        const btnText = document.getElementById('calendarBtnText');
-        const dateStr = this.selectedDate.toLocaleDateString(BYD.i18n.getLang(), { month: 'short', day: 'numeric', year: 'numeric' });
-
-        if (toggle) toggle.classList.add('has-date');
-        if (btnText) btnText.innerHTML = dateStr + ' <span class="clear-date-btn" onclick="event.stopPropagation(); TRIPS.clearDate()">✕</span>';
-
-        document.querySelectorAll('.filter-tab').forEach(b => b.classList.remove('active'));
-        this.closeCalendar();
-
-        // Clear current trips and load for the selected date
-        this.trips = [];
-        this.currentOffset = 0;
-        this.renderTripList([]);
-        document.getElementById('tripEmptyState').style.display = 'none';
-
-        // Calculate days from selected date to now
-        const now = new Date();
-        const diffDays = Math.ceil((now - this.selectedDate) / 86400000) + 1;
-        this.currentDays = diffDays;
-        this.loadTripsForDate(this.selectedDate);
-        this.loadSummary(1);
+    // "YYYY-MM-DD" local date key.
+    _dateKey(d) {
+        const m = d.getMonth() + 1, day = d.getDate();
+        return d.getFullYear() + '-' + (m < 10 ? '0' + m : m) + '-' + (day < 10 ? '0' + day : day);
     },
-
-    async loadTripsForDate(date) {
-        try {
-            // Load enough days to include the selected date, then filter client-side
-            const now = new Date();
-            const diffDays = Math.ceil((now - date) / 86400000) + 1;
-            const resp = await fetch('/api/trips?days=' + diffDays + '&limit=200');
-            const data = await resp.json();
-
-            const skel = document.getElementById('tripListSkeleton');
-            if (skel) skel.style.display = 'none';
-
-            if (data.success && data.trips) {
-                // Filter to only trips on the selected date
-                const selectedDay = date.toDateString();
-                const filtered = data.trips.filter(t => {
-                    const tripDate = new Date(t.startTime || t.start_time);
-                    return tripDate.toDateString() === selectedDay;
-                });
-
-                if (filtered.length > 0) {
-                    this.trips = filtered;
-                    this.renderTripList(filtered);
-                    document.getElementById('tripEmptyState').style.display = 'none';
-                    document.getElementById('loadMoreBtn').style.display = 'none';
-                } else {
-                    this.trips = [];
-                    this.renderTripList([]);
-                    document.getElementById('tripEmptyState').style.display = 'flex';
-                    document.getElementById('loadMoreBtn').style.display = 'none';
-                }
-            } else {
-                document.getElementById('tripEmptyState').style.display = 'flex';
-            }
-        } catch (e) {
-            console.warn('[Trips] Load trips for date failed:', e);
-            document.getElementById('tripEmptyState').style.display = 'flex';
-        }
-    },
-
-    clearDate() {
-        this.selectedDate = null;
-        const toggle = document.getElementById('calendarToggle');
-        const btnText = document.getElementById('calendarBtnText');
-        if (toggle) toggle.classList.remove('has-date');
-        if (btnText) btnText.textContent = BYD.i18n.t('trip.select_date');
-        this.quickFilter(7, document.querySelector('.filter-tab[data-days="7"]'));
+    // date key → epoch-ms at local 00:00 (or 23:59:59.999 when endOfDay).
+    _keyToMs(key, endOfDay) {
+        const p = key.split('-');
+        if (p.length !== 3) return null;
+        const y = parseInt(p[0], 10), mo = parseInt(p[1], 10) - 1, da = parseInt(p[2], 10);
+        if (isNaN(y) || isNaN(mo) || isNaN(da)) return null;
+        return (endOfDay ? new Date(y, mo, da, 23, 59, 59, 999) : new Date(y, mo, da, 0, 0, 0, 0)).getTime();
     },
 
     renderStorageUsage(usedMb, limitMb, count, unit) {
@@ -1253,8 +1260,13 @@ const TRIPS = {
     loadMore() {
         // Paginate through the same time window — don't widen `currentDays`,
         // that would re-fetch the same head rows under a larger cutoff and
-        // produce duplicates relative to what we already have.
-        this.loadTrips(this.currentDays, this.currentOffset);
+        // produce duplicates relative to what we already have. When a custom
+        // range is active, page through it instead of the days window.
+        if (this.rangeFromMs != null) {
+            this.loadTripsBetween(this.rangeFromMs, this.rangeToMs, this.currentOffset);
+        } else {
+            this.loadTrips(this.currentDays, this.currentOffset);
+        }
     },
 
     renderTripList(trips) {
@@ -1475,7 +1487,26 @@ const TRIPS = {
 
     updatePeriodSummary() {
         const trips = this.trips;
-        if (!trips || trips.length === 0) return;
+        // An empty window is legitimate for a custom range (a span with no
+        // driving), unlike the day-presets. Zero the tiles rather than leaving
+        // stale values from the previously-viewed window. Day-preset callers
+        // that early-returned before still behave the same (they never reached
+        // here with an empty list mid-session).
+        if (!trips || trips.length === 0) {
+            if (this.rangeFromMs != null) {
+                this.setEl('summaryTrips', 0);
+                this.setEl('summaryDistance', '--');
+                this.setEl('summaryTime', '--');
+                this.setEl('summaryEfficiency', '--');
+                this.setEl('summaryEnergy', '--');
+                this.setEl('summaryConsumption', '--');
+                this.setEl('summaryEfficiency2', '--');
+                this.setEl('summaryCost', '--');
+                const fuelTile = document.getElementById('summaryFuelTile');
+                if (fuelTile) fuelTile.style.display = 'none';
+            }
+            return;
+        }
 
         let totalDist = 0, totalDur = 0, totalEnergy = 0, totalCost = 0;
         let scoreSum = 0;
@@ -1533,6 +1564,16 @@ const TRIPS = {
             }
         } else {
             this.setEl('summaryConsumption', '--');
+        }
+
+        // Distance-per-energy efficiency: km/kWh (or mi/kWh). The intuitive
+        // "how far per unit of energy" metric — only meaningful with measured
+        // kWh, so no SoC fallback (that lives in the consumption tile above).
+        if (totalDist > 0.5 && totalEnergy > 0) {
+            const kmPerKwh = totalDist / totalEnergy;
+            this.setEl('summaryEfficiency2', BYD.units.effVal(kmPerKwh).toFixed(1));
+        } else {
+            this.setEl('summaryEfficiency2', '--');
         }
 
         if (totalCost > 0) {
@@ -1945,6 +1986,14 @@ const TRIPS = {
                 }
             } else {
                 this.setEl('detailConsumption', '--');
+            }
+            // Distance-per-energy efficiency (km/kWh or mi/kWh). Measured-kWh
+            // only — mirrors the period-summary tile.
+            if (!recovered && tripDist > 0.1 && detailEnergy > 0) {
+                const kmPerKwh = tripDist / detailEnergy;
+                this.setEl('detailEfficiency2', BYD.units.effVal(kmPerKwh).toFixed(1));
+            } else {
+                this.setEl('detailEfficiency2', '--');
             }
             this.setEl('detailDistance', BYD.units.distVal(trip.distanceKm || trip.distance_km || 0).toFixed(2));
             this.setEl('detailAvgSpeed', BYD.units.speedVal(trip.avgSpeedKmh || trip.avg_speed_kmh || 0).toFixed(2));

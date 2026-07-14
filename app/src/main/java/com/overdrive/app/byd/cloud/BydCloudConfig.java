@@ -20,9 +20,9 @@ public final class BydCloudConfig {
     private static final String USER_AGENT = "okhttp/4.12.0";
 
     // ── China (CN) stack ────────────────────────────────────────────────
-    // The CN DiLink app talks to a different host and uses the WBSK transport
-    // codec + /app/auth/* endpoints. Region detection mirrors BYD-re client.js:
-    // host contains "cn.byd.auto". Defaults match common CN app builds (BYD-re).
+    // The CN cloud stack talks to a different host and uses the WBSK transport
+    // codec + /app/auth/* endpoints. Region detection by host containing
+    // "cn.byd.auto". Defaults match common CN cloud builds.
     private static final String CN_BASE_URL = "https://dilinksuperappserver-cn.byd.auto";
     public static final String CN_APP_CHANNEL = "99";
     public static final String CN_APP_VERSION = "9.10.2";

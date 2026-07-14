@@ -477,7 +477,7 @@
         <item quantity="other">%d録音を削除する</item>
     </plurals>
     <plurals name="delete_recordings_message">
-        <item quantity="other">%d件の録画は永久に削除されます。削除操作は取り消せません。</item>
+        <item quantity="other">%dの録音は永久に削除されます.これは取り消すことはできません.</item>
     </plurals>
     <!-- ============================================================
          Step 2 (continued): MainActivity, fragments, dialogs
@@ -732,6 +732,7 @@
     <string name="rail_trips">走行履歴</string>
     <string name="rail_charging">充電中</string>
     <string name="rail_automations">オートメーション</string>
+    <string name="rail_key_mapping">キーマッピング</string>
     <string name="rail_integrations">統合</string>
     <string name="rail_diagnostics">診断</string>
     <string name="rail_settings">設定</string>

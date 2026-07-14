@@ -23,7 +23,7 @@
     <string name="action_select_all">เลือกทั้งหมด</string>
     <string name="action_select_all_short">ทั้งหมด</string>
     <string name="action_delete">ลบ</string>
-    <string name="action_share">Share</string>
+    <string name="action_share">แชร์</string>
     <string name="action_done">เสร็จสิ้น</string>
     <string name="action_remind_me_later">เตือนฉันภายหลัง</string>
     <string name="action_retry">ลองใหม่</string>
@@ -33,7 +33,7 @@
     <!-- Common content descriptions -->
     <string name="cd_camera">กล้อง</string>
     <string name="cd_qr">QR</string>
-    <string name="cd_qr_code">QR Code</string>
+    <string name="cd_qr_code">คิวอาร์โค้ด</string>
     <string name="cd_show_hide_token">แสดง/ซ่อน Token</string>
     <string name="cd_copy_token">คัดลอก Token</string>
     <string name="cd_copy_url">คัดลอก URL</string>
@@ -57,7 +57,7 @@
     <string name="cd_player_quadrant_rear">แสดงกล้องหลัง</string>
     <string name="cd_player_quadrant_left">แสดงกล้องด้านซ้าย</string>
     <string name="cd_delete">ลบ</string>
-    <string name="cd_share">Share</string>
+    <string name="cd_share">แชร์</string>
     <string name="cd_expand">ขยาย</string>
     <string name="cd_configure">ตั้งค่า</string>
     <string name="cd_download_log">ดาวน์โหลด Log</string>
@@ -75,7 +75,7 @@
          translatable=false to avoid bloating the i18n catalog. The
          _cd content-descriptions are real prose and ARE translatable —
          they go through the NLLB pipeline like every other a11y string. -->
-    <string name="overlay_mode_off_cd">Stop recording</string>
+    <string name="overlay_mode_off_cd">หยุดบันทึก</string>
     <string name="overlay_mode_continuous_cd">การบันทึกต่อเนื่อง</string>
     <string name="overlay_mode_drive_cd">การบันทึกในโหมดขับขี่</string>
     <string name="overlay_mode_proximity_cd">การบันทึกเฝ้าระวังสิ่งเข้าใกล้</string>
@@ -91,7 +91,7 @@
     <string name="daemon_card_subprocesses">โปรแกรมย่อย</string>
     <!-- item_time_window -->
     <!-- fragment_logs_panel -->
-    <string name="logs_panel_title">Logs</string>
+    <string name="logs_panel_title">บันทึก</string>
     <!-- activity_main_new / activity_main-land -->
     <string name="url_connecting">กำลังเชื่อมต่อ…</string>
     <!-- Shown when an external link can't open (no browser on the head unit):
@@ -133,11 +133,11 @@
     <string name="camera_option_5">กล้อง 5</string>
     <string name="camera_selection_hint">โหมด \'อัตโนมัติ\' จะเลือกกล้องที่เหมาะสมกับรุ่นรถของคุณทุกครั้งที่เปิดเครื่อง กล้อง 1 = BYD Seal, กล้อง 0 = รุ่น Atto กรุณารีสตาร์ทระบบเบื้องหลัง (Daemon) หลังจากการเปลี่ยน ID กล้องเพื่อให้การตั้งค่ามีผล</string>
     <!-- OEM Dashcam camera ID picker (Phase 5: separate forward-sensor pipeline) -->
-    <string name="camera_oem_dashcam_title">OEM Dashcam Camera ID</string>
-    <string name="camera_oem_dashcam_hint">Pick the AVMCamera id that points at the forward dashcam sensor. Dashcam is the OPPOSITE of pano: Seal/Han pano = 1 → dashcam = 0; Atto / Tang pano = 0 → dashcam = 1. Leave on Auto to let OverDrive pick.</string>
-    <string name="camera_oem_dashcam_auto_resolved">Auto — using id %1$d (pano is id %2$d)</string>
-    <string name="camera_oem_dashcam_auto_unavailable">Auto — pano id is %1$d, can\'t infer dashcam</string>
-    <string name="camera_oem_dashcam_save">Save</string>
+    <string name="camera_oem_dashcam_title">ID กล้อง OEM Dashcam</string>
+    <string name="camera_oem_dashcam_hint">เลือก AVMCamera id ที่ชี้ไปยังเซ็นเซอร์กล้องหน้ารถ Dashcam ตรงข้ามกับ pano: Seal/Han pano = 1 → dashcam = 0; Atto / Tang pano = 0 → dashcam = 1 ปล่อยไว้ที่ Auto เพื่อให้ OverDrive เลือก</string>
+    <string name="camera_oem_dashcam_auto_resolved">อัตโนมัติ — ใช้ id %1$d (pano คือ id %2$d)</string>
+    <string name="camera_oem_dashcam_auto_unavailable">อัตโนมัติ — pano id คือ %1$d ไม่สามารถอนุมานกล้องได้</string>
+    <string name="camera_oem_dashcam_save">บันทึก</string>
     <string name="camera_concurrent_probe_label">ทดสอบรองรับกล้องคู่เมื่อบูตครั้งถัดไป</string>
     <string name="camera_concurrent_probe_subtitle">การตรวจสอบครั้งเดียวที่เปิดกล้องทั้งสองตัวพร้อมกันเพื่อยืนยันว่ารถคันนี้รองรับพาโนพร้อมกล้องหน้ารถพร้อมกันได้ ทำงานครั้งเดียวเมื่อรีสตาร์ทครั้งถัดไปขณะจอด ปล่อยปิดไว้เว้นแต่ภาพบันทึกดูผิดปกติ — ไม่จำเป็นต้องใช้และอาจขัดจังหวะการบันทึกชั่วครู่หากมีการบันทึกอยู่ขณะทำงาน</string>
     <!-- Dashcam-side camera labels — REVERSE of the pano labels above. The
@@ -146,8 +146,8 @@
          dialogs. Without these strings the dashcam picker re-used the pano
          labels and told Seal owners to pick "Camera 1 — Seal" for their
          dashcam, which is the pano camera, not the dashcam. -->
-    <string name="camera_oem_option_0">Camera 0 — Seal / Han (default)</string>
-    <string name="camera_oem_option_1">Camera 1 — Atto / Tang</string>
+    <string name="camera_oem_option_0">กล้อง 0 — Seal / Han (ค่าเริ่มต้น)</string>
+    <string name="camera_oem_option_1">กล้อง 1 — Atto / Tang</string>
     <!-- Camera mapping dialog (multi-vehicle role-to-slice routing) -->
     <string name="camera_mapping_title">จับคู่ตำแหน่งกล้อง</string>
     <string name="camera_role_label">จับคู่ตำแหน่ง</string>
@@ -207,7 +207,7 @@
     <string name="adb_preset_commands_header">คำสั่งที่ตั้งไว้</string>
     <string name="adb_output_header">ผลลัพธ์</string>
     <string name="adb_output_ready">$ พร้อมรับคำสั่ง…</string>
-    <string name="adb_console_hero_title">ADB Console</string>
+    <string name="adb_console_hero_title">คอนโซล ADB</string>
     <string name="adb_console_hero_subtitle">เรียกใช้คำสั่ง Shell บนอุปกรณ์</string>
     <!-- fragment_webview -->
     <string name="webview_loading">กำลังโหลด…</string>
@@ -262,7 +262,7 @@
     <string name="recording_lib_filter_section_severity">ระดับความรุนแรง</string>
     <string name="recording_lib_filter_section_type">ประเภท</string>
     <string name="recording_lib_filter_section_place">สถานที่</string>
-    <string name="recording_lib_place_search_hint">Search places…</string>
+    <string name="recording_lib_place_search_hint">ค้นหาสถานที่…</string>
     <string name="recording_lib_chip_type_normal">ปกติ</string>
     <string name="recording_lib_chip_type_proximity">เตือนเข้าใกล้</string>
     <string name="recording_lib_date_today">วันนี้</string>
@@ -281,29 +281,29 @@
     <string name="cd_open_filters">เปิดตัวกรอง</string>
     <string name="cd_clear_filter">ล้างตัวกรอง</string>
     <!-- v5 redesign: SOTA empty state with CTA + tile type badges -->
-    <string name="recording_lib_empty_title">No recordings match</string>
-    <string name="recording_lib_empty_body">Try adjusting your date range or chip filters.</string>
-    <string name="recording_lib_empty_clear_filters">Clear filters</string>
+    <string name="recording_lib_empty_title">ไม่มีการบันทึกที่ตรงกัน</string>
+    <string name="recording_lib_empty_body">ลองปรับช่วงวันที่หรือตัวกรองชิปของคุณ</string>
+    <string name="recording_lib_empty_clear_filters">ล้างตัวกรอง</string>
     <!-- Shown on the empty-state body when there are zero clips on disk
          (no filter is active). Sets a friendlier tone than "No recordings match". -->
-    <string name="recording_lib_empty_disk_title">Nothing recorded yet</string>
-    <string name="recording_lib_empty_disk_body">Captures will appear here as soon as the dashcam or surveillance pipeline writes a clip.</string>
+    <string name="recording_lib_empty_disk_title">ยังไม่มีการบันทึก</string>
+    <string name="recording_lib_empty_disk_body">ภาพที่บันทึกจะปรากฏที่นี่ทันทีที่กล้องหน้ารถหรือระบบเฝ้าระวังเขียนคลิป</string>
     <!-- Shown while the daemon is warming the H2 recording index on cold
          start. Includes a progress counter when the daemon reports done/total,
          otherwise a static body. The library re-polls every 1.5s and
          transitions out automatically once results land. -->
-    <string name="recording_lib_building_index_title">Building library index</string>
-    <string name="recording_lib_building_index_body">One moment while the daemon scans your recordings.</string>
-    <string name="recording_lib_building_index_progress">Indexed %1$d of %2$d clips…</string>
+    <string name="recording_lib_building_index_title">กำลังสร้างดัชนีคลัง</string>
+    <string name="recording_lib_building_index_body">รอสักครู่ ขณะที่เดมอนสแกนการบันทึกของคุณ</string>
+    <string name="recording_lib_building_index_progress">จัดทำดัชนีแล้ว %1$d จาก %2$d คลิป…</string>
     <!-- Tile type badge labels — short, glanceable, mirrors the on-disk
          filename prefix (cam_/event_/dvr_/proximity_) so power users can
          map a tile back to its file group at a glance. -->
     <string name="recording_lib_type_normal">CAM</string>
-    <string name="recording_lib_type_event">EVENT</string>
+    <string name="recording_lib_type_event">เหตุการณ์</string>
     <string name="recording_lib_type_proximity">PROX</string>
     <string name="recording_lib_type_oem">OEM</string>
     <!-- Toast shown when a multi-select share is dispatched. -->
-    <string name="toast_share_recordings">Sharing %1$d recordings</string>
+    <string name="toast_share_recordings">กำลังแชร์การบันทึก %1$d รายการ</string>
     <!-- fragment_sentry_config -->
     <!-- fragment_video_player -->
     <string name="player_title_recording">วิดีโอ</string>
@@ -407,7 +407,7 @@
     <string name="update_hide">ซ่อน</string>
     <!-- Update channel selector (Settings → About) -->
     <string name="settings_update_channel_title">ช่องทางการอัปเดต</string>
-    <string name="settings_update_channel_alpha">Alpha</string>
+    <string name="settings_update_channel_alpha">อัลฟา</string>
     <string name="settings_update_channel_braveheart">Braveheart</string>
     <string name="settings_update_channel_alpha_desc">เวอร์ชันเสถียร ทุกเวอร์ชันที่เผยแพร่จะถูกเก็บไว้ — เลือกเวอร์ชันใดก็ได้เพื่อติดตั้ง (อนุญาตให้ดาวน์เกรดได้) แนะนำสำหรับการใช้งานทั่วไป</string>
     <string name="settings_update_channel_braveheart_desc">เวอร์ชันทดลองใหม่ล่าสุด จะถูกเผยแพร่ทันทีที่พร้อมใช้งาน คุณจะได้รับฟีเจอร์ใหม่ก่อนใคร แต่อาจไม่เสถียรหรือมีข้อผิดพลาด หากเกิดปัญหา ให้เปิดหน้าจอ Daemons แตะที่บันทึกของ daemon เลือก \"อัปโหลดและรับรหัส\" แล้วแชร์รหัสกับเราในช่องทางชุมชน</string>
@@ -454,7 +454,7 @@
     <string name="dialog_traffic_disable_message">แอปพลิเคชัน BYD Traffic Monitor (com.byd.trafficmonitor) เป็นระบบที่ติดตั้งมากับรถยนต์ ซึ่งจะทำการตรวจสอบสภาพการจราจรอย่างต่อเนื่องในเบื้องหลัง\n\nเหตุใดจึงควรปิดใช้งาน?\n\n• มีการใช้ข้อมูลเครือข่าย (แม้ในขณะจอดรถ)\n• ใช้ทรัพยากร CPU และแบตเตอรี่ในเบื้องหลัง\n• ไม่จำเป็นหากคุณใช้แอปพลิเคชันนำทางอื่นอยู่แล้ว\n• อาจรบกวนการใช้เครือข่ายของแอปพลิเคชันกล้องหน้ารถ\n\nการปิดใช้งานสามารถทำได้อย่างปลอดภัย โดยจะส่งผลกระทบเพียงการแสดงข้อมูลจราจรบนแผนที่ของรถเท่านั้น ระบบนำทาง บลูทูธ และฟังก์ชันอื่นๆ จะยังคงทำงานได้ตามปกติ\n\n**จำเป็นต้องรีสตาร์ทหน้าจอรถ (Hard Reboot)** หลังจากการปิดใช้งาน (กดปุ่มกลางคอนโซลค้างไว้ 5 วินาที)</string>
     <string name="dialog_traffic_enable_title">ต้องการเปิดใช้งาน BYD Traffic Monitor อีกครั้งหรือไม่?</string>
     <string name="dialog_traffic_enable_message">แอปพลิเคชัน BYD Traffic Monitor ถูกปิดใช้งานอยู่ในขณะนี้\n\nหากเปิดใช้งาน ระบบจะนำข้อมูลสภาพการจราจรกลับมาแสดงบนแผนที่ของรถ แต่ระบบจะทำงานในเบื้องหลังและใช้ข้อมูลเครือข่ายอินเทอร์เน็ต\n\n**จำเป็นต้องรีสตาร์ทหน้าจอรถ (Hard Reboot)** หลังจากการเปิดใช้งาน (กดปุ่มกลางคอนโซลค้างไว้ 5 วินาที)</string>
-    <string name="dialog_traffic_status_title">Traffic Monitor %1$s</string>
+    <string name="dialog_traffic_status_title">ตัวตรวจสอบจราจร %1$s</string>
     <string name="dialog_traffic_reboot_message">บันทึกการตั้งค่าเรียบร้อยแล้ว\n\nกรุณารีสตาร์ทหน้าจอรถของคุณ:\nกดปุ่มตรงกลางคอนโซลค้างไว้ 5 วินาที</string>
     <string name="traffic_monitor_loading">Traffic Monitor: กำลังตรวจสอบ…</string>
     <string name="traffic_monitor_tap_to_check">Traffic Monitor (แตะเพื่อตรวจสอบ)</string>
@@ -502,7 +502,7 @@
     <!-- ABRP -->
     <!-- Daemons fragment -->
     <string name="toast_no_config_needed">ไม่ต้องกำหนดการตั้งค่าเพิ่มเติมสำหรับ %1$s</string>
-    <string name="dialog_zrok_token_title">Zrok Tunnel Token</string>
+    <string name="dialog_zrok_token_title">โทเคน Zrok Tunnel</string>
     <string name="dialog_zrok_token_message">กรุณาระบุ Token สำหรับใช้งาน Zrok\nสามารถรับได้ที่: zrok.io</string>
     <string name="toast_token_cannot_be_empty">Token ต้องไม่เป็นค่าว่าง</string>
     <string name="dialog_tailscale_settings_title">การตั้งค่า Tailscale Tunnel</string>
@@ -536,16 +536,16 @@
     <string name="toast_daemon_manager_unavailable">ตัวจัดการระบบเบื้องหลังยังไม่พร้อมทำงาน กรุณาลองใหม่อีกครั้งในภายหลัง</string>
     <string name="toast_log_save_failed">บันทึก Log ไม่สำเร็จ: %1$s</string>
     <string name="toast_log_not_found">ไม่พบไฟล์ Log หรือไม่สามารถอ่านไฟล์ได้</string>
-    <string name="log_share_title">%1$s Log - %2$s</string>
+    <string name="log_share_title">บันทึก %1$s - %2$s</string>
     <string name="log_share_chooser">แชร์ข้อมูล Log %1$s</string>
-    <string name="log_header_title">=== %1$s Log ===</string>
+    <string name="log_header_title">=== บันทึก %1$s ===</string>
     <string name="log_header_source">แหล่งที่มา: %1$s</string>
     <string name="log_header_exported">ส่งออกเมื่อ: %1$s</string>
     <string name="log_header_truncated">หมายเหตุ: ตัดทอนข้อมูลให้แสดงเฉพาะ 10,000 บรรทัดล่าสุด (ทั้งหมด: %1$d บรรทัด)</string>
     <!-- Braveheart log send (upload to Cloudflare or share-sheet) -->
     <string name="logs_send_title">ส่งบันทึก %1$s</string>
     <string name="logs_send_title_plain">ส่งบันทึก daemon</string>
-    <string name="logs_send_subtitle">%1$s · choose how to send it to us</string>
+    <string name="logs_send_subtitle">%1$s · เลือกวิธีส่งให้เรา</string>
     <string name="logs_send_upload">อัปโหลดและรับรหัส</string>
     <string name="logs_send_upload_desc">ส่งบันทึกให้เราและให้รหัสสั้นๆ แก่คุณ สะดวกที่สุดสำหรับการสนับสนุน</string>
     <string name="logs_send_share">แชร์ไฟล์…</string>
@@ -554,7 +554,7 @@
     <string name="logs_uploading_subtitle">กำลังปกปิดข้อมูลลับและส่งอย่างปลอดภัย</string>
     <string name="logs_uploaded_title">อัปโหลดบันทึกแล้ว</string>
     <string name="logs_uploaded_instructions">แชร์รหัสนี้กับเรา พร้อมระบุว่าคุณกำลังทำอะไรอยู่เมื่อเกิดปัญหา โพสต์บน Discord, GitHub Issues หรือ WhatsApp — ลิงก์อยู่ในหน้าจอเกี่ยวกับ</string>
-    <string name="logs_uploaded_privacy">Secrets redacted · the log auto-expires</string>
+    <string name="logs_uploaded_privacy">ปกปิดข้อมูลลับ · บันทึกหมดอายุอัตโนมัติ</string>
     <string name="logs_copy_code">คัดลอกรหัส</string>
     <string name="logs_done">เสร็จสิ้น</string>
     <string name="placeholder_dash">—</string>
@@ -694,7 +694,7 @@
     <string name="recordings_preview_placeholder_title">เลือกวิดีโอเพื่อเล่น</string>
     <string name="recordings_preview_placeholder_body">แตะเลือกวิดีโอทางด้านซ้ายเพื่อรับชม</string>
     <!-- Diagnostics page -->
-    <string name="diagnostics_section_adb_console">ADB Console</string>
+    <string name="diagnostics_section_adb_console">คอนโซล ADB</string>
     <string name="diagnostics_section_traffic">ตรวจสอบข้อมูลเครือข่าย</string>
     <string name="diagnostics_section_camera_probe">ตรวจสอบสถานะกล้อง</string>
     <string name="diagnostics_section_battery">สุขภาพแบตเตอรี่</string>
@@ -712,7 +712,7 @@
     <string name="diagnostics_metric_online">ออนไลน์</string>
     <!-- Network tile: bottom line tunnel state (e.g. "Tunnel · Online"). %1$s is one of
          tunnel_state_online / tunnel_state_offline / tunnel_state_connecting. -->
-    <string name="diagnostics_network_tunnel_label">Tunnel · %1$s</string>
+    <string name="diagnostics_network_tunnel_label">อุโมงค์ · %1$s</string>
     <string name="diagnostics_tunnel_state_online">ออนไลน์</string>
     <string name="diagnostics_tunnel_state_offline">ออฟไลน์</string>
     <string name="diagnostics_tunnel_state_connecting">กำลังเชื่อมต่อ</string>
@@ -896,10 +896,10 @@
     <string name="pin_lock_title">ป้อน PIN</string>
     <string name="pin_lock_title_unlocked">ปลดล็อกแล้ว</string>
     <string name="pin_lock_subtitle_default">ปลดล็อก OverDrive เพื่อดำเนินการต่อ</string>
-    <string name="pin_lock_subtitle_wrong">Wrong PIN. Try again.</string>
-    <string name="pin_lock_subtitle_locked_out">Too many attempts. Try again shortly.</string>
+    <string name="pin_lock_subtitle_wrong">PIN ไม่ถูกต้อง ลองอีกครั้ง</string>
+    <string name="pin_lock_subtitle_locked_out">พยายามมากเกินไป ลองอีกครั้งในไม่ช้า</string>
     <!-- %1$s is a formatted countdown like "30s" or "2:45". -->
-    <string name="pin_lock_subtitle_locked_out_countdown">Locked. Try again in %1$s.</string>
+    <string name="pin_lock_subtitle_locked_out_countdown">ถูกล็อก ลองอีกครั้งใน %1$s</string>
     <string name="pin_lock_lockout_seconds">%1$dวินาที</string>
     <string name="pin_lock_lockout_minutes">%1$d:%2$02d</string>
     <!-- Lock-screen recovery hint. Two-part: a translatable prose prefix
@@ -907,7 +907,7 @@
          settings_security_recovery_command resource so a future edit to
          the command stays in sync across both surfaces). The lock screen
          concatenates them at runtime via String.format. -->
-    <string name="pin_lock_recovery_hint_prefix">Forgot your PIN? Run from a connected computer:\n%1$s</string>
+    <string name="pin_lock_recovery_hint_prefix">ลืม PIN? เรียกใช้จากคอมพิวเตอร์ที่เชื่อมต่อ:\n%1$s</string>
     <string name="pin_lock_backspace_cd">Backspace</string>
     <plurals name="pin_lock_dot_a11y">
         <item quantity="other">ป้อนไปแล้ว %1$d หลัก</item>
@@ -980,23 +980,23 @@
     <string name="rail_roadsense">RoadSense</string>
     <string name="rail_hazard_map">แผนที่</string>
     <string name="roadsense_title">RoadSense</string>
-    <string name="roadsense_pill_scanning">Scanning</string>
+    <string name="roadsense_pill_scanning">กำลังสแกน</string>
     <string name="roadsense_pill_idle">RoadSense</string>
-    <string name="roadsense_status_idle">Idle</string>
+    <string name="roadsense_status_idle">ว่าง</string>
     <!-- VEHICLE calibration (suspension-learning) — the green/orange/red dot. Worded
          about the car, not the route, since that's what maturity actually measures. -->
-    <string name="roadsense_cal_learning">Learning your vehicle</string>
+    <string name="roadsense_cal_learning">กำลังเรียนรู้รถของคุณ</string>
     <string name="roadsense_cal_ready">รถยนต์ปรับเทียบแล้ว</string>
-    <string name="roadsense_cal_partial">Calibration improving</string>
+    <string name="roadsense_cal_partial">การปรับเทียบดีขึ้น</string>
     <!-- Idle caption — ROUTE coverage (distinct from vehicle calibration). "Clear
          ahead" only when we've actually mapped this stretch; "New road" when we
          haven't, so an unsurveyed road isn't mistaken for confirmed-safe. -->
     <string name="roadsense_clear_ahead">เส้นทางข้างหน้าปลอดโปร่ง</string>
     <string name="roadsense_road_mapped">ทำแผนที่ถนนแล้ว · ปลอดโปร่ง</string>
-    <string name="roadsense_road_new">New road · learning</string>
+    <string name="roadsense_road_new">ถนนใหม่ · กำลังเรียนรู้</string>
     <string name="roadsense_unit_meters">ม.</string>
     <string name="roadsense_dash_distance">—</string>
-    <string name="roadsense_warn_label">Warn</string>
+    <string name="roadsense_warn_label">เตือน</string>
     <string name="roadsense_toggle_audio">เสียง</string>
     <string name="roadsense_toggle_visual">ภาพ</string>
     <!-- severity / type readouts (formatted at runtime) -->
@@ -1015,7 +1015,7 @@
     <!-- "Rough section · 40 m" — %1$d = length in metres -->
     <string name="roadsense_zone_rough">ช่วงถนนขรุขระ · %1$d ม.</string>
     <!-- Calibration-Mode confirm card (R-OVL-6) -->
-    <string name="roadsense_confirm_prompt">Was this a hazard?</string>
+    <string name="roadsense_confirm_prompt">นี่เป็นอันตรายหรือไม่?</string>
     <string name="roadsense_confirm_reject">ไม่ใช่สิ่งอันตราย</string>
     <string name="roadsense_confirm_accept">ยืนยัน</string>
     <!-- content descriptions -->
@@ -1043,7 +1043,7 @@
     <string name="roadsense_map_status_local">บนอุปกรณ์</string>
     <string name="roadsense_map_status_cloud">ที่แชร์</string>
     <!-- Meta line: "Moderate · 82% confidence · 3 reports" -->
-    <string name="roadsense_map_meta_format">%1$s · %2$d%% confidence · %3$s</string>
+    <string name="roadsense_map_meta_format">%1$s · ความมั่นใจ %2$d%% · %3$s</string>
     <!-- "3 reports" / "1 report" -->
     <plurals name="roadsense_map_reports">
         <item quantity="other">%1$d reports</item>

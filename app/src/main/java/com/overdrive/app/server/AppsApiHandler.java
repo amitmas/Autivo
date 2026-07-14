@@ -14,8 +14,9 @@ import java.io.OutputStream;
  *
  * <ul>
  *   <li>GET  /api/apps/list   — {@code {success, apps:[{package,label}]}} launchable apps, sorted by label.</li>
- *   <li>POST /api/apps/launch — body {@code {package}} → launch it. This is the endpoint an
- *       automation {@code ApiAction} targets (allowlisted in {@link HttpServer}).</li>
+ *   <li>POST /api/apps/launch — body {@code {package, split?}} → launch it (split=true
+ *       docks into split-screen). This is the endpoint an automation {@code ApiAction}
+ *       and the keymap {@code openApp} action target (allowlisted in {@link HttpServer}).</li>
  * </ul>
  */
 public final class AppsApiHandler {
@@ -64,7 +65,10 @@ public final class AppsApiHandler {
                 HttpResponse.sendJson(out, resp.toString());
                 return;
             }
-            boolean ok = AppLauncher.launch(pkg);
+            // Optional split-screen dock: {"package":..,"split":true}. Defaults to
+            // false (normal full-screen launch) so existing callers are unaffected.
+            boolean split = req.optBoolean("split", false);
+            boolean ok = AppLauncher.launch(pkg, split);
             resp.put("success", ok);
             if (!ok) resp.put("error", "Could not launch " + pkg);
         } catch (Throwable t) {

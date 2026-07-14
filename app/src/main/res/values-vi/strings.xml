@@ -23,8 +23,8 @@
     <string name="action_select_all">Chọn tất cả</string>
     <string name="action_select_all_short">Tất cả</string>
     <string name="action_delete">Xoá</string>
-    <string name="action_share">Share</string>
-    <string name="action_done">DONE</string>
+    <string name="action_share">Chia sẻ</string>
+    <string name="action_done">XONG</string>
     <string name="action_remind_me_later">Hãy nhớ tôi sau này.</string>
     <string name="action_retry">Thử lại</string>
     <string name="action_run">Chạy đi.</string>
@@ -34,7 +34,7 @@
     <string name="cd_camera">Máy ảnh</string>
     <string name="cd_qr">QR</string>
     <string name="cd_qr_code">Mã QR</string>
-    <string name="cd_show_hide_token">Show/Hide Token</string>
+    <string name="cd_show_hide_token">Hiện/Ẩn mã</string>
     <string name="cd_copy_token">Tín hiệu sao chép</string>
     <string name="cd_copy_url">Bản sao URL</string>
     <string name="cd_clear_logs">Nhìn rõ</string>
@@ -45,7 +45,7 @@
     <string name="cd_video_thumbnail">Hình ảnh nhỏ video</string>
     <string name="cd_play">Phát</string>
     <string name="cd_back">Quay lại</string>
-    <string name="cd_play_pause">Play/Pause</string>
+    <string name="cd_play_pause">Phát/Tạm dừng</string>
     <string name="cd_player_prev">Bản ghi trước đó</string>
     <string name="cd_player_next">Bản ghi kế tiếp</string>
     <string name="cd_player_maximize">Tăng tối đa người chơi</string>
@@ -57,7 +57,7 @@
     <string name="cd_player_quadrant_rear">Hiển thị camera sau</string>
     <string name="cd_player_quadrant_left">Hiển thị camera trái</string>
     <string name="cd_delete">Xoá</string>
-    <string name="cd_share">Share</string>
+    <string name="cd_share">Chia sẻ</string>
     <string name="cd_expand">Tăng cường</string>
     <string name="cd_configure">Thiết lập</string>
     <string name="cd_download_log">Lập nhật ký tải xuống</string>
@@ -67,7 +67,7 @@
     <string name="cd_permission_granted">Giấy phép được cấp</string>
     <!-- overlay_status -->
     <string name="overlay_rec_inactive_label">REC</string>
-    <string name="overlay_trip_inactive_label">TRIP</string>
+    <string name="overlay_trip_inactive_label">CHUYẾN</string>
     <string name="overlay_mic_inactive_label">MIC</string>
     <!-- Quick-action chips revealed by tapping the REC pill: switch
          recording mode without opening the app. Short labels read fine
@@ -75,10 +75,10 @@
          translatable=false to avoid bloating the i18n catalog. The
          _cd content-descriptions are real prose and ARE translatable —
          they go through the NLLB pipeline like every other a11y string. -->
-    <string name="overlay_mode_off_cd">Stop recording</string>
-    <string name="overlay_mode_continuous_cd">Continuous recording</string>
-    <string name="overlay_mode_drive_cd">Drive-mode recording</string>
-    <string name="overlay_mode_proximity_cd">Proximity-guard recording</string>
+    <string name="overlay_mode_off_cd">Dừng ghi</string>
+    <string name="overlay_mode_continuous_cd">Ghi liên tục</string>
+    <string name="overlay_mode_drive_cd">Ghi hình chế độ lái</string>
+    <string name="overlay_mode_proximity_cd">Ghi hình bảo vệ khoảng cách</string>
     <!-- item_log_entry placeholders (timestamp/tag/message are runtime, but these are
          placeholder/preview text used at design time and visible in some empty states) -->
     <string name="log_entry_default_timestamp">12:34:56</string>
@@ -96,7 +96,7 @@
     <string name="url_connecting">Kết nối...</string>
     <!-- Shown when an external link can't open (no browser on the head unit):
          the URL is copied to the clipboard instead. %1$s = the URL. -->
-    <string name="url_copied_no_browser">No browser found. Link copied: %1$s</string>
+    <string name="url_copied_no_browser">Không tìm thấy trình duyệt. Đã sao chép liên kết: %1$s</string>
     <!-- dialog_tailscale_settings -->
     <string name="tailscale_generate_login_url">Tạo login URL</string>
     <string name="tailscale_scan_to_login">Scan để Login</string>
@@ -114,7 +114,7 @@
     <string name="camera_mode_save">Động thái áp dụng</string>
     <string name="camera_mode_hint">Thay đổi chế độ khởi động lại máy ảnh daemon. Nếu video trông sai (squished, missing quadrants, red overlay), hãy thử chế độ khác.</string>
     <!-- DiLink 4 quadrant tweaks (only effective when cameraMode = DiLink 4) -->
-    <string name="camera_dilink4_tweaks_title">DiLink 4 Quadrant Tweaks</string>
+    <string name="camera_dilink4_tweaks_title">Tinh chỉnh 4 góc DiLink</string>
     <string name="camera_dilink4_tweaks_subtitle">Các điều chỉnh cho phương tiện cho đường DiLink 4. Chỉ hiệu quả khi chế độ DiLink 4 được chọn ở trên.</string>
     <string name="camera_dilink4_save">Sử dụng các điều chỉnh</string>
     <string name="camera_dilink4_hint">Đổi lại chỉ khi HAL vẽ một màu đỏ \"tích chuẩn thất bại\" chrome trên nguồn cấp dữ liệu.</string>
@@ -133,11 +133,11 @@
     <string name="camera_option_5">Camera 5</string>
     <string name="camera_selection_hint">Auto chọn máy ảnh phù hợp cho trang bị của bạn trên mỗi boot. Camera 1 = BYD Seal, Camera 0 = Atto trang bị. khởi động lại daemon sau khi thay đổi ID máy ảnh để thiết lập có hiệu lực.</string>
     <!-- OEM Dashcam camera ID picker (Phase 5: separate forward-sensor pipeline) -->
-    <string name="camera_oem_dashcam_title">OEM Dashcam Camera ID</string>
-    <string name="camera_oem_dashcam_hint">Pick the AVMCamera id that points at the forward dashcam sensor. Dashcam is the OPPOSITE of pano: Seal/Han pano = 1 → dashcam = 0; Atto / Tang pano = 0 → dashcam = 1. Leave on Auto to let OverDrive pick.</string>
-    <string name="camera_oem_dashcam_auto_resolved">Auto — using id %1$d (pano is id %2$d)</string>
-    <string name="camera_oem_dashcam_auto_unavailable">Auto — pano id is %1$d, can\'t infer dashcam</string>
-    <string name="camera_oem_dashcam_save">Save</string>
+    <string name="camera_oem_dashcam_title">ID camera OEM Dashcam</string>
+    <string name="camera_oem_dashcam_hint">Chọn AVMCamera id trỏ đến cảm biến dashcam phía trước. Dashcam NGƯỢC với pano: Seal/Han pano = 1 → dashcam = 0; Atto / Tang pano = 0 → dashcam = 1. Để ở Auto để OverDrive tự chọn.</string>
+    <string name="camera_oem_dashcam_auto_resolved">Tự động — dùng id %1$d (pano là id %2$d)</string>
+    <string name="camera_oem_dashcam_auto_unavailable">Tự động — id pano là %1$d, không thể suy ra dashcam</string>
+    <string name="camera_oem_dashcam_save">Lưu</string>
     <string name="camera_concurrent_probe_label">Kiểm tra hỗ trợ hai camera khi khởi động lần sau</string>
     <string name="camera_concurrent_probe_subtitle">Kiểm tra một lần, mở cả hai camera cùng lúc để xác nhận xe này có thể chạy đồng thời pano + camera hành trình. Chạy một lần ở lần khởi động lại tiếp theo khi đang đỗ. Để TẮT trừ khi bản ghi trông không đúng — không bắt buộc và có thể làm gián đoạn ngắn một bản ghi nếu đang ghi khi nó chạy.</string>
     <!-- Dashcam-side camera labels — REVERSE of the pano labels above. The
@@ -146,7 +146,7 @@
          dialogs. Without these strings the dashcam picker re-used the pano
          labels and told Seal owners to pick "Camera 1 — Seal" for their
          dashcam, which is the pano camera, not the dashcam. -->
-    <string name="camera_oem_option_0">Camera 0 — Seal / Han (default)</string>
+    <string name="camera_oem_option_0">Camera 0 — Seal / Han (mặc định)</string>
     <string name="camera_oem_option_1">Camera 1 — Atto / Tang</string>
     <!-- Camera mapping dialog (multi-vehicle role-to-slice routing) -->
     <string name="camera_mapping_title">Chụp bản đồ bằng máy ảnh</string>
@@ -186,7 +186,7 @@
     <string name="setup_autostart_button">Mở BYD Auto-Start</string>
     <string name="setup_overlay_title">Cho phép hiển thị trên các ứng dụng khác</string>
     <string name="setup_overlay_body">Khả năng điều này để hiển thị một chỉ số trạng thái nổi để ghi lại và theo dõi chuyến đi trên đầu các ứng dụng khác.</string>
-    <string name="setup_overlay_button">Open Overlay Settings</string>
+    <string name="setup_overlay_button">Mở cài đặt lớp phủ</string>
     <!-- Language picker (drawer footer + bottom sheet) -->
     <string name="cd_close">Đóng</string>
     <string name="language_picker_title">Ngôn ngữ</string>
@@ -207,7 +207,7 @@
     <string name="adb_preset_commands_header">Các lệnh cài đặt trước</string>
     <string name="adb_output_header">Tạo ra</string>
     <string name="adb_output_ready">Sẵn sàng cho lệnh...</string>
-    <string name="adb_console_hero_title">ADB Console</string>
+    <string name="adb_console_hero_title">Bảng điều khiển ADB</string>
     <string name="adb_console_hero_subtitle">Động hành lệnh shell trên thiết bị</string>
     <!-- fragment_webview -->
     <string name="webview_loading">Lái...</string>
@@ -229,7 +229,7 @@
     <string name="reset_cat_soc_history_desc">Các mẫu SoC, các phiên sạc, nhật ký điện áp</string>
     <string name="reset_cat_soh">Tích chuẩn SoH</string>
     <string name="reset_cat_soh_desc">Khám phá lại năng lực danh nghĩa, ước tính hạt giống mới từ BMS</string>
-    <string name="reset_cat_abrp_token">ABRP token</string>
+    <string name="reset_cat_abrp_token">Mã ABRP</string>
     <string name="reset_cat_abrp_token_desc">Thiết lập điện từ ABRP cho đến khi sửa chữa</string>
     <string name="reset_cat_byd_cloud">BYD Thông tin đăng ký đám mây</string>
     <string name="reset_cat_byd_cloud_desc">Tên người dùng, khóa đăng nhập, VIN  cần đăng nhập lại</string>
@@ -262,7 +262,7 @@
     <string name="recording_lib_filter_section_severity">Độ nghiêm trọng</string>
     <string name="recording_lib_filter_section_type">Loại</string>
     <string name="recording_lib_filter_section_place">Địa điểm</string>
-    <string name="recording_lib_place_search_hint">Search places…</string>
+    <string name="recording_lib_place_search_hint">Tìm địa điểm…</string>
     <string name="recording_lib_chip_type_normal">Nhóm chứng chuẩn</string>
     <string name="recording_lib_chip_type_proximity">Khoảng cách</string>
     <string name="recording_lib_date_today">Ngày nay</string>
@@ -281,29 +281,29 @@
     <string name="cd_open_filters">Các bộ lọc mở</string>
     <string name="cd_clear_filter">Bộ lọc rõ ràng</string>
     <!-- v5 redesign: SOTA empty state with CTA + tile type badges -->
-    <string name="recording_lib_empty_title">No recordings match</string>
-    <string name="recording_lib_empty_body">Try adjusting your date range or chip filters.</string>
-    <string name="recording_lib_empty_clear_filters">Clear filters</string>
+    <string name="recording_lib_empty_title">Không có bản ghi khớp</string>
+    <string name="recording_lib_empty_body">Hãy thử điều chỉnh phạm vi ngày hoặc bộ lọc chip của bạn.</string>
+    <string name="recording_lib_empty_clear_filters">Xóa bộ lọc</string>
     <!-- Shown on the empty-state body when there are zero clips on disk
          (no filter is active). Sets a friendlier tone than "No recordings match". -->
-    <string name="recording_lib_empty_disk_title">Nothing recorded yet</string>
-    <string name="recording_lib_empty_disk_body">Captures will appear here as soon as the dashcam or surveillance pipeline writes a clip.</string>
+    <string name="recording_lib_empty_disk_title">Chưa ghi được gì</string>
+    <string name="recording_lib_empty_disk_body">Các bản ghi sẽ xuất hiện ở đây ngay khi dashcam hoặc quy trình giám sát ghi một clip.</string>
     <!-- Shown while the daemon is warming the H2 recording index on cold
          start. Includes a progress counter when the daemon reports done/total,
          otherwise a static body. The library re-polls every 1.5s and
          transitions out automatically once results land. -->
-    <string name="recording_lib_building_index_title">Building library index</string>
-    <string name="recording_lib_building_index_body">One moment while the daemon scans your recordings.</string>
-    <string name="recording_lib_building_index_progress">Indexed %1$d of %2$d clips…</string>
+    <string name="recording_lib_building_index_title">Đang xây dựng chỉ mục thư viện</string>
+    <string name="recording_lib_building_index_body">Đợi một lát trong khi daemon quét các bản ghi của bạn.</string>
+    <string name="recording_lib_building_index_progress">Đã lập chỉ mục %1$d trong %2$d clip…</string>
     <!-- Tile type badge labels — short, glanceable, mirrors the on-disk
          filename prefix (cam_/event_/dvr_/proximity_) so power users can
          map a tile back to its file group at a glance. -->
     <string name="recording_lib_type_normal">CAM</string>
-    <string name="recording_lib_type_event">EVENT</string>
+    <string name="recording_lib_type_event">SỰ KIỆN</string>
     <string name="recording_lib_type_proximity">PROX</string>
     <string name="recording_lib_type_oem">OEM</string>
     <!-- Toast shown when a multi-select share is dispatched. -->
-    <string name="toast_share_recordings">Sharing %1$d recordings</string>
+    <string name="toast_share_recordings">Đang chia sẻ %1$d bản ghi</string>
     <!-- fragment_sentry_config -->
     <!-- fragment_video_player -->
     <string name="player_title_recording">Đăng ký</string>
@@ -446,7 +446,7 @@
     <string name="dialog_reset_soh_title">Đặt lại ước tính SOH?</string>
     <string name="dialog_reset_soh_message">Điều này sẽ xóa tất cả dữ liệu SOH và buộc tính toán lại từ đầu.\n\n Sử dụng điều này nếu:\n• Pin đã được thay thế\n• Đọc SOH dường như không chính xác\n• Bạn muốn tái chuẩn hóa\n\n Hệ thống sẽ tái phân từ nguồn dữ liệu tiếp theo có sẵn (OEM, hiệu chuẩn sạc, hoặc đọc tức thời).</string>
     <string name="dialog_reset_following_title">Đặt lại những gì sau đây?</string>
-    <string name="dialog_reset_following_message">This cannot be undone.\n\n%1$s</string>
+    <string name="dialog_reset_following_message">Không thể hoàn tác.\n\n%1$s</string>
     <string name="dialog_reset_complete_title">Đặt lại hoàn chỉnh</string>
     <string name="dialog_traffic_cannot_check_title">Không thể kiểm tra tình trạng</string>
     <string name="dialog_traffic_cannot_check_message">Kết nối ADB vẫn chưa sẵn sàng.\n\n Ứng dụng cần quyền truy cập ADB để quản lý các gói hệ thống. Xin đảm bảo:\n\n• USB Debugging được bật trong Developer Options\n• Đơn xin ủy quyền ADB đã được chấp nhận\n\nHiện trạng sẽ tự động cập nhật một khi kết nối.</string>
@@ -462,7 +462,7 @@
     <string name="reset_label_trips">Chuyến đi</string>
     <string name="reset_label_soc_history">lịch sử SoC + 12V</string>
     <string name="reset_label_soh">Tích chuẩn SoH</string>
-    <string name="reset_label_abrp_token">ABRP token</string>
+    <string name="reset_label_abrp_token">Mã ABRP</string>
     <string name="reset_label_byd_cloud">BYD Thông tin đăng ký đám mây</string>
     <string name="reset_label_recordings">Bản ghi</string>
     <string name="reset_label_sentry_events">Các sự kiện giám sát</string>
@@ -489,7 +489,7 @@
     <string name="tunnel_label_zrok">Zrok</string>
     <string name="tunnel_label_tailscale">Tailscale</string>
     <!-- Daemon names — shown on the Daemons list and dashboard. -->
-    <string name="daemon_name_camera">Camera Daemon</string>
+    <string name="daemon_name_camera">Daemon camera</string>
     <string name="daemon_name_surveillance">Daemon giám sát</string>
     <string name="daemon_name_acc_surveillance">ACC Giám sát</string>
     <string name="daemon_name_singbox">Sing-box Proxy</string>
@@ -502,7 +502,7 @@
     <!-- ABRP -->
     <!-- Daemons fragment -->
     <string name="toast_no_config_needed">Không cần thiết cấu hình cho %1$s</string>
-    <string name="dialog_zrok_token_title">Zrok Tunnel Token</string>
+    <string name="dialog_zrok_token_title">Mã Zrok Tunnel</string>
     <string name="dialog_zrok_token_message">Nhập mã hiệu kích hoạt Zrok của bạn.</string>
     <string name="toast_token_cannot_be_empty">Đơn hiệu không thể trống rỗng</string>
     <string name="dialog_tailscale_settings_title">Tailscale Cài đặt đường hầm</string>
@@ -536,16 +536,16 @@
     <string name="toast_daemon_manager_unavailable">Người quản lý Daemon không sẵn sàng, hãy thử lại ngay.</string>
     <string name="toast_log_save_failed">Không lưu nhật ký: %1$s</string>
     <string name="toast_log_not_found">Tệp nhật ký không tìm thấy hoặc không thể đọc được</string>
-    <string name="log_share_title">%1$s Log - %2$s</string>
+    <string name="log_share_title">Nhật ký %1$s - %2$s</string>
     <string name="log_share_chooser">Chia sẻ %1$s Log</string>
-    <string name="log_header_title">=== %1$s Log ===</string>
+    <string name="log_header_title">=== Nhật ký %1$s ===</string>
     <string name="log_header_source">Nguồn: %1$s</string>
     <string name="log_header_exported">Xuất khẩu: %1$s</string>
     <string name="log_header_truncated">LƯU Ý: Nhóm nhật ký được cắt ngắn để kéo dài 10000 dòng (tổng số: %1$d dòng)</string>
     <!-- Braveheart log send (upload to Cloudflare or share-sheet) -->
     <string name="logs_send_title">Gửi nhật ký %1$s</string>
     <string name="logs_send_title_plain">Gửi nhật ký daemon</string>
-    <string name="logs_send_subtitle">%1$s · choose how to send it to us</string>
+    <string name="logs_send_subtitle">%1$s · chọn cách gửi cho chúng tôi</string>
     <string name="logs_send_upload">Tải lên &amp; nhận mã</string>
     <string name="logs_send_upload_desc">Gửi nhật ký cho chúng tôi và cung cấp cho bạn một mã ngắn. Dễ dàng nhất để được hỗ trợ.</string>
     <string name="logs_send_share">Chia sẻ tệp…</string>
@@ -554,9 +554,9 @@
     <string name="logs_uploading_subtitle">Đang ẩn thông tin nhạy cảm và gửi an toàn</string>
     <string name="logs_uploaded_title">Đã tải nhật ký lên</string>
     <string name="logs_uploaded_instructions">Chia sẻ mã này với chúng tôi, cùng với ghi chú về những gì bạn đang làm khi xảy ra lỗi. Đăng nó trên Discord, GitHub Issues hoặc WhatsApp — các liên kết có trên màn hình Giới thiệu.</string>
-    <string name="logs_uploaded_privacy">Secrets redacted · the log auto-expires</string>
+    <string name="logs_uploaded_privacy">Đã ẩn thông tin bí mật · nhật ký tự hết hạn</string>
     <string name="logs_copy_code">Sao chép mã</string>
-    <string name="logs_done">Done</string>
+    <string name="logs_done">Xong</string>
     <string name="placeholder_dash">—</string>
     <string name="errors_network">Lỗi mạng</string>
     <!-- Recording controls -->
@@ -592,7 +592,7 @@
     <string name="daemon_configuration_required">Thiết lập cần thiết</string>
     <string name="daemon_configuration_message">%1$s</string>
     <!-- Navigation graph fragment labels (shown as toolbar/ActionBar titles) -->
-    <string name="nav_page_video_player">Video Player</string>
+    <string name="nav_page_video_player">Trình phát video</string>
     <string name="nav_page_telegram">Telegram</string>
     <string name="nav_page_abrp">ABRP</string>
     <string name="nav_page_mqtt">MQTT</string>
@@ -605,10 +605,10 @@
          notifications into one shade entry. The summary text is intentionally
          generic so it stays accurate whether all three services are running
          or only the keepalive survived an OOM respawn. -->
-    <string name="daemon_keepalive_notif_title">Overdrive Active</string>
-    <string name="daemon_keepalive_notif_text">Monitoring vehicle systems</string>
+    <string name="daemon_keepalive_notif_title">Overdrive đang hoạt động</string>
+    <string name="daemon_keepalive_notif_text">Đang giám sát hệ thống xe</string>
     <string name="overdrive_status_summary_title">Overdrive</string>
-    <string name="overdrive_status_summary_text">Background services running</string>
+    <string name="overdrive_status_summary_text">Dịch vụ nền đang chạy</string>
     <!-- ============================================================== -->
     <!-- M3 Revamp: navigation rail + settings sub-rail + theme picker  -->
     <!-- ============================================================== -->
@@ -628,7 +628,7 @@
     <string name="settings_section_daemons">Những con quỷ</string>
     <string name="settings_section_privacy">Bảo mật &amp; dữ liệu</string>
     <string name="settings_section_overlay">Lắp xếp trạng thái</string>
-    <string name="settings_section_security">Security</string>
+    <string name="settings_section_security">Bảo mật</string>
     <string name="settings_overlay_subtitle">Chọn những phần nào của viên thuốc trạng thái nổi vẫn còn hiển thị.</string>
     <string name="settings_overlay_camera_title">Camera chỉ dẫn</string>
     <string name="settings_overlay_camera_subtitle">Hình bày thẻ REC / PROX trong khi ghi âm đang hoạt động.</string>
@@ -694,7 +694,7 @@
     <string name="recordings_preview_placeholder_title">Chọn một bản ghi</string>
     <string name="recordings_preview_placeholder_body">Nhấn bất kỳ mục nào ở bên trái để chơi nó.</string>
     <!-- Diagnostics page -->
-    <string name="diagnostics_section_adb_console">ADB Console</string>
+    <string name="diagnostics_section_adb_console">Bảng điều khiển ADB</string>
     <string name="diagnostics_section_traffic">Kiểm tra giao thông</string>
     <string name="diagnostics_section_camera_probe">Hình ảnh</string>
     <string name="diagnostics_section_battery">Sức khỏe pin</string>
@@ -850,56 +850,56 @@
          The lock guards the OverDrive UI only. Cam daemon, AccSentry,
          surveillance, recording, Telegram alerts, status overlay, and the
          deterrent screen all run independently regardless of this state. -->
-    <string name="settings_security_title">Security</string>
-    <string name="settings_security_subtitle">Lock the OverDrive app so passengers and valets can\'t open it without your PIN.</string>
-    <string name="settings_security_stance_title">UI lock only</string>
-    <string name="settings_security_stance_body">Surveillance, recording, deterrent, alerts, and background services keep running while the app is locked. The PIN gates the OverDrive interface, nothing else.</string>
-    <string name="settings_security_overline_lock">App lock</string>
-    <string name="settings_security_overline_recovery">If you forget your PIN</string>
-    <string name="settings_security_toggle_title">Require PIN</string>
-    <string name="settings_security_toggle_subtitle_off">Off — anyone can open OverDrive.</string>
-    <string name="settings_security_toggle_subtitle_on">On — PIN required to open OverDrive.</string>
-    <string name="settings_security_change_title">Change PIN</string>
-    <string name="settings_security_change_subtitle">Confirm current PIN, then set a new one.</string>
-    <string name="settings_security_autolock_title">Auto-lock</string>
-    <string name="settings_security_autolock_immediate">Lock immediately</string>
-    <string name="settings_security_autolock_1min">After 1 minute</string>
-    <string name="settings_security_autolock_5min">After 5 minutes</string>
-    <string name="settings_security_autolock_15min">After 15 minutes</string>
-    <string name="settings_security_autolock_never">Never auto-lock by time</string>
-    <string name="settings_security_recovery_title">ADB recovery</string>
-    <string name="settings_security_recovery_body">Forgotten PIN can be cleared from a host machine over USB debugging without a factory reset. Run this command, then reopen the app.</string>
+    <string name="settings_security_title">Bảo mật</string>
+    <string name="settings_security_subtitle">Khóa ứng dụng OverDrive để hành khách và nhân viên đỗ xe không thể mở nếu không có PIN của bạn.</string>
+    <string name="settings_security_stance_title">Chỉ khóa giao diện</string>
+    <string name="settings_security_stance_body">Giám sát, ghi hình, răn đe, cảnh báo và dịch vụ nền vẫn chạy khi ứng dụng bị khóa. PIN chỉ chặn giao diện OverDrive, không gì khác.</string>
+    <string name="settings_security_overline_lock">Khóa ứng dụng</string>
+    <string name="settings_security_overline_recovery">Nếu bạn quên PIN</string>
+    <string name="settings_security_toggle_title">Yêu cầu mã PIN</string>
+    <string name="settings_security_toggle_subtitle_off">Tắt — bất kỳ ai cũng có thể mở OverDrive.</string>
+    <string name="settings_security_toggle_subtitle_on">Bật — cần PIN để mở OverDrive.</string>
+    <string name="settings_security_change_title">Đổi PIN</string>
+    <string name="settings_security_change_subtitle">Xác nhận PIN hiện tại, sau đó đặt PIN mới.</string>
+    <string name="settings_security_autolock_title">Tự động khóa</string>
+    <string name="settings_security_autolock_immediate">Khóa ngay</string>
+    <string name="settings_security_autolock_1min">Sau 1 phút</string>
+    <string name="settings_security_autolock_5min">Sau 5 phút</string>
+    <string name="settings_security_autolock_15min">Sau 15 phút</string>
+    <string name="settings_security_autolock_never">Không bao giờ tự khóa theo thời gian</string>
+    <string name="settings_security_recovery_title">Khôi phục ADB</string>
+    <string name="settings_security_recovery_body">PIN bị quên có thể được xóa từ máy chủ qua gỡ lỗi USB mà không cần khôi phục cài đặt gốc. Chạy lệnh này, sau đó mở lại ứng dụng.</string>
     <!-- Verbatim ADB command. translatable=false so the i18n pipeline
          doesn't localize the literal path/command — translators following
          Crowdin would otherwise risk breaking the only recovery path. -->
-    <string name="settings_security_dialog_set_title">Set PIN</string>
-    <string name="settings_security_dialog_set_body">Pick a 4–8 digit PIN. You\'ll need this every time you open the app.</string>
-    <string name="settings_security_dialog_disable_title">Turn off PIN lock?</string>
-    <string name="settings_security_dialog_disable_body">Confirm your current PIN to turn off the app lock.</string>
-    <string name="settings_security_dialog_change_step1_title">Confirm current PIN</string>
-    <string name="settings_security_dialog_change_step1_body">Enter your current PIN, then you\'ll set a new one.</string>
-    <string name="settings_security_action_set">Set PIN</string>
-    <string name="settings_security_action_disable">Turn off lock</string>
-    <string name="settings_security_action_continue">Continue</string>
+    <string name="settings_security_dialog_set_title">Đặt PIN</string>
+    <string name="settings_security_dialog_set_body">Chọn PIN 4–8 chữ số. Bạn sẽ cần nó mỗi lần mở ứng dụng.</string>
+    <string name="settings_security_dialog_disable_title">Tắt khóa PIN?</string>
+    <string name="settings_security_dialog_disable_body">Xác nhận PIN hiện tại để tắt khóa ứng dụng.</string>
+    <string name="settings_security_dialog_change_step1_title">Xác nhận PIN hiện tại</string>
+    <string name="settings_security_dialog_change_step1_body">Nhập PIN hiện tại, sau đó bạn sẽ đặt PIN mới.</string>
+    <string name="settings_security_action_set">Đặt PIN</string>
+    <string name="settings_security_action_disable">Tắt khóa</string>
+    <string name="settings_security_action_continue">Tiếp tục</string>
     <string name="settings_security_pin_hint">PIN</string>
-    <string name="settings_security_pin_confirm_hint">Confirm PIN</string>
-    <string name="settings_security_error_length">PIN must be 4 to 8 digits</string>
-    <string name="settings_security_error_numeric">Digits only</string>
-    <string name="settings_security_error_mismatch">PINs don\'t match</string>
-    <string name="settings_security_error_wrong">Wrong PIN</string>
-    <string name="settings_security_error_locked_out">Too many attempts. Try again in a moment.</string>
-    <string name="settings_security_error_persist">Couldn\'t save the PIN. Try again.</string>
-    <string name="settings_security_toast_set_ok">PIN set. App lock is on.</string>
-    <string name="settings_security_toast_disable_ok">App lock turned off.</string>
+    <string name="settings_security_pin_confirm_hint">Xác nhận PIN</string>
+    <string name="settings_security_error_length">PIN phải từ 4 đến 8 chữ số</string>
+    <string name="settings_security_error_numeric">Chỉ chữ số</string>
+    <string name="settings_security_error_mismatch">PIN không khớp</string>
+    <string name="settings_security_error_wrong">PIN sai</string>
+    <string name="settings_security_error_locked_out">Quá nhiều lần thử. Hãy thử lại sau giây lát.</string>
+    <string name="settings_security_error_persist">Không thể lưu PIN. Hãy thử lại.</string>
+    <string name="settings_security_toast_set_ok">Đã đặt PIN. Khóa ứng dụng đang bật.</string>
+    <string name="settings_security_toast_disable_ok">Đã tắt khóa ứng dụng.</string>
     <!-- PIN unlock screen (PinLockActivity). Shown over MainActivity when
          the app lock is enabled and the session isn\'t fresh. -->
-    <string name="pin_lock_title">Enter PIN</string>
-    <string name="pin_lock_title_unlocked">Unlocked</string>
-    <string name="pin_lock_subtitle_default">Unlock OverDrive to continue.</string>
-    <string name="pin_lock_subtitle_wrong">Wrong PIN. Try again.</string>
-    <string name="pin_lock_subtitle_locked_out">Too many attempts. Try again shortly.</string>
+    <string name="pin_lock_title">Nhập PIN</string>
+    <string name="pin_lock_title_unlocked">Đã mở khóa</string>
+    <string name="pin_lock_subtitle_default">Mở khóa OverDrive để tiếp tục.</string>
+    <string name="pin_lock_subtitle_wrong">PIN sai. Vui lòng thử lại.</string>
+    <string name="pin_lock_subtitle_locked_out">Quá nhiều lần thử. Hãy thử lại trong chốc lát.</string>
     <!-- %1$s is a formatted countdown like "30s" or "2:45". -->
-    <string name="pin_lock_subtitle_locked_out_countdown">Locked. Try again in %1$s.</string>
+    <string name="pin_lock_subtitle_locked_out_countdown">Đã khóa. Thử lại sau %1$s.</string>
     <string name="pin_lock_lockout_seconds">%1$ds</string>
     <string name="pin_lock_lockout_minutes">%1$d:%2$02d</string>
     <!-- Lock-screen recovery hint. Two-part: a translatable prose prefix
@@ -907,8 +907,8 @@
          settings_security_recovery_command resource so a future edit to
          the command stays in sync across both surfaces). The lock screen
          concatenates them at runtime via String.format. -->
-    <string name="pin_lock_recovery_hint_prefix">Forgot your PIN? Run from a connected computer:\n%1$s</string>
-    <string name="pin_lock_backspace_cd">Backspace</string>
+    <string name="pin_lock_recovery_hint_prefix">Quên PIN? Chạy từ máy tính đã kết nối:\n%1$s</string>
+    <string name="pin_lock_backspace_cd">Xóa lùi</string>
     <plurals name="pin_lock_dot_a11y">
         <item quantity="other">%1$d digits entered</item>
     </plurals>
@@ -955,7 +955,7 @@
          placeholder shape so the bold-ifier still finds the digits. -->
     <string name="dashboard_insight_kwh_format">%1$.1f kWh</string>
     <string name="dashboard_insight_percent_format">%1$.1f%%</string>
-    <string name="dashboard_insight_hours_minutes">%1$d hr %2$d min</string>
+    <string name="dashboard_insight_hours_minutes">%1$d giờ %2$d phút</string>
     <!-- Today's clips. -->
     <plurals name="dashboard_insight_today_clips">
         <item quantity="other">Các đoạn phim %1$d được ghi lại hôm nay</item>
@@ -978,152 +978,152 @@
          RoadSense — road-hazard detection feature
          ============================================================ -->
     <string name="rail_roadsense">RoadSense</string>
-    <string name="rail_hazard_map">Map</string>
+    <string name="rail_hazard_map">Bản đồ</string>
     <string name="roadsense_title">RoadSense</string>
-    <string name="roadsense_pill_scanning">Scanning</string>
+    <string name="roadsense_pill_scanning">Đang quét</string>
     <string name="roadsense_pill_idle">RoadSense</string>
-    <string name="roadsense_status_idle">Idle</string>
+    <string name="roadsense_status_idle">Nghỉ</string>
     <!-- VEHICLE calibration (suspension-learning) — the green/orange/red dot. Worded
          about the car, not the route, since that's what maturity actually measures. -->
-    <string name="roadsense_cal_learning">Learning your vehicle</string>
-    <string name="roadsense_cal_ready">Vehicle calibrated</string>
-    <string name="roadsense_cal_partial">Calibration improving</string>
+    <string name="roadsense_cal_learning">Đang tìm hiểu xe của bạn</string>
+    <string name="roadsense_cal_ready">Đã hiệu chỉnh xe</string>
+    <string name="roadsense_cal_partial">Hiệu chuẩn đang cải thiện</string>
     <!-- Idle caption — ROUTE coverage (distinct from vehicle calibration). "Clear
          ahead" only when we've actually mapped this stretch; "New road" when we
          haven't, so an unsurveyed road isn't mistaken for confirmed-safe. -->
-    <string name="roadsense_clear_ahead">Clear ahead</string>
-    <string name="roadsense_road_mapped">Road mapped · clear</string>
-    <string name="roadsense_road_new">New road · learning</string>
+    <string name="roadsense_clear_ahead">Phía trước thông thoáng</string>
+    <string name="roadsense_road_mapped">Đã lập bản đồ đường · thông thoáng</string>
+    <string name="roadsense_road_new">Đường mới · đang học</string>
     <string name="roadsense_unit_meters">m</string>
     <string name="roadsense_dash_distance">—</string>
-    <string name="roadsense_warn_label">Warn</string>
-    <string name="roadsense_toggle_audio">Audio</string>
-    <string name="roadsense_toggle_visual">Visual</string>
+    <string name="roadsense_warn_label">Cảnh báo</string>
+    <string name="roadsense_toggle_audio">Âm thanh</string>
+    <string name="roadsense_toggle_visual">Hình ảnh</string>
     <!-- severity / type readouts (formatted at runtime) -->
-    <string name="roadsense_sev_minor">Minor</string>
-    <string name="roadsense_sev_moderate">Moderate</string>
-    <string name="roadsense_sev_severe">Severe</string>
-    <string name="roadsense_type_breaker">Speed breaker</string>
-    <string name="roadsense_type_pothole">Pothole</string>
-    <string name="roadsense_type_hazard">Hazard</string>
-    <string name="roadsense_type_rough">Rough section</string>
+    <string name="roadsense_sev_minor">Nhẹ</string>
+    <string name="roadsense_sev_moderate">Trung bình</string>
+    <string name="roadsense_sev_severe">Nghiêm trọng</string>
+    <string name="roadsense_type_breaker">Gờ giảm tốc</string>
+    <string name="roadsense_type_pothole">Ổ gà</string>
+    <string name="roadsense_type_hazard">Mối nguy</string>
+    <string name="roadsense_type_rough">Đoạn đường xóc</string>
     <!-- "Moderate · Pothole" style line -->
     <string name="roadsense_hazard_format">%1$s · %2$s</string>
     <!-- Zone readouts (D-032): cluster of hazards announced as one. -->
     <!-- "3 bumps ahead" — %1$d = count -->
-    <string name="roadsense_zone_count">%1$d bumps ahead</string>
+    <string name="roadsense_zone_count">%1$d gờ giảm tốc phía trước</string>
     <!-- "Rough section · 40 m" — %1$d = length in metres -->
-    <string name="roadsense_zone_rough">Rough section · %1$d m</string>
+    <string name="roadsense_zone_rough">Đoạn đường xóc · %1$d m</string>
     <!-- Calibration-Mode confirm card (R-OVL-6) -->
-    <string name="roadsense_confirm_prompt">Was this a hazard?</string>
-    <string name="roadsense_confirm_reject">Not a hazard</string>
-    <string name="roadsense_confirm_accept">Confirm</string>
+    <string name="roadsense_confirm_prompt">Đây có phải là mối nguy không?</string>
+    <string name="roadsense_confirm_reject">Không phải mối nguy</string>
+    <string name="roadsense_confirm_accept">Xác nhận</string>
     <!-- content descriptions -->
-    <string name="roadsense_cd_cal_level">Vehicle calibration level</string>
-    <string name="roadsense_cd_direction">Direction to next hazard</string>
+    <string name="roadsense_cd_cal_level">Mức hiệu chỉnh xe</string>
+    <string name="roadsense_cd_direction">Hướng đến mối nguy tiếp theo</string>
     <!-- Blind Spot overlay labels (native overlay window). -->
     <string name="blindspot_overlay_left">TRÁI</string>
     <string name="blindspot_overlay_right">PHẢI</string>
     <!-- ============================================================== -->
     <!-- RoadSense Map (native MapLibre map view + tap-to-verify sheet). -->
     <!-- ============================================================== -->
-    <string name="roadsense_map_title">Map</string>
-    <string name="roadsense_map_route_clear">Clear</string>
-    <string name="roadsense_map_route_unmapped">Not mapped yet</string>
-    <string name="roadsense_map_back">Back</string>
-    <string name="roadsense_map_recenter">Recenter on my location</string>
+    <string name="roadsense_map_title">Bản đồ</string>
+    <string name="roadsense_map_route_clear">Xóa</string>
+    <string name="roadsense_map_route_unmapped">Chưa ánh xạ</string>
+    <string name="roadsense_map_back">Quay lại</string>
+    <string name="roadsense_map_recenter">Căn giữa lại vị trí của tôi</string>
     <!-- Tap-to-verify bottom sheet -->
-    <string name="roadsense_map_severity_label">Severity</string>
-    <string name="roadsense_map_type_label">Type</string>
-    <string name="roadsense_map_type_unknown">Unknown</string>
-    <string name="roadsense_map_confirm">Confirm</string>
-    <string name="roadsense_map_delete">Delete</string>
+    <string name="roadsense_map_severity_label">Mức độ nghiêm trọng</string>
+    <string name="roadsense_map_type_label">Loại</string>
+    <string name="roadsense_map_type_unknown">Không rõ</string>
+    <string name="roadsense_map_confirm">Xác nhận</string>
+    <string name="roadsense_map_delete">Xóa</string>
     <!-- Status chip labels: candidate / on-device / shared with fleet -->
-    <string name="roadsense_map_status_candidate">Candidate</string>
-    <string name="roadsense_map_status_local">On device</string>
-    <string name="roadsense_map_status_cloud">Shared</string>
+    <string name="roadsense_map_status_candidate">Ứng viên</string>
+    <string name="roadsense_map_status_local">Trên thiết bị</string>
+    <string name="roadsense_map_status_cloud">Đã chia sẻ</string>
     <!-- Meta line: "Moderate · 82% confidence · 3 reports" -->
-    <string name="roadsense_map_meta_format">%1$s · %2$d%% confidence · %3$s</string>
+    <string name="roadsense_map_meta_format">%1$s · độ tin cậy %2$d%% · %3$s</string>
     <!-- "3 reports" / "1 report" -->
     <plurals name="roadsense_map_reports">
         <item quantity="other">%1$d reports</item>
     </plurals>
     <!-- Snackbar / toast confirmations -->
-    <string name="roadsense_map_confirmed_toast">Hazard confirmed</string>
-    <string name="roadsense_map_deleted_toast">Hazard removed</string>
-    <string name="roadsense_map_action_failed">Could not reach RoadSense. Try again.</string>
-    <string name="roadsense_map_no_location">Waiting for GPS fix…</string>
+    <string name="roadsense_map_confirmed_toast">Đã xác nhận mối nguy</string>
+    <string name="roadsense_map_deleted_toast">Đã gỡ mối nguy</string>
+    <string name="roadsense_map_action_failed">Không thể kết nối RoadSense. Hãy thử lại.</string>
+    <string name="roadsense_map_no_location">Đang chờ định vị GPS…</string>
     <!-- Navigation: search + routing + turn-by-turn -->
-    <string name="roadsense_map_search_hint">Search destination</string>
-    <string name="roadsense_map_search_action">Search</string>
-    <string name="roadsense_map_searching">Searching…</string>
-    <string name="roadsense_map_no_results">No places found</string>
+    <string name="roadsense_map_search_hint">Tìm điểm đến</string>
+    <string name="roadsense_map_search_action">Tìm kiếm</string>
+    <string name="roadsense_map_searching">Đang tìm…</string>
+    <string name="roadsense_map_no_results">Không tìm thấy địa điểm</string>
     <string name="roadsense_map_search_network">Không thể kết nối đến dịch vụ tìm kiếm. Hãy kiểm tra kết nối hoặc proxy của bạn rồi thử lại.</string>
-    <string name="roadsense_map_pick_destination">Choose destination</string>
-    <string name="roadsense_map_routing">Finding route…</string>
-    <string name="roadsense_map_route_failed">Could not find a route. Try again.</string>
-    <string name="roadsense_map_need_key">Add a routing key in RoadSense settings to navigate.</string>
-    <string name="roadsense_map_rerouting">Off route — recalculating…</string>
-    <string name="roadsense_map_arrived">You have arrived.</string>
-    <string name="roadsense_map_nav_started">Navigating to %1$s</string>
-    <string name="roadsense_map_nav_ended">Navigation ended</string>
-    <string name="roadsense_map_end_nav">End navigation</string>
-    <string name="roadsense_map_zoom_in">Zoom in</string>
-    <string name="roadsense_map_zoom_out">Zoom out</string>
+    <string name="roadsense_map_pick_destination">Chọn điểm đến</string>
+    <string name="roadsense_map_routing">Đang tìm tuyến đường…</string>
+    <string name="roadsense_map_route_failed">Không tìm thấy tuyến đường. Hãy thử lại.</string>
+    <string name="roadsense_map_need_key">Thêm khóa định tuyến trong cài đặt RoadSense để dẫn đường.</string>
+    <string name="roadsense_map_rerouting">Chệch tuyến — đang tính lại…</string>
+    <string name="roadsense_map_arrived">Bạn đã đến nơi.</string>
+    <string name="roadsense_map_nav_started">Đang dẫn đường đến %1$s</string>
+    <string name="roadsense_map_nav_ended">Đã kết thúc dẫn đường</string>
+    <string name="roadsense_map_end_nav">Kết thúc dẫn đường</string>
+    <string name="roadsense_map_zoom_in">Phóng to</string>
+    <string name="roadsense_map_zoom_out">Thu nhỏ</string>
     <!-- Hazard visibility filter -->
-    <string name="roadsense_map_hazards_filter">Hazard visibility</string>
-    <string name="roadsense_map_hazards_all">Show all hazards</string>
-    <string name="roadsense_map_hazards_moderate">Moderate and severe</string>
-    <string name="roadsense_map_hazards_severe">Severe only</string>
-    <string name="roadsense_map_hazards_hidden">Hide hazards</string>
+    <string name="roadsense_map_hazards_filter">Hiển thị mối nguy</string>
+    <string name="roadsense_map_hazards_all">Hiện tất cả mối nguy</string>
+    <string name="roadsense_map_hazards_moderate">Trung bình và nghiêm trọng</string>
+    <string name="roadsense_map_hazards_severe">Chỉ nghiêm trọng</string>
+    <string name="roadsense_map_hazards_hidden">Ẩn mối nguy</string>
     <!-- POI along route (EV charging / fuel) -->
-    <string name="roadsense_map_poi_toggle">Charging and fuel</string>
+    <string name="roadsense_map_poi_toggle">Sạc và nhiên liệu</string>
     <!-- 2D / 3D buildings toggle -->
-    <string name="roadsense_map_dimension_toggle">2D / 3D buildings</string>
-    <string name="roadsense_map_3d_on">3D buildings on</string>
-    <string name="roadsense_map_3d_off">3D buildings off</string>
-    <string name="roadsense_map_poi_loading">Finding charging and fuel stops…</string>
-    <string name="roadsense_map_poi_none">No stations found nearby</string>
-    <string name="roadsense_map_poi_need_route">Choose a destination first</string>
+    <string name="roadsense_map_dimension_toggle">Tòa nhà 2D / 3D</string>
+    <string name="roadsense_map_3d_on">Bật tòa nhà 3D</string>
+    <string name="roadsense_map_3d_off">Tắt tòa nhà 3D</string>
+    <string name="roadsense_map_poi_loading">Đang tìm điểm sạc và đổ nhiên liệu…</string>
+    <string name="roadsense_map_poi_none">Không tìm thấy trạm gần đây</string>
+    <string name="roadsense_map_poi_need_route">Chọn điểm đến trước</string>
     <!-- POI tap action sheet -->
-    <string name="roadsense_map_stop_added">Stop added</string>
-    <string name="roadsense_map_remove_stop_action">Remove stop</string>
-    <string name="roadsense_map_poi_navigate">Navigate here</string>
-    <string name="roadsense_map_poi_kind_charging">Charging station</string>
-    <string name="roadsense_map_poi_kind_fuel">Fuel station</string>
-    <string name="roadsense_map_poi_charging_generic">Charging station</string>
-    <string name="roadsense_map_poi_fuel_generic">Fuel station</string>
-    <string name="roadsense_map_route_switched">Switched route</string>
+    <string name="roadsense_map_stop_added">Đã thêm điểm dừng</string>
+    <string name="roadsense_map_remove_stop_action">Xóa điểm dừng</string>
+    <string name="roadsense_map_poi_navigate">Dẫn đường đến đây</string>
+    <string name="roadsense_map_poi_kind_charging">Trạm sạc</string>
+    <string name="roadsense_map_poi_kind_fuel">Trạm xăng</string>
+    <string name="roadsense_map_poi_charging_generic">Trạm sạc</string>
+    <string name="roadsense_map_poi_fuel_generic">Trạm xăng</string>
+    <string name="roadsense_map_route_switched">Đã đổi tuyến</string>
     <!-- "then <next maneuver>" preview shown in the maneuver banner -->
     <string name="roadsense_map_then">sau đó</string>
     <!-- Roundabout exit ordinal in the maneuver banner (%1$d = exit number) -->
     <string name="roadsense_map_exit_n">thoát %1$d</string>
     <!-- Hazards-along-route pills (%1$d = count) -->
-    <string name="roadsense_map_pill_severe">%1$d severe</string>
-    <string name="roadsense_map_pill_moderate">%1$d moderate</string>
-    <string name="roadsense_map_pill_minor">%1$d minor</string>
+    <string name="roadsense_map_pill_severe">%1$d nghiêm trọng</string>
+    <string name="roadsense_map_pill_moderate">%1$d trung bình</string>
+    <string name="roadsense_map_pill_minor">%1$d nhẹ</string>
     <!-- Shown briefly if the basemap can\'t be reached. -->
-    <string name="roadsense_map_offline">Map data unavailable offline</string>
+    <string name="roadsense_map_offline">Dữ liệu bản đồ không khả dụng khi ngoại tuyến</string>
     <!-- Navigation: autocomplete + route options -->
-    <string name="roadsense_map_clear_search">Clear search</string>
+    <string name="roadsense_map_clear_search">Xóa tìm kiếm</string>
     <!-- Route-options sheet -->
-    <string name="roadsense_map_routes_title">Choose a route</string>
-    <string name="roadsense_map_routes_to">Routes to %1$s</string>
-    <string name="roadsense_map_routes_cancel">Cancel</string>
+    <string name="roadsense_map_routes_title">Chọn tuyến đường</string>
+    <string name="roadsense_map_routes_to">Định tuyến đến %1$s</string>
+    <string name="roadsense_map_routes_cancel">Hủy</string>
     <!-- Per-route row label, %1$d is the 1-based route number. -->
-    <string name="roadsense_map_route_option">Route %1$d</string>
-    <string name="roadsense_map_fastest">Fastest</string>
-    <string name="roadsense_map_start">Start</string>
+    <string name="roadsense_map_route_option">Tuyến %1$d</string>
+    <string name="roadsense_map_fastest">Nhanh nhất</string>
+    <string name="roadsense_map_start">Bắt đầu</string>
     <!-- Stops / waypoints in the route-options sheet -->
-    <string name="roadsense_map_your_location">Your location</string>
-    <string name="roadsense_map_add_stop">Add stop</string>
-    <string name="roadsense_map_add_stop_hint">Search a stop to add</string>
-    <string name="roadsense_map_stop_removed">Stop removed</string>
-    <string name="roadsense_map_remove_stop">Remove stop</string>
-    <string name="roadsense_map_move_stop_up">Move stop up</string>
-    <string name="roadsense_map_move_stop_down">Move stop down</string>
+    <string name="roadsense_map_your_location">Vị trí của bạn</string>
+    <string name="roadsense_map_add_stop">Thêm điểm dừng</string>
+    <string name="roadsense_map_add_stop_hint">Tìm điểm dừng để thêm</string>
+    <string name="roadsense_map_stop_removed">Đã gỡ điểm dừng</string>
+    <string name="roadsense_map_remove_stop">Xóa điểm dừng</string>
+    <string name="roadsense_map_move_stop_up">Di chuyển điểm dừng lên</string>
+    <string name="roadsense_map_move_stop_down">Di chuyển điểm dừng xuống</string>
     <!-- %1$d is the maximum number of stops allowed. -->
-    <string name="roadsense_map_max_stops">Up to %1$d stops allowed</string>
+    <string name="roadsense_map_max_stops">Cho phép tối đa %1$d điểm dừng</string>
     <!-- Map day/night override (Auto → Light → Dark) -->
     <string name="roadsense_map_theme_toggle">Chủ đề bản đồ</string>
     <string name="roadsense_map_theme_auto">Chủ đề bản đồ: Tự động</string>

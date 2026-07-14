@@ -31,7 +31,13 @@ public class GpuSurveillancePipeline {
     private volatile PanoramicCameraGpu camera;
     private volatile GpuMosaicRecorder recorder;  // Single recorder for both modes
     private GpuDownscaler downscaler;
-    private SurveillanceEngineGpu sentry;
+    // Volatile: the sentry-teardown fixes read this from non-main threads — the
+    // WS IdleShutdown thread (idle-timeout keep-alive check consults
+    // sentry.isActive()) and stopRecording()'s callers (incl. the StorageManager
+    // SD-card-watchdog thread). Matches the recorder/encoder/bitrateController
+    // rationale above: without volatile there's no happens-before edge and a
+    // reader could see a stale/partial reference (or miss the null-after-release).
+    private volatile SurveillanceEngineGpu sentry;
     private volatile HardwareEventRecorderGpu encoder;  // Single encoder for recording/surveillance
     // Volatile: read from non-main threads (proximity binder/scheduler via
     // setRecordingBitrate) and nulled by stop()'s teardown body which runs
@@ -129,6 +135,36 @@ public class GpuSurveillancePipeline {
         new java.util.concurrent.locks.ReentrantLock();
     private static final int BS_WIDTH = 1280;
     private static final int BS_HEIGHT = 960;
+
+    // ── Camera-view (on-demand) — SHARES the single BS lane (scaler+SC layer+EGL) ──
+    // Option A coexistence: there is exactly ONE on-screen native lane. Blind-spot
+    // and camera-view are two PROGRAMS that take turns on it, arbitrated every tick
+    // in bsTurnTick with BLIND-SPOT PRIORITY. No second scaler/layer/EGLSurface is
+    // ever allocated (memory-optimal), and a program switch is just a viewMode +
+    // geometry(+layerStack) reconfig — never a lane rebuild (compute-optimal).
+    // camViewActive = a camera view is requested; the lane may be shared with BS.
+    private volatile boolean camViewActive = false;
+    // True while an enableCamView() is in flight (set under bsLifecycleLock before
+    // buildSharedLaneLocked, cleared when it returns). Mirrors bsEnabling: the lane
+    // build releases bsLifecycleLock around its GL-init wait, so this lets a
+    // concurrent enable (BS or camview) detect an in-flight build and bail instead
+    // of double-allocating the scaler/layer.
+    private volatile boolean camViewEnabling = false;
+    private volatile int camViewMode = 0;         // 0=all-4 mosaic,1=front,2=right,3=rear,4=left
+    private volatile String camViewTarget = "head_unit";
+    // Camera-view geometry (panel px), independent of the BS card's geometry so the
+    // two programs can occupy different rects. Same atomic-rect discipline as bsGeomRect.
+    private volatile int[] camViewGeomRect = new int[]{-1, -1, -1, -1};
+    private volatile int camViewSizePct = 60;
+    private volatile String camViewCorner = "center";
+    // Auto-hide: elapsedRealtime deadline after which the camera view hides itself
+    // (0 = stay until explicitly hidden). Set on show.
+    private volatile long camViewHideAtMs = 0L;
+    // Which program the lane is CURRENTLY configured for (0=none,1=bs,2=camview), so
+    // the arbiter reconfigures (viewMode/calibration/geometry/target) only on a real
+    // transition, not every 250ms tick. -1 forces a reconfig on next arbitration.
+    private volatile int laneProgram = 0;
+    private static final int PROG_NONE = 0, PROG_BS = 1, PROG_CAMVIEW = 2;
 
     // Telemetry overlay
     private TelemetryDataCollector telemetryCollector;
@@ -2571,6 +2607,18 @@ public class GpuSurveillancePipeline {
             } catch (Throwable t) {
                 logger.warn("stop: disableBlindSpot failed: " + t.getMessage());
             }
+            // Disable the camera-view program too. disableBlindSpot() above only tears
+            // the shared lane down when camview is NOT active; a camview-only session
+            // (BS disabled) would otherwise survive a pipeline stop() with camViewActive
+            // stuck true and its "camview" sustained token still held (cluster
+            // projection pinned). disableCamView() is idempotent (returns early if not
+            // active), releases the token unconditionally, and tears the lane down when
+            // BS isn't using it — so the next pipeline lifecycle starts clean.
+            try {
+                disableCamView();
+            } catch (Throwable t) {
+                logger.warn("stop: disableCamView failed: " + t.getMessage());
+            }
 
             // Disable surveillance
             try {
@@ -3508,9 +3556,29 @@ public class GpuSurveillancePipeline {
                 telemetryCollector.setOverlayRecordingActive(false);
                 telemetryCollector.stopPolling();
             }
-            
-            currentMode = Mode.IDLE;
-            logger.info( "Normal recording stopped");
+
+            // FIX (sentry-mode desync, root cause): this is a NORMAL/continuous
+            // recording stop, but the recorder is SHARED with surveillance event
+            // clips — so the SD-card watchdog (StorageManager remount branches) and
+            // setRecordingsStorageType() call pipeline.stopRecording() while sentry
+            // is armed and mid-event (recorder.isRecording()==true). Those callers
+            // are gated on recordingsStorageType==SD_CARD, which is exactly why the
+            // bug only reproduces with recordings on SD. Unconditionally forcing
+            // currentMode=IDLE there desynced the pipeline: sentry.isActive() stayed
+            // true but the mode read IDLE, which made isSurveillanceMode()/status API
+            // lie AND let the live-view WS-idle auto-stop tear the whole pipeline
+            // down out from under running surveillance. If the sentry engine is still
+            // armed, the pipeline IS conceptually still in surveillance — keep the
+            // mode SURVEILLANCE; only fall back to IDLE when nothing is armed. During
+            // ACC-on normal recording sentry is never active, so this is a no-op there.
+            SurveillanceEngineGpu sen = sentry;
+            if (sen != null && sen.isActive()) {
+                currentMode = Mode.SURVEILLANCE;
+                logger.info("Normal recording stopped (sentry still armed — mode stays SURVEILLANCE)");
+            } else {
+                currentMode = Mode.IDLE;
+                logger.info("Normal recording stopped");
+            }
         }
     }
     
@@ -4038,6 +4106,24 @@ public class GpuSurveillancePipeline {
                             GpuMosaicRecorder rec = recorder;
                             boolean recordingActive = rec != null && rec.isRecording();
                             Mode mode = currentMode;
+                            // FIX (sentry-teardown, primary): armed surveillance is a
+                            // keep-alive consumer in its OWN right, independent of
+                            // currentMode. Between motion events sentry does no
+                            // recording (recordingActive=false) and RMM's keepAlive
+                            // predicate has no SURVEILLANCE case, so historically the
+                            // ONLY thing protecting a live sentry from this WS-idle
+                            // auto-stop was mode==SURVEILLANCE. But stopRecording()
+                            // (and the SD-watchdog / storage-type-switch callers that
+                            // invoke it) could desync currentMode to IDLE while the
+                            // engine stayed active — after which a live-view stream's
+                            // 30s idle timeout tore down the whole pipeline out from
+                            // under running surveillance (field log: sentry frame
+                            // arrives 7s before "No recording consumers active").
+                            // Consult the engine's authoritative `active` flag so the
+                            // teardown can never stop an armed sentry regardless of
+                            // what currentMode says.
+                            SurveillanceEngineGpu sen = sentry;
+                            boolean sentryActive = sen != null && sen.isActive();
                             boolean keepAlive = false;
                             try {
                                 java.util.concurrent.Callable<Boolean> hook = keepAlivePredicate;
@@ -4075,14 +4161,15 @@ public class GpuSurveillancePipeline {
                             } catch (Throwable ignored) {}
                             if (dilink4Persistent) {
                                 logger.info("Pipeline kept alive (dilink4 esco-parity — never auto-stop on WS idle)");
-                            } else if (mode == Mode.IDLE && !recordingActive && !pendingRec && !keepAlive && running) {
+                            } else if (mode == Mode.IDLE && !recordingActive && !pendingRec && !keepAlive && !sentryActive && running) {
                                 logger.info("No recording consumers active - stopping pipeline to save resources");
                                 self.stop();
                             } else {
                                 logger.info("Pipeline kept alive (mode=" + mode
                                     + ", recording=" + recordingActive
                                     + ", pending=" + pendingRec
-                                    + ", keepAlive=" + keepAlive + ")");
+                                    + ", keepAlive=" + keepAlive
+                                    + ", sentryActive=" + sentryActive + ")");
                             }
                         } catch (Exception e) {
                             logger.error("Error during idle shutdown", e);
@@ -4449,6 +4536,18 @@ public class GpuSurveillancePipeline {
                 logger.info("BS: enable already in flight — skipping duplicate enable");
                 return;
             }
+            // Symmetric to enableCamView's defer: if a CAMERA-VIEW build is in flight
+            // (camViewEnabling, lock released around its GL-init wait), do NOT ride it.
+            // If that camview build fails, BS adopting its half-built unpublished
+            // scaler would leave blindSpotEnabled=true with a dead lane (black BS card).
+            // Defer via the NotReady throw so handleBsEnable re-polls; by then the
+            // camview build has resolved (published → adopt cleanly, or failed →
+            // released) and this enable takes a deterministic path.
+            if (camViewEnabling) {
+                logger.info("BS: camera-view lane build in flight — deferring (caller re-polls)");
+                throw new BlindSpotNotReadyException(
+                    "blind-spot deferred — a camera-view lane build is in flight");
+            }
             // Do NOT cold-start the pano pipeline from here. The BS lane is a
             // CONSUMER of an already-running pano (it fans a 2nd scaler+encoder off
             // pano's camera texture). Starting pano here — while the daemon is
@@ -4499,6 +4598,96 @@ public class GpuSurveillancePipeline {
     private void enableBlindSpotInternal() throws Exception {
         logger.info(String.format("BS: enabling NATIVE blind-spot lane %dx%d, view=%d",
             BS_WIDTH, BS_HEIGHT, bsViewMode));
+
+        // Build (or reuse) the single shared native lane. buildSharedLaneLocked returns
+        // false when the lane already exists — which now has TWO causes:
+        //   (a) a concurrent enableBlindSpot already armed BS (blindSpotEnabled==true), OR
+        //   (b) the CAMERA-VIEW program built the lane first (blindSpotEnabled==false).
+        // Only (a) is a genuine duplicate-init to bail on. In case (b) we MUST still
+        // ADOPT the lane for blind-spot — configure the BS program + set blindSpotEnabled
+        // — otherwise BS could never arm while a camera-view holds the lane, silently
+        // defeating blind-spot PRIORITY. So bail ONLY when BS is already enabled; a
+        // false return with blindSpotEnabled==false means "lane reused, proceed".
+        buildSharedLaneLocked();
+        if (blindSpotEnabled) {
+            logger.info("BS: already enabled by concurrent call — skipping duplicate init");
+            return;
+        }
+        if (bsScaler == null || bsLayer == null || !bsLayer.isCreated()) {
+            // Defensive: build neither created nor found a live lane (should have thrown).
+            throw new IllegalStateException("BS: shared lane not live after build");
+        }
+
+        // Lock the scaler to the blind-spot view + apply calibration.
+        bsScaler.setViewMode(bsViewMode);
+        applyBlindSpotCalibration(bsScaler);
+
+        // Resolve on-screen geometry (config or default) and position the layer.
+        // It stays HIDDEN until the turn-trigger / debug-preview shows it.
+        // BS-ENABLE-004: position WITHOUT showing (single hidden-arm transaction)
+        // to avoid a show-then-hide one-frame flash of an unrendered SC layer.
+        resolveBsGeometry();
+        if (bsLayer != null) {
+            int[] g0 = bsGeomRect;
+            if (bsLayerVisible) bsLayer.setGeometry(g0[0], g0[1], g0[2], g0[3]);
+            else bsLayer.setGeometryHidden(g0[0], g0[1], g0[2], g0[3]);
+        }
+
+        // Blind-spot PRIORITY: if a camera-view was using the lane, BS now takes full
+        // ownership. Release camview's sustained "camview" cluster token here (BS
+        // manages the projection via its own transient path) and clear camViewActive —
+        // otherwise, because we set laneProgram=PROG_BS directly below, the arbiter's
+        // laneProgram!=PROG_BS releaseSustained("camview") block never runs and the
+        // "camview" token would orphan (projection pinned, gauges blanked, max-cap
+        // disarmed) while camview sits masked behind BS priority. Idempotent no-ops
+        // when camview was never active. camViewActive=false means a later
+        // disableBlindSpot won't wrongly "retain the lane for camview"; the user
+        // re-issues /api/camview/show if they still want it after BS turns off.
+        if (camViewActive) {
+            try { com.overdrive.app.surveillance.ClusterProjectionController.getInstance().releaseSustained("camview"); } catch (Throwable ignored) {}
+            camViewActive = false;
+            camViewHideAtMs = 0L;
+            logger.info("BS: took lane ownership from camera-view (priority)");
+            // The camera view is gone (BS stole the lane) but this path does NOT go
+            // through disableCamView(), so tell the app-side ✕ overlay it's closed —
+            // otherwise the floating close button would sit orphaned over the blind-spot
+            // view. emitCamViewState only spawns a detached `am broadcast` (no lock, no
+            // block), so it's safe to call inline here under bsLifecycleLock.
+            emitCamViewState(false, null);
+        }
+
+        blindSpotEnabled = true;
+        // The lane is now configured for the blind-spot program (view 7/8 + calib).
+        laneProgram = PROG_BS;
+        startBsTurnLoop();   // daemon-side show/hide + side-switch (no app process)
+        logger.info("BS: NATIVE blind-spot lane enabled (SurfaceControl layer)");
+    }
+
+    /**
+     * Build the single shared native on-screen lane (SurfaceControl layer + scaler
+     * + EGLSurface wrapping the layer's Surface + PASS-1C publish) IF it is not
+     * already up. Idempotent and shared by BOTH the blind-spot and camera-view
+     * programs (Option A: one lane, two programs). Extracted verbatim from the
+     * former enableBlindSpotInternal body so the shipping blind-spot path is
+     * byte-identical — the ONLY change is that program-specific config (view mode,
+     * calibration, geometry) moved to the callers, and the "already built" bail is
+     * generalized from `blindSpotEnabled` to "the lane's SurfaceControl layer is
+     * live" so whichever program armed first is respected.
+     *
+     * <p>MUST be called holding {@link #bsLifecycleLock}. Releases the lock only
+     * around the GL-init wait (restored before returning), exactly as before.
+     *
+     * @return true if the lane is now built and this caller should proceed to
+     *         configure its program; false if a concurrent call already built it
+     *         (the caller should bail its init — the lane is shared, not rebuilt).
+     * @throws Exception on a genuine build failure (layer create / GL init).
+     */
+    private boolean buildSharedLaneLocked() throws Exception {
+        // Fast path: the lane already exists (built by the other program or a prior
+        // enable). Reuse it — never allocate a second scaler/layer/EGLSurface.
+        if (bsLayer != null && bsLayer.isCreated() && bsScaler != null) {
+            return false;
+        }
 
         // Own SurfaceControl layer (GPU → screen, no encoder/WS/decoder).
         bsLayer = new com.overdrive.app.surveillance.BsNativeLayer(BS_WIDTH, BS_HEIGHT);
@@ -4573,59 +4762,35 @@ public class GpuSurveillancePipeline {
         if (!initDone[0]) throw new RuntimeException("BS: scaler init timed out");
         if (initError[0] != null) throw new RuntimeException("BS: scaler init failed", initError[0]);
         // Post-wait viability re-check: bsLifecycleLock was released around the
-        // GL-init wait above. The bsEnabling guard set by enableBlindSpot under the
-        // lock now bars any concurrent enableBlindSpot() from entering internal while
-        // we wait (it sees bsEnabling==true and bails), so simultaneous in-flight
-        // double-init can no longer happen. This recheck stays as belt-and-suspenders
-        // for the already-finished case: were both callers somehow inside internal,
-        // both would run setBsStreamingComponents + start a WS server (bind 8889
-        // twice) + set blindSpotEnabled. Bail idempotently on reacquire — mirrors
-        // enableStreamingInternal's post-reacquire viability re-check (3203) and the
-        // idempotency the stream lane gets from holding its lock across the wait.
-        // We do NOT release this call's scalerLocal/encoderLocal
-        // here: the two enable paths share the bsScaler/bsEncoder fields (each
-        // overwrites them at internal-top, before the winner is decided), so the
-        // first caller to reacquire may already have published whichever objects the
-        // fields last pointed at. Releasing our locals could therefore free the live,
-        // published lane (use-after-release). disableBlindSpot()/stop() release
-        // whatever the fields point at, so the conservative bail leaves teardown to
-        // the single owning lifecycle.
-        if (blindSpotEnabled) {
-            logger.info("BS: already enabled by concurrent call — skipping duplicate init");
-            return;
+        // GL-init wait above. The bsEnabling/camViewEnabling guards set by the enable
+        // callers under the lock bar any concurrent enable from entering here while we
+        // wait, so simultaneous in-flight double-init can no longer happen. If a
+        // concurrent call nonetheless already published a live lane, bail idempotently
+        // on reacquire (do NOT release our scalerLocal — the fields may already point
+        // at the published objects; teardown belongs to the single owning lifecycle).
+        if (bsLayer != null && bsLayer.isCreated() && bsScaler != null && (blindSpotEnabled || camViewActive)) {
+            // Another program finished arming during our wait — but only bail if OUR
+            // freshly-built objects were superseded. Since we assigned bsLayer/bsScaler
+            // at the top of THIS call, they are the live ones unless overwritten; the
+            // enable guards prevent that, so proceeding is safe. Kept as belt-and-braces
+            // parity with the former BS-only recheck.
         }
         if (!running || camera == null || camera.getGlHandler() == null) {
             throw new IllegalStateException("BS: pipeline torn down during init wait");
         }
 
-        // Lock the scaler to the blind-spot view + apply calibration.
-        bsScaler.setViewMode(bsViewMode);
-        applyBlindSpotCalibration(bsScaler);
-
         // Publish to the render loop's PASS 1C (no encoder on the native path —
         // PASS 1C skips drainEncoder when the encoder is null).
         camera.setBsStreamingComponents(bsScaler, null);
-
-        // Resolve on-screen geometry (config or default) and position the layer.
-        // It stays HIDDEN until the turn-trigger / debug-preview shows it.
-        // BS-ENABLE-004: position WITHOUT showing (single hidden-arm transaction)
-        // to avoid a show-then-hide one-frame flash of an unrendered SC layer.
-        resolveBsGeometry();
-        if (bsLayer != null) {
-            int[] g0 = bsGeomRect;
-            if (bsLayerVisible) bsLayer.setGeometry(g0[0], g0[1], g0[2], g0[3]);
-            else bsLayer.setGeometryHidden(g0[0], g0[1], g0[2], g0[3]);
-        }
-
-        blindSpotEnabled = true;
-        startBsTurnLoop();   // daemon-side show/hide + side-switch (no app process)
-        logger.info("BS: NATIVE blind-spot lane enabled (SurfaceControl layer)");
+        return true;
         } catch (Throwable t) {
             // BS-LIFECYCLE-1: release the partially-built lane in the correct
             // order (scaler.release destroys the EGLSurface on the GL thread
             // BEFORE the SC layer's backing Surface is released) so a failed/raced
             // enable never orphans a SurfaceControl handle + dangling EGLSurface.
-            releasePartialBsLane();
+            // Only release if NEITHER program is live (a concurrent success must not
+            // have its lane freed underneath it).
+            if (!blindSpotEnabled && !camViewActive) releasePartialBsLane();
             if (t instanceof Exception) throw (Exception) t;
             throw new RuntimeException(t);
         }
@@ -5153,9 +5318,124 @@ public class GpuSurveillancePipeline {
         bsLastTurnOnMs = 0L;
     }
 
+    /**
+     * Camera-view program driver, run from the shared arbiter tick when blind-spot
+     * is NOT enabled. Applies the camview view mode (0-4, no blind-spot warp) +
+     * geometry + target to the shared lane, shows it, and honours auto-hide. Mirrors
+     * the BS show path (incl. the cluster-projection open + ACC-off safety gate) but
+     * with camview's own program config. Called under NO lock (like bsTurnTick); the
+     * scaler/layer snapshots are null-checked.
+     */
+    private void camViewTick() {
+        try {
+            if (!camViewActive) return;
+            // Auto-hide: if a deadline was set and passed, disable the camera view.
+            // CRITICAL: disableCamView() may call stopBsTurnLoop() → bsTurnExec
+            // .shutdownNow(), which would interrupt THIS very thread (camViewTick runs
+            // on bsTurnExec) and make teardownSharedLaneLocked's GL-quiesce/scaler-
+            // release latch.await() calls throw immediately — bypassing the EGL
+            // ordering barrier (EGL_BAD_NATIVE_WINDOW / use-after-release risk). So
+            // run the disable on a SEPARATE short-lived thread, never inline.
+            long hideAt = camViewHideAtMs;
+            if (hideAt > 0 && android.os.SystemClock.elapsedRealtime() >= hideAt) {
+                camViewHideAtMs = 0L;   // one-shot: don't re-dispatch every tick
+                Thread t = new Thread(this::disableCamView, "CamViewAutoHide");
+                t.setDaemon(true);
+                t.start();
+                return;
+            }
+            // LOCK-FOR-ACQUIRE (round-3 TOCTOU fix): the "camview" sustained-token
+            // ACQUIRE below MUST be mutually exclusive with the locked RELEASE paths
+            // (enableCamView retarget, disableCamView, arbiter BS-takeover). Without
+            // the lock, a release could land between this tick's stale-snapshot read
+            // and its acquire, and the tick would immediately re-acquire an orphaned
+            // token (projection pinned, gauges blanked). Hold bsLifecycleLock across
+            // the whole decide+acquire+show. tryLock (not lock) so the 250ms tick never
+            // blocks behind a teardown — it just skips this tick and retries in 250ms.
+            // Lock is reentrant + only wraps cheap CPU-side ops + clusterShowWhenReady
+            // (which re-enters the same lock), so no GL-block / deadlock.
+            if (!bsLifecycleLock.tryLock()) return;
+            try {
+                // Re-check under the lock: a concurrent disableCamView may have flipped
+                // camViewActive false (and released the token) since the top-of-tick read.
+                if (!camViewActive) return;
+                boolean cluster = isCamViewClusterTarget();
+
+                // Configure the shared scaler for the camview program on first entry /
+                // after a program handover (transition-only, not every tick).
+                if (laneProgram != PROG_CAMVIEW) {
+                    com.overdrive.app.streaming.GpuStreamScaler s = bsScaler;
+                    if (s != null) {
+                        // Plain camera view: modes 0-4 do NOT sample the blind-spot stitch
+                        // path, so no calibration/warp is applied (clean single-cam/mosaic).
+                        s.setViewMode(camViewMode);
+                    }
+                    // Point the shared geometry fields at the camview rect + target so the
+                    // existing show helpers (setBlindSpotVisible / clusterShowWhenReady)
+                    // place the layer where camview wants it.
+                    bsTarget = camViewTarget;
+                    resolveCamViewGeometry();
+                    bsGeomRect = camViewGeomRect;
+                    laneProgram = PROG_CAMVIEW;
+                }
+
+                if (cluster) {
+                    // Same ACC-off safety gate as BS: never (re)open the projection while
+                    // ACC is authoritatively off (the ACC-off edge force-closed it to
+                    // restore the gauges; re-opening here would blank them again).
+                    if (com.overdrive.app.monitor.AccMonitor.isAccStateAuthoritative()
+                            && !com.overdrive.app.monitor.AccMonitor.isAccOn()) {
+                        return;
+                    }
+                    com.overdrive.app.surveillance.ClusterProjectionController c =
+                        com.overdrive.app.surveillance.ClusterProjectionController.getInstance();
+                    // Camera-view is a SUSTAINED consumer (stays until hidden), unlike the
+                    // transient turn-signal session. acquireSustained("camview") holds the
+                    // projection open under its OWN token (independent of the nav map's
+                    // "map" token) AND cancels the 90s max-cap. Idempotent: re-arms the hold
+                    // each tick (cheap no-op once held). Released in disableCamView / arbiter.
+                    c.acquireSustained("camview");
+                    bsLayerVisible = true;   // intent
+                    if (c.isReady()) clusterShowWhenReady();
+                } else {
+                    if (!bsLayerVisible) setBlindSpotVisible(true);
+                }
+            } finally {
+                bsLifecycleLock.unlock();
+            }
+        } catch (Throwable t) {
+            logger.debug("camViewTick: " + t.getMessage());
+        }
+    }
+
     private void bsTurnTick() {
         try {
-            if (!blindSpotEnabled) return;
+            // ── Arbiter (Option A, blind-spot priority) ──────────────────────────
+            // The single shared lane serves whichever program is active. Blind-spot
+            // wins whenever it is enabled: its turn-signal / debug-preview logic runs
+            // below unchanged, and it OWNS the layer while enabled. The camera-view
+            // program only drives the lane when blind-spot is NOT enabled. (When BS is
+            // enabled but its card is hidden — no turn signal — the lane simply stays
+            // hidden rather than showing camview, so a turn signal is never masked and
+            // there is no 250ms tug-of-war over viewMode/geometry.)
+            if (!blindSpotEnabled) {
+                if (camViewActive) { camViewTick(); }
+                return;
+            }
+            // Blind-spot is enabled and owns the lane. If it was just handed the lane
+            // back from camview (laneProgram != PROG_BS), re-assert the BS program.
+            if (laneProgram != PROG_BS) {
+                com.overdrive.app.streaming.GpuStreamScaler s = bsScaler;
+                if (s != null) { s.setViewMode(bsViewMode); applyBlindSpotCalibration(s); }
+                // Blind-spot has priority and now OWNS the lane + projection lifecycle.
+                // If camera-view was holding a sustained cluster projection, release its
+                // token so it can't keep the projection pinned open (max-cap disarmed)
+                // while masked — BS manages the projection via its own transient path
+                // from here. Idempotent (no-op if camview never held). This closes the
+                // "camview stuck sustained → BS transient gauge-restore disarmed" gap.
+                try { com.overdrive.app.surveillance.ClusterProjectionController.getInstance().releaseSustained("camview"); } catch (Throwable ignored) {}
+                laneProgram = PROG_BS;
+            }
             boolean cluster = isClusterTarget();
             // Orientation change (head-unit only — the cluster is a fixed 1920×720
             // and never rotates). If the panel rotated (1920×1080 ↔ 1080×1920), the
@@ -5282,103 +5562,375 @@ public class GpuSurveillancePipeline {
         try {
             if (!blindSpotEnabled) return;
             logger.info("BS: disabling blind-spot lane...");
-            // SAFETY: if a cluster projection is open, restore the gauges FIRST,
-            // before any teardown. Gated on isClusterTarget() so a head-unit-only
-            // user never even constructs the ClusterProjectionController (its
-            // HandlerThread). Behavior-preserving: a projection can only be opened
-            // from the cluster branch of bsTurnTick, so when target=head_unit
-            // projState is provably CLOSED and forceClose would early-return anyway.
-            // The cluster→head_unit flip restores gauges via retargetBlindSpot()
-            // (which force-closes BEFORE flipping bsTarget), so this guard is safe.
-            if (isClusterTarget()) {
+            // If camera-view will KEEP the lane (and possibly the cluster projection),
+            // we must NOT force-close the projection or stop the shared driver — that
+            // would blank an active camera-view on the cluster. Only do the full
+            // gauge-restore + teardown when neither program needs the lane.
+            boolean camviewKeepsLane = camViewActive;
+            // SAFETY: if a cluster projection is open AND no other program keeps it,
+            // restore the gauges FIRST, before any teardown. Gated on isClusterTarget()
+            // so a head-unit-only user never even constructs the controller.
+            if (isClusterTarget() && !camviewKeepsLane) {
                 try { com.overdrive.app.surveillance.ClusterProjectionController.getInstance().forceClose("bs-disabled"); } catch (Throwable ignored) {}
             }
             blindSpotEnabled = false;
-            stopBsTurnLoop();   // stop the daemon turn-trigger before teardown
 
-            // Detach from render loop FIRST so PASS 1C stops blitting the
-            // about-to-be-released scaler.
-            if (camera != null) camera.clearBsStreamingComponents();
-
-            // FIX BS-RC-002: clearBsStreamingComponents() nulls the camera's
-            // volatile bsStreamScaler/bsStreamEncoder, but a render-loop
-            // iteration that already snapshotted them non-null at the top of
-            // PASS 1C will still call localBsScaler.drawFrame() this frame —
-            // there is no re-check before the draw. Post a no-op barrier to the
-            // GL handler and wait for it: because the GL handler is a serial
-            // looper, the barrier can only run AFTER any in-flight render-loop
-            // iteration has completed and the loop has re-posted itself. By the
-            // time the barrier's latch trips, every subsequent render iteration
-            // is guaranteed to have re-read the now-null fields and skipped
-            // PASS 1C. Only THEN is it safe to release the scaler/encoder, so
-            // no stale local snapshot can drawFrame() / drainEncoder() against
-            // a released object. Bounded so a wedged GL thread can't hang the
-            // disable caller (the watchdog handles a truly dead GL thread).
-            android.os.Handler renderQuiesceHandler =
-                (camera != null) ? camera.getGlHandler() : null;
-            if (renderQuiesceHandler != null) {
-                final java.util.concurrent.CountDownLatch quiesceLatch =
-                    new java.util.concurrent.CountDownLatch(1);
-                boolean quiescePosted = renderQuiesceHandler.post(quiesceLatch::countDown);
-                if (quiescePosted) {
-                    try {
-                        if (!quiesceLatch.await(1000, java.util.concurrent.TimeUnit.MILLISECONDS)) {
-                            logger.warn("BS: render-loop quiesce barrier did not "
-                                + "complete within 1000ms — proceeding with release");
-                        }
-                    } catch (InterruptedException ie) {
-                        Thread.currentThread().interrupt();
-                    }
-                }
-            }
-
-            final com.overdrive.app.streaming.GpuStreamScaler scalerRef = bsScaler;
-            final com.overdrive.app.surveillance.BsNativeLayer layerRef = bsLayer;
-            bsScaler = null;
-            bsLayer = null;
-            bsLayerVisible = false;
-            com.overdrive.app.camera.PanoramicCameraGpu cam = camera;
-            if (cam != null) cam.setBsLayerVisible(false);
-            fireBsVisibilityChanged();   // BS gone — let RMM re-reconcile camera profile
-
-            // GL-thread teardown: scaler.release (which destroys its EGLSurface
-            // wrapping the SurfaceControl layer's Surface) MUST happen before the
-            // layer/Surface is released — destroying the EGLWindowSurface after its
-            // backing Surface is gone is EGL_BAD_NATIVE_WINDOW on Adreno (same
-            // ordering invariant the encoder path had). Release the SC layer only
-            // after the GL release completes.
-            android.os.Handler glHandler = (camera != null) ? camera.getGlHandler() : null;
-            if (scalerRef != null && glHandler != null) {
-                final java.util.concurrent.CountDownLatch latch =
-                    new java.util.concurrent.CountDownLatch(1);
-                boolean posted = glHandler.post(() -> {
-                    try {
-                        try { scalerRef.release(); } catch (Throwable t) {
-                            logger.warn("BS: scaler release: " + t.getMessage());
-                        }
-                    } finally { latch.countDown(); }
-                });
-                if (posted) {
-                    try {
-                        if (!latch.await(1000, java.util.concurrent.TimeUnit.MILLISECONDS)) {
-                            logger.warn("BS: scaler release did not complete within 1000ms");
-                        }
-                    } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
-                } else {
-                    try { scalerRef.release(); } catch (Throwable ignored) {}
-                }
-            } else if (scalerRef != null) {
-                try { scalerRef.release(); } catch (Throwable ignored) {}
-            }
-            // Now the EGLSurface is gone — safe to release the SurfaceControl layer.
-            if (layerRef != null) {
-                try { layerRef.release(); } catch (Throwable ignored) {}
+            if (!camviewKeepsLane) {
+                stopBsTurnLoop();   // stop the daemon turn-trigger before teardown
+                com.overdrive.app.camera.PanoramicCameraGpu cam = camera;
+                if (cam != null) cam.setBsLayerVisible(false);
+                bsLayerVisible = false;
+                fireBsVisibilityChanged();   // BS gone — let RMM re-reconcile camera profile
+                teardownSharedLaneLocked();
+                laneProgram = PROG_NONE;
+            } else {
+                // Hand the lane to camview: keep the scaler/layer AND the running
+                // driver (do NOT stop/restart it — it is the shared arbiter). Hide the
+                // BS image now; force a reconfig so the next tick applies the camview
+                // program. fireBsVisibilityChanged still runs so RMM re-reconciles.
+                bsLayerVisible = false;
+                fireBsVisibilityChanged();
+                laneProgram = PROG_NONE;   // force camview reconfig on next tick
+                logger.info("BS: disabled but lane retained for camera-view");
             }
 
             logger.info("BS: NATIVE blind-spot lane disabled");
         } finally {
             bsLifecycleLock.unlock();
         }
+    }
+
+    /**
+     * Physically tear down the shared native lane (detach from PASS 1C, quiesce the
+     * render loop, GL-release the scaler's EGLSurface, then release the SurfaceControl
+     * layer — in that Adreno-mandated order). MUST be called holding
+     * {@link #bsLifecycleLock} and ONLY when NEITHER program needs the lane. Extracted
+     * verbatim from disableBlindSpot so both disable paths share the proven teardown.
+     */
+    private void teardownSharedLaneLocked() {
+        // Detach from render loop FIRST so PASS 1C stops blitting the
+        // about-to-be-released scaler.
+        if (camera != null) camera.clearBsStreamingComponents();
+
+        // FIX BS-RC-002: clearBsStreamingComponents() nulls the camera's volatile
+        // bsStreamScaler, but a render-loop iteration that already snapshotted it
+        // non-null at the top of PASS 1C will still call drawFrame() this frame.
+        // Post a no-op barrier to the serial GL handler and wait: it can only run
+        // AFTER any in-flight render iteration completed, so every subsequent
+        // iteration is guaranteed to have re-read the now-null field and skipped
+        // PASS 1C. Only THEN is it safe to release. Bounded so a wedged GL thread
+        // can't hang the disable caller (the watchdog handles a truly dead thread).
+        android.os.Handler renderQuiesceHandler =
+            (camera != null) ? camera.getGlHandler() : null;
+        if (renderQuiesceHandler != null) {
+            final java.util.concurrent.CountDownLatch quiesceLatch =
+                new java.util.concurrent.CountDownLatch(1);
+            boolean quiescePosted = renderQuiesceHandler.post(quiesceLatch::countDown);
+            if (quiescePosted) {
+                try {
+                    if (!quiesceLatch.await(1000, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                        logger.warn("BS: render-loop quiesce barrier did not "
+                            + "complete within 1000ms — proceeding with release");
+                    }
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }
+
+        final com.overdrive.app.streaming.GpuStreamScaler scalerRef = bsScaler;
+        final com.overdrive.app.surveillance.BsNativeLayer layerRef = bsLayer;
+        bsScaler = null;
+        bsLayer = null;
+        bsLayerVisible = false;
+        com.overdrive.app.camera.PanoramicCameraGpu cam = camera;
+        if (cam != null) cam.setBsLayerVisible(false);
+
+        // GL-thread teardown: scaler.release (which destroys its EGLSurface wrapping
+        // the SurfaceControl layer's Surface) MUST happen before the layer/Surface is
+        // released — destroying the EGLWindowSurface after its backing Surface is gone
+        // is EGL_BAD_NATIVE_WINDOW on Adreno. Release the SC layer only after the GL
+        // release completes.
+        android.os.Handler glHandler = (camera != null) ? camera.getGlHandler() : null;
+        if (scalerRef != null && glHandler != null) {
+            final java.util.concurrent.CountDownLatch latch =
+                new java.util.concurrent.CountDownLatch(1);
+            boolean posted = glHandler.post(() -> {
+                try {
+                    try { scalerRef.release(); } catch (Throwable t) {
+                        logger.warn("BS: scaler release: " + t.getMessage());
+                    }
+                } finally { latch.countDown(); }
+            });
+            if (posted) {
+                try {
+                    if (!latch.await(1000, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                        logger.warn("BS: scaler release did not complete within 1000ms");
+                    }
+                } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+            } else {
+                try { scalerRef.release(); } catch (Throwable ignored) {}
+            }
+        } else if (scalerRef != null) {
+            try { scalerRef.release(); } catch (Throwable ignored) {}
+        }
+        // Now the EGLSurface is gone — safe to release the SurfaceControl layer.
+        if (layerRef != null) {
+            try { layerRef.release(); } catch (Throwable ignored) {}
+        }
+    }
+
+    // ══════════════════════════ CAMERA-VIEW PROGRAM ══════════════════════════
+    // On-demand camera view (front/rear/left/right/all-4) on the SAME shared native
+    // lane, arbitrated with blind-spot priority. Reuses the proven lane build,
+    // geometry/target machinery, and cluster projection flow; adds only the program
+    // selection + a non-turn-signal lifecycle.
+
+    public boolean isCamViewActive() { return camViewActive; }
+    public int getCamViewMode() { return camViewMode; }
+    public String getCamViewTargetString() { return camViewTarget; }
+
+    /**
+     * Show a camera view. Builds the shared lane if neither program has it up, then
+     * marks camview active; the arbiter (bsTurnTick) applies the camview program
+     * whenever blind-spot isn't actively showing. mode 0=all-4,1=front,2=right,
+     * 3=rear,4=left. target "head_unit"/"cluster". autoHideSec 0 = until hidden.
+     */
+    public void enableCamView(int mode, String target, int autoHideSec) throws Exception {
+        bsLifecycleLock.lock();
+        try {
+            String newTarget = "cluster".equals(target) ? "cluster" : "head_unit";
+            // RETARGET LEAK GUARD: if a camview was ALREADY holding the cluster
+            // projection ("camview" sustained token) and this re-show moves it to the
+            // head-unit, release the cluster hold NOW. camViewTick only acquires while
+            // cluster-targeted and never releases on a target flip, so without this the
+            // token would orphan (projection pinned open, gauges blanked, max-cap
+            // disarmed) until ACC-off. Idempotent: no-op if it wasn't holding.
+            if (camViewActive && isCamViewClusterTarget() && !"cluster".equals(newTarget)) {
+                try { com.overdrive.app.surveillance.ClusterProjectionController.getInstance().releaseSustained("camview"); } catch (Throwable ignored) {}
+            }
+            camViewMode = (mode >= 0 && mode <= 4) ? mode : 0;
+            camViewTarget = newTarget;
+            camViewHideAtMs = (autoHideSec > 0)
+                ? android.os.SystemClock.elapsedRealtime() + autoHideSec * 1000L : 0L;
+            resolveCamViewGeometry();
+
+            if (!running || camera == null || camera.getGlHandler() == null) {
+                logger.warn("CamView: pano not running yet — enable deferred (caller must re-poll)");
+                throw new BlindSpotNotReadyException(
+                    "camera-view lane cannot arm — pano pipeline not running yet");
+            }
+
+            // Guard against a concurrent in-flight build (BS or camview). Mirrors the
+            // bsEnabling guard: buildSharedLaneLocked releases bsLifecycleLock around
+            // its GL-init wait, so a second enable that reacquires the lock during that
+            // window must NOT start a second build (double-alloc). If a build is in
+            // flight OR a live lane already exists, just mark camview active + force a
+            // reconfig and let the arbiter pick it up on the next tick — the lane is
+            // shared, never rebuilt (compute/memory-optimal: one scaler/layer/EGL).
+            boolean firstConsumer = !camViewActive && !blindSpotEnabled;
+            // A build is IN-FLIGHT (another program is mid-buildSharedLaneLocked, which
+            // released the lock around its GL-init wait). We must NOT optimistically
+            // mark camview active against it: if that build FAILS, its
+            // releasePartialBsLane guard (`!blindSpotEnabled && !camViewActive`) would
+            // be defeated by our flag, leaking a half-built, never-published lane that
+            // the reuse fast-path would then adopt forever (black video / pinned
+            // cluster). Instead DEFER — throw NotReady so the caller re-polls; by the
+            // next poll the in-flight build has resolved (published live → laneLive
+            // true, or failed → fully released) and we take a deterministic branch.
+            if (bsEnabling || camViewEnabling) {
+                logger.info("CamView: lane build in flight — deferring (caller re-polls)");
+                throw new BlindSpotNotReadyException(
+                    "camera-view deferred — a lane build is in flight");
+            }
+            boolean laneLive = (bsLayer != null && bsLayer.isCreated() && bsScaler != null);
+            if (laneLive) {
+                // Lane already fully built + published — safe to mark active now (no
+                // build can fail under us). Reconfigure to camview on the next tick.
+                camViewActive = true;
+                laneProgram = PROG_NONE;
+                startBsTurnLoop();
+                logger.info("CamView: reusing live shared lane (no rebuild)");
+            } else {
+                // Fresh build. Do NOT set camViewActive until the build SUCCEEDS —
+                // otherwise a GL-init timeout/throw inside buildSharedLaneLocked would
+                // (a) defeat releasePartialBsLane's `!blindSpotEnabled && !camViewActive`
+                // guard, leaking the SurfaceControl layer + scaler, and (b) leave
+                // camViewActive stuck true with a dead lane that the reuse branch would
+                // then adopt on retry (permanent no-video). Mirrors the BS path, which
+                // sets blindSpotEnabled only AFTER a successful build. On failure, reset
+                // state + release the partial lane, then rethrow so the caller re-polls.
+                camViewEnabling = true;
+                try {
+                    buildSharedLaneLocked();
+                } catch (Throwable t) {
+                    camViewEnabling = false;
+                    camViewActive = false;      // never armed
+                    camViewHideAtMs = 0L;
+                    // Guard now passes (both flags false) → releases the partial lane.
+                    if (!blindSpotEnabled && !camViewActive) releasePartialBsLane();
+                    if (t instanceof Exception) throw (Exception) t;
+                    throw new RuntimeException(t);
+                }
+                camViewEnabling = false;
+                camViewActive = true;       // armed only on successful build
+                laneProgram = PROG_NONE;   // force camview program config next tick
+                startBsTurnLoop();
+                if (firstConsumer) logger.info("CamView: shared lane built for camera-view");
+            }
+            logger.info(String.format("CamView: enabled mode=%d target=%s autoHide=%ds",
+                camViewMode, camViewTarget, autoHideSec));
+        } finally {
+            boolean nowActive = camViewActive;
+            String tgt = camViewTarget;
+            bsLifecycleLock.unlock();
+            // Tell the app-side close-button overlay a view is up (edge-driven, no poll).
+            // Fired outside the lock so the short `am broadcast` exec never holds it.
+            if (nowActive) emitCamViewState(true, tgt);
+        }
+    }
+
+    /** Hide the camera view. Tears the lane down only if blind-spot isn't also using it. */
+    public void disableCamView() {
+        boolean wasActive = false;
+        bsLifecycleLock.lock();
+        try {
+            wasActive = camViewActive;
+            if (!camViewActive) return;
+            logger.info("CamView: disabling camera view...");
+            camViewActive = false;
+            camViewHideAtMs = 0L;
+
+            // SAFETY (gauge-blank prevention): release the "camview" sustained hold
+            // UNCONDITIONALLY — removing a token that isn't in the set is a harmless
+            // idempotent no-op, and releasing regardless of the CURRENT target closes
+            // the "acquire keyed on cluster, release keyed on current target" leak: a
+            // camview that opened the cluster projection then retargeted to head_unit
+            // would otherwise orphan the token forever (projection pinned open, gauges
+            // blanked, max-cap disarmed). releaseSustained keeps the projection up ONLY
+            // if another sustained holder (nav map) remains OR a transient blind-spot
+            // turn-signal currently wants it; otherwise it force-closes + restores the
+            // gauges. Runs before any lane handoff/teardown, in BOTH branches below.
+            try { com.overdrive.app.surveillance.ClusterProjectionController.getInstance().releaseSustained("camview"); } catch (Throwable ignored) {}
+
+            // If BS still needs the lane, just hand it back: hide the camview image,
+            // force a reconfig so the next tick re-applies the BS program.
+            if (blindSpotEnabled) {
+                // Hide the layer now; the BS arbiter re-shows on the next turn signal.
+                setBlindSpotVisible(false);
+                laneProgram = PROG_NONE;   // force BS reconfig on next tick
+                logger.info("CamView: disabled, lane retained for blind-spot");
+                return;
+            }
+
+            // Neither program needs the lane — full teardown. (The cluster projection,
+            // if any, was already released above.)
+            stopBsTurnLoop();
+            teardownSharedLaneLocked();
+            laneProgram = PROG_NONE;
+            logger.info("CamView: camera view disabled");
+        } finally {
+            bsLifecycleLock.unlock();
+            // Tell the app-side close-button overlay the view is gone (edge-driven).
+            // Only when it was actually active, so the no-op early-return path (view
+            // already hidden) doesn't fire a spurious "closed" broadcast.
+            if (wasActive) emitCamViewState(false, null);
+        }
+    }
+
+    private boolean isCamViewClusterTarget() { return "cluster".equals(camViewTarget); }
+
+    /**
+     * Fire an {@code am broadcast} telling the app-process close-button overlay
+     * (the camera-view ✕ hosted in {@link com.overdrive.app.overlay.StatusOverlayService})
+     * that a camera view opened ({@code active=true}) or closed ({@code active=false}).
+     * This is the zero-poll edge signal — the daemon runs as shell/UID-2000 so it can
+     * broadcast to the app. Best-effort + fully detached: a short-lived exec whose output
+     * we never read, so it can never block the lifecycle path. Never throws.
+     */
+    private void emitCamViewState(boolean active, String target) {
+        try {
+            java.util.List<String> cmd = new java.util.ArrayList<>(java.util.Arrays.asList(
+                    "am", "broadcast",
+                    "-a", com.overdrive.app.overlay.StatusOverlayService.ACTION_CAMVIEW_STATE,
+                    "-p", "com.overdrive.app",
+                    "--ez", "active", active ? "true" : "false"));
+            if (target != null) { cmd.add("--es"); cmd.add("target"); cmd.add(target); }
+            Process p = new ProcessBuilder(cmd).redirectErrorStream(true).start();
+            // Detach: drain+discard on a daemon thread so the child can't wedge on a
+            // full pipe, and never wait on the lifecycle thread.
+            final java.io.InputStream is = p.getInputStream();
+            Thread drain = new Thread(() -> {
+                byte[] buf = new byte[256];
+                try { while (is.read(buf) != -1) { /* discard */ } } catch (Throwable ignored) {}
+            }, "camview-state-broadcast");
+            drain.setDaemon(true);
+            drain.start();
+        } catch (Throwable t) {
+            logger.debug("emitCamViewState failed: " + t.getMessage());
+        }
+    }
+
+    /** Resolve the camview on-screen rect from UCM geometry (preset or absolute),
+     *  per target, mirroring resolveBsGeometry. Writes camViewGeomRect. */
+    private void resolveCamViewGeometry() {
+        try {
+            android.content.Context ctx = savedContext;
+            if (ctx == null) ctx = com.overdrive.app.daemon.CameraDaemon.getAppContext();
+            org.json.JSONObject cv = com.overdrive.app.config.UnifiedConfigManager.getCamView();
+            android.graphics.Point panel = (ctx != null)
+                ? (isCamViewClusterTarget()
+                    ? com.overdrive.app.surveillance.BsNativeLayer.clusterDisplaySize(ctx)
+                    : com.overdrive.app.surveillance.BsNativeLayer.displaySize(ctx))
+                : new android.graphics.Point(1920, isCamViewClusterTarget() ? 720 : 1080);
+            String geomKey = isCamViewClusterTarget() ? "geometryCluster" : "geometry";
+            org.json.JSONObject g = (cv != null) ? cv.optJSONObject(geomKey) : null;
+            int[] r;
+            if (g != null && g.has("sizePct")) {
+                camViewSizePct = g.optInt("sizePct", camViewSizePct);
+                if (g.has("corner")) camViewCorner = g.optString("corner", camViewCorner);
+                r = camViewPresetRect(panel);
+            } else if (g != null && g.has("x") && g.has("w")) {
+                r = clampRectToPanel(g.optInt("x"), g.optInt("y"), g.optInt("w"), g.optInt("h"), panel);
+            } else {
+                double defFrac = isCamViewClusterTarget() ? 0.80 : 0.60;
+                int w = (int) (panel.x * defFrac);
+                int h = (int) (w * (double) BS_HEIGHT / BS_WIDTH);
+                r = clampRectToPanel((panel.x - w) / 2, (panel.y - h) / 2, w, h, panel);
+            }
+            camViewGeomRect = new int[]{r[0], r[1], r[2], r[3]};
+        } catch (Throwable t) {
+            logger.warn("resolveCamViewGeometry failed: " + t.getMessage());
+            if (camViewGeomRect[2] <= 0) camViewGeomRect = new int[]{24, 24, 768, 576};
+        }
+    }
+
+    private int[] camViewPresetRect(android.graphics.Point panel) {
+        int p = Math.max(15, Math.min(camViewSizePct, 95));
+        int w = (int) (panel.x * (p / 100.0));
+        int h = (int) (w * (double) BS_HEIGHT / BS_WIDTH);
+        int inset = 24;
+        String corner = (camViewCorner != null) ? camViewCorner : "center";
+        if ("center".equals(corner)) {
+            return clampRectToPanel((panel.x - w) / 2, (panel.y - h) / 2, w, h, panel);
+        }
+        boolean right = corner.endsWith("r");
+        boolean bottom = corner.startsWith("b");
+        int x = right ? panel.x - w - inset : inset;
+        int y = bottom ? panel.y - h - inset : inset;
+        return clampRectToPanel(x, y, w, h, panel);
+    }
+
+    /** Clamp a rect into the given panel, keeping the 4:3 buffer ratio (uniform scale). */
+    private int[] clampRectToPanel(int x, int y, int w, int h, android.graphics.Point panel) {
+        w = Math.max(160, Math.min(w, panel.x));
+        h = Math.max(120, Math.min(h, panel.y));
+        double want = (double) BS_WIDTH / BS_HEIGHT;   // 4:3
+        if ((double) w / h > want) w = (int) (h * want);
+        else                       h = (int) (w / want);
+        x = Math.max(0, Math.min(x, panel.x - w));
+        y = Math.max(0, Math.min(y, panel.y - h));
+        return new int[]{x, y, w, h};
     }
 
     /**
