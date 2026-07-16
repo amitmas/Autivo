@@ -148,6 +148,9 @@ BYD.performance = {
         // — when a click hits an already-open tab, sw.js navigates the
         // existing window which only updates location.hash, no reload.
         var self = this;
+        if (BYD.i18n && typeof BYD.i18n.onChange === 'function') {
+            BYD.i18n.onChange(function() { self.fetchSohStatus(); });
+        }
         if (window.location.hash === '#soh-fix') {
             this._scrollToSohFixBanner();
         }
@@ -2490,7 +2493,8 @@ BYD.performance = {
         // Best-effort: capitalize first letter. Manifest titles aren't cached
         // here; the modal has the full list when the user opens it.
         if (!id) return '';
-        return id.charAt(0).toUpperCase() + id.slice(1);
+        var fallback = id.charAt(0).toUpperCase() + id.slice(1);
+        return BYD.i18n.modelName(id, fallback);
     },
 
     // ==================== SOH Capacity Modal ====================
@@ -2575,7 +2579,8 @@ BYD.performance = {
             opt.value = m.id || '';
             // Manifest's canonical user-facing string is "name"; older
             // copies used "title". Fall back to id when neither is set.
-            opt.textContent = m.name || m.title || m.id || '';
+            var canonicalName = m.name || m.title || m.id || '';
+            opt.textContent = BYD.i18n.modelName(m.id, canonicalName);
             modelSel.appendChild(opt);
             // Gross nameplate for every drivetrain. PHEV remainKwh is corrected
             // to the gross frame at the HAL read boundary (the BYD HAL reports

@@ -76,6 +76,12 @@ var VC = {
 
     init: function() {
         var self = this;
+        // Model ids are global, but their badges can be market-specific
+        // (for example, Seagull is sold as Dolphin Mini in Brazil). Refresh
+        // the already-built picker when the user changes the web locale.
+        if (BYD.i18n && typeof BYD.i18n.onChange === 'function') {
+            BYD.i18n.onChange(function() { self.refreshModelPickerNames(); });
+        }
         // Default: Aurora White (converted to linear so it matches the rest
         // of the colour pipeline; see applyColor() for the rationale).
         this.baseColor = new THREE.Color(0xE8E8EC).convertSRGBToLinear();
@@ -1132,7 +1138,9 @@ var VC = {
 
         _download: function(id, entry, url, onDone, onProgress) {
             var self = this;
-            if (onProgress) onProgress(BYD.i18n.t('vehicle.downloading_model', {name: entry.name, pct: 0}));
+            if (onProgress) onProgress(BYD.i18n.t('vehicle.downloading_model', {
+                name: BYD.i18n.modelName(entry.id, entry.name), pct: 0
+            }));
 
             var xhr = new XMLHttpRequest();
             xhr.open('POST', '/api/models/download?id=' + encodeURIComponent(id), true);
@@ -1181,7 +1189,9 @@ var VC = {
                     }
                     if (onProgress) {
                         var pct = typeof s.percent === 'number' ? s.percent : 0;
-                        onProgress(BYD.i18n.t('vehicle.downloading_model', {name: entry.name, pct: pct}));
+                        onProgress(BYD.i18n.t('vehicle.downloading_model', {
+                            name: BYD.i18n.modelName(entry.id, entry.name), pct: pct
+                        }));
                     }
                     setTimeout(tick, 250);
                 };
@@ -1205,7 +1215,7 @@ var VC = {
             var m = this.manifest.models[i];
             var opt = document.createElement('option');
             opt.value = m.id;
-            opt.textContent = m.name;
+            opt.textContent = BYD.i18n.modelName(m.id, m.name);
             sel.appendChild(opt);
         }
 
@@ -1225,6 +1235,18 @@ var VC = {
             self._lastStaleRetryMs = now;
             self._kickManifestRefresh();
         });
+    },
+
+    /** Re-label the existing options without rebuilding listeners/selection. */
+    refreshModelPickerNames: function() {
+        var sel = document.getElementById('modelPicker');
+        if (!sel || !this.manifest || !this.manifest.models) return;
+        for (var i = 0; i < this.manifest.models.length; i++) {
+            var m = this.manifest.models[i];
+            if (sel.options[i]) {
+                sel.options[i].textContent = BYD.i18n.modelName(m.id, m.name);
+            }
+        }
     },
 
     setModel: function(id) {

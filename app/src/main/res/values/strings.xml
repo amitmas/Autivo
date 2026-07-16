@@ -1070,6 +1070,7 @@
     <string name="vehicle_dialog_capacity_suffix">kWh</string>
     <string name="vehicle_dialog_capacity_helper">15 to 120 kWh. Leave to use the model default.</string>
     <string name="vehicle_dialog_model_label">Model</string>
+    <string name="vehicle_model_seagull">BYD Seagull</string>
     <string name="vehicle_dialog_save">Save</string>
     <string name="vehicle_dialog_reset">Reset to auto-detect</string>
     <string name="vehicle_dialog_invalid_capacity">Capacity must be 15 - 120 kWh</string>

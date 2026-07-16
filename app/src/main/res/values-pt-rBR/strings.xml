@@ -922,6 +922,7 @@
     <string name="vehicle_dialog_capacity_suffix">kWh</string>
     <string name="vehicle_dialog_capacity_helper">15 a 120 kWh. Deixe em branco para usar o padrão do modelo.</string>
     <string name="vehicle_dialog_model_label">Modelo</string>
+    <string name="vehicle_model_seagull">BYD Dolphin Mini</string>
     <string name="vehicle_dialog_save">Salvar</string>
     <string name="vehicle_dialog_reset">Redefinir para detecção automática</string>
     <string name="vehicle_dialog_invalid_capacity">A capacidade deve ser de 15 a 120 kWh</string>

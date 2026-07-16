@@ -196,6 +196,22 @@ BYD.i18n = (function () {
         return interpolate(val, vars);
     }
 
+    /**
+     * Resolve a manifest model name through the active locale when a market
+     * uses a different badge. The manifest id remains canonical, so persisted
+     * selections and downloaded GLBs are unaffected by localized branding.
+     */
+    function modelName(modelId, fallback) {
+        var rawId = modelId == null ? '' : String(modelId);
+        var normalized = rawId.toLowerCase().replace(/[^a-z0-9]+/g, '_');
+        if (normalized) {
+            var key = 'vehicle.model_name_' + normalized;
+            var translated = t(key);
+            if (translated != null && translated !== key) return translated;
+        }
+        return fallback || rawId;
+    }
+
     function plural(key, count, vars) {
         var val = lookup(state.catalog, key);
         if (val == null) return key;
@@ -461,6 +477,7 @@ BYD.i18n = (function () {
         setLang: setLang,
         onChange: onChange,
         getLang: function () { return state.lang; },
+        modelName: modelName,
         getDisplayName: function (lang) { return DISPLAY_NAMES[lang] || lang; },
         supported: function () { return SUPPORTED.slice(); },
         // True when the app's server-side locale should override the local

@@ -3059,7 +3059,7 @@ class MainActivity : AppCompatActivity() {
             "song" -> "BYD Song"
             "qin" -> "BYD Qin"
             "dolphin" -> "BYD Dolphin"
-            "seagull" -> "BYD Seagull"
+            "seagull" -> getString(R.string.vehicle_model_seagull)
             "sealion6" -> "BYD Sealion 6"
             "sealion7" -> "BYD Sealion 7"
             "sealu", "seal-u" -> "BYD Seal U"
