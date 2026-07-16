@@ -7,12 +7,12 @@ class AppLauncherGhostActivity : Activity() { // <--- Agora herda da classe base
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // Não definimos layout. Ela nasce totalmente transparente.
+        // without layout. totally transparent.
     }
 
     override fun onResume() {
         super.onResume()
-        // Dá 2.5 segundos para os apps reais serem movidos por cima dela e fecha-se
+        // 2.5 second to app opens over it and then destroy itself
         window.decorView.postDelayed({
             finish()
         }, 2500)
