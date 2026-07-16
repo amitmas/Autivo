@@ -3,7 +3,7 @@ package com.overdrive.app
 import android.app.Activity // <--- Alterado de androidx.appcompat.app.AppCompatActivity
 import android.os.Bundle
 
-class AppLauncherGhostActivity : Activity() { // <--- Agora herda da classe base Activity
+class AppLauncherGhostActivity : Activity() { // <--- Now inherits from the base Activity
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -14,7 +14,7 @@ class AppLauncherGhostActivity : Activity() { // <--- Agora herda da classe base
         super.onResume()
         // 2.5 second to app opens over it and then destroy itself
         window.decorView.postDelayed({
-            finish()
+            finishAndRemoveTask()
         }, 2500)
     }
 }
