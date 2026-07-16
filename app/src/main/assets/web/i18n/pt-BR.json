@@ -2030,6 +2030,7 @@
     "copy_code": "Copiar código"
   },
   "vehicle": {
+    "model_name_seagull": "BYD Dolphin Mini",
     "car_locked": "Carro travado",
     "car_unlocked": "Carro destravado",
     "lock_failed": "Falha ao travar",

@@ -2030,6 +2030,7 @@
     "copy_code": "Copy code"
   },
   "vehicle": {
+    "model_name_seagull": "BYD Seagull",
     "car_locked": "Car locked",
     "car_unlocked": "Car unlocked",
     "lock_failed": "Lock failed",

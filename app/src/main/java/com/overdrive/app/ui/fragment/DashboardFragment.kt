@@ -914,7 +914,7 @@ class DashboardFragment : Fragment() {
                 if (!isAdded || view == null) return@post
                 if (nominalKwh > 0) {
                     tile.text = if (modelId != null) {
-                        getString(R.string.dashboard_vehicle_summary, nominalKwh, modelId.replaceFirstChar { it.uppercase() })
+                        getString(R.string.dashboard_vehicle_summary, nominalKwh, modelDisplayName(modelId))
                     } else {
                         String.format("%.1f kWh", nominalKwh)
                     }
@@ -1041,10 +1041,15 @@ class DashboardFragment : Fragment() {
                             // The previous version read "title" first which never
                             // existed in our manifest, so models showed as the
                             // id text. Ordering: name → title → id.
-                            val title = when {
+                            val canonicalTitle = when {
                                 m.optString("name", "").isNotEmpty() -> m.optString("name")
                                 m.optString("title", "").isNotEmpty() -> m.optString("title")
                                 else -> id
+                            }
+                            val title = if (id.equals("seagull", ignoreCase = true)) {
+                                ctx.getString(R.string.vehicle_model_seagull)
+                            } else {
+                                canonicalTitle
                             }
                             // nominalKwh is the manifest's canonical pack
                             // capacity for this model. 0 means the manifest
@@ -1231,7 +1236,7 @@ class DashboardFragment : Fragment() {
             "song" -> "BYD Song"
             "qin" -> "BYD Qin"
             "dolphin" -> "BYD Dolphin"
-            "seagull" -> "BYD Seagull"
+            "seagull" -> getString(R.string.vehicle_model_seagull)
             "sealion6" -> "BYD Sealion 6"
             "sealion7" -> "BYD Sealion 7"
             "sealu", "seal-u" -> "BYD Seal U"
