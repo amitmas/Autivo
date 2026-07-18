@@ -25,7 +25,7 @@ import javax.crypto.spec.SecretKeySpec;
  * Auth Flow:
  * 1. User enters device token (displayed in app)
  * 2. Token validated → JWT session created
- * 3. JWT used for subsequent requests (1 year expiry)
+ * 3. JWT used for subsequent requests (30 day expiry, then re-login)
  *
  * Security:
  * - Device token = deviceId + secret (e.g., byd-a1b2c3d4-x7k9m2p5)
@@ -68,8 +68,26 @@ public class AuthManager {
     // deviceId yet (cold-start before MainActivity has synced).
     private static final String DEVICE_ID_FILE = "/data/local/tmp/.overdrive_device_id";
 
-    // JWT settings
-    private static final long JWT_EXPIRY_MS = 365 * 24 * 60 * 60 * 1000L; // 1 year (effectively indefinite)
+    // JWT settings.
+    //
+    // Was 1 year ("effectively indefinite") — anyone who read the device
+    // secret once (a co-located process reading the world-rw unified config,
+    // or a leaked config backup per ConfigBackupService's own documented
+    // risk) got near-permanent API access, since nothing re-validates a
+    // still-unexpired JWT against anything but its signature. 30 days caps
+    // that exposure window at roughly 1/12th of the previous one.
+    //
+    // There's no silent-refresh endpoint: a client's cookie/localStorage JWT
+    // is minted once at login (AuthApiHandler.handleTokenValidation) and used
+    // until it expires, at which point auth.js's 401 handler redirects to
+    // /login.html for the user to re-enter their (unchanged) device token.
+    // That's an acceptable, deliberately simple trade-off at 30 days; a
+    // shorter expiry would need an actual refresh mechanism to avoid
+    // constant re-login friction.
+    private static final long JWT_EXPIRY_MS = 30L * 24 * 60 * 60 * 1000L; // 30 days
+    // Public so AuthApiHandler's login response can report the real value
+    // instead of hardcoding its own copy that could drift from this one.
+    public static final long JWT_EXPIRY_SECONDS = JWT_EXPIRY_MS / 1000;
     private static final String JWT_ALGORITHM = "HS256";
 
     // In-memory cache. UnifiedConfigManager already mtime-invalidates its
