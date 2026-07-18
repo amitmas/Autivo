@@ -234,7 +234,7 @@ public class AuthApiHandler {
                     response.put("success", true);
                     response.put("jwt", jwt);
                     response.put("deviceId", state.deviceId);
-                    response.put("expiresIn", 365 * 24 * 60 * 60); // 1 year — matches JWT expiry
+                    response.put("expiresIn", AuthManager.JWT_EXPIRY_SECONDS);
 
                     log("Token validated for device: " + state.deviceId);
                 }
