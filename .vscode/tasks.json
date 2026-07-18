@@ -26,8 +26,8 @@
         {
             "label": "Build Release APK",
             "type": "shell",
-            "command": "./gradlew assembleRelease",
-            "detail": "Requires KEYSTORE_FILE, KEYSTORE_PASSWORD, KEY_PASSWORD, KEY_ALIAS env vars set (see Readme.md 'Building from Source') — fails at signing otherwise, no release.jks is committed.",
+            "command": "[ -f .env.release ] && source .env.release; ./gradlew assembleRelease",
+            "detail": "Requires KEYSTORE_FILE, KEYSTORE_PASSWORD, KEY_PASSWORD, KEY_ALIAS env vars set (see Readme.md 'Building from Source') — sourced from the gitignored .env.release if present, fails at signing otherwise since no release.jks is committed.",
             "group": "build",
             "problemMatcher": []
         },
@@ -44,7 +44,7 @@
         {
             "label": "Test Release",
             "type": "shell",
-            "command": "./gradlew testReleaseUnitTest",
+            "command": "[ -f .env.release ] && source .env.release; ./gradlew testReleaseUnitTest",
             "group": "test",
             "problemMatcher": []
         },
@@ -66,6 +66,73 @@
                 "Test Release"
             ],
             "group": "build",
+            "problemMatcher": []
+        },
+        {
+            "label": "Deploy Debug APK (adb)",
+            "type": "shell",
+            "command": "adb install -r app/build/outputs/apk/debug/app-arm64-v8a-debug.apk",
+            "detail": "Installs over adb onto whatever device/emulator is connected (fails with 'more than one device/emulator' if several are attached — disambiguate with 'adb -s <serial> install ...'). Run 'Build Debug APK' first if the APK is stale.",
+            "group": "none",
+            "problemMatcher": []
+        },
+        {
+            "label": "Deploy Release APK (adb)",
+            "type": "shell",
+            "command": "adb install -r app/build/outputs/apk/release/app-arm64-v8a-release.apk",
+            "detail": "Installs the signed release APK over adb. Run 'Build Release APK' first (needs .env.release / KEYSTORE_* env vars) if the APK is stale. Only deploy to the real head unit parked with ignition off, and with MQTT vehicle control / Telegram / tunnels / shell automations left off until you've smoke-tested the build — see the android-build skill for the full staged rollout.",
+            "group": "none",
+            "problemMatcher": []
+        },
+        {
+            "label": "Build & Deploy Debug (adb)",
+            "dependsOrder": "sequence",
+            "dependsOn": [
+                "Build Debug APK",
+                "Deploy Debug APK (adb)"
+            ],
+            "group": "build",
+            "problemMatcher": []
+        },
+        {
+            "label": "Build & Deploy Release (adb)",
+            "dependsOrder": "sequence",
+            "dependsOn": [
+                "Build Release APK",
+                "Deploy Release APK (adb)"
+            ],
+            "detail": "Real vehicle commands can be issued once this build is running with those features enabled — see android-build skill staged rollout before enabling MQTT vehicle control, tunnels, or shell automations.",
+            "group": "build",
+            "problemMatcher": []
+        },
+        {
+            "label": "Uninstall App (adb)",
+            "type": "shell",
+            "command": "adb uninstall com.overdrive.app",
+            "detail": "WIPES APP DATA on the connected device (settings, MQTT/Telegram/tunnel credentials, everything under /data/data/com.overdrive.app). Needed to switch a device between a debug-signed and release-signed install — Android refuses to install over a package signed with a different key (INSTALL_FAILED_UPDATE_INCOMPATIBLE). Don't run this against a daily-driver head-unit install without knowing you're OK losing its configured settings.",
+            "group": "none",
+            "problemMatcher": []
+        },
+        {
+            "label": "Uninstall & Deploy Debug (adb)",
+            "dependsOrder": "sequence",
+            "dependsOn": [
+                "Uninstall App (adb)",
+                "Deploy Debug APK (adb)"
+            ],
+            "detail": "Use when the device currently has a release-signed (or otherwise differently-signed) build installed and you need to switch it to debug. Wipes app data first — see 'Uninstall App (adb)'.",
+            "group": "none",
+            "problemMatcher": []
+        },
+        {
+            "label": "Uninstall & Deploy Release (adb)",
+            "dependsOrder": "sequence",
+            "dependsOn": [
+                "Uninstall App (adb)",
+                "Deploy Release APK (adb)"
+            ],
+            "detail": "Use when the device currently has a debug-signed (or otherwise differently-signed) build installed and you need to switch it to release. Wipes app data first — see 'Uninstall App (adb)'.",
+            "group": "none",
             "problemMatcher": []
         },
         {

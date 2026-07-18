@@ -8,3 +8,5 @@
 /app/.cxx
 /app/src/main/cpp/opencv
 /app/src/main/cpp/openh264
+/app/*.jks
+/.env.release
