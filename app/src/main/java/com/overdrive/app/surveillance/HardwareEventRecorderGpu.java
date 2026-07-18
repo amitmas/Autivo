@@ -1755,6 +1755,14 @@ public class HardwareEventRecorderGpu {
             return;
         }
 
+        // A per-instance encoder can receive its duration settings before
+        // init() allocates the private ring. Its desired fields are already
+        // updated above; it must not resize another encoder's shared ring in
+        // this pre-init state. Once initialized, the branch above owns updates.
+        if (useInstancePreRecordBuffer && preRecordBuffer == null) {
+            return;
+        }
+
         synchronized (bufferLock) {
             if (sharedPreRecordBuffer != null) {
                 sharedPreRecordBuffer.setMaxDurationUs(desiredUs);
