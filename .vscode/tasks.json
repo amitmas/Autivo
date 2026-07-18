@@ -1,0 +1,86 @@
+{
+    "version": "2.0.0",
+    "options": {
+        "cwd": "${workspaceFolder}",
+        "env": {
+            // AGP 8.13.x needs JDK 17 to run Gradle itself (distinct from the
+            // app's own Java 11 source/target compatibility). Only JDK 25 was
+            // found installed on this machine, which fails with an opaque
+            // "What went wrong: 25.0.3" error and no other detail — installed
+            // via `brew install openjdk@17`. Adjust this path if your JDK 17
+            // lives elsewhere.
+            "JAVA_HOME": "/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home"
+        }
+    },
+    "tasks": [
+        {
+            "label": "Build Debug APK",
+            "type": "shell",
+            "command": "./gradlew assembleDebug",
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Build Release APK",
+            "type": "shell",
+            "command": "./gradlew assembleRelease",
+            "detail": "Requires KEYSTORE_FILE, KEYSTORE_PASSWORD, KEY_PASSWORD, KEY_ALIAS env vars set (see Readme.md 'Building from Source') — fails at signing otherwise, no release.jks is committed.",
+            "group": "build",
+            "problemMatcher": []
+        },
+        {
+            "label": "Test Debug",
+            "type": "shell",
+            "command": "./gradlew testDebugUnitTest",
+            "group": {
+                "kind": "test",
+                "isDefault": true
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Test Release",
+            "type": "shell",
+            "command": "./gradlew testReleaseUnitTest",
+            "group": "test",
+            "problemMatcher": []
+        },
+        {
+            "label": "Build & Test Debug",
+            "dependsOrder": "sequence",
+            "dependsOn": [
+                "Build Debug APK",
+                "Test Debug"
+            ],
+            "group": "build",
+            "problemMatcher": []
+        },
+        {
+            "label": "Build & Test Release",
+            "dependsOrder": "sequence",
+            "dependsOn": [
+                "Build Release APK",
+                "Test Release"
+            ],
+            "group": "build",
+            "problemMatcher": []
+        },
+        {
+            "label": "Lint",
+            "type": "shell",
+            "command": "./gradlew lint",
+            "group": "test",
+            "problemMatcher": []
+        },
+        {
+            "label": "Clean",
+            "type": "shell",
+            "command": "./gradlew clean",
+            "group": "build",
+            "problemMatcher": []
+        }
+    ]
+}
