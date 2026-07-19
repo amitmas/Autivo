@@ -136,6 +136,14 @@
             "problemMatcher": []
         },
         {
+            "label": "Clear Persisted Update Version (adb)",
+            "type": "shell",
+            "command": "adb shell rm -f /data/local/tmp/overdrive_version",
+            "detail": "Deletes the world-readable version label the in-app updater writes on every install (AppUpdater.VERSION_FILE). This file survives 'adb uninstall' (it lives outside the app's data dir), so a stale label from a previous release can keep overriding the About screen / web dashboard version display even after a fresh sideload. Run this whenever the displayed version doesn't match the build you just installed.",
+            "group": "none",
+            "problemMatcher": []
+        },
+        {
             "label": "Lint",
             "type": "shell",
             "command": "./gradlew lint",
