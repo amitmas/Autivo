@@ -92,6 +92,7 @@
     "logs_upload_unavailable": "La carga de registros no está disponible en esta versión",
     "logs_unknown_daemon": "Daemón desconocido. Intentar: {0}",
     "update_progress_unreadable": "Ficha de progreso no se puede leer",
+    "vehicle_blocked_in_motion": "Esta acción no está disponible mientras el vehículo está en movimiento",
     "vehicle_data_unavailable": "Datos del vehículo no disponibles",
     "vehicle_trunk_unlock_failed": "No se puede abrir el maletero, el desbloqueo no funcionó.",
     "vehicle_window_target_requires_area": "objetivoEl porcentaje requiere un área específica (1-6)",
@@ -137,6 +138,7 @@
     "proximity_alert": " Tiempo de alerta de proximidad: {0} Trigger: {1} ({2}) La grabación comenzó..."
   },
   "vehicle_control": {
+    "blocked_driving": "Esta acción no está disponible mientras el vehículo está en movimiento",
     "cloud_required": "Conectar una cuenta BYD en Configuración para usar este control",
     "cloud_sent": "Enviado a través de la nube",
     "cloud_unavailable_used_local": "Nube no disponible  conexión directa utilizada",

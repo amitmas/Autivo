@@ -92,6 +92,7 @@
     "logs_upload_unavailable": "Tải nhật ký lên không khả dụng trong bản dựng này",
     "logs_unknown_daemon": "Daemon không xác định. Thử: {0}",
     "update_progress_unreadable": "Dữ liệu tiến bộ không thể đọc được",
+    "vehicle_blocked_in_motion": "Thao tác này không khả dụng khi xe đang di chuyển",
     "vehicle_data_unavailable": "Dữ liệu xe không có sẵn",
     "vehicle_trunk_unlock_failed": "Tôi không thể mở thùng, khóa đã thất bại, có thể xe vẫn bị khóa.",
     "vehicle_window_target_requires_area": "mục tiêuPhần trăm yêu cầu một khu vực cụ thể (1-6)",
@@ -137,6 +138,7 @@
     "proximity_alert": " Thời gian cảnh báo gần gũi: {0} Trigger: {1} ({2}) Việc ghi lại bắt đầu..."
   },
   "vehicle_control": {
+    "blocked_driving": "Thao tác này không khả dụng khi xe đang di chuyển",
     "cloud_required": "Kết nối tài khoản BYD trong Cài đặt để sử dụng điều khiển này",
     "cloud_sent": "Được gửi qua đám mây",
     "cloud_unavailable_used_local": "Không có điện toán đám mây  kết nối trực tiếp được sử dụng",
