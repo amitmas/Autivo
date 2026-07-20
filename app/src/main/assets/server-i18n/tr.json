@@ -92,6 +92,7 @@
     "logs_upload_unavailable": "Bu yapıda günlük yükleme mevcut değil",
     "logs_unknown_daemon": "Bilinmeyen arka plan programı. Deneyin: {0}",
     "update_progress_unreadable": "Gelişme dosyası okunamıyor",
+    "vehicle_blocked_in_motion": "Araç hareket halindeyken bu işlem kullanılamaz",
     "vehicle_data_unavailable": "Araç verileri mevcut değil",
     "vehicle_trunk_unlock_failed": "Bagajı açamıyorum, kilitleme başarısız oldu.",
     "vehicle_window_target_requires_area": "hedef% belirli bir alan gerektirir (1-6)",
@@ -137,6 +138,7 @@
     "proximity_alert": " Yakınlık Alarmı Zamanı: {0} Trigger: {1} ({2}) Kayıt başlandı..."
   },
   "vehicle_control": {
+    "blocked_driving": "Araç hareket halindeyken bu işlem kullanılamaz",
     "cloud_required": "Bu kontrolü kullanmak için Ayarlarda BYD hesabını bağlayın",
     "cloud_sent": "Bulut yoluyla gönderilir",
     "cloud_unavailable_used_local": "Bulut kullanılamıyor  kullanılmış doğrudan bağlantı",

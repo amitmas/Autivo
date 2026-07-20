@@ -92,6 +92,7 @@
     "logs_upload_unavailable": "Il caricamento dei log non è disponibile in questa build",
     "logs_unknown_daemon": "Demone sconosciuto. Prova: {0}",
     "update_progress_unreadable": "File avanzamento illeggibile",
+    "vehicle_blocked_in_motion": "Questa azione non è disponibile mentre il veicolo è in movimento",
     "vehicle_data_unavailable": "Dati veicolo non disponibili",
     "vehicle_trunk_unlock_failed": "Impossibile aprire il bagagliaio: sblocco non riuscito. L'auto potrebbe essere ancora chiusa.",
     "vehicle_window_target_requires_area": "targetPercent richiede un'area specifica (1-6)",
@@ -137,6 +138,7 @@
     "proximity_alert": "🚨 Avviso di prossimita\nOra: {0}\nTrigger: {1} ({2})\nRegistrazione avviata..."
   },
   "vehicle_control": {
+    "blocked_driving": "Questa azione non è disponibile mentre il veicolo è in movimento",
     "cloud_required": "Connettere un account BYD nelle impostazioni per utilizzare questo controllo",
     "cloud_sent": "Invio tramite cloud",
     "cloud_unavailable_used_local": "Cloud non disponibile connessione diretta utilizzata",

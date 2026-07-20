@@ -92,6 +92,7 @@
     "logs_upload_unavailable": "इस बिल्ड में लॉग अपलोड उपलब्ध नहीं है",
     "logs_unknown_daemon": "अज्ञात डीमन। प्रयास करें: {0}",
     "update_progress_unreadable": "प्रगति फ़ाइल अपठनीय",
+    "vehicle_blocked_in_motion": "वाहन चलते समय यह क्रिया उपलब्ध नहीं है",
     "vehicle_data_unavailable": "वाहन डेटा उपलब्ध नहीं",
     "vehicle_trunk_unlock_failed": "ट्रंक नहीं खोल सकता, अनलॉक विफल रहा। कार अभी भी लॉक हो सकता है।",
     "vehicle_window_target_requires_area": "लक्ष्य प्रतिशत के लिए एक विशिष्ट क्षेत्र की आवश्यकता होती है (1-6)",
@@ -137,6 +138,7 @@
     "proximity_alert": " निकटता अलर्ट समय: {0} ट्रिगर: {1} ({2}) रिकॉर्डिंग शुरू..."
   },
   "vehicle_control": {
+    "blocked_driving": "वाहन चलते समय यह क्रिया उपलब्ध नहीं है",
     "cloud_required": "इस नियंत्रण का उपयोग करने के लिए सेटिंग्स में एक BYD खाता कनेक्ट करें",
     "cloud_sent": "बादल के माध्यम से भेजा जाता है",
     "cloud_unavailable_used_local": "क्लाउड अनुपलब्ध  इस्तेमाल किया गया प्रत्यक्ष कनेक्शन",

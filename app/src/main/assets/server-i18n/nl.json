@@ -92,6 +92,7 @@
     "logs_upload_unavailable": "Log-upload is niet beschikbaar in deze versie",
     "logs_unknown_daemon": "Onbekende dagvaard. Probeer: {0}",
     "update_progress_unreadable": "Progressbestand onleesbaar",
+    "vehicle_blocked_in_motion": "Deze actie is niet beschikbaar terwijl het voertuig rijdt",
     "vehicle_data_unavailable": "Voertuiggegevens niet beschikbaar",
     "vehicle_trunk_unlock_failed": "Ik kan de kofferbak niet openen.",
     "vehicle_window_target_requires_area": "TargetPercentage vereist een specifiek gebied (1-6)",
@@ -137,6 +138,7 @@
     "proximity_alert": " Nabijheid Alert Tijd: {0} Trigger: {1} ({2}) Opname begint..."
   },
   "vehicle_control": {
+    "blocked_driving": "Deze actie is niet beschikbaar terwijl het voertuig rijdt",
     "cloud_required": "Verbind een BYD-account in Instellingen om deze bediening te gebruiken",
     "cloud_sent": "Gestuurd via de wolk",
     "cloud_unavailable_used_local": "Cloud niet beschikbaar  Gebruikte directe verbinding",
