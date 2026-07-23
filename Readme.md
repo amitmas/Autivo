@@ -332,6 +332,7 @@ If you've contributed substantial translations for a language, open an issue or 
 
 - **Native Bangcle Crypto Engine** — Full Java port of BYD's proprietary white-box AES encryption, based on the reverse engineering work by [Niek/BYD-re](https://github.com/Niek/BYD-re) and [jkaberg/pyBYD](https://github.com/jkaberg/pyBYD). Zero new dependencies — uses the existing OkHttp stack and Java crypto libraries.
 - **3D BYD Vehicle Models** — Vehicle Control page uses base models from [ddiaz-design's BYD collection on Sketchfab](https://sketchfab.com/ddiaz-design/collections/byd-base-models-5bf92ab5f2be4ff6be5c3ac49f7099f3).
+- **BYD Dashcast** — Overdrive projection to instrument cluster uses some vetted techinques of [BYD-Dashcast](https://github.com/Kiroha/byd-dashcast), a fantastic open-source project for application projection.
 
 ## Changelog
 
